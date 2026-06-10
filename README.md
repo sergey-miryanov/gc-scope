@@ -1,1 +1,1 @@
-# gc-monitor-rs
+# gc-scope
