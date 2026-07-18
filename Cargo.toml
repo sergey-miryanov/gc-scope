@@ -1,0 +1,21 @@
+[package]
+name = "gcscope"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+read-process-memory = "0.1" # Adds cross-platform memory reading
+proc-maps = "0.5.0"
+goblin = "0.10.7"
+remoteprocess = "0.5.2"
+ctrlc = "3.5.2"
+ratatui = "0.26"
+crossterm = "0.27"
+sysinfo = "0.33"
+
+[dev-dependencies]
+goblin = "0.10.7"
+bindgen-cli = "0.72"
+
