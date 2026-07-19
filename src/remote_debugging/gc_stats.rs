@@ -1,6 +1,7 @@
 use anyhow::Result;
 use crate::memory::reader;
 use crate::remote_debugging::offsets;
+use crate::remote_debugging::offsets::offset_table::GcStatsKind;
 use crate::remote_debugging::version::PythonVersion;
 
 #[allow(dead_code)]
@@ -41,37 +42,78 @@ pub fn read_gc_stats(pid: u32, version: &PythonVersion, all_interpreters: bool) 
     let _ = vo.validate();
 
     let table = vo.to_offset_table(pid, runtime_addr);
+
+    // Catch-all guard for an unregistered build: the process's own
+    // `_Py_DebugOffsets.gc.generation_stats_size` records the TOTAL byte size of the
+    // ring-buffer region. `to_offset_table` has already SELECTED the best-matching GC
+    // layout for this hex (`select_gc_shape` — including picking between a clean release
+    // and a `+inc` build that share a hex), so for any recognized build the reconstructed
+    // total below equals `reported` and this stays silent. It fires only when selection
+    // fell through to the nav variant's default with no matching candidate — i.e. a build
+    // whose ring layout gcscope doesn't know — emitting a regeneration hint. Only
+    // ring-buffer versions (3.15.0a8+) expose this field; inline versions (3.8–3.14)
+    // report 0 here (skipped). A warning, not a hard error, because the +8 trailing-index
+    // model is validated only against GIL builds; confirm a free-threaded build first.
+    if table.gc_stats_kind == GcStatsKind::RingBuffer {
+        let reported = vo.gc_generation_stats_size();
+        if let (Some(item), Some(bases), Some(slots)) =
+            (table.gc_item_size, table.gc_gen_base_offsets, table.gc_slots_per_gen)
+        {
+            let expected = bases[2] + slots[2] * item + 8;
+            if reported != 0 && reported != expected {
+                eprintln!(
+                    "warning: gc_generation_stats size mismatch for {:#010x}: the process \
+                     reports {reported} bytes but gcscope's compiled layout expects {expected}. \
+                     This build's GC ring layout may differ from the registered one — \
+                     regenerate offsets with scripts/gen-offsets.py against this exact build.",
+                    table.version_hex
+                );
+            }
+        }
+    }
+
     let head_addr = read_u64(pid, runtime_addr + table.runtime_interpreters_head())?;
     let next_off = table.interp_next();
     let id_off = table.interp_id();
     let gc_off = table.interp_gc.unwrap_or(0);
-    let gc_item_size = table.gc_item_size;
-    let gc_is_inline = gc_item_size == Some(24) || gc_item_size == Some(40);
 
     let mut stats = Vec::new();
     let mut current = head_addr;
     let mut first = true;
     while current != 0 {
         let iid = read_i64(pid, current + id_off)?;
-        let gc_addr = current + gc_off;
-        // gc_addr now points to `_gc_runtime_state` for this interpreter
+        let gc_addr = current + gc_off; // this interpreter's `_gc_runtime_state`
 
-        if gc_item_size.is_some() {
-            let mut interp_table = table.clone();
-            if gc_is_inline {
-                // Inline array: data at gc_state_addr + 0x80
-                interp_table.gc_stats_addr = Some(gc_addr + offsets::pre_3_13::GC_STATS_INLINE_OFF);
-            } else {
-                // Ring buffer: follow the pointer stored at gc_state_addr + field_offset
-                let gen_stats_off = vo.gc_generation_stats();
-                if gen_stats_off == 0 { continue; }
-                let stats_ptr = read_u64(pid, gc_addr + gen_stats_off)?;
-                if stats_ptr == 0 { continue; }
-                interp_table.gc_stats_addr = Some(stats_ptr);
+        // Resolve this interpreter's stats address by its region shape.
+        let stats_addr = match table.gc_stats_kind {
+            GcStatsKind::None => None,
+            GcStatsKind::InlineArray => {
+                // Data lives inline at a version-specific offset from the gc state
+                // (3.13 = 0x80, 3.14 = 0x78), computed per build by gen-offsets.py
+                Some(gc_addr + table.gc_stats_inline_off)
             }
+            GcStatsKind::RingBuffer => {
+                // Follow the `gc.generation_stats` pointer in the gc state.
+                let gen_stats_off = vo.gc_generation_stats();
+                if gen_stats_off == 0 {
+                    None
+                } else {
+                    let ptr = read_u64(pid, gc_addr + gen_stats_off)?;
+                    // A NULL pointer is a normal transient state (stats not yet
+                    // allocated, or teardown): skip this interpreter, never hang.
+                    (ptr != 0).then_some(ptr)
+                }
+            }
+        };
+
+        if let Some(addr) = stats_addr {
+            let mut interp_table = table.clone();
+            interp_table.gc_stats_addr = Some(addr);
             stats.extend(interp_table.read_gc_stats(pid, iid));
         }
 
+        // Always advance — the walk must make progress even for an interpreter
+        // with no readable stats (this is what previously hung on NULL pointers).
         current = read_u64(pid, current + next_off)?;
         if first && !all_interpreters {
             break;

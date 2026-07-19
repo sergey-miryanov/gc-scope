@@ -26,10 +26,15 @@ fn table(version_hex: u64, runtime_ih: u64, interp_next: u64, interp_id: u64,
         gc_generations: gc_gen,
         gc_collecting: GC_COLLECTING,
         gc_frame: None,
+        // Pre-3.13 has inline generation stats but gcscope does not decode them
+        // (no per-slot layout wired) — navigation/verify only.
+        gc_stats_kind: crate::remote_debugging::offsets::offset_table::GcStatsKind::None,
+        gc_layout: None,
         gc_stats_addr: None,  // filled by caller using GC_STATS_INLINE_OFF + gc_state_addr
         gc_item_size: Some(GC_ITEM_SIZE),
         gc_slots_per_gen: Some(GC_SLOTS),
         gc_gen_base_offsets: Some(GC_BASES),
+        gc_stats_inline_off: GC_STATS_INLINE_OFF,
         gc_stats_addr_is_per_interp: true,
     }
 }

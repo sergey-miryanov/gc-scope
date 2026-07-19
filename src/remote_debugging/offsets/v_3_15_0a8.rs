@@ -20,7 +20,6 @@ pub struct _Py_DebugOffsets {
     pub code_object: _Py_DebugOffsets__code_object,
     pub pyobject: _Py_DebugOffsets__pyobject,
     pub type_object: _Py_DebugOffsets__type_object,
-    pub heap_type_object: _Py_DebugOffsets__heap_type_object,
     pub tuple_object: _Py_DebugOffsets__tuple_object,
     pub list_object: _Py_DebugOffsets__list_object,
     pub set_object: _Py_DebugOffsets__set_object,
@@ -296,13 +295,11 @@ pub struct _Py_DebugOffsets__type_object {
     pub tp_name: u64,
     pub tp_repr: u64,
     pub tp_flags: u64,
-    pub tp_basicsize: u64,
-    pub tp_dictoffset: u64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _Py_DebugOffsets__type_object"]
-        [::std::mem::size_of::<_Py_DebugOffsets__type_object>() - 48usize];
+        [::std::mem::size_of::<_Py_DebugOffsets__type_object>() - 32usize];
     ["Alignment of _Py_DebugOffsets__type_object"]
         [::std::mem::align_of::<_Py_DebugOffsets__type_object>() - 8usize];
     ["Offset of field: _Py_DebugOffsets__type_object::size"]
@@ -313,27 +310,6 @@ const _: () = {
         [::std::mem::offset_of!(_Py_DebugOffsets__type_object, tp_repr) - 16usize];
     ["Offset of field: _Py_DebugOffsets__type_object::tp_flags"]
         [::std::mem::offset_of!(_Py_DebugOffsets__type_object, tp_flags) - 24usize];
-    ["Offset of field: _Py_DebugOffsets__type_object::tp_basicsize"]
-        [::std::mem::offset_of!(_Py_DebugOffsets__type_object, tp_basicsize) - 32usize];
-    ["Offset of field: _Py_DebugOffsets__type_object::tp_dictoffset"]
-        [::std::mem::offset_of!(_Py_DebugOffsets__type_object, tp_dictoffset) - 40usize];
-};
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct _Py_DebugOffsets__heap_type_object {
-    pub size: u64,
-    pub ht_cached_keys: u64,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of _Py_DebugOffsets__heap_type_object"]
-        [::std::mem::size_of::<_Py_DebugOffsets__heap_type_object>() - 16usize];
-    ["Alignment of _Py_DebugOffsets__heap_type_object"]
-        [::std::mem::align_of::<_Py_DebugOffsets__heap_type_object>() - 8usize];
-    ["Offset of field: _Py_DebugOffsets__heap_type_object::size"]
-        [::std::mem::offset_of!(_Py_DebugOffsets__heap_type_object, size) - 0usize];
-    ["Offset of field: _Py_DebugOffsets__heap_type_object::ht_cached_keys"]
-        [::std::mem::offset_of!(_Py_DebugOffsets__heap_type_object, ht_cached_keys) - 8usize];
 };
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -482,12 +458,11 @@ pub struct _Py_DebugOffsets__unicode_object {
     pub state: u64,
     pub length: u64,
     pub asciiobject_size: u64,
-    pub compactunicodeobject_size: u64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _Py_DebugOffsets__unicode_object"]
-        [::std::mem::size_of::<_Py_DebugOffsets__unicode_object>() - 40usize];
+        [::std::mem::size_of::<_Py_DebugOffsets__unicode_object>() - 32usize];
     ["Alignment of _Py_DebugOffsets__unicode_object"]
         [::std::mem::align_of::<_Py_DebugOffsets__unicode_object>() - 8usize];
     ["Offset of field: _Py_DebugOffsets__unicode_object::size"]
@@ -498,10 +473,6 @@ const _: () = {
         [::std::mem::offset_of!(_Py_DebugOffsets__unicode_object, length) - 16usize];
     ["Offset of field: _Py_DebugOffsets__unicode_object::asciiobject_size"]
         [::std::mem::offset_of!(_Py_DebugOffsets__unicode_object, asciiobject_size) - 24usize];
-    ["Offset of field: _Py_DebugOffsets__unicode_object::compactunicodeobject_size"][::std::mem::offset_of!(
-        _Py_DebugOffsets__unicode_object,
-        compactunicodeobject_size
-    ) - 32usize];
 };
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -608,7 +579,7 @@ const _: () = {
 };
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of _Py_DebugOffsets"][::std::mem::size_of::<_Py_DebugOffsets>() - 880usize];
+    ["Size of _Py_DebugOffsets"][::std::mem::size_of::<_Py_DebugOffsets>() - 840usize];
     ["Alignment of _Py_DebugOffsets"][::std::mem::align_of::<_Py_DebugOffsets>() - 8usize];
     ["Offset of field: _Py_DebugOffsets::cookie"]
         [::std::mem::offset_of!(_Py_DebugOffsets, cookie) - 0usize];
@@ -632,32 +603,30 @@ const _: () = {
         [::std::mem::offset_of!(_Py_DebugOffsets, pyobject) - 456usize];
     ["Offset of field: _Py_DebugOffsets::type_object"]
         [::std::mem::offset_of!(_Py_DebugOffsets, type_object) - 472usize];
-    ["Offset of field: _Py_DebugOffsets::heap_type_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, heap_type_object) - 520usize];
     ["Offset of field: _Py_DebugOffsets::tuple_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, tuple_object) - 536usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, tuple_object) - 504usize];
     ["Offset of field: _Py_DebugOffsets::list_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, list_object) - 560usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, list_object) - 528usize];
     ["Offset of field: _Py_DebugOffsets::set_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, set_object) - 584usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, set_object) - 552usize];
     ["Offset of field: _Py_DebugOffsets::dict_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, dict_object) - 616usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, dict_object) - 584usize];
     ["Offset of field: _Py_DebugOffsets::float_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, float_object) - 640usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, float_object) - 608usize];
     ["Offset of field: _Py_DebugOffsets::long_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, long_object) - 656usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, long_object) - 624usize];
     ["Offset of field: _Py_DebugOffsets::bytes_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, bytes_object) - 680usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, bytes_object) - 648usize];
     ["Offset of field: _Py_DebugOffsets::unicode_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, unicode_object) - 704usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, unicode_object) - 672usize];
     ["Offset of field: _Py_DebugOffsets::gc"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, gc) - 744usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, gc) - 704usize];
     ["Offset of field: _Py_DebugOffsets::gen_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, gen_object) - 784usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, gen_object) - 744usize];
     ["Offset of field: _Py_DebugOffsets::llist_node"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, llist_node) - 816usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, llist_node) - 776usize];
     ["Offset of field: _Py_DebugOffsets::debugger_support"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, debugger_support) - 832usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, debugger_support) - 792usize];
 };
 pub type Py_ssize_t = ::std::os::raw::c_longlong;
 pub type PyTime_t = ::std::os::raw::c_longlong;
@@ -666,136 +635,46 @@ pub type PyTime_t = ::std::os::raw::c_longlong;
 pub struct gc_generation_stats {
     pub ts_start: PyTime_t,
     pub ts_stop: PyTime_t,
+    pub heap_size: Py_ssize_t,
+    pub work_to_do: Py_ssize_t,
     pub collections: Py_ssize_t,
+    pub object_visits: Py_ssize_t,
     pub collected: Py_ssize_t,
     pub uncollectable: Py_ssize_t,
     pub candidates: Py_ssize_t,
+    pub objects_transitively_reachable: Py_ssize_t,
+    pub objects_not_transitively_reachable: Py_ssize_t,
     pub duration: f64,
-    pub heap_size: Py_ssize_t,
-    pub increment_size: Py_ssize_t,
-    pub alive_size: Py_ssize_t,
-    pub finalized_garbage_count: Py_ssize_t,
-    pub clear_weakrefs_count: Py_ssize_t,
-    pub deleted_garbage_count: Py_ssize_t,
-    pub ts_mark_alive_start: PyTime_t,
-    pub ts_mark_alive_stop: PyTime_t,
-    pub ts_fill_increment_start: PyTime_t,
-    pub ts_fill_increment_stop: PyTime_t,
-    pub ts_deduce_unreachable_start: PyTime_t,
-    pub ts_deduce_unreachable_stop: PyTime_t,
-    pub ts_handle_weakref_callbacks_start: PyTime_t,
-    pub ts_handle_weakref_callbacks_stop: PyTime_t,
-    pub ts_finalize_garbage_stop: PyTime_t,
-    pub ts_handle_resurrected_stop: PyTime_t,
-    pub ts_clear_weakrefs_stop: PyTime_t,
-    pub ts_delete_garbage_start: PyTime_t,
-    pub ts_delete_garbage_stop: PyTime_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of gc_generation_stats"][::std::mem::size_of::<gc_generation_stats>() - 208usize];
+    ["Size of gc_generation_stats"][::std::mem::size_of::<gc_generation_stats>() - 96usize];
     ["Alignment of gc_generation_stats"][::std::mem::align_of::<gc_generation_stats>() - 8usize];
     ["Offset of field: gc_generation_stats::ts_start"]
         [::std::mem::offset_of!(gc_generation_stats, ts_start) - 0usize];
     ["Offset of field: gc_generation_stats::ts_stop"]
         [::std::mem::offset_of!(gc_generation_stats, ts_stop) - 8usize];
-    ["Offset of field: gc_generation_stats::collections"]
-        [::std::mem::offset_of!(gc_generation_stats, collections) - 16usize];
-    ["Offset of field: gc_generation_stats::collected"]
-        [::std::mem::offset_of!(gc_generation_stats, collected) - 24usize];
-    ["Offset of field: gc_generation_stats::uncollectable"]
-        [::std::mem::offset_of!(gc_generation_stats, uncollectable) - 32usize];
-    ["Offset of field: gc_generation_stats::candidates"]
-        [::std::mem::offset_of!(gc_generation_stats, candidates) - 40usize];
-    ["Offset of field: gc_generation_stats::duration"]
-        [::std::mem::offset_of!(gc_generation_stats, duration) - 48usize];
     ["Offset of field: gc_generation_stats::heap_size"]
-        [::std::mem::offset_of!(gc_generation_stats, heap_size) - 56usize];
-    ["Offset of field: gc_generation_stats::increment_size"]
-        [::std::mem::offset_of!(gc_generation_stats, increment_size) - 64usize];
-    ["Offset of field: gc_generation_stats::alive_size"]
-        [::std::mem::offset_of!(gc_generation_stats, alive_size) - 72usize];
-    ["Offset of field: gc_generation_stats::finalized_garbage_count"]
-        [::std::mem::offset_of!(gc_generation_stats, finalized_garbage_count) - 80usize];
-    ["Offset of field: gc_generation_stats::clear_weakrefs_count"]
-        [::std::mem::offset_of!(gc_generation_stats, clear_weakrefs_count) - 88usize];
-    ["Offset of field: gc_generation_stats::deleted_garbage_count"]
-        [::std::mem::offset_of!(gc_generation_stats, deleted_garbage_count) - 96usize];
-    ["Offset of field: gc_generation_stats::ts_mark_alive_start"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_mark_alive_start) - 104usize];
-    ["Offset of field: gc_generation_stats::ts_mark_alive_stop"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_mark_alive_stop) - 112usize];
-    ["Offset of field: gc_generation_stats::ts_fill_increment_start"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_fill_increment_start) - 120usize];
-    ["Offset of field: gc_generation_stats::ts_fill_increment_stop"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_fill_increment_stop) - 128usize];
-    ["Offset of field: gc_generation_stats::ts_deduce_unreachable_start"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_deduce_unreachable_start) - 136usize];
-    ["Offset of field: gc_generation_stats::ts_deduce_unreachable_stop"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_deduce_unreachable_stop) - 144usize];
-    ["Offset of field: gc_generation_stats::ts_handle_weakref_callbacks_start"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_handle_weakref_callbacks_start) - 152usize];
-    ["Offset of field: gc_generation_stats::ts_handle_weakref_callbacks_stop"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_handle_weakref_callbacks_stop) - 160usize];
-    ["Offset of field: gc_generation_stats::ts_finalize_garbage_stop"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_finalize_garbage_stop) - 168usize];
-    ["Offset of field: gc_generation_stats::ts_handle_resurrected_stop"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_handle_resurrected_stop) - 176usize];
-    ["Offset of field: gc_generation_stats::ts_clear_weakrefs_stop"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_clear_weakrefs_stop) - 184usize];
-    ["Offset of field: gc_generation_stats::ts_delete_garbage_start"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_delete_garbage_start) - 192usize];
-    ["Offset of field: gc_generation_stats::ts_delete_garbage_stop"]
-        [::std::mem::offset_of!(gc_generation_stats, ts_delete_garbage_stop) - 200usize];
+        [::std::mem::offset_of!(gc_generation_stats, heap_size) - 16usize];
+    ["Offset of field: gc_generation_stats::work_to_do"]
+        [::std::mem::offset_of!(gc_generation_stats, work_to_do) - 24usize];
+    ["Offset of field: gc_generation_stats::collections"]
+        [::std::mem::offset_of!(gc_generation_stats, collections) - 32usize];
+    ["Offset of field: gc_generation_stats::object_visits"]
+        [::std::mem::offset_of!(gc_generation_stats, object_visits) - 40usize];
+    ["Offset of field: gc_generation_stats::collected"]
+        [::std::mem::offset_of!(gc_generation_stats, collected) - 48usize];
+    ["Offset of field: gc_generation_stats::uncollectable"]
+        [::std::mem::offset_of!(gc_generation_stats, uncollectable) - 56usize];
+    ["Offset of field: gc_generation_stats::candidates"]
+        [::std::mem::offset_of!(gc_generation_stats, candidates) - 64usize];
+    ["Offset of field: gc_generation_stats::objects_transitively_reachable"]
+        [::std::mem::offset_of!(gc_generation_stats, objects_transitively_reachable) - 72usize];
+    ["Offset of field: gc_generation_stats::objects_not_transitively_reachable"]
+        [::std::mem::offset_of!(gc_generation_stats, objects_not_transitively_reachable) - 80usize];
+    ["Offset of field: gc_generation_stats::duration"]
+        [::std::mem::offset_of!(gc_generation_stats, duration) - 88usize];
 };
-
-impl_display_debug_offsets!(_Py_DebugOffsets,
-    _Py_DebugOffsets__runtime_state,
-    _Py_DebugOffsets__interpreter_state,
-    _Py_DebugOffsets__thread_state,
-    _Py_DebugOffsets__bindgen_ty_1,
-    _Py_DebugOffsets__interpreter_frame,
-    _Py_DebugOffsets__code_object,
-    _Py_DebugOffsets__pyobject,
-    _Py_DebugOffsets__type_object,
-    _Py_DebugOffsets__heap_type_object,
-    _Py_DebugOffsets__tuple_object,
-    _Py_DebugOffsets__list_object,
-    _Py_DebugOffsets__set_object,
-    _Py_DebugOffsets__dict_object,
-    _Py_DebugOffsets__float_object,
-    _Py_DebugOffsets__long_object,
-    _Py_DebugOffsets__bytes_object,
-    _Py_DebugOffsets__unicode_object,
-    _Py_DebugOffsets__gc,
-    _Py_DebugOffsets__gen_object,
-    _Py_DebugOffsets__llist_node,
-    _Py_DebugOffsets__debugger_support
-);
-
-impl_validate_debug_offsets!(_Py_DebugOffsets,
-    _Py_DebugOffsets__runtime_state,
-    _Py_DebugOffsets__interpreter_state,
-    _Py_DebugOffsets__thread_state,
-    _Py_DebugOffsets__bindgen_ty_1,
-    _Py_DebugOffsets__interpreter_frame,
-    _Py_DebugOffsets__code_object,
-    _Py_DebugOffsets__pyobject,
-    _Py_DebugOffsets__type_object,
-    _Py_DebugOffsets__heap_type_object,
-    _Py_DebugOffsets__tuple_object,
-    _Py_DebugOffsets__list_object,
-    _Py_DebugOffsets__set_object,
-    _Py_DebugOffsets__dict_object,
-    _Py_DebugOffsets__float_object,
-    _Py_DebugOffsets__long_object,
-    _Py_DebugOffsets__bytes_object,
-    _Py_DebugOffsets__unicode_object,
-    _Py_DebugOffsets__gc,
-    _Py_DebugOffsets__gen_object,
-    _Py_DebugOffsets__llist_node,
-    _Py_DebugOffsets__debugger_support
-);
 
 
 // -- GC generation stats field layout --
@@ -810,33 +689,35 @@ pub static GC_LAYOUT: GcItemLayout = GcItemLayout {
     fields: &[
         ("ts_start", std::mem::offset_of!(gc_generation_stats, ts_start)),
         ("ts_stop", std::mem::offset_of!(gc_generation_stats, ts_stop)),
+        ("heap_size", std::mem::offset_of!(gc_generation_stats, heap_size)),
+        ("work_to_do", std::mem::offset_of!(gc_generation_stats, work_to_do)),
         ("collections", std::mem::offset_of!(gc_generation_stats, collections)),
+        ("object_visits", std::mem::offset_of!(gc_generation_stats, object_visits)),
         ("collected", std::mem::offset_of!(gc_generation_stats, collected)),
         ("uncollectable", std::mem::offset_of!(gc_generation_stats, uncollectable)),
         ("candidates", std::mem::offset_of!(gc_generation_stats, candidates)),
+        ("objects_transitively_reachable", std::mem::offset_of!(gc_generation_stats, objects_transitively_reachable)),
+        ("objects_not_transitively_reachable", std::mem::offset_of!(gc_generation_stats, objects_not_transitively_reachable)),
         ("duration", std::mem::offset_of!(gc_generation_stats, duration)),
-        ("heap_size", std::mem::offset_of!(gc_generation_stats, heap_size)),
-        ("increment_size", std::mem::offset_of!(gc_generation_stats, increment_size)),
-        ("alive_size", std::mem::offset_of!(gc_generation_stats, alive_size)),
-        ("finalized_garbage_count", std::mem::offset_of!(gc_generation_stats, finalized_garbage_count)),
-        ("clear_weakrefs_count", std::mem::offset_of!(gc_generation_stats, clear_weakrefs_count)),
-        ("deleted_garbage_count", std::mem::offset_of!(gc_generation_stats, deleted_garbage_count)),
-        ("ts_mark_alive_start", std::mem::offset_of!(gc_generation_stats, ts_mark_alive_start)),
-        ("ts_mark_alive_stop", std::mem::offset_of!(gc_generation_stats, ts_mark_alive_stop)),
-        ("ts_fill_increment_start", std::mem::offset_of!(gc_generation_stats, ts_fill_increment_start)),
-        ("ts_fill_increment_stop", std::mem::offset_of!(gc_generation_stats, ts_fill_increment_stop)),
-        ("ts_deduce_unreachable_start", std::mem::offset_of!(gc_generation_stats, ts_deduce_unreachable_start)),
-        ("ts_deduce_unreachable_stop", std::mem::offset_of!(gc_generation_stats, ts_deduce_unreachable_stop)),
-        ("ts_handle_weakref_callbacks_start", std::mem::offset_of!(gc_generation_stats, ts_handle_weakref_callbacks_start)),
-        ("ts_handle_weakref_callbacks_stop", std::mem::offset_of!(gc_generation_stats, ts_handle_weakref_callbacks_stop)),
-        ("ts_finalize_garbage_stop", std::mem::offset_of!(gc_generation_stats, ts_finalize_garbage_stop)),
-        ("ts_handle_resurrected_stop", std::mem::offset_of!(gc_generation_stats, ts_handle_resurrected_stop)),
-        ("ts_clear_weakrefs_stop", std::mem::offset_of!(gc_generation_stats, ts_clear_weakrefs_stop)),
-        ("ts_delete_garbage_start", std::mem::offset_of!(gc_generation_stats, ts_delete_garbage_start)),
-        ("ts_delete_garbage_stop", std::mem::offset_of!(gc_generation_stats, ts_delete_garbage_stop)),
     ],
 };
 
 pub fn gc_field_names() -> &'static [(&'static str, usize)] {
     GC_LAYOUT.fields
+}
+
+// -- DebugOffsetsView: per-version dispatch (see offsets/mod.rs) --
+impl crate::remote_debugging::offsets::DebugOffsetsView for _Py_DebugOffsets {
+    fn layout_version(&self) -> u64 { 0x030f00a8 }
+    fn threads_main(&self) -> u64 { self.interpreter_state.threads_main }
+    fn gc_frame(&self) -> u64 { self.gc.frame }
+    fn gc_generation_stats(&self) -> u64 { self.gc.generation_stats }
+    fn gc_generation_stats_size(&self) -> u64 { self.gc.generation_stats_size }
+    fn gc_stats_shape(&self) -> crate::remote_debugging::offsets::GcStatsShape {
+        crate::remote_debugging::offsets::GcStatsShape {
+            kind: crate::remote_debugging::offsets::offset_table::GcStatsKind::RingBuffer,
+            item_size: GC_ITEM_SIZE as u64,
+            layout: Some(&GC_LAYOUT),
+        }
+    }
 }

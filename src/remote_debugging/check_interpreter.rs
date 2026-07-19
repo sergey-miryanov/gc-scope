@@ -3,7 +3,7 @@ use proc_maps::{get_process_maps, MapRange};
 
 use crate::memory::{process, reader};
 use crate::remote_debugging::offsets;
-use crate::remote_debugging::offsets::offset_table::{self, OffsetTable};
+use crate::remote_debugging::offsets::offset_table::OffsetTable;
 use crate::remote_debugging::version;
 
 pub struct CheckResult {
@@ -112,33 +112,44 @@ pub fn verify_process(pid: u32) -> Option<bool> {
         return None;
     }
 
-    // Try 3.13+ path first (from _Py_DebugOffsets)
+    // 3.13+: offsets come from the process's self-describing `_Py_DebugOffsets`, read
+    // through the versioned bindgen layout. `read_offsets` handles both exact and
+    // same-minor-fallback dispatch, so it covers any 3.13+ build; an `Err` means the
+    // version is genuinely unsupported (can't verify).
     if ver.minor >= 13 {
-        // First try the versioned bindgen path (3.15.0a8, 3.16.0a0)
-        if let Ok((_addr, _stored, offs)) = offsets::read_offsets(pid, &ver) {
-            let result = check_runtime(
-                pid,
-                runtime_addr,
-                offs.runtime_state_size(),
-                offs.runtime_interpreters_head(),
-                offs.interpreter_state_threads_head(),
-                offs.thread_state_interp(),
-            )
-            .ok()?;
-            return Some(result.match_ok);
-        }
-        // Fallback: try generated layout tables (3.13.x, 3.14.x, newer)
-        let stored = reader::read_u64(pid, runtime_addr + 8).ok()?;
-        if let Some(layout) = offsets::tables::layout_for_version(stored) {
-            let table = offset_table::read_offset_table(pid, runtime_addr, layout);
-            return verify_with_table(pid, runtime_addr, &table);
-        }
-        return None; // unknown 3.13+ version
+        let (_addr, _stored, offs) = offsets::read_offsets(pid, &ver).ok()?;
+        let result = check_runtime(
+            pid,
+            runtime_addr,
+            offs.runtime_state_size(),
+            offs.runtime_interpreters_head(),
+            offs.interpreter_state_threads_head(),
+            offs.thread_state_interp(),
+        )
+        .ok()?;
+        return Some(result.match_ok);
     }
 
-    // Pre-3.13 path: hardcoded offset tables
+    // Pre-3.13 path: hardcoded, minor-level offset tables. There is no self-describing
+    // `_Py_DebugOffsets` to validate against here, so we use the minor's table for any
+    // micro (pre-3.13 offsets are stable within a minor) and warn once. GC generation
+    // stats are not available on these versions.
     let table = offsets::pre_3_13::table_for_version(ver.major, ver.minor)?;
+    warn_pre_3_13_once(ver.major, ver.minor, ver.micro);
     verify_with_table(pid, runtime_addr, &table)
+}
+
+/// Warn once per (major, minor) that pre-3.13 support uses minor-level hardcoded
+/// offsets (micro not distinguished) and provides no GC generation stats.
+fn warn_pre_3_13_once(major: u8, minor: u8, micro: u8) {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(u8, u8)>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if WARNED.lock().unwrap().insert((major, minor)) {
+        eprintln!(
+            "warning: Python {major}.{minor}.{micro} predates _Py_DebugOffsets; using \
+             hardcoded {major}.{minor}.x offsets (navigation only, no GC generation stats).",
+        );
+    }
 }
 
 fn verify_with_table(pid: u32, runtime_addr: u64, table: &OffsetTable) -> Option<bool> {

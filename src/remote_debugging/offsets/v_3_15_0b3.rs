@@ -20,6 +20,7 @@ pub struct _Py_DebugOffsets {
     pub code_object: _Py_DebugOffsets__code_object,
     pub pyobject: _Py_DebugOffsets__pyobject,
     pub type_object: _Py_DebugOffsets__type_object,
+    pub heap_type_object: _Py_DebugOffsets__heap_type_object,
     pub tuple_object: _Py_DebugOffsets__tuple_object,
     pub list_object: _Py_DebugOffsets__list_object,
     pub set_object: _Py_DebugOffsets__set_object,
@@ -295,11 +296,13 @@ pub struct _Py_DebugOffsets__type_object {
     pub tp_name: u64,
     pub tp_repr: u64,
     pub tp_flags: u64,
+    pub tp_basicsize: u64,
+    pub tp_dictoffset: u64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _Py_DebugOffsets__type_object"]
-        [::std::mem::size_of::<_Py_DebugOffsets__type_object>() - 32usize];
+        [::std::mem::size_of::<_Py_DebugOffsets__type_object>() - 48usize];
     ["Alignment of _Py_DebugOffsets__type_object"]
         [::std::mem::align_of::<_Py_DebugOffsets__type_object>() - 8usize];
     ["Offset of field: _Py_DebugOffsets__type_object::size"]
@@ -310,6 +313,27 @@ const _: () = {
         [::std::mem::offset_of!(_Py_DebugOffsets__type_object, tp_repr) - 16usize];
     ["Offset of field: _Py_DebugOffsets__type_object::tp_flags"]
         [::std::mem::offset_of!(_Py_DebugOffsets__type_object, tp_flags) - 24usize];
+    ["Offset of field: _Py_DebugOffsets__type_object::tp_basicsize"]
+        [::std::mem::offset_of!(_Py_DebugOffsets__type_object, tp_basicsize) - 32usize];
+    ["Offset of field: _Py_DebugOffsets__type_object::tp_dictoffset"]
+        [::std::mem::offset_of!(_Py_DebugOffsets__type_object, tp_dictoffset) - 40usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct _Py_DebugOffsets__heap_type_object {
+    pub size: u64,
+    pub ht_cached_keys: u64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _Py_DebugOffsets__heap_type_object"]
+        [::std::mem::size_of::<_Py_DebugOffsets__heap_type_object>() - 16usize];
+    ["Alignment of _Py_DebugOffsets__heap_type_object"]
+        [::std::mem::align_of::<_Py_DebugOffsets__heap_type_object>() - 8usize];
+    ["Offset of field: _Py_DebugOffsets__heap_type_object::size"]
+        [::std::mem::offset_of!(_Py_DebugOffsets__heap_type_object, size) - 0usize];
+    ["Offset of field: _Py_DebugOffsets__heap_type_object::ht_cached_keys"]
+        [::std::mem::offset_of!(_Py_DebugOffsets__heap_type_object, ht_cached_keys) - 8usize];
 };
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -458,11 +482,12 @@ pub struct _Py_DebugOffsets__unicode_object {
     pub state: u64,
     pub length: u64,
     pub asciiobject_size: u64,
+    pub compactunicodeobject_size: u64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _Py_DebugOffsets__unicode_object"]
-        [::std::mem::size_of::<_Py_DebugOffsets__unicode_object>() - 32usize];
+        [::std::mem::size_of::<_Py_DebugOffsets__unicode_object>() - 40usize];
     ["Alignment of _Py_DebugOffsets__unicode_object"]
         [::std::mem::align_of::<_Py_DebugOffsets__unicode_object>() - 8usize];
     ["Offset of field: _Py_DebugOffsets__unicode_object::size"]
@@ -473,6 +498,10 @@ const _: () = {
         [::std::mem::offset_of!(_Py_DebugOffsets__unicode_object, length) - 16usize];
     ["Offset of field: _Py_DebugOffsets__unicode_object::asciiobject_size"]
         [::std::mem::offset_of!(_Py_DebugOffsets__unicode_object, asciiobject_size) - 24usize];
+    ["Offset of field: _Py_DebugOffsets__unicode_object::compactunicodeobject_size"][::std::mem::offset_of!(
+        _Py_DebugOffsets__unicode_object,
+        compactunicodeobject_size
+    ) - 32usize];
 };
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -480,10 +509,12 @@ pub struct _Py_DebugOffsets__gc {
     pub size: u64,
     pub collecting: u64,
     pub frame: u64,
+    pub generation_stats_size: u64,
+    pub generation_stats: u64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of _Py_DebugOffsets__gc"][::std::mem::size_of::<_Py_DebugOffsets__gc>() - 24usize];
+    ["Size of _Py_DebugOffsets__gc"][::std::mem::size_of::<_Py_DebugOffsets__gc>() - 40usize];
     ["Alignment of _Py_DebugOffsets__gc"][::std::mem::align_of::<_Py_DebugOffsets__gc>() - 8usize];
     ["Offset of field: _Py_DebugOffsets__gc::size"]
         [::std::mem::offset_of!(_Py_DebugOffsets__gc, size) - 0usize];
@@ -491,6 +522,10 @@ const _: () = {
         [::std::mem::offset_of!(_Py_DebugOffsets__gc, collecting) - 8usize];
     ["Offset of field: _Py_DebugOffsets__gc::frame"]
         [::std::mem::offset_of!(_Py_DebugOffsets__gc, frame) - 16usize];
+    ["Offset of field: _Py_DebugOffsets__gc::generation_stats_size"]
+        [::std::mem::offset_of!(_Py_DebugOffsets__gc, generation_stats_size) - 24usize];
+    ["Offset of field: _Py_DebugOffsets__gc::generation_stats"]
+        [::std::mem::offset_of!(_Py_DebugOffsets__gc, generation_stats) - 32usize];
 };
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -573,7 +608,7 @@ const _: () = {
 };
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of _Py_DebugOffsets"][::std::mem::size_of::<_Py_DebugOffsets>() - 824usize];
+    ["Size of _Py_DebugOffsets"][::std::mem::size_of::<_Py_DebugOffsets>() - 880usize];
     ["Alignment of _Py_DebugOffsets"][::std::mem::align_of::<_Py_DebugOffsets>() - 8usize];
     ["Offset of field: _Py_DebugOffsets::cookie"]
         [::std::mem::offset_of!(_Py_DebugOffsets, cookie) - 0usize];
@@ -597,56 +632,116 @@ const _: () = {
         [::std::mem::offset_of!(_Py_DebugOffsets, pyobject) - 456usize];
     ["Offset of field: _Py_DebugOffsets::type_object"]
         [::std::mem::offset_of!(_Py_DebugOffsets, type_object) - 472usize];
+    ["Offset of field: _Py_DebugOffsets::heap_type_object"]
+        [::std::mem::offset_of!(_Py_DebugOffsets, heap_type_object) - 520usize];
     ["Offset of field: _Py_DebugOffsets::tuple_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, tuple_object) - 504usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, tuple_object) - 536usize];
     ["Offset of field: _Py_DebugOffsets::list_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, list_object) - 528usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, list_object) - 560usize];
     ["Offset of field: _Py_DebugOffsets::set_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, set_object) - 552usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, set_object) - 584usize];
     ["Offset of field: _Py_DebugOffsets::dict_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, dict_object) - 584usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, dict_object) - 616usize];
     ["Offset of field: _Py_DebugOffsets::float_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, float_object) - 608usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, float_object) - 640usize];
     ["Offset of field: _Py_DebugOffsets::long_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, long_object) - 624usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, long_object) - 656usize];
     ["Offset of field: _Py_DebugOffsets::bytes_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, bytes_object) - 648usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, bytes_object) - 680usize];
     ["Offset of field: _Py_DebugOffsets::unicode_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, unicode_object) - 672usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, unicode_object) - 704usize];
     ["Offset of field: _Py_DebugOffsets::gc"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, gc) - 704usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, gc) - 744usize];
     ["Offset of field: _Py_DebugOffsets::gen_object"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, gen_object) - 728usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, gen_object) - 784usize];
     ["Offset of field: _Py_DebugOffsets::llist_node"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, llist_node) - 760usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, llist_node) - 816usize];
     ["Offset of field: _Py_DebugOffsets::debugger_support"]
-        [::std::mem::offset_of!(_Py_DebugOffsets, debugger_support) - 776usize];
+        [::std::mem::offset_of!(_Py_DebugOffsets, debugger_support) - 832usize];
 };
 pub type Py_ssize_t = ::std::os::raw::c_longlong;
+pub type PyTime_t = ::std::os::raw::c_longlong;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct gc_generation_stats {
+    pub ts_start: PyTime_t,
+    pub ts_stop: PyTime_t,
     pub collections: Py_ssize_t,
     pub collected: Py_ssize_t,
     pub uncollectable: Py_ssize_t,
     pub candidates: Py_ssize_t,
     pub duration: f64,
+    pub heap_size: Py_ssize_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of gc_generation_stats"][::std::mem::size_of::<gc_generation_stats>() - 40usize];
+    ["Size of gc_generation_stats"][::std::mem::size_of::<gc_generation_stats>() - 64usize];
     ["Alignment of gc_generation_stats"][::std::mem::align_of::<gc_generation_stats>() - 8usize];
+    ["Offset of field: gc_generation_stats::ts_start"]
+        [::std::mem::offset_of!(gc_generation_stats, ts_start) - 0usize];
+    ["Offset of field: gc_generation_stats::ts_stop"]
+        [::std::mem::offset_of!(gc_generation_stats, ts_stop) - 8usize];
     ["Offset of field: gc_generation_stats::collections"]
-        [::std::mem::offset_of!(gc_generation_stats, collections) - 0usize];
+        [::std::mem::offset_of!(gc_generation_stats, collections) - 16usize];
     ["Offset of field: gc_generation_stats::collected"]
-        [::std::mem::offset_of!(gc_generation_stats, collected) - 8usize];
+        [::std::mem::offset_of!(gc_generation_stats, collected) - 24usize];
     ["Offset of field: gc_generation_stats::uncollectable"]
-        [::std::mem::offset_of!(gc_generation_stats, uncollectable) - 16usize];
+        [::std::mem::offset_of!(gc_generation_stats, uncollectable) - 32usize];
     ["Offset of field: gc_generation_stats::candidates"]
-        [::std::mem::offset_of!(gc_generation_stats, candidates) - 24usize];
+        [::std::mem::offset_of!(gc_generation_stats, candidates) - 40usize];
     ["Offset of field: gc_generation_stats::duration"]
-        [::std::mem::offset_of!(gc_generation_stats, duration) - 32usize];
+        [::std::mem::offset_of!(gc_generation_stats, duration) - 48usize];
+    ["Offset of field: gc_generation_stats::heap_size"]
+        [::std::mem::offset_of!(gc_generation_stats, heap_size) - 56usize];
 };
+
+impl_display_debug_offsets!(_Py_DebugOffsets,
+    _Py_DebugOffsets__runtime_state,
+    _Py_DebugOffsets__interpreter_state,
+    _Py_DebugOffsets__thread_state,
+    _Py_DebugOffsets__bindgen_ty_1,
+    _Py_DebugOffsets__interpreter_frame,
+    _Py_DebugOffsets__code_object,
+    _Py_DebugOffsets__pyobject,
+    _Py_DebugOffsets__type_object,
+    _Py_DebugOffsets__heap_type_object,
+    _Py_DebugOffsets__tuple_object,
+    _Py_DebugOffsets__list_object,
+    _Py_DebugOffsets__set_object,
+    _Py_DebugOffsets__dict_object,
+    _Py_DebugOffsets__float_object,
+    _Py_DebugOffsets__long_object,
+    _Py_DebugOffsets__bytes_object,
+    _Py_DebugOffsets__unicode_object,
+    _Py_DebugOffsets__gc,
+    _Py_DebugOffsets__gen_object,
+    _Py_DebugOffsets__llist_node,
+    _Py_DebugOffsets__debugger_support
+);
+
+impl_validate_debug_offsets!(_Py_DebugOffsets,
+    _Py_DebugOffsets__runtime_state,
+    _Py_DebugOffsets__interpreter_state,
+    _Py_DebugOffsets__thread_state,
+    _Py_DebugOffsets__bindgen_ty_1,
+    _Py_DebugOffsets__interpreter_frame,
+    _Py_DebugOffsets__code_object,
+    _Py_DebugOffsets__pyobject,
+    _Py_DebugOffsets__type_object,
+    _Py_DebugOffsets__heap_type_object,
+    _Py_DebugOffsets__tuple_object,
+    _Py_DebugOffsets__list_object,
+    _Py_DebugOffsets__set_object,
+    _Py_DebugOffsets__dict_object,
+    _Py_DebugOffsets__float_object,
+    _Py_DebugOffsets__long_object,
+    _Py_DebugOffsets__bytes_object,
+    _Py_DebugOffsets__unicode_object,
+    _Py_DebugOffsets__gc,
+    _Py_DebugOffsets__gen_object,
+    _Py_DebugOffsets__llist_node,
+    _Py_DebugOffsets__debugger_support
+);
 
 
 // -- GC generation stats field layout --
@@ -659,14 +754,33 @@ pub const GC_ITEM_SIZE: usize = std::mem::size_of::<gc_generation_stats>();
 pub static GC_LAYOUT: GcItemLayout = GcItemLayout {
     item_size: GC_ITEM_SIZE,
     fields: &[
+        ("ts_start", std::mem::offset_of!(gc_generation_stats, ts_start)),
+        ("ts_stop", std::mem::offset_of!(gc_generation_stats, ts_stop)),
         ("collections", std::mem::offset_of!(gc_generation_stats, collections)),
         ("collected", std::mem::offset_of!(gc_generation_stats, collected)),
         ("uncollectable", std::mem::offset_of!(gc_generation_stats, uncollectable)),
         ("candidates", std::mem::offset_of!(gc_generation_stats, candidates)),
         ("duration", std::mem::offset_of!(gc_generation_stats, duration)),
+        ("heap_size", std::mem::offset_of!(gc_generation_stats, heap_size)),
     ],
 };
 
 pub fn gc_field_names() -> &'static [(&'static str, usize)] {
     GC_LAYOUT.fields
+}
+
+// -- DebugOffsetsView: per-version dispatch (see offsets/mod.rs) --
+impl crate::remote_debugging::offsets::DebugOffsetsView for _Py_DebugOffsets {
+    fn layout_version(&self) -> u64 { 0x030f00b3 }
+    fn threads_main(&self) -> u64 { self.interpreter_state.threads_main }
+    fn gc_frame(&self) -> u64 { self.gc.frame }
+    fn gc_generation_stats(&self) -> u64 { self.gc.generation_stats }
+    fn gc_generation_stats_size(&self) -> u64 { self.gc.generation_stats_size }
+    fn gc_stats_shape(&self) -> crate::remote_debugging::offsets::GcStatsShape {
+        crate::remote_debugging::offsets::GcStatsShape {
+            kind: crate::remote_debugging::offsets::offset_table::GcStatsKind::RingBuffer,
+            item_size: GC_ITEM_SIZE as u64,
+            layout: Some(&GC_LAYOUT),
+        }
+    }
 }

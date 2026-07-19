@@ -624,3 +624,24 @@ pub static GC_LAYOUT: GcItemLayout = GcItemLayout {
 pub fn gc_field_names() -> &'static [(&'static str, usize)] {
     GC_LAYOUT.fields
 }
+
+/// Byte offset of the inline `generation_stats[]` array within `_gc_runtime_state`,
+/// computed by scripts/gen-offsets.py from this build's headers (version-specific).
+pub const GC_STATS_INLINE_OFF: u64 = 0x78;
+
+// -- DebugOffsetsView: per-version dispatch (see offsets/mod.rs) --
+impl crate::remote_debugging::offsets::DebugOffsetsView for _Py_DebugOffsets {
+    fn layout_version(&self) -> u64 { 0x030e04f0 }
+    fn threads_main(&self) -> u64 { self.interpreter_state.threads_main }
+    fn gc_frame(&self) -> u64 { 0 }
+    fn gc_generation_stats(&self) -> u64 { 0 }
+    fn gc_generation_stats_size(&self) -> u64 { 0 }
+    fn gc_stats_shape(&self) -> crate::remote_debugging::offsets::GcStatsShape {
+        crate::remote_debugging::offsets::GcStatsShape {
+            kind: crate::remote_debugging::offsets::offset_table::GcStatsKind::InlineArray,
+            item_size: GC_ITEM_SIZE as u64,
+            layout: Some(&GC_LAYOUT),
+        }
+    }
+    fn gc_inline_off(&self) -> u64 { GC_STATS_INLINE_OFF }
+}

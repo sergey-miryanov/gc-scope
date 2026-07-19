@@ -768,3 +768,19 @@ pub static GC_LAYOUT: GcItemLayout = GcItemLayout {
 pub fn gc_field_names() -> &'static [(&'static str, usize)] {
     GC_LAYOUT.fields
 }
+
+// -- DebugOffsetsView: per-version dispatch (see offsets/mod.rs) --
+impl crate::remote_debugging::offsets::DebugOffsetsView for _Py_DebugOffsets {
+    fn layout_version(&self) -> u64 { 0x031000a0 }
+    fn threads_main(&self) -> u64 { self.interpreter_state.threads_main }
+    fn gc_frame(&self) -> u64 { self.gc.frame }
+    fn gc_generation_stats(&self) -> u64 { self.gc.generation_stats }
+    fn gc_generation_stats_size(&self) -> u64 { self.gc.generation_stats_size }
+    fn gc_stats_shape(&self) -> crate::remote_debugging::offsets::GcStatsShape {
+        crate::remote_debugging::offsets::GcStatsShape {
+            kind: crate::remote_debugging::offsets::offset_table::GcStatsKind::RingBuffer,
+            item_size: GC_ITEM_SIZE as u64,
+            layout: Some(&GC_LAYOUT),
+        }
+    }
+}

@@ -659,6 +659,41 @@ const _: () = {
     ["Offset of field: _Py_DebugOffsets::debugger_support"]
         [::std::mem::offset_of!(_Py_DebugOffsets, debugger_support) - 832usize];
 };
+pub type Py_ssize_t = ::std::os::raw::c_longlong;
+pub type PyTime_t = ::std::os::raw::c_longlong;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct gc_generation_stats {
+    pub ts_start: PyTime_t,
+    pub ts_stop: PyTime_t,
+    pub collections: Py_ssize_t,
+    pub collected: Py_ssize_t,
+    pub uncollectable: Py_ssize_t,
+    pub candidates: Py_ssize_t,
+    pub duration: f64,
+    pub heap_size: Py_ssize_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of gc_generation_stats"][::std::mem::size_of::<gc_generation_stats>() - 64usize];
+    ["Alignment of gc_generation_stats"][::std::mem::align_of::<gc_generation_stats>() - 8usize];
+    ["Offset of field: gc_generation_stats::ts_start"]
+        [::std::mem::offset_of!(gc_generation_stats, ts_start) - 0usize];
+    ["Offset of field: gc_generation_stats::ts_stop"]
+        [::std::mem::offset_of!(gc_generation_stats, ts_stop) - 8usize];
+    ["Offset of field: gc_generation_stats::collections"]
+        [::std::mem::offset_of!(gc_generation_stats, collections) - 16usize];
+    ["Offset of field: gc_generation_stats::collected"]
+        [::std::mem::offset_of!(gc_generation_stats, collected) - 24usize];
+    ["Offset of field: gc_generation_stats::uncollectable"]
+        [::std::mem::offset_of!(gc_generation_stats, uncollectable) - 32usize];
+    ["Offset of field: gc_generation_stats::candidates"]
+        [::std::mem::offset_of!(gc_generation_stats, candidates) - 40usize];
+    ["Offset of field: gc_generation_stats::duration"]
+        [::std::mem::offset_of!(gc_generation_stats, duration) - 48usize];
+    ["Offset of field: gc_generation_stats::heap_size"]
+        [::std::mem::offset_of!(gc_generation_stats, heap_size) - 56usize];
+};
 
 impl_display_debug_offsets!(_Py_DebugOffsets,
     _Py_DebugOffsets__runtime_state,
@@ -708,3 +743,44 @@ impl_validate_debug_offsets!(_Py_DebugOffsets,
     _Py_DebugOffsets__debugger_support
 );
 
+
+// -- GC generation stats field layout --
+// Computed from bindgen-generated #[repr(C)] struct via offset_of! at compile time.
+
+pub use crate::remote_debugging::offsets::offset_table::GcItemLayout;
+
+pub const GC_ITEM_SIZE: usize = std::mem::size_of::<gc_generation_stats>();
+
+pub static GC_LAYOUT: GcItemLayout = GcItemLayout {
+    item_size: GC_ITEM_SIZE,
+    fields: &[
+        ("ts_start", std::mem::offset_of!(gc_generation_stats, ts_start)),
+        ("ts_stop", std::mem::offset_of!(gc_generation_stats, ts_stop)),
+        ("collections", std::mem::offset_of!(gc_generation_stats, collections)),
+        ("collected", std::mem::offset_of!(gc_generation_stats, collected)),
+        ("uncollectable", std::mem::offset_of!(gc_generation_stats, uncollectable)),
+        ("candidates", std::mem::offset_of!(gc_generation_stats, candidates)),
+        ("duration", std::mem::offset_of!(gc_generation_stats, duration)),
+        ("heap_size", std::mem::offset_of!(gc_generation_stats, heap_size)),
+    ],
+};
+
+pub fn gc_field_names() -> &'static [(&'static str, usize)] {
+    GC_LAYOUT.fields
+}
+
+// -- DebugOffsetsView: per-version dispatch (see offsets/mod.rs) --
+impl crate::remote_debugging::offsets::DebugOffsetsView for _Py_DebugOffsets {
+    fn layout_version(&self) -> u64 { 0x030f00b1 }
+    fn threads_main(&self) -> u64 { self.interpreter_state.threads_main }
+    fn gc_frame(&self) -> u64 { self.gc.frame }
+    fn gc_generation_stats(&self) -> u64 { self.gc.generation_stats }
+    fn gc_generation_stats_size(&self) -> u64 { self.gc.generation_stats_size }
+    fn gc_stats_shape(&self) -> crate::remote_debugging::offsets::GcStatsShape {
+        crate::remote_debugging::offsets::GcStatsShape {
+            kind: crate::remote_debugging::offsets::offset_table::GcStatsKind::RingBuffer,
+            item_size: GC_ITEM_SIZE as u64,
+            layout: Some(&GC_LAYOUT),
+        }
+    }
+}

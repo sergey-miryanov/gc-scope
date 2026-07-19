@@ -29,19 +29,30 @@ Generated offset structs are in `src/remote_debugging/offsets/`. Currently suppo
 | 3.13.1 | `0x030d01f0` | bindgen |
 | 3.13.13+ | `0x030d0df0` | bindgen |
 | 3.14.4 | `0x030e04f0` | bindgen |
-| 3.15.0a7 | `0x030f00a7` | generated layout |
 | 3.15.0a8 | `0x030f00a8` | bindgen |
-| 3.15.0b1+ | `0x030f00b1` | bindgen |
+| 3.15.0b1 | `0x030f00b1` | bindgen |
+| 3.15.0b3 | `0x030f00b3` | bindgen |
 | 3.16.0a0 | `0x031000a0` | bindgen |
 
 All pre-3.13 versions (3.8–3.12) use hardcoded tables in `pre_3_13.rs`.
+
+### Builds that share a version hex (multi-candidate GC layout)
+
+A clean release and a GC-instrumented `+inc` build can share a `PY_VERSION_HEX` and an
+identical `_Py_DebugOffsets`, differing only in the per-slot `gc_generation_stats` struct.
+For those, `GC_CANDIDATES` (in `offsets/mod.rs`) registers each candidate GC layout for the
+hex, and `select_gc_shape` picks the right one at read-time by the process-published
+`generation_stats_size` (total ring bytes). Candidates for one hex must have distinct ring
+sizes — the only out-of-process discriminator — enforced by a test. Example:
+`0x030f00b1` serves both clean 3.15.0b1 (64-byte stats) and the `gc-gen-3.15+inc` build
+(208-byte stats).
 
 ## How offset tables work
 
 gcscope needs to know the byte offsets of fields within `_PyRuntime`,
 `PyInterpreterState`, `PyThreadState`, and the GC state. These offsets
 change between every Python minor version (3.8 → 3.9 → … → 3.16).
-There are three ways to obtain them:
+There are two ways to obtain them:
 
 ### 1. Hardcoded tables (3.8–3.12)
 
@@ -50,19 +61,7 @@ extracted from CPython headers by hand and stored in
 `src/remote_debugging/offsets/pre_3_13.rs`. Each version needs ~7
 field offsets. These versions do not support GC stats reading.
 
-### 2. Generated layout (any 3.13+, verify-only)
-
-`scripts/gen-offsets-table.py` parses the `_Py_DebugOffsets` C struct
-definition using pure Python (no compiler needed). It walks the
-`uint64_t` fields sequentially, recording each field's byte position
-within the struct, and emits a compact `DebugOffsetsLayout` constant.
-
-At runtime, gcscope reads the raw `_Py_DebugOffsets` bytes from the
-target process, extracts the actual offset values at the recorded
-positions, and builds an `OffsetTable`. This supports `--verify` and
-pointer walking for any 3.13+ version with zero toolchain dependencies.
-
-### 3. Bindgen-generated struct (3.13+, full support)
+### 2. Bindgen-generated struct (3.13+, full support)
 
 `scripts/gen-offsets.py` uses `bindgen` (Rust FFI bindings) to
 generate a complete `#[repr(C)]` Rust struct that mirrors the C
@@ -140,26 +139,43 @@ $env:LIBCLANG_PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC
 python scripts/gen-offsets.py X:/path/to/cpython
 ```
 
-Then register in `src/remote_debugging/offsets/mod.rs`:
+The generator prints an **exact registration checklist to stderr** — follow it. It refuses
+to overwrite an existing `v_*.rs` (use `--force` to regenerate a build in place). The
+generated `v_*.rs` is self-contained (it carries its own `impl DebugOffsetsView` with all
+version-varying offsets and the GC-stats shape), so registering it in
+`src/remote_debugging/offsets/mod.rs` is ~8 lines and every site except the `LAYOUTS` row
+is compiler-enforced (a forgotten site fails to build):
 
 ```diff
+  // 1. module decl, with the other `mod v_*;`
 + mod v_3_15_0;
-+ use v_3_15_0::_Py_DebugOffsets; // in read_offsets match
-+ VersionedOffsets::V3_15_0(raw)
+  // 2. LAYOUTS row (hex → struct reader) — the ONLY non-compiler-enforced site
++ (0x030f00f0, |p, a| Ok(VersionedOffsets::V3_15_0(read_struct(p, a)?))),
+  // 3. VersionedOffsets enum variant
++ V3_15_0(v_3_15_0::_Py_DebugOffsets),
+  // 4. for_each_variant! arm — drives ~20 accessors + the trait delegation automatically
++ Self::V3_15_0($o) => $body,
+  // 5. validate() arm   — validate_basic(o, expected)  OR  v_3_15_0::validate_offsets(o, expected)
+  // 6. Display arm       — fmt_debug_offsets_basic(o, f) OR  fmt::Display::fmt(o, f)
+  // 7. basic tier only  — add to the impl_basic_display! and impl_basic_offsets! lists
 ```
 
-**Quick verify-only** (generated layout, no bindgen needed):
+Basic vs full tier (steps 5–7) is decided by the sub-struct count (`>= 21` → full, with
+generated `validate_offsets`/`Display`); the generator's checklist tells you which applies.
+
+**Same-hex second build** (a clean release vs a gc-instrumented `+inc` build sharing a
+`PY_VERSION_HEX` — see "Builds that share a version hex" above). If the `+inc` build doesn't
+bump `patchlevel.h`, its version alone can't distinguish it, so pass an explicit name:
 
 ```powershell
-python scripts/gen-offsets-table.py X:/path/to/cpython
+python scripts/gen-offsets.py X:/path/to/cpython-+inc --suffix gcinc
 ```
 
-Then register in `src/remote_debugging/offsets/tables/mod.rs`:
-
-```diff
-+ mod v_3_15_0;
-  0x030f00f0 => Some(&v_3_15_0::LAYOUT),
-```
+This writes `v_<version>_gcinc.rs` instead of clobbering the clean file, and (because the
+hex is already registered) the checklist prints the *same-hex* path: just a `mod` decl plus
+one `GC_CANDIDATES` row — no new enum variant, `LAYOUTS` row, or accessor arms. `cargo test`
+then enforces that the candidates have distinct ring sizes (the only out-of-process
+discriminator).
 
 ### Version hex reference
 

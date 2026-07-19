@@ -449,3 +449,64 @@ const _: () = {
     ["Offset of field: _Py_DebugOffsets::gc"]
         [::std::mem::offset_of!(_Py_DebugOffsets, gc) - 568usize];
 };
+pub type Py_ssize_t = ::std::os::raw::c_longlong;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct gc_generation_stats {
+    pub collections: Py_ssize_t,
+    pub collected: Py_ssize_t,
+    pub uncollectable: Py_ssize_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of gc_generation_stats"][::std::mem::size_of::<gc_generation_stats>() - 24usize];
+    ["Alignment of gc_generation_stats"][::std::mem::align_of::<gc_generation_stats>() - 8usize];
+    ["Offset of field: gc_generation_stats::collections"]
+        [::std::mem::offset_of!(gc_generation_stats, collections) - 0usize];
+    ["Offset of field: gc_generation_stats::collected"]
+        [::std::mem::offset_of!(gc_generation_stats, collected) - 8usize];
+    ["Offset of field: gc_generation_stats::uncollectable"]
+        [::std::mem::offset_of!(gc_generation_stats, uncollectable) - 16usize];
+};
+
+
+// -- GC generation stats field layout --
+// Computed from bindgen-generated #[repr(C)] struct via offset_of! at compile time.
+
+pub use crate::remote_debugging::offsets::offset_table::GcItemLayout;
+
+pub const GC_ITEM_SIZE: usize = std::mem::size_of::<gc_generation_stats>();
+
+pub static GC_LAYOUT: GcItemLayout = GcItemLayout {
+    item_size: GC_ITEM_SIZE,
+    fields: &[
+        ("collections", std::mem::offset_of!(gc_generation_stats, collections)),
+        ("collected", std::mem::offset_of!(gc_generation_stats, collected)),
+        ("uncollectable", std::mem::offset_of!(gc_generation_stats, uncollectable)),
+    ],
+};
+
+pub fn gc_field_names() -> &'static [(&'static str, usize)] {
+    GC_LAYOUT.fields
+}
+
+/// Byte offset of the inline `generation_stats[]` array within `_gc_runtime_state`,
+/// computed by scripts/gen-offsets.py from this build's headers (version-specific).
+pub const GC_STATS_INLINE_OFF: u64 = 0x80;
+
+// -- DebugOffsetsView: per-version dispatch (see offsets/mod.rs) --
+impl crate::remote_debugging::offsets::DebugOffsetsView for _Py_DebugOffsets {
+    fn layout_version(&self) -> u64 { 0x030d0df0 }
+    fn threads_main(&self) -> u64 { 0 }
+    fn gc_frame(&self) -> u64 { 0 }
+    fn gc_generation_stats(&self) -> u64 { 0 }
+    fn gc_generation_stats_size(&self) -> u64 { 0 }
+    fn gc_stats_shape(&self) -> crate::remote_debugging::offsets::GcStatsShape {
+        crate::remote_debugging::offsets::GcStatsShape {
+            kind: crate::remote_debugging::offsets::offset_table::GcStatsKind::InlineArray,
+            item_size: GC_ITEM_SIZE as u64,
+            layout: Some(&GC_LAYOUT),
+        }
+    }
+    fn gc_inline_off(&self) -> u64 { GC_STATS_INLINE_OFF }
+}

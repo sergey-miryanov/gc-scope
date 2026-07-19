@@ -8,11 +8,26 @@ Requires bindgen on PATH (install with: cargo install bindgen-cli).
 Requires LIBCLANG_PATH set on Windows.
 """
 
+import argparse
 import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+
+def hex_already_registered(version_hex: int) -> bool:
+    """True if `version_hex` already has a `LAYOUTS` row in offsets/mod.rs.
+
+    When it does, a second checkout reporting the same hex is a *same-hex* build
+    (a clean release vs a gc-instrumented `+inc` build sharing a PY_VERSION_HEX):
+    it must NOT get its own nav variant, only a `GC_CANDIDATES` GC layout.
+    """
+    mod_rs = Path("src") / "remote_debugging" / "offsets" / "mod.rs"
+    if not mod_rs.exists():
+        return False
+    # Match a LAYOUTS row: `(0x030f00b1, |p, a| ...)`.
+    return bool(re.search(rf'\(\s*0x{version_hex:08x}\s*,\s*\|p,\s*a\|', mod_rs.read_text()))
 
 
 def get_define(lines: list[str], name: str) -> str | None:
@@ -36,12 +51,255 @@ def resolve_release_level(lines: list[str], level_str: str) -> int:
     raise ValueError(f"Cannot resolve PY_RELEASE_LEVEL: {level_str}")
 
 
-def main() -> None:
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <cpython_path>", file=sys.stderr)
-        sys.exit(1)
+def variant_name(major: int, minor: int, micro: int, level: int, serial: int) -> str:
+    """Derive the `VersionedOffsets` enum variant name (no commit suffix).
 
-    cpython_path = Path(sys.argv[1])
+    e.g. 3.14.4 final -> V3_14_4 ; 3.15.0a7 -> V3_15_0a7 ; 3.15.0b1 -> V3_15_0b1.
+    """
+    letters = {0xA: "a", 0xB: "b", 0xC: "rc", 0xF: ""}
+    suffix = "" if level == 0xF else f"{letters.get(level, f'x{level:x}')}{serial}"
+    return f"V{major}_{minor}_{micro}{suffix}"
+
+
+def _brace_end(text: str, open_idx: int) -> int:
+    """Index of the `}` matching the `{` at `open_idx`, or -1."""
+    depth = 0
+    for j in range(open_idx, len(text)):
+        if text[j] == '{':
+            depth += 1
+        elif text[j] == '}':
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def _extract_struct(text: str, anchor: str) -> str | None:
+    """Extract a `struct NAME { ... };` block given its opening `anchor`."""
+    s = text.find(anchor)
+    if s < 0:
+        return None
+    o = text.index('{', s)
+    e = _brace_end(text, o)
+    if e < 0:
+        return None
+    end = e + 1
+    m = re.match(r'\s*[A-Za-z_]\w*\s*;', text[end:])   # optional trailing `name;`
+    if m:
+        end += m.end()
+    elif text[end:end + 1] == ';':
+        end += 1
+    return text[s:end]
+
+
+def _extract_typedef_named(text: str, name: str) -> str | None:
+    """Extract a `typedef struct { ... } NAME;` block by its `name`."""
+    tail = f"}} {name};"
+    ti = text.find(tail)
+    if ti < 0:
+        return None
+    head = text.rfind("typedef struct", 0, ti)
+    if head < 0:
+        return None
+    return text[head:ti + len(tail)]
+
+
+def _find_header_with(inc: Path, anchor: str, names: tuple[str, ...]) -> str | None:
+    """Text of the first header in `names` whose content contains `anchor`."""
+    for n in names:
+        h = inc / n
+        if h.exists() and anchor in h.read_text():
+            return h.read_text()
+    return None
+
+
+def compute_inline_stats_off(cpython_path: Path) -> int | None:
+    """Byte offset of the inline `generation_stats[]` array within `_gc_runtime_state`.
+
+    This offset is version-specific (3.13 = 128, 3.14 = 120, 3.15.0a7 = 104) because
+    each release reshuffles the fields preceding `generation_stats`: 3.14 dropped the
+    `generation0` pointer, 3.15.0a7 dropped `trash_delete_later`, and so on. Crucially
+    it is NOT exposed by `_Py_DebugOffsets` for these versions (their `gc` sub-struct
+    carries only `size`/`collecting`), so gcscope cannot read it from the target — it
+    must be computed at generation time. We reconstruct `_gc_runtime_state` from the
+    real headers and let bindgen compute the offset via `offset_of!`.
+
+    Returns None if the struct can't be reconstructed or bindgen fails; the caller then
+    treats this build as having no readable inline stats (`GcStatsKind::None`).
+    """
+    inc = cpython_path / "Include" / "internal"
+    grt = _extract_struct(
+        _find_header_with(inc, "struct _gc_runtime_state {",
+                          ("pycore_interp_structs.h", "pycore_gc.h")) or "",
+        "struct _gc_runtime_state {")
+    pygc = _extract_typedef_named(
+        _find_header_with(inc, "} PyGC_Head;",
+                          ("pycore_gc.h", "pycore_interp_structs.h")) or "",
+        "PyGC_Head")
+    ggen = _extract_struct(
+        _find_header_with(inc, "struct gc_generation {",
+                          ("pycore_gc.h", "pycore_interp_structs.h")) or "",
+        "struct gc_generation {")
+    gstat = _extract_struct(
+        _find_header_with(inc, "struct gc_generation_stats {",
+                          ("pycore_interp_structs.h", "pycore_gc.h")) or "",
+        "struct gc_generation_stats {")
+    if not (grt and "generation_stats[" in grt and pygc and ggen and gstat):
+        return None
+
+    ng_src = _find_header_with(inc, "#define NUM_GENERATIONS",
+                               ("pycore_gc.h", "pycore_interp_structs.h")) or ""
+    ng_m = re.search(r'#define\s+NUM_GENERATIONS\s+(\d+)', ng_src)
+    num_gen = ng_m.group(1) if ng_m else "3"
+
+    # Prerequisites: forward-declare opaque referents (PyObject, _PyInterpreterFrame)
+    # and neutralize the alignment macro. Dropping `_Py_ALIGNED_DEF`'s alignment is
+    # layout-safe here because `_PyObject_MIN_ALIGNMENT` is 4 <= natural pointer
+    # alignment, so it never inserts padding. The `#ifdef Py_GIL_DISABLED` tail
+    # (PyMutex etc.) is excluded because we don't define that macro.
+    wrapper = f"""typedef unsigned long long uintptr_t;
+typedef long long Py_ssize_t;
+typedef struct _object PyObject;
+typedef struct _PyInterpreterFrame _PyInterpreterFrame;
+#define _Py_ALIGNED_DEF(N, T) T
+#define NUM_GENERATIONS {num_gen}
+{pygc}
+{ggen}
+{gstat}
+{grt}
+"""
+    with tempfile.TemporaryDirectory(prefix="gcscope-inlineoff-") as tmpdir:
+        wpath = Path(tmpdir) / "gcrt.h"
+        wpath.write_text(wrapper)
+        opath = Path(tmpdir) / "gcrt.rs"
+        r = subprocess.run(
+            ["bindgen", "--allowlist-type", "_gc_runtime_state",
+             "--output", str(opath), str(wpath), "--", "-DPy_BUILD_CORE"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print("Note: could not compute the inline generation_stats offset "
+                  "(bindgen failed on _gc_runtime_state) — GC stats will be "
+                  "unavailable for this build.", file=sys.stderr)
+            return None
+        m = re.search(
+            r'offset_of!\(_gc_runtime_state, generation_stats\)\s*-\s*(\d+)usize',
+            opath.read_text())
+        return int(m.group(1)) if m else None
+
+
+def print_same_hex_checklist(
+    *, version_hex: int, mod_name: str, gc_kind: str,
+) -> None:
+    """Checklist for a second build sharing an already-registered PY_VERSION_HEX.
+
+    The nav struct (`_Py_DebugOffsets`) is identical to the registered build, so this
+    module is NOT a new `VersionedOffsets` variant — only its `gc_generation_stats`
+    layout differs. It is wired in as a `GC_CANDIDATES` entry, selected at read-time by
+    the process-published ring size. This is the ONLY registration needed.
+    """
+    bar = "═" * 70
+    kind_path = f"offset_table::GcStatsKind::{gc_kind}"
+    print(f"\n{bar}", file=sys.stderr)
+    print(f"SAME-HEX BUILD (0x{version_hex:08x} already registered) — GC layout only",
+          file=sys.stderr)
+    print(bar, file=sys.stderr)
+    print(f"""\
+  This build shares its PY_VERSION_HEX and `_Py_DebugOffsets` with an already-registered
+  version; only its `gc_generation_stats` differs. Do NOT add a `LAYOUTS` row, a
+  `VersionedOffsets` variant, a `for_each_variant!` / validate / Display arm, or any
+  `impl_basic_*` entry. Two edits in src/remote_debugging/offsets/mod.rs:
+
+  1. Module decl (with the other `mod v_*;`):
+       mod {mod_name};
+
+  2. `GC_CANDIDATES` — add this build's layout to the entry for 0x{version_hex:08x}
+     (create the `(0x{version_hex:08x}, &[ ... ])` entry if it's the first pair, and
+     include the ALREADY-registered nav variant's own layout as the other candidate):
+       GcCandidate {{
+           kind: {kind_path},
+           item_size: {mod_name}::GC_ITEM_SIZE as u64,
+           layout: &{mod_name}::GC_LAYOUT,
+       }},
+
+  Then `cargo test` — `gc_candidates_have_distinct_ring_sizes` must pass. If it fails,
+  the two builds have the SAME ring size and cannot be told apart out-of-process; one
+  must be dropped (see the test's message). Live-check: `cargo run -- gc-stats <PID>`
+  against a process of THIS build decodes with the extended columns.
+{bar}""", file=sys.stderr)
+
+
+def print_registration_checklist(
+    *, version_hex: int, mod_name: str, variant: str,
+    sub_struct_count: int, has_gc_stats: bool,
+) -> None:
+    """Print the exact edits needed to wire a generated module into dispatch.
+
+    Registration is manual (the enum + `read_offsets` are hand-written), and a
+    module that is generated but only half-registered fails at runtime for that
+    version. This checklist makes every required site explicit so none is missed.
+    """
+    full_macros = sub_struct_count >= 21
+    if full_macros:
+        display_line = "uses the FULL macros: v_...::validate_offsets / fmt::Display::fmt"
+    else:
+        display_line = ("uses BASIC: validate_basic + fmt_debug_offsets_basic; also add to "
+                        "the impl_basic_display! and impl_basic_offsets! lists")
+    if has_gc_stats:
+        gc_note = "(this module exports GC_LAYOUT — reference it in the arm above)"
+    else:
+        gc_note = "(no GC_LAYOUT emitted for this build)"
+
+    bar = "═" * 70
+    print(f"\n{bar}", file=sys.stderr)
+    print("REGISTER THIS VERSION in src/remote_debugging/offsets/mod.rs", file=sys.stderr)
+    print(bar, file=sys.stderr)
+    print(f"""\
+  The generated file already carries its `impl DebugOffsetsView` (version-varying
+  offsets + GC-stats shape), so no per-version accessor / to_offset_table edits are
+  needed. Add these {mod_name} entries — every one is compiler-enforced except #2:
+
+  1. Module decl (with the other `mod v_*;`):
+       mod {mod_name};
+
+  2. `LAYOUTS` registry row (hex → struct reader):
+       (0x{version_hex:08x}, |p, a| Ok(VersionedOffsets::{variant}(read_struct(p, a)?))),
+
+  3. `VersionedOffsets` enum variant:
+       {variant}({mod_name}::_Py_DebugOffsets),
+
+  4. `for_each_variant!` macro arm (drives every accessor + the trait delegation):
+       Self::{variant}($o) => $body,
+
+  5. `validate` arm:
+       {display_line}
+       (this build has {sub_struct_count} sub-structs; full macros need >= 21)
+
+  6. `Display` arm (same basic/full split as validate).
+
+  {"7. impl_basic_display! + impl_basic_offsets! lists (basic tier only)." if not full_macros else "(full tier: no impl_basic_* entries needed.)"}
+       {gc_note}
+{bar}""", file=sys.stderr)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate Rust _Py_DebugOffsets bindings from a CPython checkout.")
+    parser.add_argument("cpython_path", type=Path,
+                        help="CPython source checkout (must have Include/patchlevel.h).")
+    parser.add_argument(
+        "--suffix", "-s", default="",
+        help="Disambiguating tag for the output filename: --suffix gcinc writes "
+             "v_<version>_gcinc.rs. Use for a second build that shares a PY_VERSION_HEX "
+             "with an already-registered one (e.g. a clean release vs a `+inc` build "
+             "whose patchlevel.h is unchanged, so the version alone can't tell them apart).")
+    parser.add_argument(
+        "--force", "-f", action="store_true",
+        help="Overwrite an existing v_<version>.rs in place (regenerate the same build). "
+             "Without it, an existing output file is a hard error, not a silent clobber.")
+    args = parser.parse_args()
+
+    cpython_path = args.cpython_path
     patchlevel = cpython_path / "Include" / "patchlevel.h"
     if not patchlevel.exists():
         print(f"Error: {patchlevel} not found", file=sys.stderr)
@@ -70,11 +328,37 @@ def main() -> None:
             commit_suffix = f"_{commit}"
         version_str = version_str.rstrip("+")
 
-    safe_tag = re.sub(r'[^a-zA-Z0-9_]', '', version_str.replace('.', '_')) + commit_suffix
+    ver_tag = re.sub(r'[^a-zA-Z0-9_]', '', version_str.replace('.', '_'))
+    suffix = re.sub(r'[^a-zA-Z0-9_]', '', args.suffix)
+    # An explicit --suffix names a distinct file (a same-hex second build); otherwise the
+    # tag is the version plus, for `+`-tagged dev builds, the git commit. `+inc`-style
+    # builds that DON'T bump patchlevel.h land on the bare version tag and would collide
+    # with the clean release — that collision is caught by the overwrite guard below.
+    safe_tag = f"{ver_tag}_{suffix}" if suffix else ver_tag + commit_suffix
     out_file = Path("src") / "remote_debugging" / "offsets" / f"v_{safe_tag}.rs"
 
     print(f"CPython {raw_version}  ->  0x{version_hex:08x}")
     print(f"Output: {out_file}")
+
+    # Never silently clobber an existing layout. A clean release and a gc-instrumented
+    # `+inc` build can share a PY_VERSION_HEX and thus derive the SAME filename, so a bare
+    # regen of the second would overwrite the first. Require an explicit choice.
+    if out_file.exists() and not args.force and not suffix:
+        print(f"\nError: {out_file} already exists — refusing to overwrite.", file=sys.stderr)
+        if hex_already_registered(version_hex):
+            print(
+                f"  0x{version_hex:08x} is already registered. If this is a DIFFERENT build\n"
+                f"  sharing this PY_VERSION_HEX (e.g. clean release vs a gc-instrumented\n"
+                f"  `+inc` build), give it a distinct name — only its GC layout is new:\n\n"
+                f"      python {Path(sys.argv[0]).name} {cpython_path} --suffix gcinc\n\n"
+                f"  → writes v_{ver_tag}_gcinc.rs; the checklist then shows the one\n"
+                f"  GC_CANDIDATES entry to add (no new enum variant).\n"
+                f"  To instead regenerate THIS same build in place, re-run with --force.",
+                file=sys.stderr)
+        else:
+            print(f"  Re-run with --force to regenerate it in place, or --suffix <tag> to\n"
+                  f"  write a distinct v_{ver_tag}_<tag>.rs.", file=sys.stderr)
+        sys.exit(1)
 
     include_internal = cpython_path / "Include" / "internal"
     include_pc = cpython_path / "PC"
@@ -90,10 +374,19 @@ def main() -> None:
         use_runtime_h = True
 
     # ── Detect gc_generation_stats support ────────────────────────────
-    interp_structs = include_internal / "pycore_interp_structs.h"
-    has_gc_stats = False
-    if interp_structs.exists():
-        has_gc_stats = "struct gc_generation_stats {" in interp_structs.read_text()
+    # The struct lives in different headers across versions: pycore_interp_structs.h
+    # (3.14+) or pycore_gc.h (3.13.x). Search both so GC_LAYOUT is emitted for every
+    # version that actually defines the struct.
+    gc_stats_header = None
+    for _name in ("pycore_interp_structs.h", "pycore_gc.h"):
+        _h = include_internal / _name
+        if _h.exists() and "struct gc_generation_stats {" in _h.read_text():
+            gc_stats_header = _h
+            break
+    has_gc_stats = gc_stats_header is not None
+    if not has_gc_stats:
+        print("Note: `struct gc_generation_stats` not found in pycore_interp_structs.h "
+              "or pycore_gc.h — GC_LAYOUT will NOT be emitted for this build.", file=sys.stderr)
 
     # Write a wrapper header that supplies prerequisites for bindgen.
     # For 3.13.x (_Py_DebugOffsets is inside pycore_runtime.h), extract just
@@ -121,10 +414,10 @@ def main() -> None:
 #define _Py_NONSTRING
 #include "{offsets_header.resolve()}"
 """
-    # Extract struct gc_generation_stats from pycore_interp_structs.h to
-    # avoid pulling in the full header tree (which has clang-irresolvable deps).
+    # Extract struct gc_generation_stats from its header to avoid pulling in the
+    # full header tree (which has clang-irresolvable deps).
     if has_gc_stats:
-        text = interp_structs.read_text()
+        text = gc_stats_header.read_text()
         start = text.find("struct gc_generation_stats {")
         if start >= 0:
             depth = 0
@@ -141,7 +434,7 @@ def main() -> None:
                         break
             gc_struct_text = text[start:end]
             wrapper += f"""
-// Extracted from pycore_interp_structs.h
+// Extracted from {gc_stats_header.name}
 typedef long long Py_ssize_t;
 typedef long long PyTime_t;
 {gc_struct_text}"""
@@ -181,35 +474,36 @@ typedef long long PyTime_t;
     generated = out_file.read_text()
     sub_structs = re.findall(r'pub struct (_Py_DebugOffsets__\w+)', generated)
 
-    # The display/validate macros require ALL 21 sub-structs.
-    # 3.15+ has all 21; earlier versions have fewer.
-    # Only generate macros for versions that have the full set.
+    # Emit the full Display/validation macros only when this build has the full set
+    # of 21 nested sub-structs those macros expect (one positional type arg each, in
+    # declaration order). Counting the generated sub-struct types is the reliable
+    # gate: several fields (e.g. `err_stackitem`) are ANONYMOUS structs that bindgen
+    # names `_Py_DebugOffsets__bindgen_ty_N`, so matching by field/type NAME is not
+    # safe — the count is. Earlier versions with fewer sub-structs fall back to basic.
     if len(sub_structs) >= 21:
         indent = "    "
-        macro_call = (
-            "\nimpl_display_debug_offsets!(_Py_DebugOffsets,\n"
-            + ",\n".join(f"{indent}{s}" for s in sub_structs)
-            + "\n);\n"
-        )
-        validate_call = (
-            "\nimpl_validate_debug_offsets!(_Py_DebugOffsets,\n"
-            + ",\n".join(f"{indent}{s}" for s in sub_structs[:-1])
-            + f",\n{indent}{sub_structs[-1]}"
-            + "\n);\n"
-        )
+        args = ",\n".join(f"{indent}{s}" for s in sub_structs)
+        macro_call = f"\nimpl_display_debug_offsets!(_Py_DebugOffsets,\n{args}\n);\n"
+        validate_call = f"\nimpl_validate_debug_offsets!(_Py_DebugOffsets,\n{args}\n);\n"
         with open(out_file, "a") as f:
             f.write(macro_call)
             f.write(validate_call)
 
     # ── Extract gc_generation_stats field layout from bindgen output ──
     # bindgen already generated the #[repr(C)] struct; we just need field names.
+    wrote_gc_layout = False
     if "pub struct gc_generation_stats {" in generated:
         # Extract field names from bindgen's Rust output
         brace = generated.index("pub struct gc_generation_stats {")
         brace = generated.index('{', brace)
         close = generated.index('}', brace)
         body = generated[brace+1:close]
-        field_names = re.findall(r'^\s+pub (\w+):', body, re.MULTILINE)
+        # Real gc_generation_stats fields never start with `_`; drop bindgen
+        # artifacts (__bindgen_padding_*, _bitfield_*) so they don't pollute the layout.
+        field_names = [
+            n for n in re.findall(r'^\s+pub (\w+):', body, re.MULTILINE)
+            if not n.startswith('_')
+        ]
 
         field_entries = "\n".join(
             f'        ("{name}", std::mem::offset_of!(gc_generation_stats, {name})),'
@@ -237,10 +531,108 @@ pub fn gc_field_names() -> &'static [(&'static str, usize)] {{
 """
         with open(out_file, "a") as f:
             f.write(gc_block)
+        wrote_gc_layout = True
 
         print(f"  gc_generation_stats: {len(field_names)} fields, via bindgen + offset_of!", file=sys.stderr)
 
+    # ── Emit the DebugOffsetsView impl (per-version dispatch) ──
+    # This is what lets `VersionedOffsets` delegate the version-varying offsets and the
+    # GC-stats shape uniformly, so mod.rs needs no per-version accessor arms.
+    def _substruct_body(name: str) -> str:
+        key = f"pub struct _Py_DebugOffsets__{name} {{"
+        if key not in generated:
+            return ""
+        i = generated.index("{", generated.index(key))
+        return generated[i:generated.index("}", i)]
+
+    gc_body = _substruct_body("gc")
+    has_threads_main = "threads_main:" in _substruct_body("interpreter_state")
+    has_frame = "frame:" in gc_body
+    has_gen_stats = "generation_stats:" in gc_body           # ring-buffer pointer
+    has_gen_stats_size = "generation_stats_size:" in gc_body
+
+    # The stats are readable two ways: a ring-buffer pointer in _Py_DebugOffsets.gc
+    # (3.15.0a8+), OR an inline `generation_stats[]` array in `_gc_runtime_state`
+    # (3.8–3.15.0a7). The inline array's offset moves every release (3.13 = 0x80,
+    # 3.14 = 0x78, 3.15.0a7 = 0x68) and is NOT in _Py_DebugOffsets, so we compute it
+    # from the headers. `is_inline` is true exactly when that computation succeeds and
+    # this build has no ring pointer; the ring pointer always wins when both exist.
+    inline_off = None
+    if wrote_gc_layout and not has_gen_stats:
+        inline_off = compute_inline_stats_off(cpython_path)
+
+    is_ring = has_gen_stats and wrote_gc_layout
+    is_inline = inline_off is not None
+
+    tm = "self.interpreter_state.threads_main" if has_threads_main else "0"
+    fr = "self.gc.frame" if has_frame else "0"
+    gs = "self.gc.generation_stats" if has_gen_stats else "0"
+    gss = "self.gc.generation_stats_size" if has_gen_stats_size else "0"
+    if is_ring:
+        kind, item, layout = "RingBuffer", "GC_ITEM_SIZE as u64", "Some(&GC_LAYOUT)"
+    elif is_inline:
+        kind, item, layout = "InlineArray", "GC_ITEM_SIZE as u64", "Some(&GC_LAYOUT)"
+    else:
+        kind, item, layout = "None", "0", "None"
+
+    # Inline versions carry the per-build offset of `generation_stats[]` within
+    # `_gc_runtime_state` (computed above) and override `gc_inline_off`; every other
+    # version inherits the trait default of 0.
+    if is_inline:
+        inline_const = (
+            f"\n/// Byte offset of the inline `generation_stats[]` array within "
+            f"`_gc_runtime_state`,\n/// computed by scripts/gen-offsets.py from this "
+            f"build's headers (version-specific).\n"
+            f"pub const GC_STATS_INLINE_OFF: u64 = 0x{inline_off:x};\n"
+        )
+        with open(out_file, "a") as f:
+            f.write(inline_const)
+        inline_off_fn = "\n    fn gc_inline_off(&self) -> u64 { GC_STATS_INLINE_OFF }"
+        print(f"  inline generation_stats at 0x{inline_off:x} "
+              f"({inline_off}) within _gc_runtime_state", file=sys.stderr)
+    else:
+        inline_off_fn = ""
+
+    view_impl = f"""
+// -- DebugOffsetsView: per-version dispatch (see offsets/mod.rs) --
+impl crate::remote_debugging::offsets::DebugOffsetsView for _Py_DebugOffsets {{
+    fn layout_version(&self) -> u64 {{ 0x{version_hex:08x} }}
+    fn threads_main(&self) -> u64 {{ {tm} }}
+    fn gc_frame(&self) -> u64 {{ {fr} }}
+    fn gc_generation_stats(&self) -> u64 {{ {gs} }}
+    fn gc_generation_stats_size(&self) -> u64 {{ {gss} }}
+    fn gc_stats_shape(&self) -> crate::remote_debugging::offsets::GcStatsShape {{
+        crate::remote_debugging::offsets::GcStatsShape {{
+            kind: crate::remote_debugging::offsets::offset_table::GcStatsKind::{kind},
+            item_size: {item},
+            layout: {layout},
+        }}
+    }}{inline_off_fn}
+}}
+"""
+    with open(out_file, "a") as f:
+        f.write(view_impl)
+
     print(f"Generated {out_file}  (version hex: 0x{version_hex:08x})")
+
+    # A same-hex second build (this hex already has a nav variant, and we wrote a distinct
+    # suffixed/commit-tagged file rather than the bare version file) only contributes a GC
+    # layout — print the focused GcCandidate checklist. Otherwise it's a new nav variant.
+    same_hex = hex_already_registered(version_hex) and safe_tag != ver_tag
+    if same_hex:
+        print_same_hex_checklist(
+            version_hex=version_hex,
+            mod_name=f"v_{safe_tag}",
+            gc_kind=kind,
+        )
+    else:
+        print_registration_checklist(
+            version_hex=version_hex,
+            mod_name=f"v_{safe_tag}",
+            variant=variant_name(major, minor, micro, level, serial),
+            sub_struct_count=len(sub_structs),
+            has_gc_stats=has_gc_stats,
+        )
 
 
 if __name__ == "__main__":
