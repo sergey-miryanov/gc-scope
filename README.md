@@ -59,11 +59,12 @@ There are two ways to obtain them:
 For versions before `_Py_DebugOffsets` existed, the offsets are
 extracted from CPython headers by hand and stored in
 `src/remote_debugging/offsets/pre_3_13.rs`. Each version needs ~7
-field offsets. GC generation stats are read for 3.9–3.12 (the
-inline-array layout is identical to 3.13/3.14); 3.8 keeps its GC
-state global in `_PyRuntime`, which is not yet decoded. The
-diagram/TUI is unavailable for these versions (it visualizes the
-`_Py_DebugOffsets` struct, which they lack).
+field offsets. GC generation stats are read for all of 3.8–3.12
+(the inline-array layout is identical to 3.13/3.14); 3.9–3.12 have
+per-interpreter GC state, while 3.8 keeps its GC state global in
+`_PyRuntime` and is decoded through the stats loop's global-GC
+branch. The diagram/TUI is unavailable for these versions (it
+visualizes the `_Py_DebugOffsets` struct, which they lack).
 
 ### 2. Bindgen-generated struct (3.13+, full support)
 

@@ -42,8 +42,9 @@ fn table(version_hex: u64, runtime_ih: u64, interp_next: u64, interp_id: u64,
         gc_frame: None,
         // The `gc_generation_stats` item and the inline `generation_stats[]` position
         // are identical to 3.13, so pre-3.13 decodes through the same `InlineArray`
-        // path in `PySession::gc_stats`. (3.8 keeps GC global in `_PyRuntime`, a path
-        // the stats loop does not yet resolve, so `v3_8` flips these back to `None`.)
+        // path in `PySession::gc_stats`. (3.8 keeps GC global in `_PyRuntime` rather
+        // than per-interpreter; the stats loop's global-GC branch resolves that from
+        // `runtime_gc`, so 3.8 decodes through this same `InlineArray` layout too.)
         gc_stats_kind: GcStatsKind::InlineArray,
         gc_layout: Some(&LEGACY_GC_LAYOUT),
         gc_stats_addr: None,  // filled per-interpreter by the stats loop (gc_state + GC_STATS_INLINE_OFF)
@@ -71,9 +72,12 @@ pub fn table_for_version(major: u8, minor: u8) -> Option<OffsetTable> {
 
 // ── Per-version tables ────────────────────────────────────────────
 
-/// Python 3.8: GC is global in `_PyRuntime`, not per-interpreter.
+/// Python 3.8: GC is global in `_PyRuntime` (`runtime_gc`), not per-interpreter.
+/// The stats loop's global-GC branch resolves the stats region from
+/// `runtime_addr + runtime_gc + gc_stats_inline_off`, so the shared `InlineArray`
+/// decode applies unchanged.
 fn v3_8(version_hex: u64) -> OffsetTable {
-    let mut t = table(
+    table(
         version_hex,
         0x20,    // runtime_interpreters_head
         0x00,    // interp_next
@@ -83,13 +87,7 @@ fn v3_8(version_hex: u64) -> OffsetTable {
         0x10,    // thread_interp
         0x18,    // gc_generations
         Some(0x158), // runtime_gc
-    );
-    // GC state lives in `_PyRuntime` (runtime_gc), not per-interpreter. The stats
-    // loop resolves the stats address from each interpreter's `interp_gc`, which 3.8
-    // lacks — so leave stats undecoded until that global-GC path is wired (follow-up).
-    t.gc_stats_kind = GcStatsKind::None;
-    t.gc_layout = None;
-    t
+    )
 }
 
 /// Python 3.9: GC is per-interpreter at offset 0x268.

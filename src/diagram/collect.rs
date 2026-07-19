@@ -118,6 +118,14 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
         .context("Failed to read interpreters_head pointer")?;
 
     let gc_offset = offset_table.interp_gc.unwrap_or(0);
+    // Absolute address of `_gc_runtime_state`: per-interpreter (`interp_gc`) for 3.9+
+    // and every 3.13+ build, or global in `_PyRuntime` (`runtime_gc`) for 3.8 — mirrors
+    // the global-GC branch in `PySession::gc_stats`. Without this, 3.8 would read the
+    // stats at `interpreter + 0x80` (garbage) instead of `runtime + runtime_gc + 0x80`.
+    let gc_addr = match (offset_table.interp_gc, offset_table.runtime_gc) {
+        (None, Some(r)) => runtime_addr + r,
+        _ => head_addr + gc_offset,
+    };
     // Exact `gc` sub-struct span on 3.13+; on Legacy synthesize the inline stats region
     // (only used for the section-2 hexdump, which Legacy skips).
     let gc_size = match off_opt {
@@ -132,9 +140,9 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
         .read(head_addr, 256)
         .context("Failed to read interpreter state start")?;
 
-    // Read GC sub-struct at its actual offset within the interpreter
+    // Read GC sub-struct at its actual location (`gc_addr`, which handles 3.8's global GC)
     let gc_raw = session
-        .read(head_addr + gc_offset, gc_size as usize)
+        .read(gc_addr, gc_size as usize)
         .context("Failed to read GC state")?;
 
     // Resolve the GC generation-stats region by its version-specific shape — same logic as
@@ -146,7 +154,7 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
     let (stats_addr, stats_total) = match offset_table.gc_stats_kind {
         offsets::offset_table::GcStatsKind::None => (0u64, 0usize),
         offsets::offset_table::GcStatsKind::InlineArray => {
-            let addr = head_addr + gc_offset + offset_table.gc_stats_inline_off;
+            let addr = gc_addr + offset_table.gc_stats_inline_off;
             (addr, gc_stats_total_bytes(&offset_table))
         }
         offsets::offset_table::GcStatsKind::RingBuffer => {
@@ -155,7 +163,7 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
                 0
             } else {
                 session
-                    .read_u64(head_addr + gc_offset + gen_stats_field_off)
+                    .read_u64(gc_addr + gen_stats_field_off)
                     .context("Failed to read generation_stats pointer")?
             };
             let size = off_opt.map(|o| o.gc_generation_stats_size()).unwrap_or(0) as usize;

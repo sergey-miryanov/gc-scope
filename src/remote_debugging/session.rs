@@ -302,6 +302,22 @@ impl PySession {
         let head_addr = self.read_u64(self.runtime_addr + table.runtime_interpreters_head())?;
         let next_off = table.interp_next();
         let id_off = table.interp_id();
+
+        // Global-GC path (3.8): the GC state lives in `_PyRuntime` itself, not per
+        // interpreter. Resolve the stats region once from the runtime and read it a
+        // single time — reading it inside the interpreter walk would emit the same
+        // global generations once per interpreter under `--all`.
+        if table.interp_gc.is_none()
+            && table.gc_stats_kind == GcStatsKind::InlineArray
+            && let Some(runtime_gc) = table.runtime_gc
+        {
+            let iid = if head_addr != 0 { self.read_i64(head_addr + id_off)? } else { 0 };
+            let mut global_table = table.clone();
+            global_table.gc_stats_addr =
+                Some(self.runtime_addr + runtime_gc + table.gc_stats_inline_off);
+            return global_table.read_gc_stats(&self.handle, iid);
+        }
+
         let gc_off = table.interp_gc.unwrap_or(0);
 
         let mut stats = Vec::new();
