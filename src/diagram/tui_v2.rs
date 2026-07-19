@@ -465,6 +465,12 @@ fn hex_dump_rows(
                 }
             }
         }
+        // Pad the hex column to the full-row width so the ascii column stays aligned on a
+        // short final row (region length not a multiple of 16).
+        if chunk.len() < 16 {
+            let pad = hex_col_emitted(16) - hex_col_emitted(chunk.len());
+            spans.push(Span::raw(" ".repeat(pad)));
+        }
         let ascii: String = chunk
             .iter()
             .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
@@ -473,6 +479,15 @@ fn hex_dump_rows(
         rows.push(spans);
     }
     rows
+}
+
+/// Rendered width of the hex-bytes column emitted by `hex_dump_rows` for `n` bytes
+/// (`n <= 16`): 2 chars per byte plus one interspace per byte where `i < 15` (2 at the
+/// mid-row gap `i == 7`, else 1). A full 16-byte row is 48 chars wide.
+fn hex_col_emitted(n: usize) -> usize {
+    (0..n)
+        .map(|i| 2 + if i < 15 { if i == 7 { 2 } else { 1 } } else { 0 })
+        .sum()
 }
 
 // ── Section 1: _Py_DebugOffsets ───────────────────────────────────

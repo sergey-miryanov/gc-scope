@@ -302,7 +302,7 @@ fn render_gc_stats(mut s: String, data: &CollectedData, rate_per_gen: [f64; 3], 
             let ch = if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' };
             ascii.push(ch);
         }
-        right_lines.push(format!("  {:08x}  {} |{}", base, hex.trim_end(), ascii));
+        right_lines.push(format!("  {:08x}  {:<w$} |{}", base, hex.trim_end(), ascii, w = HEX_COL_WIDTH));
     }
     // slot field table (like GC State format) with borders
     let dashes = PR - 12;
@@ -359,10 +359,16 @@ fn hex_panel(bytes: &[u8], limit: usize, base_off: usize, _panel_w: usize) -> Ve
             let ch = if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' };
             ascii.push(ch);
         }
-        lines.push(format!("  {:08x}  {} |{}", base, hex.trim_end(), ascii));
+        // Pad the hex column to the full-row width so the ascii column stays aligned on a
+        // short final row (region length not a multiple of 16).
+        lines.push(format!("  {:08x}  {:<w$} |{}", base, hex.trim_end(), ascii, w = HEX_COL_WIDTH));
     }
     lines
 }
+
+/// Rendered width of the hex-bytes column for a full 16-byte row: 16 * "XX " (48) plus the
+/// mid-gap space before byte 8 (49) minus the trailing space stripped by `trim_end` (48).
+const HEX_COL_WIDTH: usize = 48;
 
 // -- Format helpers -------------------------------------------
 fn fmt_val(val: u64) -> String {
