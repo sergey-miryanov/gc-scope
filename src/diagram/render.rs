@@ -54,7 +54,7 @@ pub enum TreeEntryKind {
     RawValue { offset: usize },
     Group,
     Derived,
-    Layout { field_type: &'static str, field_offset: u8 },
+    Layout { field_type: &'static str, field_offset: u32 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -64,42 +64,23 @@ pub struct TreeEntry {
     pub kind: TreeEntryKind,
 }
 
-/// Base slot fields (always present)
-const SLOT_BASE_FIELDS: &[( &str, &str, u8 )] = &[
-    ("ts_start",           "i64",  0),
-    ("ts_stop",            "i64",  8),
-    ("collections",        "i64", 16),
-    ("collected",          "i64", 24),
-    ("uncollectable",      "i64", 32),
-    ("candidates",         "i64", 40),
-    ("duration",           "f64", 48),
-    ("heap_size",          "i64", 56),
-];
-
-/// Extended slot fields (when item_size > 64)
-const SLOT_EXT_FIELDS: &[( &str, &str, u8 )] = &[
-    ("increment_size",              "i64",  64),
-    ("alive_size",                  "i64",  72),
-    ("finalized_garbage_count",     "i64",  80),
-    ("clear_weakrefs_count",        "i64",  88),
-    ("deleted_garbage_count",       "i64",  96),
-    ("ts_mark_alive_start",         "i64", 104),
-    ("ts_mark_alive_stop",          "i64", 112),
-    ("ts_fill_increment_start",     "i64", 120),
-    ("ts_fill_increment_stop",      "i64", 128),
-    ("ts_deduce_unreachable_start", "i64", 136),
-    ("ts_deduce_unreachable_stop",  "i64", 144),
-    ("ts_handle_weakref_cb_start",  "i64", 152),
-    ("ts_handle_weakref_cb_stop",   "i64", 160),
-    ("ts_finalize_garbage_stop",    "i64", 168),
-    ("ts_handle_resurrected_stop",  "i64", 176),
-    ("ts_clear_weakrefs_stop",      "i64", 184),
-    ("ts_delete_garbage_start",     "i64", 192),
-    ("ts_delete_garbage_stop",      "i64", 200),
-];
-
-/// Build the full tree of _Py_DebugOffsets
-pub fn debug_offsets_tree(item_size: u64) -> Vec<TreeEntry> {
+/// Build the full tree of _Py_DebugOffsets.
+///
+/// The GC-state subtree is data-driven, not hardcoded:
+/// - `gc_fields` are the actual `gc` sub-struct fields as `(name, absolute offset within
+///   _Py_DebugOffsets)`, from `VersionedOffsets::gc_debug_fields()`. On 3.13/3.14 this is
+///   just `size`/`collecting`; on ring-buffer builds it also has
+///   `frame`/`generation_stats_size`/`generation_stats`.
+/// - `slot_fields` are the per-slot `gc_generation_stats` fields as `(name, offset within
+///   one slot)`, from the resolved `GcItemLayout` (so a `+inc` build shows its extended
+///   fields). `None` when this build exposes no readable stats layout.
+///
+/// The derived `generation_stats` layout subtree (item_size, young/old slot groups) is
+/// emitted only when a `generation_stats` field is present (ring-buffer builds).
+pub fn debug_offsets_tree(
+    gc_fields: &[(&'static str, u64)],
+    slot_fields: Option<&[(&'static str, usize)]>,
+) -> Vec<TreeEntry> {
     let mut e = Vec::new();
 
     // depth 0
@@ -124,38 +105,36 @@ pub fn debug_offsets_tree(item_size: u64) -> Vec<TreeEntry> {
     e.push(TreeEntry { depth: 2, label: "threads_main",       kind: TreeEntryKind::RawValue { offset: 80 } });
     e.push(TreeEntry { depth: 2, label: "gc",                 kind: TreeEntryKind::RawValue { offset: 88 } });
 
-    // depth 3 under gc: gc sub-struct raw values
-    e.push(TreeEntry { depth: 3, label: "size",               kind: TreeEntryKind::RawValue { offset: 744 } });
-    e.push(TreeEntry { depth: 3, label: "collecting",         kind: TreeEntryKind::RawValue { offset: 752 } });
-    e.push(TreeEntry { depth: 3, label: "frame",              kind: TreeEntryKind::RawValue { offset: 760 } });
-    e.push(TreeEntry { depth: 3, label: "gen_stats_size",     kind: TreeEntryKind::RawValue { offset: 768 } });
-    e.push(TreeEntry { depth: 3, label: "generation_stats",   kind: TreeEntryKind::RawValue { offset: 776 } });
-
-    // depth 4 derived entries under generation_stats
-    e.push(TreeEntry { depth: 4, label: "item_size",          kind: TreeEntryKind::Derived });
-    e.push(TreeEntry { depth: 4, label: "young_slots (11)",   kind: TreeEntryKind::Derived });
-
-    // depth 5 slot group under young_slots
-    e.push(TreeEntry { depth: 5, label: "slot",               kind: TreeEntryKind::Group });
-
-    // depth 6 base slot fields
-    for &(name, ty, off) in SLOT_BASE_FIELDS {
-        e.push(TreeEntry { depth: 6, label: name, kind: TreeEntryKind::Layout { field_type: ty, field_offset: off } });
+    // depth 3 under gc: actual gc sub-struct fields at their real offsets.
+    for &(name, offset) in gc_fields {
+        e.push(TreeEntry { depth: 3, label: name, kind: TreeEntryKind::RawValue { offset: offset as usize } });
     }
 
-    // depth 6 extended slot fields (only if item_size > 64)
-    if item_size > 64 {
-        for &(name, ty, off) in SLOT_EXT_FIELDS {
-            e.push(TreeEntry { depth: 6, label: name, kind: TreeEntryKind::Layout { field_type: ty, field_offset: off } });
+    // Ring-buffer builds publish a `generation_stats` pointer; only then does the
+    // derived per-generation slot layout apply. Inline (3.13/3.14) and stat-less builds
+    // have no such subtree.
+    if gc_fields.iter().any(|&(name, _)| name == "generation_stats") {
+        // depth 4 derived entries under generation_stats
+        e.push(TreeEntry { depth: 4, label: "item_size",          kind: TreeEntryKind::Derived });
+        e.push(TreeEntry { depth: 4, label: "young_slots (11)",   kind: TreeEntryKind::Derived });
+
+        // depth 5 slot group under young_slots
+        e.push(TreeEntry { depth: 5, label: "slot",               kind: TreeEntryKind::Group });
+
+        // depth 6 actual slot fields
+        if let Some(fields) = slot_fields {
+            for &(name, off) in fields {
+                e.push(TreeEntry { depth: 6, label: name, kind: TreeEntryKind::Layout { field_type: "", field_offset: off as u32 } });
+            }
         }
-    }
 
-    // depth 4 more derived entries
-    e.push(TreeEntry { depth: 4, label: "index0",             kind: TreeEntryKind::Derived });
-    e.push(TreeEntry { depth: 4, label: "old0_slots (3)",     kind: TreeEntryKind::Derived });
-    e.push(TreeEntry { depth: 4, label: "index1",             kind: TreeEntryKind::Derived });
-    e.push(TreeEntry { depth: 4, label: "old1_slots (3)",     kind: TreeEntryKind::Derived });
-    e.push(TreeEntry { depth: 4, label: "index2",             kind: TreeEntryKind::Derived });
+        // depth 4 more derived entries
+        e.push(TreeEntry { depth: 4, label: "index0",             kind: TreeEntryKind::Derived });
+        e.push(TreeEntry { depth: 4, label: "old0_slots (3)",     kind: TreeEntryKind::Derived });
+        e.push(TreeEntry { depth: 4, label: "index1",             kind: TreeEntryKind::Derived });
+        e.push(TreeEntry { depth: 4, label: "old1_slots (3)",     kind: TreeEntryKind::Derived });
+        e.push(TreeEntry { depth: 4, label: "index2",             kind: TreeEntryKind::Derived });
+    }
 
     e
 }

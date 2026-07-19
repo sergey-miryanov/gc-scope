@@ -371,6 +371,65 @@ impl VersionedOffsets {
         for_each_variant!(self, o => o.gc_inline_off())
     }
 
+    /// The `gc` sub-struct fields as `(name, absolute byte offset within
+    /// `_Py_DebugOffsets`)`, version-correct. Used to drive the diagram's GC-state
+    /// subtree from actual layout instead of hardcoded offsets.
+    ///
+    /// The `gc` sub-struct is append-only across CPython versions (`size`@0,
+    /// `collecting`@8, `frame`@16, `generation_stats_size`@24, `generation_stats`@32);
+    /// older builds simply have a shorter struct (3.13/3.14 = `size`, `collecting`
+    /// only). So a version has a field iff its `gc` sub-struct is large enough to
+    /// contain it. Both `gc_off` and `gc_size` are compile-time constants of that
+    /// variant's own generated types, so the match is exhaustive (a new version fails
+    /// to compile until it adds an arm).
+    pub fn gc_debug_fields(&self) -> Vec<(&'static str, u64)> {
+        use std::mem::{offset_of, size_of};
+        fn build(gc_off: usize, gc_size: usize) -> Vec<(&'static str, u64)> {
+            const CANON: &[(&str, usize)] = &[
+                ("size", 0),
+                ("collecting", 8),
+                ("frame", 16),
+                ("generation_stats_size", 24),
+                ("generation_stats", 32),
+            ];
+            CANON
+                .iter()
+                .filter(|(_, off)| *off < gc_size)
+                .map(|(name, off)| (*name, (gc_off + off) as u64))
+                .collect()
+        }
+        match self {
+            Self::V3_13_1(_) => build(
+                offset_of!(v_3_13_1::_Py_DebugOffsets, gc),
+                size_of::<v_3_13_1::_Py_DebugOffsets__gc>(),
+            ),
+            Self::V3_13_13(_) => build(
+                offset_of!(v_3_13_13_53e07256802::_Py_DebugOffsets, gc),
+                size_of::<v_3_13_13_53e07256802::_Py_DebugOffsets__gc>(),
+            ),
+            Self::V3_14_4(_) => build(
+                offset_of!(v_3_14_4::_Py_DebugOffsets, gc),
+                size_of::<v_3_14_4::_Py_DebugOffsets__gc>(),
+            ),
+            Self::V3_15_0a8(_) => build(
+                offset_of!(v_3_15_0a8::_Py_DebugOffsets, gc),
+                size_of::<v_3_15_0a8::_Py_DebugOffsets__gc>(),
+            ),
+            Self::V3_15_0b1(_) => build(
+                offset_of!(v_3_15_0b1::_Py_DebugOffsets, gc),
+                size_of::<v_3_15_0b1::_Py_DebugOffsets__gc>(),
+            ),
+            Self::V3_15_0b3(_) => build(
+                offset_of!(v_3_15_0b3::_Py_DebugOffsets, gc),
+                size_of::<v_3_15_0b3::_Py_DebugOffsets__gc>(),
+            ),
+            Self::V3_16_0a0(_) => build(
+                offset_of!(v_3_16_0a0::_Py_DebugOffsets, gc),
+                size_of::<v_3_16_0a0::_Py_DebugOffsets__gc>(),
+            ),
+        }
+    }
+
     pub fn debug_offsets_highlight_regions(&self) -> Vec<(usize, u8, &'static str, usize)> {
         // Use any of the 3.15+ struct types for compile-time offset calculations;
         // the actual in-memory layout is the same for the struct fields we access.

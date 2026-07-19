@@ -256,8 +256,10 @@ def print_registration_checklist(
     print(bar, file=sys.stderr)
     print(f"""\
   The generated file already carries its `impl DebugOffsetsView` (version-varying
-  offsets + GC-stats shape), so no per-version accessor / to_offset_table edits are
-  needed. Add these {mod_name} entries — every one is compiler-enforced except #2:
+  offsets + GC-stats shape), so almost no per-version accessor edits are needed — the
+  one exception is the `gc_debug_fields` arm (#5), a hand-written `match` rather than a
+  `for_each_variant!` accessor. Add these {mod_name} entries — every one is
+  compiler-enforced except #2:
 
   1. Module decl (with the other `mod v_*;`):
        mod {mod_name};
@@ -268,16 +270,22 @@ def print_registration_checklist(
   3. `VersionedOffsets` enum variant:
        {variant}({mod_name}::_Py_DebugOffsets),
 
-  4. `for_each_variant!` macro arm (drives every accessor + the trait delegation):
+  4. `for_each_variant!` macro arm (drives most accessors + the trait delegation):
        Self::{variant}($o) => $body,
 
-  5. `validate` arm:
+  5. `gc_debug_fields` match arm (NOT for_each_variant!-driven — computes the gc
+     sub-struct field offsets from this build's own types via offset_of!/size_of!):
+       Self::{variant}(_) => build(
+           offset_of!({mod_name}::_Py_DebugOffsets, gc),
+           size_of::<{mod_name}::_Py_DebugOffsets__gc>()),
+
+  6. `validate` arm:
        {display_line}
        (this build has {sub_struct_count} sub-structs; full macros need >= 21)
 
-  6. `Display` arm (same basic/full split as validate).
+  7. `Display` arm (same basic/full split as validate).
 
-  {"7. impl_basic_display! + impl_basic_offsets! lists (basic tier only)." if not full_macros else "(full tier: no impl_basic_* entries needed.)"}
+  {"8. impl_basic_display! + impl_basic_offsets! lists (basic tier only)." if not full_macros else "(full tier: no impl_basic_* entries needed.)"}
        {gc_note}
 {bar}""", file=sys.stderr)
 

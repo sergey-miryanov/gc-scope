@@ -143,7 +143,7 @@ The generator prints an **exact registration checklist to stderr** — follow it
 to overwrite an existing `v_*.rs` (use `--force` to regenerate a build in place). The
 generated `v_*.rs` is self-contained (it carries its own `impl DebugOffsetsView` with all
 version-varying offsets and the GC-stats shape), so registering it in
-`src/remote_debugging/offsets/mod.rs` is ~8 lines and every site except the `LAYOUTS` row
+`src/remote_debugging/offsets/mod.rs` is ~9 lines and every site except the `LAYOUTS` row
 is compiler-enforced (a forgotten site fails to build):
 
 ```diff
@@ -153,15 +153,22 @@ is compiler-enforced (a forgotten site fails to build):
 + (0x030f00f0, |p, a| Ok(VersionedOffsets::V3_15_0(read_struct(p, a)?))),
   // 3. VersionedOffsets enum variant
 + V3_15_0(v_3_15_0::_Py_DebugOffsets),
-  // 4. for_each_variant! arm — drives ~20 accessors + the trait delegation automatically
+  // 4. for_each_variant! arm — drives most accessors + the trait delegation automatically
 + Self::V3_15_0($o) => $body,
-  // 5. validate() arm   — validate_basic(o, expected)  OR  v_3_15_0::validate_offsets(o, expected)
-  // 6. Display arm       — fmt_debug_offsets_basic(o, f) OR  fmt::Display::fmt(o, f)
-  // 7. basic tier only  — add to the impl_basic_display! and impl_basic_offsets! lists
+  // 5. gc_debug_fields arm — the one accessor NOT driven by for_each_variant!
++ Self::V3_15_0(_) => build(offset_of!(v_3_15_0::_Py_DebugOffsets, gc),
++                           size_of::<v_3_15_0::_Py_DebugOffsets__gc>()),
+  // 6. validate() arm   — validate_basic(o, expected)  OR  v_3_15_0::validate_offsets(o, expected)
+  // 7. Display arm       — fmt_debug_offsets_basic(o, f) OR  fmt::Display::fmt(o, f)
+  // 8. basic tier only  — add to the impl_basic_display! and impl_basic_offsets! lists
 ```
 
-Basic vs full tier (steps 5–7) is decided by the sub-struct count (`>= 21` → full, with
-generated `validate_offsets`/`Display`); the generator's checklist tells you which applies.
+Step 5 (`gc_debug_fields`) is a hand-written `match` — not a `for_each_variant!` accessor —
+because it computes the `gc` sub-struct's field offsets from each build's own struct types
+via `offset_of!`/`size_of!`; it drives the diagram's GC-state subtree. It's still
+compiler-enforced (the `match` is exhaustive). Basic vs full tier (steps 6–8) is decided by
+the sub-struct count (`>= 21` → full, with generated `validate_offsets`/`Display`); the
+generator's checklist tells you which applies.
 
 **Same-hex second build** (a clean release vs a gc-instrumented `+inc` build sharing a
 `PY_VERSION_HEX` — see "Builds that share a version hex" above). If the `+inc` build doesn't

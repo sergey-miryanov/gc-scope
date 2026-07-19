@@ -511,14 +511,18 @@ fn section_debug_offsets(data: &CollectedData, show_tree: bool, show_hex: bool, 
         &[]
     };
 
-    let gen_stats_size = if 768 + 8 <= bytes.len() && 768 + 8 <= debug_size {
-        u64::from_le_bytes(bytes[768..776].try_into().unwrap())
-    } else {
-        0
-    };
+    // `gc.generation_stats_size` is read from the target's `_Py_DebugOffsets`, so the
+    // accessor already holds the process-published value (0 on builds without the field).
+    let gen_stats_size = data.offsets.gc_generation_stats_size();
     let gs = gen_stats_layout(gen_stats_size);
 
-    let tree = debug_offsets_tree(gs.0);
+    // Drive the GC-state subtree from actual, version-correct layout: the `gc`
+    // sub-struct fields and the resolved per-slot field layout (which reflects the
+    // clean-vs-`+inc` selection).
+    let gc_fields = data.offsets.gc_debug_fields();
+    let offset_table = data.offsets.to_offset_table(data.pid, data.runtime_addr);
+    let slot_fields = offset_table.gc_layout.map(|l| l.fields);
+    let tree = debug_offsets_tree(&gc_fields, slot_fields);
     let prefixes = tree_prefixes(&tree);
 
     let debug_highlights = if !show_runtime_hex {
