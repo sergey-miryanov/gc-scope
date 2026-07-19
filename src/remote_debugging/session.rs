@@ -63,24 +63,15 @@ pub enum Revalidated {
     Dead,
 }
 
-/// Support tier for an attached process.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Tier {
-    /// 3.13+ with an exact compiled `_Py_DebugOffsets` layout: everything works.
-    Full,
-    /// 3.13+ resolved through a validated same-minor fallback layout: navigation
-    /// works and GC stats are best-effort (may be approximate for this build).
-    LayoutOnly,
-    /// 3.8–3.12: hardcoded minor-level table. Navigation/verify only, no GC stats.
-    Legacy,
-}
-
 /// The resolved offset layout for an attached process.
 ///
-/// `Full` and `LayoutOnly` both carry the bindgen `VersionedOffsets` (the
-/// fallback path still reads a real struct) plus the flat `OffsetTable` derived
-/// from it; they differ only in confidence (exact hex vs. same-minor fallback).
-/// `Legacy` has no self-describing struct, only a hardcoded table.
+/// The three variants are the support tiers. `Full` and `LayoutOnly` both carry the
+/// bindgen `VersionedOffsets` (the fallback path still reads a real struct) plus the
+/// flat `OffsetTable` derived from it; they differ only in confidence (exact hex vs.
+/// same-minor fallback). `Legacy` (3.8–3.12) has no self-describing struct, only a
+/// hardcoded table: it supports interpreter navigation and — for 3.9–3.12 — GC
+/// generation stats (see [`PySession::supports_gc_stats`]), but not the
+/// `_Py_DebugOffsets` struct panels of the diagram.
 #[derive(Debug)]
 pub enum Resolved {
     Full { offsets: VersionedOffsets, table: OffsetTable },
@@ -89,14 +80,6 @@ pub enum Resolved {
 }
 
 impl Resolved {
-    pub fn tier(&self) -> Tier {
-        match self {
-            Resolved::Full { .. } => Tier::Full,
-            Resolved::LayoutOnly { .. } => Tier::LayoutOnly,
-            Resolved::Legacy { .. } => Tier::Legacy,
-        }
-    }
-
     /// The flat offset table, available for every tier.
     pub fn table(&self) -> &OffsetTable {
         match self {
@@ -256,8 +239,12 @@ impl PySession {
         self.stored_hex
     }
 
-    pub fn tier(&self) -> Tier {
-        self.resolved.tier()
+    /// Whether this build exposes decodable GC generation stats. True for 3.13+
+    /// (`Full`/`LayoutOnly`) and pre-3.13 3.9–3.12 (`Legacy` with the inline layout);
+    /// false for 3.8 (global GC, not yet decoded) or any build without a stats layout.
+    /// This is the capability the TUI picker and `list-pids` "S" column report.
+    pub fn supports_gc_stats(&self) -> bool {
+        self.resolved.table().gc_stats_kind != GcStatsKind::None
     }
 
     /// Read `size` bytes at `addr` through the held handle (no per-call open).

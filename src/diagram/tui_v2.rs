@@ -12,6 +12,7 @@ use ratatui::Terminal;
 
 use super::collect::{avg_collection_time_per_gen, collections_rate_from_slots, CollectedData};
 use super::render::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
+use crate::remote_debugging::offsets::VersionedOffsets;
 
 // ── Layout constants ──────────────────────────────────────────────
 const OUTER_W: usize = 158;
@@ -341,17 +342,26 @@ fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, rate
 // ── Main line builder ─────────────────────────────────────────────
 fn build_lines(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_coll_time_per_gen: [Option<f64>; 3], selected_slot: usize, debug_offsets_show_tree: bool, debug_offsets_show_hex: bool, show_runtime_hex: bool) -> (Vec<Line<'static>>, usize) {
     let mut lines = Vec::new();
-    let s1 = section_debug_offsets(data, debug_offsets_show_tree, debug_offsets_show_hex, show_runtime_hex);
-    let s2 = section_interpreter(data);
+    // Sections 1–2 render the `_Py_DebugOffsets` struct — 3.13+ only. Pre-3.13 skips
+    // section 1 entirely and shows a focused interpreter header (section 2), then the
+    // GC generation-stats table.
+    let (s1, s2) = match data.offsets() {
+        Some(off) => (
+            section_debug_offsets(data, off, debug_offsets_show_tree, debug_offsets_show_hex, show_runtime_hex),
+            section_interpreter(data, off),
+        ),
+        None => (Vec::new(), section_interpreter_legacy(data)),
+    };
     let s1_len = s1.len();
     let s2_len = s2.len();
     lines.extend(s1);
-    lines.push(Line::from(""));
+    // Blank separator after section 1 only when it was rendered (3.13+).
+    let sep1 = if s1_len > 0 { lines.push(Line::from("")); 1 } else { 0 };
     lines.extend(s2);
     lines.push(Line::from(""));
     lines.extend(section_gc_stats(data, rate_per_gen, avg_coll_time_per_gen, selected_slot));
     // Slot row in section_gc_stats starts at index 3 (top/buffer/top) + 7 header lines in the interleave
-    let slot_line_idx = s1_len + 1 + s2_len + 1 + 3 + 7 + selected_slot;
+    let slot_line_idx = s1_len + sep1 + s2_len + 1 + 3 + 7 + selected_slot;
     (lines, slot_line_idx)
 }
 
@@ -494,7 +504,7 @@ fn hex_col_emitted(n: usize) -> usize {
 }
 
 // ── Section 1: _Py_DebugOffsets ───────────────────────────────────
-fn section_debug_offsets(data: &CollectedData, show_tree: bool, show_hex: bool, show_runtime_hex: bool) -> Vec<Line<'static>> {
+fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets, show_tree: bool, show_hex: bool, show_runtime_hex: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let debug_size = data.debug_offsets_size as usize;
 
@@ -531,20 +541,20 @@ fn section_debug_offsets(data: &CollectedData, show_tree: bool, show_hex: bool, 
 
     // `gc.generation_stats_size` is read from the target's `_Py_DebugOffsets`, so the
     // accessor already holds the process-published value (0 on builds without the field).
-    let gen_stats_size = data.offsets().gc_generation_stats_size();
+    let gen_stats_size = off.gc_generation_stats_size();
     let gs = gen_stats_layout(gen_stats_size);
 
     // Drive the GC-state subtree from actual, version-correct layout: the `gc`
     // sub-struct fields and the resolved per-slot field layout (which reflects the
     // clean-vs-`+inc` selection).
-    let gc_fields = data.offsets().gc_debug_fields();
-    let offset_table = data.offsets().to_offset_table(data.pid, data.runtime_addr);
+    let gc_fields = off.gc_debug_fields();
+    let offset_table = off.to_offset_table(data.pid, data.runtime_addr);
     let slot_fields = offset_table.gc_layout.map(|l| l.fields);
     let tree = debug_offsets_tree(&gc_fields, slot_fields);
     let prefixes = tree_prefixes(&tree);
 
     let debug_highlights = if !show_runtime_hex {
-        data.offsets().debug_offsets_highlight_regions()
+        off.debug_offsets_highlight_regions()
     } else {
         vec![]
     };
@@ -708,10 +718,27 @@ fn section_debug_offsets(data: &CollectedData, show_tree: bool, show_hex: bool, 
 }
 
 // ── Section 2: PyInterpreterState ─────────────────────────────────
-fn section_interpreter(data: &CollectedData) -> Vec<Line<'static>> {
+// Pre-3.13 focused interpreter header: no `_Py_DebugOffsets`, so no field table or
+// GC-state box — just the interpreter address/id and a note; GC stats follow below.
+fn section_interpreter_legacy(data: &CollectedData) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let interp = &data.interpreter;
-    let off = data.offsets();
+    lines.push(Line::from(Span::raw(top())));
+    lines.push(Line::from(Span::raw(l(&format!(
+        "PyInterpreterState @ {:#x}  (id: {})",
+        interp.addr, interp.id
+    )))));
+    lines.push(Line::from(Span::raw(top())));
+    lines.push(Line::from(Span::raw(l(
+        "pre-3.13: no _Py_DebugOffsets struct — showing GC generation stats only",
+    ))));
+    lines.push(Line::from(Span::raw(top())));
+    lines
+}
+
+fn section_interpreter(data: &CollectedData, off: &VersionedOffsets) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let interp = &data.interpreter;
     // Show the whole GC state struct (raw_bytes is read to exactly gc.size bytes), so the
     // dump matches the "GC struct (N bytes)" header. A fixed cap truncated larger structs
     // like the +inc build's 232-byte state.
@@ -903,8 +930,9 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
     lines.push(Line::from(Span::raw(top())));
 
     // Version-correct geometry/layout for this build (IO-free): drives the per-slot size,
-    // the per-generation slot counts, and the slot-items field list below.
-    let offset_table = data.offsets().to_offset_table(data.pid, data.runtime_addr);
+    // the per-generation slot counts, and the slot-items field list below. Sourced from
+    // the flat table the session already built, so it works for every tier (incl. Legacy).
+    let offset_table = data.resolved.table().clone();
     let item_size = if gc.item_size > 0 { gc.item_size } else { gc.raw_stats_bytes.len().min(64) };
     // Per-generation slot counts come from the collected snapshot (version/layout-derived,
     // FT-correct) rather than a GIL-assuming literal or a per-frame tally.

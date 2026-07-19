@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use crate::remote_debugging::offsets::{self, VersionedOffsets};
 use crate::remote_debugging::session::{PySession, Resolved};
 
@@ -68,9 +68,9 @@ pub struct CollectedData {
     pub runtime_version: u64,
     pub runtime_raw_bytes: Vec<u8>,
     pub debug_offsets_size: u64,
-    /// Shared layout from the attached [`PySession`]. Only 3.13+ tiers reach here
-    /// (`collect_data` bails on `Legacy`), so [`CollectedData::offsets`] is always
-    /// available.
+    /// Shared layout from the attached [`PySession`]. Present for every tier;
+    /// [`CollectedData::offsets`] returns `None` for pre-3.13 (`Legacy`), which has
+    /// no `_Py_DebugOffsets` struct.
     pub resolved: Arc<Resolved>,
     pub interpreter: InterpreterSnapshot,
     pub collect_duration: Duration,
@@ -91,28 +91,41 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
     let pid = session.pid();
     let runtime_addr = session.runtime_addr();
 
-    // The diagram reads self-describing `_Py_DebugOffsets` fields, so it needs a
-    // 3.13+ tier. Pre-3.13 (`Legacy`) has no such struct — bail as before.
-    let off = session.resolved().offsets().ok_or_else(|| {
-        anyhow!("visualization requires Python 3.13+ (_Py_DebugOffsets); this process is pre-3.13")
-    })?;
+    // The `_Py_DebugOffsets` struct dump (diagram sections 1–2) needs a 3.13+ tier.
+    // Pre-3.13 (`Legacy`) has no such struct: navigate via the flat `OffsetTable`
+    // instead and render a focused GC-generation-stats view. The renderers gate the
+    // debug-offsets panels on `offsets()` being present.
+    let off_opt = session.resolved().offsets();
+    // The table was built once in `attach`; reuse it for navigation on both tiers.
+    let offset_table = session.resolved().table().clone();
 
-    let debug_offsets_size = off.debug_offsets_total_size();
-    let total_read = (debug_offsets_size as usize) * 2;
-    let runtime_raw_bytes = session
-        .read(runtime_addr, total_read)
-        .context("Failed to read _Py_DebugOffsets + _PyRuntime memory")?;
+    // `_Py_DebugOffsets` bytes for the struct panels — 3.13+ only; empty for Legacy.
+    let (debug_offsets_size, runtime_raw_bytes) = match off_opt {
+        Some(off) => {
+            let sz = off.debug_offsets_total_size();
+            let raw = session
+                .read(runtime_addr, (sz as usize) * 2)
+                .context("Failed to read _Py_DebugOffsets + _PyRuntime memory")?;
+            (sz, raw)
+        }
+        None => (0u64, Vec::new()),
+    };
 
-    // Follow the same pattern as gc_stats.rs: use offset values from
-    // _Py_DebugOffsets as byte offsets from runtime_addr (which IS _PyRuntime).
+    // Navigation offsets come from the flat table — identical values to the bindgen
+    // accessors on 3.13+, and the only source available pre-3.13.
     let head_addr = session
-        .read_u64(runtime_addr + off.runtime_interpreters_head())
+        .read_u64(runtime_addr + offset_table.runtime_interpreters_head())
         .context("Failed to read interpreters_head pointer")?;
 
-    let gc_offset = off.interpreter_state_gc();
-    let gc_size = off.gc_size();
-    let next_addr = session.read_u64(head_addr + off.interpreter_state_next())?;
-    let id = session.read_i64(head_addr + off.interpreter_state_id())?;
+    let gc_offset = offset_table.interp_gc.unwrap_or(0);
+    // Exact `gc` sub-struct span on 3.13+; on Legacy synthesize the inline stats region
+    // (only used for the section-2 hexdump, which Legacy skips).
+    let gc_size = match off_opt {
+        Some(off) => off.gc_size(),
+        None => offset_table.gc_stats_inline_off + gc_stats_total_bytes(&offset_table) as u64,
+    };
+    let next_addr = session.read_u64(head_addr + offset_table.interp_next())?;
+    let id = session.read_i64(head_addr + offset_table.interp_id())?;
 
     // Read a reasonable chunk of interpreter state (first 256 bytes) for hex dump
     let interp_raw = session
@@ -125,11 +138,9 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
         .context("Failed to read GC state")?;
 
     // Resolve the GC generation-stats region by its version-specific shape — same logic as
-    // `gc_stats.rs::read_gc_stats`. 3.13/3.14 (`InlineArray`) store the stats inline in
-    // `_gc_runtime_state` at a fixed offset (no pointer, and `gc.generation_stats*` = 0);
-    // 3.15+ (`RingBuffer`) reach a ring buffer through the `gc.generation_stats` pointer.
-    // The table was already built once in `attach`; reuse it.
-    let offset_table = session.resolved().table().clone();
+    // `gc_stats.rs::read_gc_stats`. `InlineArray` (pre-3.13, 3.13/3.14) stores the stats
+    // inline in `_gc_runtime_state` at a fixed offset; `RingBuffer` (3.15+, always a 3.13+
+    // tier) reaches a ring buffer through the `gc.generation_stats` pointer.
     let item_size = offset_table.gc_item_size.unwrap_or(0) as usize;
     let slots_per_gen = offset_table.gc_slots_per_gen.unwrap_or([0, 0, 0]);
     let (stats_addr, stats_total) = match offset_table.gc_stats_kind {
@@ -139,7 +150,7 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
             (addr, gc_stats_total_bytes(&offset_table))
         }
         offsets::offset_table::GcStatsKind::RingBuffer => {
-            let gen_stats_field_off = off.gc_generation_stats();
+            let gen_stats_field_off = off_opt.map(|o| o.gc_generation_stats()).unwrap_or(0);
             let ptr = if gen_stats_field_off == 0 {
                 0
             } else {
@@ -147,7 +158,8 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
                     .read_u64(head_addr + gc_offset + gen_stats_field_off)
                     .context("Failed to read generation_stats pointer")?
             };
-            (ptr, off.gc_generation_stats_size() as usize)
+            let size = off_opt.map(|o| o.gc_generation_stats_size()).unwrap_or(0) as usize;
+            (ptr, size)
         }
     };
 
@@ -195,7 +207,7 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
     Ok(CollectedData {
         pid,
         runtime_addr,
-        runtime_version: session.stored_hex().unwrap_or(0),
+        runtime_version: session.stored_hex().unwrap_or(offset_table.version_hex),
         runtime_raw_bytes,
         debug_offsets_size,
         resolved: session.resolved_arc(),
@@ -206,16 +218,15 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
 
 /// Extract debug offset values for display.
 impl CollectedData {
-    /// The bindgen offsets. Always present: `collect_data` only builds a
-    /// `CollectedData` for 3.13+ tiers.
-    pub fn offsets(&self) -> &VersionedOffsets {
-        self.resolved
-            .offsets()
-            .expect("CollectedData is only built for 3.13+ tiers")
+    /// The bindgen offsets, or `None` for pre-3.13 (`Legacy`), which has no
+    /// `_Py_DebugOffsets` struct. Renderers gate the debug-offsets panels on this.
+    pub fn offsets(&self) -> Option<&VersionedOffsets> {
+        self.resolved.offsets()
     }
 
+    /// Key `_Py_DebugOffsets` field values for the interpreter panel; empty pre-3.13.
     pub fn runtime_offset_fields(&self) -> Vec<DebugOffsetField> {
-        let off = self.offsets();
+        let Some(off) = self.offsets() else { return Vec::new(); };
         vec![
             DebugOffsetField { name: "runtime_state.finalizing", value: off.runtime_state_finalizing() },
             DebugOffsetField { name: "runtime_state.interpreters_head", value: off.runtime_interpreters_head() },

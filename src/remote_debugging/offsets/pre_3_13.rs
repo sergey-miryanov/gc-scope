@@ -1,4 +1,4 @@
-use crate::remote_debugging::offsets::offset_table::OffsetTable;
+use crate::remote_debugging::offsets::offset_table::{GcItemLayout, GcStatsKind, OffsetTable};
 
 /// Offset of `generation_stats` within `_gc_runtime_state` (identical 3.8–3.13).
 pub const GC_STATS_INLINE_OFF: u64 = 0x80;
@@ -10,6 +10,20 @@ pub const GC_SLOTS: [u64; 3] = [1, 1, 1];
 pub const GC_BASES: [u64; 3] = [0, 24, 48];
 /// Offset of `collecting` within `_gc_runtime_state`.
 pub const GC_COLLECTING: u64 = 0xC8;
+
+/// Field layout of one `gc_generation_stats` item — identical across 3.8–3.13
+/// (`collections`, `collected`, `uncollectable`, each a `Py_ssize_t`). Hand-written
+/// because pre-3.13 has no bindgen struct to derive it from via `offset_of!`; this
+/// mirrors the generated `GC_LAYOUT` in the `v_*` modules and lets the shared
+/// `InlineArray` decode path in `PySession::gc_stats` handle Legacy interpreters.
+pub static LEGACY_GC_LAYOUT: GcItemLayout = GcItemLayout {
+    item_size: GC_ITEM_SIZE as usize,
+    fields: &[
+        ("collections", 0),
+        ("collected", 8),
+        ("uncollectable", 16),
+    ],
+};
 
 fn table(version_hex: u64, runtime_ih: u64, interp_next: u64, interp_id: u64,
          interp_ts_head: u64, interp_gc: Option<u64>, thread_interp: u64,
@@ -26,11 +40,13 @@ fn table(version_hex: u64, runtime_ih: u64, interp_next: u64, interp_id: u64,
         gc_generations: gc_gen,
         gc_collecting: GC_COLLECTING,
         gc_frame: None,
-        // Pre-3.13 has inline generation stats but gcscope does not decode them
-        // (no per-slot layout wired) — navigation/verify only.
-        gc_stats_kind: crate::remote_debugging::offsets::offset_table::GcStatsKind::None,
-        gc_layout: None,
-        gc_stats_addr: None,  // filled by caller using GC_STATS_INLINE_OFF + gc_state_addr
+        // The `gc_generation_stats` item and the inline `generation_stats[]` position
+        // are identical to 3.13, so pre-3.13 decodes through the same `InlineArray`
+        // path in `PySession::gc_stats`. (3.8 keeps GC global in `_PyRuntime`, a path
+        // the stats loop does not yet resolve, so `v3_8` flips these back to `None`.)
+        gc_stats_kind: GcStatsKind::InlineArray,
+        gc_layout: Some(&LEGACY_GC_LAYOUT),
+        gc_stats_addr: None,  // filled per-interpreter by the stats loop (gc_state + GC_STATS_INLINE_OFF)
         gc_item_size: Some(GC_ITEM_SIZE),
         gc_slots_per_gen: Some(GC_SLOTS),
         gc_gen_base_offsets: Some(GC_BASES),
@@ -57,7 +73,7 @@ pub fn table_for_version(major: u8, minor: u8) -> Option<OffsetTable> {
 
 /// Python 3.8: GC is global in `_PyRuntime`, not per-interpreter.
 fn v3_8(version_hex: u64) -> OffsetTable {
-    table(
+    let mut t = table(
         version_hex,
         0x20,    // runtime_interpreters_head
         0x00,    // interp_next
@@ -67,7 +83,13 @@ fn v3_8(version_hex: u64) -> OffsetTable {
         0x10,    // thread_interp
         0x18,    // gc_generations
         Some(0x158), // runtime_gc
-    )
+    );
+    // GC state lives in `_PyRuntime` (runtime_gc), not per-interpreter. The stats
+    // loop resolves the stats address from each interpreter's `interp_gc`, which 3.8
+    // lacks — so leave stats undecoded until that global-GC path is wired (follow-up).
+    t.gc_stats_kind = GcStatsKind::None;
+    t.gc_layout = None;
+    t
 }
 
 /// Python 3.9: GC is per-interpreter at offset 0x268.

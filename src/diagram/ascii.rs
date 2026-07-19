@@ -1,6 +1,7 @@
 use std::fmt::Write;
 
 use super::collect::CollectedData;
+use crate::remote_debugging::offsets::VersionedOffsets;
 
 // Total line width: 160 chars including | borders.
 // | (1) + left panel (PL) + " | " (3) + right panel (PR) + | (1) = 4 + PL + PR = 160
@@ -40,28 +41,38 @@ pub fn render_ascii(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
     let mut s = String::new();
     writeln!(s, "{}", top()).unwrap();
     writeln!(s, "{}", l(&format!("gcscope ascii - PID {} - Python 0x{:08x}", data.pid, data.runtime_version))).unwrap();
-    writeln!(s, "{}", l(&format!("_PyRuntime (aka _Py_DebugOffsets) @ {:#x}  |  Interpreter head @ {:#x}", data.runtime_addr, data.interpreter.addr))).unwrap();
+    let runtime_label = match data.offsets() {
+        Some(_) => format!("_PyRuntime (aka _Py_DebugOffsets) @ {:#x}  |  Interpreter head @ {:#x}", data.runtime_addr, data.interpreter.addr),
+        None => format!("_PyRuntime @ {:#x}  |  Interpreter head @ {:#x}  (pre-3.13: no _Py_DebugOffsets)", data.runtime_addr, data.interpreter.addr),
+    };
+    writeln!(s, "{}", l(&runtime_label)).unwrap();
     writeln!(s, "{}", bot()).unwrap();
     writeln!(s).unwrap();
-    s = render_runtime(s, data);
-    s = render_interpreter(s, data);
+    // Sections 1–2 render the `_Py_DebugOffsets` struct — 3.13+ only. Pre-3.13 shows a
+    // focused view: a minimal interpreter header, then the GC generation-stats table.
+    if let Some(off) = data.offsets() {
+        s = render_runtime(s, data, off);
+        s = render_interpreter(s, data, off);
+    } else {
+        s = render_interpreter_legacy(s, data);
+    }
     s = render_gc_stats(s, data, rate_per_gen, avg_coll_time_per_gen);
     s
 }
 
 // -- Section: _Py_DebugOffsets --------------------------------
-fn render_runtime(mut s: String, data: &CollectedData) -> String {
+fn render_runtime(mut s: String, data: &CollectedData, off: &VersionedOffsets) -> String {
     let bytes = &data.runtime_raw_bytes;
     let debug_size = data.debug_offsets_size as usize;
 
     // `gc.generation_stats_size` is read from the target's `_Py_DebugOffsets`, so the
     // accessor already holds the process-published value (0 on builds without the field).
-    let gen_stats_size = data.offsets().gc_generation_stats_size();
+    let gen_stats_size = off.gc_generation_stats_size();
     let gs = super::render::gen_stats_layout(gen_stats_size);
 
     // Drive the GC-state subtree from actual, version-correct layout.
-    let gc_fields = data.offsets().gc_debug_fields();
-    let offset_table = data.offsets().to_offset_table(data.pid, data.runtime_addr);
+    let gc_fields = off.gc_debug_fields();
+    let offset_table = off.to_offset_table(data.pid, data.runtime_addr);
     let slot_fields = offset_table.gc_layout.map(|l| l.fields);
     let tree = super::render::debug_offsets_tree(&gc_fields, slot_fields);
     let prefixes = super::render::tree_prefixes(&tree);
@@ -161,10 +172,23 @@ fn derived_val(label: &str, gs_size: u64, gs: (u64, u64, u64, u64, u64, u64, u64
     }
 }
 
-// -- Section: PyInterpreterState ------------------------------
-fn render_interpreter(mut s: String, data: &CollectedData) -> String {
+// -- Section: PyInterpreterState (pre-3.13, focused) ----------
+// No `_Py_DebugOffsets`, so no field table / GC-state box — just an interpreter header
+// noting the limited view; the GC generation-stats section follows.
+fn render_interpreter_legacy(mut s: String, data: &CollectedData) -> String {
     let interp = &data.interpreter;
-    let off = data.offsets();
+    writeln!(s, "{}", top()).unwrap();
+    writeln!(s, "{}", l(&format!("PyInterpreterState @ {:#x}  (id: {})", interp.addr, interp.id))).unwrap();
+    writeln!(s, "{}", sep()).unwrap();
+    writeln!(s, "{}", l("pre-3.13: no _Py_DebugOffsets struct — showing GC generation stats only")).unwrap();
+    writeln!(s, "{}", bot()).unwrap();
+    writeln!(s).unwrap();
+    s
+}
+
+// -- Section: PyInterpreterState ------------------------------
+fn render_interpreter(mut s: String, data: &CollectedData, off: &VersionedOffsets) -> String {
+    let interp = &data.interpreter;
     // Show the whole GC state struct (raw_bytes is read to exactly gc.size bytes), so the
     // dump matches the "GC struct (N bytes)" header. A fixed cap truncated larger structs
     // like the +inc build's 232-byte state.
@@ -273,8 +297,9 @@ fn render_gc_stats(mut s: String, data: &CollectedData, rate_per_gen: [Option<f6
     }
 
     // Version-correct geometry/layout for this build (IO-free): drives the per-slot size,
-    // the per-generation slot counts, and the slot-items field list below.
-    let offset_table = data.offsets().to_offset_table(data.pid, data.runtime_addr);
+    // the per-generation slot counts, and the slot-items field list below. Sourced from
+    // the flat table the session already built, so it works for every tier (incl. Legacy).
+    let offset_table = data.resolved.table().clone();
     let item_size = if gc.item_size > 0 { gc.item_size } else { gc.raw_stats_bytes.len().min(64) };
     // Per-generation slot counts come from the collected snapshot (version/layout-derived,
     // FT-correct) rather than a GIL-assuming literal or a per-frame tally.

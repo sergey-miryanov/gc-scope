@@ -16,7 +16,7 @@ use ratatui::Terminal;
 use crate::list_pids::{build_flat_rows, FlatRow, ProcessInfo};
 
 fn is_supported(r: &FlatRow) -> bool {
-    r.is_python && r.runtime_found && r.offsets_known
+    r.is_python && r.runtime_found && r.supports_stats
 }
 
 /// First supported row at or after `from`, if any.
@@ -204,7 +204,7 @@ fn render_dialog(
             row.name.clone()
         };
         let r_char = if row.is_python && row.runtime_found { "Y" } else if row.is_python { "N" } else { "-" };
-        let s_char = if row.is_python && row.offsets_known { "Y" } else if row.is_python { "N" } else { "-" };
+        let s_char = if row.is_python && row.supports_stats { "Y" } else if row.is_python { "N" } else { "-" };
         let indent = "  ".repeat(prefix_depth(&row.prefix));
         let full_name = format!("{}{}", indent, display_name);
 
@@ -220,7 +220,7 @@ fn render_dialog(
             row.pid, r_char, s_char, full_name, cmd_display
         );
 
-        let supported = row.is_python && row.runtime_found && row.offsets_known;
+        let supported = row.is_python && row.runtime_found && row.supports_stats;
         let style = if i == selected {
             Style::new().bg(Color::DarkGray).fg(Color::White)
         } else if !supported {

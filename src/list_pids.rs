@@ -4,7 +4,7 @@ use anyhow::Result;
 use sysinfo::System;
 
 use crate::memory::process;
-use crate::remote_debugging::session::{PySession, Tier};
+use crate::remote_debugging::session::PySession;
 use crate::remote_debugging::version;
 
 pub struct ProcessInfo {
@@ -14,7 +14,7 @@ pub struct ProcessInfo {
     pub cmdline: String,
     pub version: Option<String>,
     pub runtime_found: bool,
-    pub offsets_known: bool,
+    pub supports_stats: bool,
 }
 
 pub struct FlatRow {
@@ -25,7 +25,7 @@ pub struct FlatRow {
     pub is_python: bool,
     pub version: Option<String>,
     pub runtime_found: bool,
-    pub offsets_known: bool,
+    pub supports_stats: bool,
 }
 
 struct ProcessEntry {
@@ -36,7 +36,7 @@ struct ProcessEntry {
     is_python: bool,
     version: Option<String>,
     runtime_found: bool,
-    offsets_known: bool,
+    supports_stats: bool,
 }
 
 pub fn list_python_processes() -> Result<(Vec<ProcessInfo>, HashMap<u32, (String, u32)>)> {
@@ -66,7 +66,7 @@ pub fn list_python_processes() -> Result<(Vec<ProcessInfo>, HashMap<u32, (String
             .map(|s| s.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
-        result.push(ProcessInfo { pid, ppid, name: name_orig, cmdline, version: None, runtime_found: false, offsets_known: false });
+        result.push(ProcessInfo { pid, ppid, name: name_orig, cmdline, version: None, runtime_found: false, supports_stats: false });
     }
     result.sort_by_key(|p| p.pid);
 
@@ -78,7 +78,7 @@ pub fn list_python_processes() -> Result<(Vec<ProcessInfo>, HashMap<u32, (String
         match PySession::attach(p.pid) {
             Ok(session) => {
                 p.runtime_found = true;
-                p.offsets_known = matches!(session.tier(), Tier::Full | Tier::LayoutOnly);
+                p.supports_stats = session.supports_gc_stats();
                 p.version = Some(session.version().to_string());
             }
             Err(_) => {
@@ -105,7 +105,7 @@ pub fn print_process_table(processes: &[ProcessInfo], no_cmdline: bool) {
         for p in processes {
             let ver = p.version.as_deref().unwrap_or("-");
             let rnt = if p.runtime_found { "Y" } else { "N" };
-            let off = if p.offsets_known { "Y" } else { "N" };
+            let off = if p.supports_stats { "Y" } else { "N" };
             println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25}", p.pid, p.ppid, p.name, rnt, off, ver);
         }
     } else {
@@ -114,7 +114,7 @@ pub fn print_process_table(processes: &[ProcessInfo], no_cmdline: bool) {
         for p in processes {
             let ver = p.version.as_deref().unwrap_or("-");
             let rnt = if p.runtime_found { "Y" } else { "N" };
-            let off = if p.offsets_known { "Y" } else { "N" };
+            let off = if p.supports_stats { "Y" } else { "N" };
             println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25} {}", p.pid, p.ppid, p.name, rnt, off, ver, p.cmdline);
         }
     }
@@ -138,7 +138,7 @@ pub fn build_flat_rows(
             is_python: true,
             version: p.version.clone(),
             runtime_found: p.runtime_found,
-            offsets_known: p.offsets_known,
+            supports_stats: p.supports_stats,
         });
     }
 
@@ -163,7 +163,7 @@ pub fn build_flat_rows(
                     is_python: false,
                     version: None,
                     runtime_found: false,
-                    offsets_known: false,
+                    supports_stats: false,
                 });
             }
         }
@@ -221,7 +221,7 @@ fn flatten_node(
         is_python: entry.is_python,
         version: entry.version.clone(),
         runtime_found: entry.runtime_found,
-        offsets_known: entry.offsets_known,
+        supports_stats: entry.supports_stats,
     });
 
     if let Some(children) = children_by_ppid.get(&pid) {
@@ -246,7 +246,7 @@ fn write_row(no_cmdline: bool, row: &FlatRow) {
     let indent = "  ".repeat(prefix_depth(&row.prefix));
     let full_name = format!("{}{}", indent, display_name);
     let r_char = if row.is_python && row.runtime_found { "Y" } else if row.is_python { "N" } else { "-" };
-    let s_char = if row.is_python && row.offsets_known { "Y" } else if row.is_python { "N" } else { "-" };
+    let s_char = if row.is_python && row.supports_stats { "Y" } else if row.is_python { "N" } else { "-" };
 
     if no_cmdline {
         println!("{:>8}  {}  {}  {:<22}",

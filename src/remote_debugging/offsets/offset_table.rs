@@ -12,10 +12,11 @@ use crate::remote_debugging::gc_stats::GcStat;
 /// re-infer the shape from magic item sizes (`24`/`40` == inline, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcStatsKind {
-    /// No readable generation stats (3.13.x, pre-3.13).
+    /// No readable generation stats — e.g. Python 3.8 (GC state is global, not yet
+    /// decoded) or a build whose per-slot GC layout wasn't generated.
     None,
-    /// One slot per generation, contiguous at a fixed offset from the gc state
-    /// (3.13.x, 3.14.4).
+    /// One slot per generation, contiguous at a fixed offset from the gc state.
+    /// The same inline layout spans pre-3.13 (3.9–3.12) and 3.13.x / 3.14.4.
     InlineArray,
     /// Ring buffer reached via the `gc.generation_stats` pointer (3.15.0a8+).
     RingBuffer,
