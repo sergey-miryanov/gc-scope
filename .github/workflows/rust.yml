@@ -1,4 +1,4 @@
-name: Rust
+name: CI
 
 on:
   push:
@@ -10,13 +10,98 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Build + unit tests on every supported platform. This is the real gate:
+  # goblin's ELF/PE/Mach-O section finders and the per-OS memory reader all
+  # differ by target, so a green build on one OS says nothing about the others.
   build:
-
-    runs-on: ubuntu-latest
-
+    name: Build & test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --verbose
+
+      # `cargo test` currently runs only unit tests + any integration test that
+      # needs no live target. The live gc-stats harness (docs/tests-harness-plan.md)
+      # is #[ignore]-gated and machine-specific, so it is skipped here — a stock
+      # runner has neither the custom CPython builds nor (necessarily) the
+      # process-attach privileges those tests require.
+      - name: Test
+        run: cargo test --verbose
+
+      # Lint + format are reported but NON-BLOCKING for now: the tree carries a
+      # known clippy-warning baseline and is not yet rustfmt-clean, so denying
+      # would red every build. Flip `continue-on-error` to false (and drop the
+      # `|| true` intent) once the baseline is cleaned.
+      - name: Clippy (non-blocking)
+        continue-on-error: true
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format check (non-blocking)
+        continue-on-error: true
+        run: cargo fmt --all --check
+
+  # Best-effort proof the attach + decode pipeline actually works end-to-end
+  # against a real interpreter. NON-BLOCKING (continue-on-error) because it
+  # depends on runner ptrace permissions and on the setup-python build carrying
+  # a resolvable PyRuntime section/cookie — neither guaranteed. When it turns
+  # green reliably we can promote it to a gate.
+  live-smoke:
+    name: Live gc-stats smoke (3.13, ubuntu)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Build gcscope
+        run: cargo build --verbose
+
+      # Same-uid, non-descendant attach needs a permissive ptrace scope. GitHub
+      # runners allow passwordless sudo; best-effort so the step never hard-fails
+      # here (the job is continue-on-error regardless).
+      - name: Allow ptrace (best-effort)
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+
+      - name: Attach and assert non-empty GC stats
+        run: |
+          set -euo pipefail
+          # A spinner that keeps the GC busy so the generation counters are non-zero.
+          python -c '
+          import gc, time
+          while True:
+              [ [0]*50 for _ in range(2000) ]
+              gc.collect()
+              time.sleep(0.05)
+          ' &
+          PYPID=$!
+          # Give the interpreter a moment to initialize its runtime + run a few GCs.
+          sleep 2
+
+          set +e
+          OUT="$(./target/debug/gcscope gc-stats "$PYPID" 2>&1)"
+          RC=$?
+          set -e
+          kill "$PYPID" 2>/dev/null || true
+
+          echo "----- gc-stats output -----"
+          echo "$OUT"
+          echo "---------------------------"
+
+          test "$RC" -eq 0 || { echo "FAIL: gc-stats exited $RC"; exit 1; }
+          echo "$OUT" | grep -q "No GC stats found." && { echo "FAIL: no stats decoded"; exit 1; }
+          echo "$OUT" | grep -q "Collections" || { echo "FAIL: no stats table in output"; exit 1; }
+          echo "PASS: attached and decoded non-empty GC stats"
