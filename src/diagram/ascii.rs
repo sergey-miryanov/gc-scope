@@ -36,7 +36,7 @@ fn panels(left: &[String], right: &[String]) -> Vec<String> {
     out
 }
 
-pub fn render_ascii(data: &CollectedData, rate_per_gen: [f64; 3], avg_coll_time_per_gen: [f64; 3]) -> String {
+pub fn render_ascii(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_coll_time_per_gen: [Option<f64>; 3]) -> String {
     let mut s = String::new();
     writeln!(s, "{}", top()).unwrap();
     writeln!(s, "{}", l(&format!("gcscope ascii - PID {} - Python 0x{:08x}", data.pid, data.runtime_version))).unwrap();
@@ -252,7 +252,7 @@ fn render_interpreter(mut s: String, data: &CollectedData) -> String {
 }
 
 // -- Section: GC Generation Stats ----------------------------
-fn render_gc_stats(mut s: String, data: &CollectedData, rate_per_gen: [f64; 3], avg_coll_time_per_gen: [f64; 3]) -> String {
+fn render_gc_stats(mut s: String, data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_coll_time_per_gen: [Option<f64>; 3]) -> String {
     let gc = &data.interpreter.gc.generation_stats;
 
     let mut left_lines: Vec<String> = Vec::new();
@@ -286,8 +286,8 @@ fn render_gc_stats(mut s: String, data: &CollectedData, rate_per_gen: [f64; 3], 
         (format!("Gen 2 (Oldest) - {} slots", slots_per_gen[2]), rate_per_gen[2], avg_coll_time_per_gen[2]),
     ];
     for (name, rate, avg_coll) in &gen_names {
-        let rate_str = fmt_rate(*rate);
-        let coll_str = fmt_duration(*avg_coll);
+        let rate_str = match rate { Some(r) => fmt_rate(*r), None => "n/a".to_string() };
+        let coll_str = match avg_coll { Some(d) => fmt_duration(*d), None => "n/a".to_string() };
         left_lines.push(format!("{:<pl$}", format!("{}  (rate = {}, avg coll = {})", name, rate_str, coll_str), pl = PL));
     }
 

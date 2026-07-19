@@ -223,10 +223,11 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
             }
         }
 
-        let slots = &data.interpreter.gc.generation_stats.slots;
+        let stats = &data.interpreter.gc.generation_stats;
+        let slots = &stats.slots;
         let (rate_per_gen, avg_coll_time_per_gen) = (
-            collections_rate_from_slots(slots),
-            avg_collection_time_per_gen(slots),
+            collections_rate_from_slots(slots, stats.has_timestamps),
+            avg_collection_time_per_gen(slots, stats.has_duration),
         );
         let (styled_lines, _slot_line) = build_lines(&data, rate_per_gen, avg_coll_time_per_gen, selected_slot, debug_offsets_show_tree, debug_offsets_show_hex, show_runtime_hex);
 
@@ -336,7 +337,7 @@ fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, rate
 }
 
 // ── Main line builder ─────────────────────────────────────────────
-fn build_lines(data: &CollectedData, rate_per_gen: [f64; 3], avg_coll_time_per_gen: [f64; 3], selected_slot: usize, debug_offsets_show_tree: bool, debug_offsets_show_hex: bool, show_runtime_hex: bool) -> (Vec<Line<'static>>, usize) {
+fn build_lines(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_coll_time_per_gen: [Option<f64>; 3], selected_slot: usize, debug_offsets_show_tree: bool, debug_offsets_show_hex: bool, show_runtime_hex: bool) -> (Vec<Line<'static>>, usize) {
     let mut lines = Vec::new();
     let s1 = section_debug_offsets(data, debug_offsets_show_tree, debug_offsets_show_hex, show_runtime_hex);
     let s2 = section_interpreter(data);
@@ -881,7 +882,7 @@ fn section_interpreter(data: &CollectedData) -> Vec<Line<'static>> {
 }
 
 // ── Section 3: GC Generation Stats ────────────────────────────────
-fn section_gc_stats(data: &CollectedData, rate_per_gen: [f64; 3], avg_coll_time_per_gen: [f64; 3], selected_slot: usize) -> Vec<Line<'static>> {
+fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_coll_time_per_gen: [Option<f64>; 3], selected_slot: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let gc = &data.interpreter.gc.generation_stats;
 
@@ -919,8 +920,8 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [f64; 3], avg_coll_time_
         (format!("Gen 2 (Oldest) - {} slots", slots_per_gen[2]), rate_per_gen[2], avg_coll_time_per_gen[2]),
     ];
     for (name, rate, avg_coll) in &gen_names {
-        let rate_str = fmt_rate(*rate);
-        let coll_str = fmt_duration(*avg_coll);
+        let rate_str = match rate { Some(r) => fmt_rate(*r), None => "n/a".to_string() };
+        let coll_str = match avg_coll { Some(d) => fmt_duration(*d), None => "n/a".to_string() };
         left.push(format!("{:<pl$}", format!("{}  (rate = {}, avg coll = {})", name, rate_str, coll_str), pl = PL));
     }
     left.push(format!(

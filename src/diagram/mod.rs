@@ -32,10 +32,11 @@ pub fn run(pid: u32, output: &Path) -> Result<()> {
 pub fn run_ascii(pid: u32) -> Result<()> {
     let ver = version::detect(pid)?;
     let data = collect::collect_data(pid, &ver)?;
-    let slots = &data.interpreter.gc.generation_stats.slots;
+    let stats = &data.interpreter.gc.generation_stats;
+    let slots = &stats.slots;
     let (rate_per_gen, avg_coll_time_per_gen) = (
-        collections_rate_from_slots(slots),
-        avg_collection_time_per_gen(slots),
+        collections_rate_from_slots(slots, stats.has_timestamps),
+        avg_collection_time_per_gen(slots, stats.has_duration),
     );
     print!("{}", ascii::render_ascii(&data, rate_per_gen, avg_coll_time_per_gen));
     Ok(())
@@ -69,10 +70,11 @@ pub fn run_ascii_watch(pid: u32, rate_ms: u64) -> Result<()> {
             Err(e) => break Err(e),
         };
 
-        let slots = &data.interpreter.gc.generation_stats.slots;
+        let stats = &data.interpreter.gc.generation_stats;
+        let slots = &stats.slots;
         let (rate_per_gen, avg_coll_time_per_gen) = (
-            collections_rate_from_slots(slots),
-            avg_collection_time_per_gen(slots),
+            collections_rate_from_slots(slots, stats.has_timestamps),
+            avg_collection_time_per_gen(slots, stats.has_duration),
         );
         let output = ascii::render_ascii(&data, rate_per_gen, avg_coll_time_per_gen);
 

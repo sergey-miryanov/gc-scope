@@ -41,6 +41,14 @@ pub struct GcStatsSnapshot {
     /// `[1, 1, 1]` for inline 3.13/3.14 and free-threaded rings, `[11, 3, 3]` for GIL rings.
     /// Captured here so renderers read it rather than assuming a GIL layout.
     pub slots_per_gen: [u64; 3],
+    /// Whether the version's slot layout carries GC-pause timing (`ts_start`/`ts_stop`).
+    /// Gates the collections-rate summary: false (e.g. inline 3.13/3.14) -> rate renders
+    /// "n/a" instead of a fake 0.
+    pub has_timestamps: bool,
+    /// Whether the slot layout carries the `duration` field. Gates the avg-collection-time
+    /// summary: false -> "n/a" (unrecoverable without the field — an external sampler can't
+    /// observe an internal GC pause).
+    pub has_duration: bool,
     pub raw_stats_bytes: Vec<u8>,
     pub slots: Vec<GcSlot>,
 }
@@ -146,6 +154,13 @@ pub fn collect_data(pid: u32, version: &PythonVersion) -> Result<CollectedData> 
         (Vec::new(), Vec::new())
     };
 
+    // Field presence is a property of the version's slot layout (a GcSlot's absent fields
+    // are indistinguishable zeros), so capture it once here alongside the geometry.
+    let (has_timestamps, has_duration) = match offset_table.gc_layout {
+        Some(l) => (l.has_field("ts_start") && l.has_field("ts_stop"), l.has_field("duration")),
+        None => (false, false),
+    };
+
     let gc = GcSubState {
         raw_bytes: gc_raw,
         generation_stats: GcStatsSnapshot {
@@ -153,6 +168,8 @@ pub fn collect_data(pid: u32, version: &PythonVersion) -> Result<CollectedData> 
             stats_size: stats_total as u64,
             item_size,
             slots_per_gen,
+            has_timestamps,
+            has_duration,
             raw_stats_bytes,
             slots,
         },
@@ -288,7 +305,13 @@ fn parse_slot(
 
 /// Compute average collection pause time per generation from a single snapshot.
 /// Uses the full ring range: `(max.duration - min.duration) / (max.collections - min.collections)`.
-pub fn avg_collection_time_per_gen(slots: &[GcSlot]) -> [f64; 3] {
+/// Returns `[None; 3]` when the slot layout has no `duration` field (e.g. inline 3.13/3.14):
+/// the pause time is unrecoverable externally, so the summary renders "n/a" rather than a
+/// fake 0. Gens with <2 slots stay `Some(0.0)` (formatted like before).
+pub fn avg_collection_time_per_gen(slots: &[GcSlot], has_duration: bool) -> [Option<f64>; 3] {
+    if !has_duration {
+        return [None, None, None];
+    }
     let mut gen_slots: [Vec<&GcSlot>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for slot in slots {
         let g = slot.generation as usize;
@@ -297,7 +320,7 @@ pub fn avg_collection_time_per_gen(slots: &[GcSlot]) -> [f64; 3] {
         }
     }
 
-    let mut avgs = [0.0f64; 3];
+    let mut avgs = [Some(0.0f64); 3];
     for (g, gslots) in gen_slots.iter().enumerate() {
         if gslots.len() < 2 {
             continue;
@@ -309,7 +332,7 @@ pub fn avg_collection_time_per_gen(slots: &[GcSlot]) -> [f64; 3] {
         let dur_delta = max_coll.duration - min_coll.duration;
 
         if coll_delta > 0 {
-            avgs[g] = dur_delta / coll_delta as f64;
+            avgs[g] = Some(dur_delta / coll_delta as f64);
         }
     }
     avgs
@@ -317,7 +340,13 @@ pub fn avg_collection_time_per_gen(slots: &[GcSlot]) -> [f64; 3] {
 
 /// Compute collections rate per second for each generation from a single snapshot.
 /// Uses the full ring range: `(max.collections - min.collections) / ((max.stop_ts - min.start_ts) / 1e9)`.
-pub fn collections_rate_from_slots(slots: &[GcSlot]) -> [f64; 3] {
+/// Returns `[None; 3]` when the slot layout has no `ts_start`/`ts_stop` fields (e.g. inline
+/// 3.13/3.14): there is no time base in a single snapshot, so the summary renders "n/a"
+/// rather than a fake 0. Gens with <2 slots stay `Some(0.0)` (formatted like before).
+pub fn collections_rate_from_slots(slots: &[GcSlot], has_timestamps: bool) -> [Option<f64>; 3] {
+    if !has_timestamps {
+        return [None, None, None];
+    }
     let mut gen_slots: [Vec<&GcSlot>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for slot in slots {
         let g = slot.generation as usize;
@@ -326,7 +355,7 @@ pub fn collections_rate_from_slots(slots: &[GcSlot]) -> [f64; 3] {
         }
     }
 
-    let mut rates = [0.0f64; 3];
+    let mut rates = [Some(0.0f64); 3];
     for (g, gslots) in gen_slots.iter().enumerate() {
         if gslots.len() < 2 {
             continue;
@@ -340,7 +369,7 @@ pub fn collections_rate_from_slots(slots: &[GcSlot]) -> [f64; 3] {
         let ts_delta_ns = max_ts.stop_ts - min_ts.start_ts;
 
         if ts_delta_ns > 0 && coll_delta > 0 {
-            rates[g] = coll_delta as f64 / (ts_delta_ns as f64 / 1_000_000_000.0);
+            rates[g] = Some(coll_delta as f64 / (ts_delta_ns as f64 / 1_000_000_000.0));
         }
     }
     rates
