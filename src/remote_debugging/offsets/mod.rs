@@ -80,6 +80,15 @@ const GC_CANDIDATES: &[(u64, &[GcCandidate])] = &[
     ]),
 ];
 
+/// Whether `stored` (a `PY_VERSION_HEX`) has an EXACT compiled layout in `LAYOUTS`.
+///
+/// `read_offsets` succeeds for both exact matches and validated same-minor
+/// fallbacks; callers that need to distinguish the two tiers (e.g. `PySession`
+/// tagging `Full` vs `LayoutOnly`) ask here.
+pub fn has_exact_layout(stored: u64) -> bool {
+    LAYOUTS.iter().any(|(h, _)| *h == stored)
+}
+
 /// Read the target's `_Py_DebugOffsets` through the compiled struct for `layout_hex`.
 /// Returns `None` if gcscope has no layout for `layout_hex`.
 fn build_variant(pid: u32, addr: u64, layout_hex: u64) -> Result<Option<VersionedOffsets>> {

@@ -243,7 +243,7 @@ fn render_section_runtime(s: &mut String, data: &CollectedData, y: f64) -> f64 {
 // ── Section: PyInterpreterState ──────────────────────────────────────
 fn render_section_interpreter(s: &mut String, data: &CollectedData, y: f64) -> f64 {
     let interp = &data.interpreter;
-    let off = &data.offsets;
+    let off = data.offsets();
 
     // Calculate heights first
     let offset_list_rows = data.runtime_offset_fields().len();

@@ -4,8 +4,7 @@ use anyhow::Result;
 use sysinfo::System;
 
 use crate::memory::process;
-use crate::remote_debugging::check_interpreter;
-use crate::remote_debugging::offsets;
+use crate::remote_debugging::session::{PySession, Tier};
 use crate::remote_debugging::version;
 
 pub struct ProcessInfo {
@@ -70,25 +69,32 @@ pub fn list_python_processes(verify: bool) -> Result<(Vec<ProcessInfo>, HashMap<
             .map(|s| s.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
-        let version = version::detect(pid)
-            .ok()
-            .map(|v| v.to_string());
-        result.push(ProcessInfo { pid, ppid, name: name_orig, cmdline, version, runtime_found: false, offsets_known: false, check_ok: None });
+        result.push(ProcessInfo { pid, ppid, name: name_orig, cmdline, version: None, runtime_found: false, offsets_known: false, check_ok: None });
     }
     result.sort_by_key(|p| p.pid);
 
+    // Resolve each process through a single `PySession::attach` — one pass that
+    // finds the runtime, detects the version, and reads the offset layout, instead
+    // of the old detect ×2 + find_runtime + read_offsets + verify_process. The
+    // process-wide layout cache means PIDs sharing one interpreter binary parse its
+    // offsets only once (E2).
     for p in &mut result {
-        p.runtime_found = process::find_runtime(p.pid).is_ok();
-        if p.runtime_found {
-            p.offsets_known = version::detect(p.pid)
-                .and_then(|v| offsets::read_offsets(p.pid, &v))
-                .is_ok();
-        }
-    }
-
-    if verify {
-        for p in &mut result {
-            p.check_ok = check_interpreter::verify_process(p.pid);
+        match PySession::attach(p.pid) {
+            Ok(session) => {
+                p.runtime_found = true;
+                p.offsets_known = matches!(session.tier(), Tier::Full | Tier::LayoutOnly);
+                p.version = Some(session.version().to_string());
+                if verify {
+                    p.check_ok = session.verify().ok();
+                }
+            }
+            Err(_) => {
+                // Attach failed. The runtime may still exist (Python present but its
+                // offsets are unsupported/unreadable) — distinguish that from a
+                // non-Python process, and best-effort a version string for display.
+                p.runtime_found = process::find_runtime(p.pid).is_ok();
+                p.version = version::detect(p.pid).ok().map(|v| v.to_string());
+            }
         }
     }
 

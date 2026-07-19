@@ -100,7 +100,7 @@ fn validate_cookie(pid: u32, addr: u64) -> Result<bool> {
 // Per-process lookup
 // ---------------------------------------------------------------------------
 
-fn try_find_runtime(pid: u32) -> Result<u64> {
+fn try_find_runtime(pid: u32) -> Result<(u64, String)> {
     let modules = binary::find_python_modules(pid)?;
     if modules.is_empty() {
         anyhow::bail!("No python-related modules found in process {}", pid);
@@ -122,7 +122,7 @@ fn try_find_runtime(pid: u32) -> Result<u64> {
         if let Some(addr) = addr
             && validate_cookie(pid, addr)?
         {
-            return Ok(addr);
+            return Ok((addr, path.clone()));
         }
     }
 
@@ -132,9 +132,9 @@ fn try_find_runtime(pid: u32) -> Result<u64> {
     );
 }
 
-fn search_pid_and_children(pid: u32, depth: u32) -> Result<u64> {
-    if let Ok(addr) = try_find_runtime(pid) {
-        return Ok(addr);
+fn search_pid_and_children(pid: u32, depth: u32) -> Result<(u64, String)> {
+    if let Ok(found) = try_find_runtime(pid) {
+        return Ok(found);
     }
 
     if depth >= MAX_DEPTH {
@@ -152,7 +152,7 @@ fn search_pid_and_children(pid: u32, depth: u32) -> Result<u64> {
     let mut errors = Vec::new();
     for child in children {
         match search_pid_and_children(child, depth + 1) {
-            Ok(addr) => return Ok(addr),
+            Ok(found) => return Ok(found),
             Err(e) => errors.push((child, e)),
         }
     }
@@ -173,5 +173,34 @@ fn search_pid_and_children(pid: u32, depth: u32) -> Result<u64> {
 // ---------------------------------------------------------------------------
 
 pub fn find_runtime(pid: u32) -> Result<u64> {
+    Ok(search_pid_and_children(pid, 0)?.0)
+}
+
+/// Like [`find_runtime`], but also returns the on-disk path of the Python
+/// module (interpreter or libpython) whose `PyRuntime` section validated. That
+/// path — not `argv[0]` — is the correct identity for a layout cache keyed by
+/// binary (see `docs/pysession-plan.md` §6).
+pub fn find_runtime_module(pid: u32) -> Result<(u64, String)> {
     search_pid_and_children(pid, 0)
+}
+
+/// Best-effort command line for `pid`, as a single space-joined string.
+///
+/// Used only as a change-detector for a reused PID (`PySession::revalidate`),
+/// never on the hot read path. Returns `None` if the process is gone or its
+/// command line is unavailable.
+pub fn read_cmdline(pid: u32) -> Option<String> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    let mut sys = System::new();
+    let spid = Pid::from_u32(pid);
+    sys.refresh_processes(ProcessesToUpdate::Some(&[spid]), true);
+    let process = sys.process(spid)?;
+    let cmd = process
+        .cmd()
+        .iter()
+        .map(|s| s.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(cmd)
 }

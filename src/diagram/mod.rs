@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use collect::{avg_collection_time_per_gen, collections_rate_from_slots};
-use crate::remote_debugging::version;
+use crate::remote_debugging::session::PySession;
 
 fn fmt_duration_ns(d: std::time::Duration) -> String {
     let ns = d.as_nanos() as f64;
@@ -22,16 +22,16 @@ fn fmt_duration_ns(d: std::time::Duration) -> String {
 }
 
 pub fn run(pid: u32, output: &Path) -> Result<()> {
-    let ver = version::detect(pid)?;
-    let data = collect::collect_data(pid, &ver)?;
+    let session = PySession::attach(pid)?;
+    let data = collect::collect_data(&session)?;
     render::render_svg(&data, output)?;
     println!("Diagram saved to {}", output.display());
     Ok(())
 }
 
 pub fn run_ascii(pid: u32) -> Result<()> {
-    let ver = version::detect(pid)?;
-    let data = collect::collect_data(pid, &ver)?;
+    let session = PySession::attach(pid)?;
+    let data = collect::collect_data(&session)?;
     let stats = &data.interpreter.gc.generation_stats;
     let slots = &stats.slots;
     let (rate_per_gen, avg_coll_time_per_gen) = (
@@ -54,7 +54,7 @@ pub fn run_ascii_watch(pid: u32, rate_ms: u64) -> Result<()> {
         r.store(false, Ordering::SeqCst);
     })?;
 
-    let ver = version::detect(pid)?;
+    let session = PySession::attach(pid)?;
     let mut out = std::io::stdout().lock();
     let start = Instant::now();
 
@@ -65,7 +65,7 @@ pub fn run_ascii_watch(pid: u32, rate_ms: u64) -> Result<()> {
     let mut frame: u64 = 0;
     let result = loop {
         let elapsed = start.elapsed();
-        let data = match collect::collect_data(pid, &ver) {
+        let data = match collect::collect_data(&session) {
             Ok(d) => d,
             Err(e) => break Err(e),
         };

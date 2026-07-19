@@ -56,12 +56,12 @@ fn render_runtime(mut s: String, data: &CollectedData) -> String {
 
     // `gc.generation_stats_size` is read from the target's `_Py_DebugOffsets`, so the
     // accessor already holds the process-published value (0 on builds without the field).
-    let gen_stats_size = data.offsets.gc_generation_stats_size();
+    let gen_stats_size = data.offsets().gc_generation_stats_size();
     let gs = super::render::gen_stats_layout(gen_stats_size);
 
     // Drive the GC-state subtree from actual, version-correct layout.
-    let gc_fields = data.offsets.gc_debug_fields();
-    let offset_table = data.offsets.to_offset_table(data.pid, data.runtime_addr);
+    let gc_fields = data.offsets().gc_debug_fields();
+    let offset_table = data.offsets().to_offset_table(data.pid, data.runtime_addr);
     let slot_fields = offset_table.gc_layout.map(|l| l.fields);
     let tree = super::render::debug_offsets_tree(&gc_fields, slot_fields);
     let prefixes = super::render::tree_prefixes(&tree);
@@ -164,7 +164,7 @@ fn derived_val(label: &str, gs_size: u64, gs: (u64, u64, u64, u64, u64, u64, u64
 // -- Section: PyInterpreterState ------------------------------
 fn render_interpreter(mut s: String, data: &CollectedData) -> String {
     let interp = &data.interpreter;
-    let off = &data.offsets;
+    let off = data.offsets();
     // Show the whole GC state struct (raw_bytes is read to exactly gc.size bytes), so the
     // dump matches the "GC struct (N bytes)" header. A fixed cap truncated larger structs
     // like the +inc build's 232-byte state.
@@ -274,7 +274,7 @@ fn render_gc_stats(mut s: String, data: &CollectedData, rate_per_gen: [Option<f6
 
     // Version-correct geometry/layout for this build (IO-free): drives the per-slot size,
     // the per-generation slot counts, and the slot-items field list below.
-    let offset_table = data.offsets.to_offset_table(data.pid, data.runtime_addr);
+    let offset_table = data.offsets().to_offset_table(data.pid, data.runtime_addr);
     let item_size = if gc.item_size > 0 { gc.item_size } else { gc.raw_stats_bytes.len().min(64) };
     // Per-generation slot counts come from the collected snapshot (version/layout-derived,
     // FT-correct) rather than a GIL-assuming literal or a per-frame tally.

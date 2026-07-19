@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+use anyhow::{Context, Result};
+use read_process_memory::ProcessHandle;
+
 use crate::memory::reader;
 use crate::remote_debugging::gc_stats::GcStat;
 
@@ -79,34 +82,37 @@ impl OffsetTable {
         self.runtime_gc.expect("runtime_gc is only available on Python 3.8")
     }
 
-    /// Read GC generation stats from the target process.
-    /// Returns empty vec if GC stats are not available for this version.
-    pub fn read_gc_stats(&self, pid: u32, iid: i64) -> Vec<GcStat> {
+    /// Read GC generation stats for one interpreter through an already-open handle.
+    ///
+    /// Returns `Ok(vec![])` for the legitimate "this build exposes no decodable
+    /// stats" cases (no stats address, zero item size, no slot/base/layout info) —
+    /// those are shape facts, not failures. A failed *read* of the stats buffer is
+    /// a real error and propagates as `Err` (C6): the caller has already decided,
+    /// via a non-NULL `gc_stats_addr`, that stats should be there.
+    pub fn read_gc_stats(&self, handle: &ProcessHandle, iid: i64) -> Result<Vec<GcStat>> {
         let addr = match self.gc_stats_addr {
             Some(a) => a,
-            None => return vec![],
+            None => return Ok(vec![]),
         };
         let item_size = self.gc_item_size.unwrap_or(0) as usize;
-        if item_size == 0 { return vec![]; }
+        if item_size == 0 { return Ok(vec![]); }
         let slots = match self.gc_slots_per_gen {
             Some(s) => s,
-            None => return vec![],
+            None => return Ok(vec![]),
         };
         let bases = match self.gc_gen_base_offsets {
             Some(b) => b,
-            None => return vec![],
+            None => return Ok(vec![]),
         };
 
         // total data = last gen's base + its slots
         let total = (bases[2] as usize) + (slots[2] as usize) * item_size;
-        let raw = match reader::read_memory(pid, addr, total) {
-            Ok(b) => b,
-            Err(_) => return vec![],
-        };
+        let raw = reader::read_memory_h(handle, addr, total)
+            .with_context(|| format!("Failed to read gc_stats buffer at {addr:#x} ({total} bytes)"))?;
 
         let layout = match self.gc_layout {
             Some(l) => l,
-            None => return vec![],
+            None => return Ok(vec![]),
         };
 
         let mut stats = Vec::new();
@@ -151,7 +157,7 @@ impl OffsetTable {
                 });
             }
         }
-        stats
+        Ok(stats)
     }
 }
 

@@ -1,10 +1,7 @@
 use anyhow::{bail, Result};
 use proc_maps::{get_process_maps, MapRange};
 
-use crate::memory::{process, reader};
-use crate::remote_debugging::offsets;
-use crate::remote_debugging::offsets::offset_table::OffsetTable;
-use crate::remote_debugging::version;
+use crate::memory::reader;
 
 pub struct CheckResult {
     pub expected: u64,
@@ -100,68 +97,8 @@ pub fn check_runtime(
     })
 }
 
-/// Full-chain verification for a given PID: find runtime, detect version,
-/// read offsets, and run [`check_interpreter_addresses`].
-///
-/// Works for any supported Python version (3.8+).
-/// Returns `None` if any step fails (process exited, unsupported version, etc.).
-pub fn verify_process(pid: u32) -> Option<bool> {
-    let runtime_addr = process::find_runtime(pid).ok()?;
-    let ver = version::detect(pid).ok()?;
-    if ver.major != 3 {
-        return None;
-    }
-
-    // 3.13+: offsets come from the process's self-describing `_Py_DebugOffsets`, read
-    // through the versioned bindgen layout. `read_offsets` handles both exact and
-    // same-minor-fallback dispatch, so it covers any 3.13+ build; an `Err` means the
-    // version is genuinely unsupported (can't verify).
-    if ver.minor >= 13 {
-        let (_addr, _stored, offs) = offsets::read_offsets(pid, &ver).ok()?;
-        let result = check_runtime(
-            pid,
-            runtime_addr,
-            offs.runtime_state_size(),
-            offs.runtime_interpreters_head(),
-            offs.interpreter_state_threads_head(),
-            offs.thread_state_interp(),
-        )
-        .ok()?;
-        return Some(result.match_ok);
-    }
-
-    // Pre-3.13 path: hardcoded, minor-level offset tables. There is no self-describing
-    // `_Py_DebugOffsets` to validate against here, so we use the minor's table for any
-    // micro (pre-3.13 offsets are stable within a minor) and warn once. GC generation
-    // stats are not available on these versions.
-    let table = offsets::pre_3_13::table_for_version(ver.major, ver.minor)?;
-    warn_pre_3_13_once(ver.major, ver.minor, ver.micro);
-    verify_with_table(pid, runtime_addr, &table)
-}
-
-/// Warn once per (major, minor) that pre-3.13 support uses minor-level hardcoded
-/// offsets (micro not distinguished) and provides no GC generation stats.
-fn warn_pre_3_13_once(major: u8, minor: u8, micro: u8) {
-    static WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(u8, u8)>>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    if WARNED.lock().unwrap().insert((major, minor)) {
-        eprintln!(
-            "warning: Python {major}.{minor}.{micro} predates _Py_DebugOffsets; using \
-             hardcoded {major}.{minor}.x offsets (navigation only, no GC generation stats).",
-        );
-    }
-}
-
-fn verify_with_table(pid: u32, runtime_addr: u64, table: &OffsetTable) -> Option<bool> {
-    let scan_size = table.runtime_interpreters_head + 64;
-    let result = check_runtime(
-        pid,
-        runtime_addr,
-        scan_size,
-        table.runtime_interpreters_head,
-        table.interp_threads_head,
-        table.thread_interp,
-    )
-    .ok()?;
-    Some(result.match_ok)
-}
+// The full-chain PID verification that used to live here (`verify_process` +
+// `verify_with_table` + `warn_pre_3_13_once`) moved to `PySession::verify`, so the
+// three-way resolve cascade lives in exactly one place (`PySession::attach`).
+// `check_runtime` above is still used by `PySession::verify`, the offsets fallback
+// validator, and `main.rs`'s `find-runtime --check`.

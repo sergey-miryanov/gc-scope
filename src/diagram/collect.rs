@@ -1,19 +1,10 @@
 #![allow(dead_code)]
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use anyhow::{Context, Result};
-use crate::{memory::reader, memory::process, remote_debugging::offsets};
-use crate::remote_debugging::version::PythonVersion;
-
-fn read_u64(pid: u32, addr: u64) -> Result<u64> {
-    let bytes = reader::read_memory(pid, addr, 8)?;
-    Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
-}
-
-fn read_i64(pid: u32, addr: u64) -> Result<i64> {
-    let bytes = reader::read_memory(pid, addr, 8)?;
-    Ok(i64::from_le_bytes(bytes[..8].try_into().unwrap()))
-}
+use anyhow::{anyhow, Context, Result};
+use crate::remote_debugging::offsets::{self, VersionedOffsets};
+use crate::remote_debugging::session::{PySession, Resolved};
 
 #[derive(Debug)]
 pub struct GcSlot {
@@ -77,7 +68,10 @@ pub struct CollectedData {
     pub runtime_version: u64,
     pub runtime_raw_bytes: Vec<u8>,
     pub debug_offsets_size: u64,
-    pub offsets: offsets::VersionedOffsets,
+    /// Shared layout from the attached [`PySession`]. Only 3.13+ tiers reach here
+    /// (`collect_data` bails on `Legacy`), so [`CollectedData::offsets`] is always
+    /// available.
+    pub resolved: Arc<Resolved>,
     pub interpreter: InterpreterSnapshot,
     pub collect_duration: Duration,
 }
@@ -92,39 +86,50 @@ pub struct DebugOffsetField {
     pub value: u64,       // the stored offset value
 }
 
-pub fn collect_data(pid: u32, version: &PythonVersion) -> Result<CollectedData> {
+pub fn collect_data(session: &PySession) -> Result<CollectedData> {
     let t0 = Instant::now();
-    let runtime_addr = process::find_runtime(pid)?;
-    let (_, runtime_version, off) = offsets::read_offsets(pid, version)?;
+    let pid = session.pid();
+    let runtime_addr = session.runtime_addr();
+
+    // The diagram reads self-describing `_Py_DebugOffsets` fields, so it needs a
+    // 3.13+ tier. Pre-3.13 (`Legacy`) has no such struct — bail as before.
+    let off = session.resolved().offsets().ok_or_else(|| {
+        anyhow!("visualization requires Python 3.13+ (_Py_DebugOffsets); this process is pre-3.13")
+    })?;
 
     let debug_offsets_size = off.debug_offsets_total_size();
     let total_read = (debug_offsets_size as usize) * 2;
-    let runtime_raw_bytes = reader::read_memory(pid, runtime_addr, total_read)
+    let runtime_raw_bytes = session
+        .read(runtime_addr, total_read)
         .context("Failed to read _Py_DebugOffsets + _PyRuntime memory")?;
 
     // Follow the same pattern as gc_stats.rs: use offset values from
     // _Py_DebugOffsets as byte offsets from runtime_addr (which IS _PyRuntime).
-    let head_addr = read_u64(pid, runtime_addr + off.runtime_interpreters_head())
+    let head_addr = session
+        .read_u64(runtime_addr + off.runtime_interpreters_head())
         .context("Failed to read interpreters_head pointer")?;
 
     let gc_offset = off.interpreter_state_gc();
     let gc_size = off.gc_size();
-    let next_addr = read_u64(pid, head_addr + off.interpreter_state_next())?;
-    let id = read_i64(pid, head_addr + off.interpreter_state_id())?;
+    let next_addr = session.read_u64(head_addr + off.interpreter_state_next())?;
+    let id = session.read_i64(head_addr + off.interpreter_state_id())?;
 
     // Read a reasonable chunk of interpreter state (first 256 bytes) for hex dump
-    let interp_raw = reader::read_memory(pid, head_addr, 256)
+    let interp_raw = session
+        .read(head_addr, 256)
         .context("Failed to read interpreter state start")?;
 
     // Read GC sub-struct at its actual offset within the interpreter
-    let gc_raw = reader::read_memory(pid, head_addr + gc_offset, gc_size as usize)
+    let gc_raw = session
+        .read(head_addr + gc_offset, gc_size as usize)
         .context("Failed to read GC state")?;
 
     // Resolve the GC generation-stats region by its version-specific shape — same logic as
     // `gc_stats.rs::read_gc_stats`. 3.13/3.14 (`InlineArray`) store the stats inline in
     // `_gc_runtime_state` at a fixed offset (no pointer, and `gc.generation_stats*` = 0);
     // 3.15+ (`RingBuffer`) reach a ring buffer through the `gc.generation_stats` pointer.
-    let offset_table = off.to_offset_table(pid, runtime_addr);
+    // The table was already built once in `attach`; reuse it.
+    let offset_table = session.resolved().table().clone();
     let item_size = offset_table.gc_item_size.unwrap_or(0) as usize;
     let slots_per_gen = offset_table.gc_slots_per_gen.unwrap_or([0, 0, 0]);
     let (stats_addr, stats_total) = match offset_table.gc_stats_kind {
@@ -138,7 +143,8 @@ pub fn collect_data(pid: u32, version: &PythonVersion) -> Result<CollectedData> 
             let ptr = if gen_stats_field_off == 0 {
                 0
             } else {
-                read_u64(pid, head_addr + gc_offset + gen_stats_field_off)
+                session
+                    .read_u64(head_addr + gc_offset + gen_stats_field_off)
                     .context("Failed to read generation_stats pointer")?
             };
             (ptr, off.gc_generation_stats_size() as usize)
@@ -146,7 +152,8 @@ pub fn collect_data(pid: u32, version: &PythonVersion) -> Result<CollectedData> 
     };
 
     let (raw_stats_bytes, slots) = if stats_addr != 0 && stats_total > 0 {
-        let raw = reader::read_memory(pid, stats_addr, stats_total)
+        let raw = session
+            .read(stats_addr, stats_total)
             .context("Failed to read GC stats buffer")?;
         let parsed = parse_gc_slots(&raw, &offset_table);
         (raw, parsed)
@@ -188,10 +195,10 @@ pub fn collect_data(pid: u32, version: &PythonVersion) -> Result<CollectedData> 
     Ok(CollectedData {
         pid,
         runtime_addr,
-        runtime_version,
+        runtime_version: session.stored_hex().unwrap_or(0),
         runtime_raw_bytes,
         debug_offsets_size,
-        offsets: off,
+        resolved: session.resolved_arc(),
         interpreter,
         collect_duration: t0.elapsed(),
     })
@@ -199,8 +206,16 @@ pub fn collect_data(pid: u32, version: &PythonVersion) -> Result<CollectedData> 
 
 /// Extract debug offset values for display.
 impl CollectedData {
+    /// The bindgen offsets. Always present: `collect_data` only builds a
+    /// `CollectedData` for 3.13+ tiers.
+    pub fn offsets(&self) -> &VersionedOffsets {
+        self.resolved
+            .offsets()
+            .expect("CollectedData is only built for 3.13+ tiers")
+    }
+
     pub fn runtime_offset_fields(&self) -> Vec<DebugOffsetField> {
-        let off = &self.offsets;
+        let off = self.offsets();
         vec![
             DebugOffsetField { name: "runtime_state.finalizing", value: off.runtime_state_finalizing() },
             DebugOffsetField { name: "runtime_state.interpreters_head", value: off.runtime_interpreters_head() },

@@ -71,8 +71,8 @@ fn main() -> Result<()> {
         }
         Command::GcStats { pid, all } => {
             let pid = resolve_pid(pid);
-            let ver = remote_debugging::version::detect(pid)?;
-            let stats = remote_debugging::gc_stats::read_gc_stats(pid, &ver, all)?;
+            let session = remote_debugging::session::PySession::attach(pid)?;
+            let stats = session.gc_stats(all)?;
             remote_debugging::gc_stats::print_stats(&stats);
         }
         Command::Monitor { pid, opts } => {

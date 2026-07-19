@@ -57,7 +57,7 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
         }
     };
 
-    let mut ver = crate::remote_debugging::version::detect(pid)?;
+    let mut session = crate::remote_debugging::session::PySession::attach(pid)?;
     let mut start = Instant::now();
     let mut frame: u64 = 0;
     let mut scroll: u16 = 0;
@@ -127,17 +127,19 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
                         KeyCode::Char('p') => {
                             if let Ok((processes, pid_info_map)) = crate::list_pids::list_python_processes(true) {
                                 if let Ok(Some(new_pid)) = super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map) {
-                                    pid = new_pid;
-                                    if let Ok(new_ver) = crate::remote_debugging::version::detect(pid) {
-                                        ver = new_ver;
+                                    // Re-attach to the newly picked PID; only commit
+                                    // the switch if it resolves.
+                                    if let Ok(new_session) = crate::remote_debugging::session::PySession::attach(new_pid) {
+                                        session = new_session;
+                                        pid = new_pid;
+                                        start = Instant::now();
+                                        scroll = 0;
+                                        selected_slot = 0;
+                                        frame = 0;
+                                        debug_offsets_show_tree = true;
+                                        debug_offsets_show_hex = true;
+                                        show_runtime_hex = false;
                                     }
-                                    start = Instant::now();
-                                    scroll = 0;
-                                    selected_slot = 0;
-                                    frame = 0;
-                                    debug_offsets_show_tree = true;
-                                    debug_offsets_show_hex = true;
-                                    show_runtime_hex = false;
                                 }
                             }
                         }
@@ -151,7 +153,7 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
             }
         }
 
-        let data = match crate::diagram::collect::collect_data(pid, &ver) {
+        let data = match crate::diagram::collect::collect_data(&session) {
             Ok(d) => d,
             Err(e) => {
                 terminal.draw(|f| {
@@ -529,20 +531,20 @@ fn section_debug_offsets(data: &CollectedData, show_tree: bool, show_hex: bool, 
 
     // `gc.generation_stats_size` is read from the target's `_Py_DebugOffsets`, so the
     // accessor already holds the process-published value (0 on builds without the field).
-    let gen_stats_size = data.offsets.gc_generation_stats_size();
+    let gen_stats_size = data.offsets().gc_generation_stats_size();
     let gs = gen_stats_layout(gen_stats_size);
 
     // Drive the GC-state subtree from actual, version-correct layout: the `gc`
     // sub-struct fields and the resolved per-slot field layout (which reflects the
     // clean-vs-`+inc` selection).
-    let gc_fields = data.offsets.gc_debug_fields();
-    let offset_table = data.offsets.to_offset_table(data.pid, data.runtime_addr);
+    let gc_fields = data.offsets().gc_debug_fields();
+    let offset_table = data.offsets().to_offset_table(data.pid, data.runtime_addr);
     let slot_fields = offset_table.gc_layout.map(|l| l.fields);
     let tree = debug_offsets_tree(&gc_fields, slot_fields);
     let prefixes = tree_prefixes(&tree);
 
     let debug_highlights = if !show_runtime_hex {
-        data.offsets.debug_offsets_highlight_regions()
+        data.offsets().debug_offsets_highlight_regions()
     } else {
         vec![]
     };
@@ -709,7 +711,7 @@ fn section_debug_offsets(data: &CollectedData, show_tree: bool, show_hex: bool, 
 fn section_interpreter(data: &CollectedData) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let interp = &data.interpreter;
-    let off = &data.offsets;
+    let off = data.offsets();
     // Show the whole GC state struct (raw_bytes is read to exactly gc.size bytes), so the
     // dump matches the "GC struct (N bytes)" header. A fixed cap truncated larger structs
     // like the +inc build's 232-byte state.
@@ -902,7 +904,7 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
 
     // Version-correct geometry/layout for this build (IO-free): drives the per-slot size,
     // the per-generation slot counts, and the slot-items field list below.
-    let offset_table = data.offsets.to_offset_table(data.pid, data.runtime_addr);
+    let offset_table = data.offsets().to_offset_table(data.pid, data.runtime_addr);
     let item_size = if gc.item_size > 0 { gc.item_size } else { gc.raw_stats_bytes.len().min(64) };
     // Per-generation slot counts come from the collected snapshot (version/layout-derived,
     // FT-correct) rather than a GIL-assuming literal or a per-frame tally.
