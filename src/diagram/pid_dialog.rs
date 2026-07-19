@@ -47,11 +47,14 @@ fn capacity_of(popup_h: u16) -> usize {
     popup_h.saturating_sub(4).max(1) as usize
 }
 
+/// Shows the interactive PID picker. Returns `Ok(Some(pid))` when the user selects a
+/// process, `Ok(None)` when the user cancels (q/Esc), and `Err` only for genuine errors
+/// (no processes available).
 pub fn show_pid_dialog(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     processes: &[ProcessInfo],
     pid_info_map: &HashMap<u32, (String, u32)>,
-) -> Result<u32> {
+) -> Result<Option<u32>> {
     if processes.is_empty() {
         anyhow::bail!("No Python processes found");
     }
@@ -68,6 +71,11 @@ pub fn show_pid_dialog(
     };
     let mut cmdline_scroll = 0u16;
     let mut scroll_offset = 0usize;
+
+    // Wipe any text (e.g. runtime-probe warnings) printed to the screen before the
+    // dialog opened; the popup only paints its own rect, so stray text would otherwise
+    // remain visible around it.
+    terminal.clear()?;
 
     loop {
         terminal.draw(|f| {
@@ -128,11 +136,11 @@ pub fn show_pid_dialog(
                         }
                         KeyCode::Enter => {
                             if is_supported(&flat_rows[selected]) {
-                                return Ok(flat_rows[selected].pid);
+                                return Ok(Some(flat_rows[selected].pid));
                             }
                         }
                         KeyCode::Char('q') | KeyCode::Esc => {
-                            anyhow::bail!("Cancelled by user");
+                            return Ok(None);
                         }
                         _ => {}
                     }

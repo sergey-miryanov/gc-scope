@@ -21,9 +21,24 @@ const INNER_W: usize = PL - 4;      // 61
 const INNER_TW: usize = INNER_W - 2; // 59
 
 
+/// Restores the terminal (raw mode, alternate screen, cursor) on drop, so it is cleaned
+/// up on every exit path — including an early `?` return from the PID dialog or setup —
+/// not just when the main loop breaks normally.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let mut out = stdout();
+        let _ = out.execute(crossterm::cursor::Show);
+        let _ = disable_raw_mode();
+        let _ = out.execute(LeaveAlternateScreen);
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────
 pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, mut glitch_enabled: bool) -> Result<()> {
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     stdout().execute(EnterAlternateScreen)?;
 
     let backend = ratatui::backend::CrosstermBackend::new(stdout());
@@ -35,7 +50,10 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
         Some(p) => p,
         None => {
             let (processes, pid_info_map) = crate::list_pids::list_python_processes(true)?;
-            super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map)?
+            match super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map)? {
+                Some(p) => p,
+                None => return Ok(()), // user cancelled the picker — exit cleanly
+            }
         }
     };
 
@@ -108,7 +126,7 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
                         }
                         KeyCode::Char('p') => {
                             if let Ok((processes, pid_info_map)) = crate::list_pids::list_python_processes(true) {
-                                if let Ok(new_pid) = super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map) {
+                                if let Ok(Some(new_pid)) = super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map) {
                                     pid = new_pid;
                                     if let Ok(new_ver) = crate::remote_debugging::version::detect(pid) {
                                         ver = new_ver;
@@ -275,10 +293,7 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
         })?;
     };
 
-    terminal.show_cursor()?;
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-
+    // Terminal teardown is handled by `_guard` on drop, covering every exit path.
     result
 }
 
