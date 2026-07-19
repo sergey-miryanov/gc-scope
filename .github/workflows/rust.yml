@@ -50,40 +50,56 @@ jobs:
         continue-on-error: true
         run: cargo fmt --all --check
 
-  # Best-effort proof the attach + decode pipeline actually works end-to-end
-  # against a real interpreter. NON-BLOCKING (continue-on-error) because it
-  # depends on runner ptrace permissions and on the setup-python build carrying
-  # a resolvable PyRuntime section/cookie — neither guaranteed. When it turns
-  # green reliably we can promote it to a gate.
+  # End-to-end proof the attach + version-detect + decode pipeline works against
+  # a REAL interpreter, one leg per Python minor 3.8 → 3.15 (all that setup-python
+  # ships; 3.15 is beta-only, 3.16 does not exist yet). This exercises both finding
+  # paths (symbol/cross-reference for 3.8–3.12, "xdebugpy" cookie for 3.13+), the
+  # 3.8 global-GC branch, and both decode kinds (InlineArray ≤3.14, RingBuffer 3.15).
+  #
+  # NON-BLOCKING (continue-on-error) until the first real run confirms the two
+  # things that can't be verified from a dev box: (a) runner ptrace permissions,
+  # and (b) that setup-python's build keeps `_PyRuntime`/`Py_Version` resolvable
+  # (dynsym for pre-3.13) and ships the PyRuntime cookie section (3.13+). A leg
+  # that can't resolve the symbol goes yellow and pinpoints exactly which version
+  # to fix, without reddening the build.
   live-smoke:
-    name: Live gc-stats smoke (3.13, ubuntu)
+    name: gc-stats smoke (py${{ matrix.python }})
     runs-on: ubuntu-latest
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.16 omitted: not in the setup-python registry (unreleased — 3.15 is
+        # still beta). It needs a self-built runner artifact; out of scope here.
+        python: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: ${{ matrix.python }}
+          # Harmless for stable minors (they still resolve to their latest stable);
+          # required for 3.15, which only exists as a beta in the registry.
+          allow-prereleases: true
 
       - name: Build gcscope
         run: cargo build --verbose
 
       # Same-uid, non-descendant attach needs a permissive ptrace scope. GitHub
-      # runners allow passwordless sudo; best-effort so the step never hard-fails
-      # here (the job is continue-on-error regardless).
+      # runners allow passwordless sudo; best-effort (the job is continue-on-error).
       - name: Allow ptrace (best-effort)
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      - name: Attach and assert non-empty GC stats
+      - name: Attach, detect version, assert non-empty GC stats
         run: |
-          set -euo pipefail
-          # A spinner that keeps the GC busy so the generation counters are non-zero.
+          set -uo pipefail
+          python --version
+          # A spinner that keeps the GC busy so the generation counters advance.
           python -c '
           import gc, time
           while True:
-              [ [0]*50 for _ in range(2000) ]
+              [ [0] * 50 for _ in range(2000) ]
               gc.collect()
               time.sleep(0.05)
           ' &
@@ -91,17 +107,33 @@ jobs:
           # Give the interpreter a moment to initialize its runtime + run a few GCs.
           sleep 2
 
-          set +e
-          OUT="$(./target/debug/gcscope gc-stats "$PYPID" 2>&1)"
-          RC=$?
-          set -e
+          # find-runtime goes through the same version-aware attach path as gc-stats,
+          # so a failure here localizes the problem to *finding* (e.g. the pre-3.13
+          # symbol lookup) vs. decoding.
+          echo "----- find-runtime -----"
+          if ! ./target/debug/gcscope find-runtime "$PYPID"; then
+            echo "FAIL(py${{ matrix.python }}): could not locate _PyRuntime"
+            kill "$PYPID" 2>/dev/null || true
+            exit 1
+          fi
+
+          # Best-effort version echo for the log (read-runtime uses its own finder,
+          # so don't gate on it — purely informational).
+          echo "----- read-runtime (version, best-effort) -----"
+          ./target/debug/gcscope read-runtime "$PYPID" 2>&1 | head -4 || true
+
+          echo "----- gc-stats -----"
+          OUT="$(./target/debug/gcscope gc-stats "$PYPID" 2>&1)"; RC=$?
           kill "$PYPID" 2>/dev/null || true
-
-          echo "----- gc-stats output -----"
           echo "$OUT"
-          echo "---------------------------"
 
-          test "$RC" -eq 0 || { echo "FAIL: gc-stats exited $RC"; exit 1; }
-          echo "$OUT" | grep -q "No GC stats found." && { echo "FAIL: no stats decoded"; exit 1; }
-          echo "$OUT" | grep -q "Collections" || { echo "FAIL: no stats table in output"; exit 1; }
-          echo "PASS: attached and decoded non-empty GC stats"
+          if [ "$RC" -ne 0 ]; then
+            echo "FAIL(py${{ matrix.python }}): gc-stats exited $RC"; exit 1
+          fi
+          if echo "$OUT" | grep -q "No GC stats found."; then
+            echo "FAIL(py${{ matrix.python }}): stats decoded empty"; exit 1
+          fi
+          if ! echo "$OUT" | grep -q "Collections"; then
+            echo "FAIL(py${{ matrix.python }}): no stats table in output"; exit 1
+          fi
+          echo "PASS(py${{ matrix.python }}): attached + detected + decoded non-empty GC stats"
