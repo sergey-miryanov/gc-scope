@@ -15,7 +15,6 @@ pub struct ProcessInfo {
     pub version: Option<String>,
     pub runtime_found: bool,
     pub offsets_known: bool,
-    pub check_ok: Option<bool>,
 }
 
 pub struct FlatRow {
@@ -27,7 +26,6 @@ pub struct FlatRow {
     pub version: Option<String>,
     pub runtime_found: bool,
     pub offsets_known: bool,
-    pub check_ok: Option<bool>,
 }
 
 struct ProcessEntry {
@@ -39,10 +37,9 @@ struct ProcessEntry {
     version: Option<String>,
     runtime_found: bool,
     offsets_known: bool,
-    check_ok: Option<bool>,
 }
 
-pub fn list_python_processes(verify: bool) -> Result<(Vec<ProcessInfo>, HashMap<u32, (String, u32)>)> {
+pub fn list_python_processes() -> Result<(Vec<ProcessInfo>, HashMap<u32, (String, u32)>)> {
     let sys = System::new_all();
 
     // Build PID info map for ALL processes: pid → (name, ppid)
@@ -69,13 +66,12 @@ pub fn list_python_processes(verify: bool) -> Result<(Vec<ProcessInfo>, HashMap<
             .map(|s| s.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
-        result.push(ProcessInfo { pid, ppid, name: name_orig, cmdline, version: None, runtime_found: false, offsets_known: false, check_ok: None });
+        result.push(ProcessInfo { pid, ppid, name: name_orig, cmdline, version: None, runtime_found: false, offsets_known: false });
     }
     result.sort_by_key(|p| p.pid);
 
     // Resolve each process through a single `PySession::attach` — one pass that
-    // finds the runtime, detects the version, and reads the offset layout, instead
-    // of the old detect ×2 + find_runtime + read_offsets + verify_process. The
+    // finds the runtime, detects the version, and reads the offset layout. The
     // process-wide layout cache means PIDs sharing one interpreter binary parse its
     // offsets only once (E2).
     for p in &mut result {
@@ -84,9 +80,6 @@ pub fn list_python_processes(verify: bool) -> Result<(Vec<ProcessInfo>, HashMap<
                 p.runtime_found = true;
                 p.offsets_known = matches!(session.tier(), Tier::Full | Tier::LayoutOnly);
                 p.version = Some(session.version().to_string());
-                if verify {
-                    p.check_ok = session.verify().ok();
-                }
             }
             Err(_) => {
                 // Attach failed. The runtime may still exist (Python present but its
@@ -101,53 +94,28 @@ pub fn list_python_processes(verify: bool) -> Result<(Vec<ProcessInfo>, HashMap<
     Ok((result, pid_info_map))
 }
 
-fn v_char(p: &ProcessInfo) -> &'static str {
-    match p.check_ok {
-        Some(true) => "Y",
-        Some(false) => "N",
-        None => "-",
-    }
-}
-
-pub fn print_process_table(processes: &[ProcessInfo], no_cmdline: bool, verify: bool) {
+pub fn print_process_table(processes: &[ProcessInfo], no_cmdline: bool) {
     if processes.is_empty() {
         println!("No Python processes found.");
         return;
     }
-    let sep_extra = if verify { 5 } else { 0 };
     if no_cmdline {
-        if verify {
-            println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<4} {:<25}", "PID", "PPID", "Name", "R", "S", "V", "Version");
-        } else {
-            println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25}", "PID", "PPID", "Name", "R", "S", "Version");
-        }
-        println!("{}", "-".repeat(65 + sep_extra));
+        println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25}", "PID", "PPID", "Name", "R", "S", "Version");
+        println!("{}", "-".repeat(65));
         for p in processes {
             let ver = p.version.as_deref().unwrap_or("-");
             let rnt = if p.runtime_found { "Y" } else { "N" };
             let off = if p.offsets_known { "Y" } else { "N" };
-            if verify {
-                println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<4} {:<25}", p.pid, p.ppid, p.name, rnt, off, v_char(p), ver);
-            } else {
-                println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25}", p.pid, p.ppid, p.name, rnt, off, ver);
-            }
+            println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25}", p.pid, p.ppid, p.name, rnt, off, ver);
         }
     } else {
-        if verify {
-            println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<4} {:<25} {}", "PID", "PPID", "Name", "R", "S", "V", "Version", "Command Line");
-        } else {
-            println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25} {}", "PID", "PPID", "Name", "R", "S", "Version", "Command Line");
-        }
-        println!("{}", "-".repeat(128 + sep_extra));
+        println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25} {}", "PID", "PPID", "Name", "R", "S", "Version", "Command Line");
+        println!("{}", "-".repeat(128));
         for p in processes {
             let ver = p.version.as_deref().unwrap_or("-");
             let rnt = if p.runtime_found { "Y" } else { "N" };
             let off = if p.offsets_known { "Y" } else { "N" };
-            if verify {
-                println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<4} {:<25} {}", p.pid, p.ppid, p.name, rnt, off, v_char(p), ver, p.cmdline);
-            } else {
-                println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25} {}", p.pid, p.ppid, p.name, rnt, off, ver, p.cmdline);
-            }
+            println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25} {}", p.pid, p.ppid, p.name, rnt, off, ver, p.cmdline);
         }
     }
 }
@@ -171,7 +139,6 @@ pub fn build_flat_rows(
             version: p.version.clone(),
             runtime_found: p.runtime_found,
             offsets_known: p.offsets_known,
-            check_ok: p.check_ok,
         });
     }
 
@@ -197,7 +164,6 @@ pub fn build_flat_rows(
                     version: None,
                     runtime_found: false,
                     offsets_known: false,
-                    check_ok: None,
                 });
             }
         }
@@ -256,7 +222,6 @@ fn flatten_node(
         version: entry.version.clone(),
         runtime_found: entry.runtime_found,
         offsets_known: entry.offsets_known,
-        check_ok: entry.check_ok,
     });
 
     if let Some(children) = children_by_ppid.get(&pid) {
@@ -272,15 +237,7 @@ fn prefix_depth(prefix: &str) -> usize {
     (prefix.len().saturating_sub(4)) / 4
 }
 
-fn v_char_row(row: &FlatRow) -> &'static str {
-    match row.check_ok {
-        Some(true) => "Y",
-        Some(false) => "N",
-        None => "-",
-    }
-}
-
-fn write_row(no_cmdline: bool, verify: bool, row: &FlatRow) {
+fn write_row(no_cmdline: bool, row: &FlatRow) {
     let display_name = if row.is_python {
         row.version.as_deref().unwrap_or("-").to_string()
     } else {
@@ -291,16 +248,7 @@ fn write_row(no_cmdline: bool, verify: bool, row: &FlatRow) {
     let r_char = if row.is_python && row.runtime_found { "Y" } else if row.is_python { "N" } else { "-" };
     let s_char = if row.is_python && row.offsets_known { "Y" } else if row.is_python { "N" } else { "-" };
 
-    if verify {
-        let v_char = v_char_row(row);
-        if no_cmdline {
-            println!("{:>8}  {}  {}  {}  {:<22}",
-                row.pid, r_char, s_char, v_char, full_name);
-        } else {
-            println!("{:>8}  {}  {}  {}  {:<22}    {}",
-                row.pid, r_char, s_char, v_char, full_name, row.cmdline);
-        }
-    } else if no_cmdline {
+    if no_cmdline {
         println!("{:>8}  {}  {}  {:<22}",
             row.pid, r_char, s_char, full_name);
     } else {
@@ -309,7 +257,7 @@ fn write_row(no_cmdline: bool, verify: bool, row: &FlatRow) {
     }
 }
 
-pub fn print_process_tree(processes: &[ProcessInfo], pid_info_map: &HashMap<u32, (String, u32)>, no_cmdline: bool, verify: bool) {
+pub fn print_process_tree(processes: &[ProcessInfo], pid_info_map: &HashMap<u32, (String, u32)>, no_cmdline: bool) {
     if processes.is_empty() {
         println!("No Python processes found.");
         return;
@@ -317,24 +265,15 @@ pub fn print_process_tree(processes: &[ProcessInfo], pid_info_map: &HashMap<u32,
 
     let flat_rows = build_flat_rows(processes, pid_info_map);
 
-    let sep_extra = if verify { 5 } else { 0 };
     if no_cmdline {
-        if verify {
-            println!("{:>8}  {}  {}  {}  {:<22}", "PID", "R", "S", "V", "Version/Name");
-        } else {
-            println!("{:>8}  {}  {}  {:<22}", "PID", "R", "S", "Version/Name");
-        }
-        println!("{}", "-".repeat(50 + sep_extra));
+        println!("{:>8}  {}  {}  {:<22}", "PID", "R", "S", "Version/Name");
+        println!("{}", "-".repeat(50));
     } else {
-        if verify {
-            println!("{:>8}  {}  {}  {}  {:<22}    {}", "PID", "R", "S", "V", "Version/Name", "Command Line");
-        } else {
-            println!("{:>8}  {}  {}  {:<22}    {}", "PID", "R", "S", "Version/Name", "Command Line");
-        }
-        println!("{}", "-".repeat(80 + sep_extra));
+        println!("{:>8}  {}  {}  {:<22}    {}", "PID", "R", "S", "Version/Name", "Command Line");
+        println!("{}", "-".repeat(80));
     }
 
     for row in &flat_rows {
-        write_row(no_cmdline, verify, row);
+        write_row(no_cmdline, row);
     }
 }

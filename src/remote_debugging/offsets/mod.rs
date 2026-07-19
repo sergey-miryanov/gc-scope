@@ -98,64 +98,34 @@ fn build_variant(pid: u32, addr: u64, layout_hex: u64) -> Result<Option<Versione
     }
 }
 
-/// Does this offset set navigate the live interpreter chain? Used to validate an
-/// approximate (same-minor) fallback layout before trusting it: if
-/// interpreters_head → threads_head → interp round-trips, the struct positions we
-/// pulled these offsets from line up with the target's real `_Py_DebugOffsets`.
-fn navigation_validates(pid: u32, addr: u64, vo: &VersionedOffsets) -> bool {
-    let rt_size = vo.runtime_state_size();
-    // A wrong layout yields a garbage size; don't attempt an absurd read.
-    if rt_size == 0 || rt_size > 16 * 1024 * 1024 {
-        return false;
-    }
-    crate::remote_debugging::check_interpreter::check_runtime(
-        pid,
-        addr,
-        rt_size,
-        vo.runtime_interpreters_head(),
-        vo.interpreter_state_threads_head(),
-        vo.thread_state_interp(),
-    )
-    .map(|r| r.match_ok)
-    .unwrap_or(false)
-}
-
 /// Resolved fallback layout hexes for (pid, stored-version) pairs that have no exact
-/// compiled layout — so the (expensive) navigation validation and the warning happen
-/// once per process, not on every poll.
+/// compiled layout — so the resolution and its warning happen once per process, not on
+/// every poll.
 static FALLBACK_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<(u32, u64), u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Graceful degradation for a 3.13+ build with no exact compiled layout: pick the
-/// closest same-(major,minor) layout and confirm it by live interpreter navigation.
-/// `_Py_DebugOffsets` is self-describing and stable within a minor, so a same-minor
-/// layout normally matches; navigation is the guard against the cases where it doesn't.
-fn resolve_fallback_layout(pid: u32, addr: u64, stored: u64) -> Result<u64> {
+/// closest same-(major,minor) layout. `_Py_DebugOffsets` is self-describing and stable
+/// within a minor, so a same-minor layout normally matches the target's real offsets.
+fn resolve_fallback_layout(stored: u64) -> Result<u64> {
     let tgt_mm = stored & MAJOR_MINOR_MASK;
     let tgt_micro = ((stored >> 8) & 0xff) as i64;
 
-    let mut candidates: Vec<u64> = LAYOUTS
+    LAYOUTS
         .iter()
         .map(|(h, _)| *h)
         .filter(|h| h & MAJOR_MINOR_MASK == tgt_mm)
-        .collect();
-    // nearest micro first
-    candidates.sort_by_key(|h| ((((*h >> 8) & 0xff) as i64) - tgt_micro).unsigned_abs());
-
-    for cand in candidates {
-        if let Some(vo) = build_variant(pid, addr, cand)?
-            && navigation_validates(pid, addr, &vo)
-        {
-            return Ok(cand);
-        }
-    }
-    bail!(
-        "Unsupported Python version {:#010x}: no exact layout, and no same-minor layout \
-         validated against the live interpreter. Generate offsets for this exact build \
-         with scripts/gen-offsets.py.",
-        stored
-    );
+        // nearest micro wins
+        .min_by_key(|h| ((((*h >> 8) & 0xff) as i64) - tgt_micro).unsigned_abs())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unsupported Python version {:#010x}: no exact layout and no same-minor \
+                 layout is compiled in. Generate offsets for this exact build with \
+                 scripts/gen-offsets.py.",
+                stored
+            )
+        })
 }
 
 pub fn read_offsets(pid: u32, version: &PythonVersion) -> Result<(u64, u64, VersionedOffsets)> {
@@ -190,19 +160,18 @@ pub fn read_offsets(pid: u32, version: &PythonVersion) -> Result<(u64, u64, Vers
     }
 
     // Resolve which compiled layout to read the struct through: exact hex match,
-    // else a validated same-minor fallback (cached per pid+version so the validation
-    // and warning happen once, not on every poll).
+    // else the closest same-minor fallback (cached per pid+version so the warning
+    // happens once, not on every poll).
     let layout_hex = if LAYOUTS.iter().any(|(h, _)| *h == stored) {
         stored
     } else if let Some(&h) = FALLBACK_CACHE.lock().unwrap().get(&(pid, stored)) {
         h
     } else {
-        let h = resolve_fallback_layout(pid, addr, stored)?;
+        let h = resolve_fallback_layout(stored)?;
         eprintln!(
             "warning: no exact offsets for Python {:#010x}; using the closest known \
-             layout {:#010x} (same {}.{}), validated by live interpreter navigation. \
-             GC-stat offsets are approximate — a buffer-size warning will appear if they \
-             don't match this build.",
+             layout {:#010x} (same {}.{}). GC-stat offsets are approximate — a \
+             buffer-size warning will appear if they don't match this build.",
             stored, h, (stored >> 24) & 0xff, (stored >> 16) & 0xff
         );
         FALLBACK_CACHE.lock().unwrap().insert((pid, stored), h);

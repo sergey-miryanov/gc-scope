@@ -144,7 +144,7 @@ impl PySession {
     /// matches, else running the full cascade and caching the result (§6).
     pub fn attach(pid: u32) -> Result<Self> {
         let handle = reader::open_handle(pid)?;
-        let (runtime_addr, module_path) = process::find_runtime_module(pid)?;
+        let (runtime_addr, module_path, version) = find_runtime_versioned(pid)?;
         let exe_key = exe_key_for(&module_path);
         let cmdline = process::read_cmdline(pid);
 
@@ -166,7 +166,7 @@ impl PySession {
         let cached = match cached {
             Some(entry) => entry,
             None => {
-                let entry = resolve_layout(pid, runtime_addr)?;
+                let entry = resolve_layout(pid, runtime_addr, version)?;
                 if let Some(key) = &exe_key {
                     LAYOUT_CACHE.lock().unwrap().insert(key.clone(), entry.clone());
                 }
@@ -213,7 +213,7 @@ impl PySession {
     /// changed program.
     fn soft_reattach(&mut self) -> Result<bool> {
         let handle = reader::open_handle(self.pid)?;
-        let (runtime_addr, module_path) = process::find_runtime_module(self.pid)?;
+        let (runtime_addr, module_path, _version) = find_runtime_versioned(self.pid)?;
 
         if exe_key_for(&module_path) != self.exe_key {
             return Ok(false);
@@ -254,40 +254,6 @@ impl PySession {
     /// The `_Py_DebugOffsets` version word for 3.13+ (`None` for pre-3.13).
     pub fn stored_hex(&self) -> Option<u64> {
         self.stored_hex
-    }
-
-    /// Validate the resolved offsets against the live process by navigation: scan
-    /// `_PyRuntime` for a `PyInterpreterState*` that round-trips through
-    /// `threads_head → interp`, and check it equals the stored `interpreters_head`.
-    /// Works for every tier (bindgen sizes for 3.13+, table fields for pre-3.13).
-    /// This is the port of the old `check_interpreter::verify_process`.
-    pub fn verify(&self) -> Result<bool> {
-        let table = self.resolved.table();
-        let (scan_size, ih, th, ti) = match self.resolved.offsets() {
-            Some(vo) => (
-                vo.runtime_state_size(),
-                vo.runtime_interpreters_head(),
-                vo.interpreter_state_threads_head(),
-                vo.thread_state_interp(),
-            ),
-            // Pre-3.13 has no `runtime_state.size`; scan a small window past the
-            // interpreters_head field (matches the old `verify_with_table`).
-            None => (
-                table.runtime_interpreters_head + 64,
-                table.runtime_interpreters_head,
-                table.interp_threads_head,
-                table.thread_interp,
-            ),
-        };
-        let result = crate::remote_debugging::check_interpreter::check_runtime(
-            self.pid,
-            self.runtime_addr,
-            scan_size,
-            ih,
-            th,
-            ti,
-        )?;
-        Ok(result.match_ok)
     }
 
     pub fn tier(&self) -> Tier {
@@ -419,19 +385,43 @@ fn layout_still_valid(
     }
 }
 
-/// Run the full resolve cascade (bindgen exact → same-minor fallback → pre-3.13)
-/// and package it for the cache. This is the only path that reads offsets out of
-/// the process; a cache hit skips it entirely.
-fn resolve_layout(pid: u32, runtime_addr: u64) -> Result<CachedLayout> {
-    let detected = version::detect(pid)?;
-    if detected.major != 3 {
+/// Find `_PyRuntime` in `pid`, dispatching on the interpreter's Python version.
+///
+/// 3.13+ is anchored by the `"xdebugpy"` cookie ([`process::find_runtime_module`]);
+/// pre-3.13, which predates that cookie, is anchored by resolving the `_PyRuntime`
+/// symbol and confirming it with the interpreter/thread cross-reference heuristic
+/// ([`process::find_runtime_pre_3_13`]). Returns the runtime address, the module path
+/// (the layout-cache identity), and the detected version so callers avoid re-detecting.
+fn find_runtime_versioned(pid: u32) -> Result<(u64, String, PythonVersion)> {
+    let version = version::detect(pid)?;
+    if version.major != 3 {
         return Err(anyhow!(
             "Unsupported Python major version {}.{}",
-            detected.major,
-            detected.minor
+            version.major,
+            version.minor
         ));
     }
 
+    let (addr, path) = if version.minor >= 13 {
+        process::find_runtime_module(pid)?
+    } else {
+        let table = offsets::pre_3_13::table_for_version(version.major, version.minor)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Unsupported Python version {}.{} (no pre-3.13 offset table)",
+                    version.major,
+                    version.minor
+                )
+            })?;
+        process::find_runtime_pre_3_13(pid, &table)?
+    };
+    Ok((addr, path, version))
+}
+
+/// Run the full resolve cascade (bindgen exact → same-minor fallback → pre-3.13)
+/// and package it for the cache. This is the only path that reads offsets out of
+/// the process; a cache hit skips it entirely.
+fn resolve_layout(pid: u32, runtime_addr: u64, detected: PythonVersion) -> Result<CachedLayout> {
     if detected.minor >= 13 {
         // 3.13+: the live `_Py_DebugOffsets` word is authoritative; `stored`
         // drives dispatch inside `read_offsets` (exact or same-minor fallback).

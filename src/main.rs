@@ -35,29 +35,12 @@ fn main() -> Result<()> {
             let bytes = memory::reader::read_memory(pid, addr, size)?;
             memory::dump::hex_dump(&bytes, addr);
         }
-        Command::FindRuntime { pid, check } => {
+        Command::FindRuntime { pid } => {
             let pid = resolve_pid(pid);
-            let addr = memory::process::find_runtime(pid)?;
-            print!("PyRuntime at {:#018x}", addr);
-            if check {
-                match try_check_runtime(pid, addr) {
-                    Ok(r) => {
-                        if r.match_ok {
-                            println!("  check OK ({:#018x})", r.found);
-                        } else {
-                            println!(
-                                "  check MISMATCH: found {:#018x}, expected {:#018x}",
-                                r.found, r.expected
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        println!("  check FAILED: {}", e);
-                    }
-                }
-            } else {
-                println!();
-            }
+            // Attach dispatches version-aware finding (cookie for 3.13+, symbol +
+            // cross-reference heuristic for pre-3.13), so this works on every version.
+            let session = remote_debugging::session::PySession::attach(pid)?;
+            println!("PyRuntime at {:#018x}", session.runtime_addr());
         }
         Command::ReadRuntime { pid } => {
             let pid = resolve_pid(pid);
@@ -86,12 +69,12 @@ fn main() -> Result<()> {
                 &script_args, &opts)?;
             std::process::exit(exit_code);
         }
-        Command::ListPids { tree, no_cmdline, verify } => {
-            let (processes, pid_info_map) = list_pids::list_python_processes(verify)?;
+        Command::ListPids { tree, no_cmdline } => {
+            let (processes, pid_info_map) = list_pids::list_python_processes()?;
             if tree {
-                list_pids::print_process_tree(&processes, &pid_info_map, no_cmdline, verify);
+                list_pids::print_process_tree(&processes, &pid_info_map, no_cmdline);
             } else {
-                list_pids::print_process_table(&processes, no_cmdline, verify);
+                list_pids::print_process_table(&processes, no_cmdline);
             }
         }
         Command::Diagram { pid, output } => {
@@ -115,82 +98,6 @@ fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Try to verify the runtime address by scanning for PyInterpreterState.
-/// Uses `_Py_DebugOffsets` offsets read from the target process.
-fn try_check_runtime(pid: u32, runtime_addr: u64) -> Result<
-    remote_debugging::check_interpreter::CheckResult,
-> {
-    let version = remote_debugging::version::detect(pid)?;
-    if version.major < 3 || version.minor < 13 {
-        anyhow::bail!("check requires Python >= 3.13 (detected {})", version);
-    }
-
-    // Try the versioned code path first (works for 3.15.x where we have bindgen structs)
-    if let Ok((_, _, offsets)) = remote_debugging::offsets::read_offsets(pid, &version) {
-        return remote_debugging::check_interpreter::check_runtime(
-            pid,
-            runtime_addr,
-            offsets.runtime_state_size(),
-            offsets.runtime_interpreters_head(),
-            offsets.interpreter_state_threads_head(),
-            offsets.thread_state_interp(),
-        );
-    }
-
-    // Fallback: read offsets directly from _Py_DebugOffsets in process memory.
-    // The overall struct layout is:
-    //   [ 0..8]  cookie
-    //   [ 8..16] version
-    //   [16..24] free_threaded
-    //   [24..?]  runtime_state  (size + N×u64 fields, at least 3)
-    //
-    // The first field of every debug-offset sub-struct is its `size`.
-    // We use this to skip from one sub-struct to the next.
-
-    let buf = memory::reader::read_memory(pid, runtime_addr, 4096)?;
-
-    fn le_u64(buf: &[u8], off: usize) -> u64 {
-        u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
-    }
-
-    let rt_size = le_u64(&buf, 24);
-    let rt_interpreters_head = le_u64(&buf, 40);
-
-    // interpreter_state starts right after runtime_state.
-    // Determine runtime_state's byte count from the sub-struct header.
-    // (runtime_state has at least the fields `size`, `finalizing`, `interpreters_head`,
-    //  but may have more in some versions – we count by advancing past
-    //  each known field + any extras.  Since every debug sub-struct starts
-    //  with `size`, we can compute the boundary by walking.)
-    //
-    // For now, assume the known 3-field layout (24 bytes), confirmed for 3.15+.
-    // If it's wrong for this version, we'll fall through with a clear error.
-
-    let is_off: usize = 48; // runtime_state occupies bytes 24..48 for known versions
-    let is_size = le_u64(&buf, is_off);
-    let threads_head_off = is_off + 24; // threads_head is at offset 24 within interpreter_state
-    let threads_head_offset = le_u64(&buf, threads_head_off);
-
-    // thread_state starts after interpreter_state
-    let ts_off = is_off + is_size as usize;
-    if ts_off + 32 > buf.len() {
-        anyhow::bail!(
-            "computed thread_state offset {} exceeds buffer (layout unknown for this version)",
-            ts_off
-        );
-    }
-    let thread_interp_offset = le_u64(&buf, ts_off + 24);
-
-    remote_debugging::check_interpreter::check_runtime(
-        pid,
-        runtime_addr,
-        rt_size,
-        rt_interpreters_head,
-        threads_head_offset,
-        thread_interp_offset,
-    )
 }
 
 fn parse_address(s: &str) -> Result<u64> {

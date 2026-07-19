@@ -3,12 +3,6 @@ use proc_maps::{get_process_maps, MapRange};
 
 use crate::memory::reader;
 
-pub struct CheckResult {
-    pub expected: u64,
-    pub found: u64,
-    pub match_ok: bool,
-}
-
 fn maps_contains(maps: &[MapRange], addr: usize) -> bool {
     maps.iter()
         .any(|m| addr >= m.start() && addr < m.start() + m.size())
@@ -59,9 +53,13 @@ pub fn check_interpreter_addresses(
     bail!("Failed to find a valid PyInterpreterState address");
 }
 
-/// High-level check: given a known-good `_PyRuntime` address and the offsets
-/// obtained from `_Py_DebugOffsets`, verify that [`check_interpreter_addresses`]
-/// finds the same `interpreters_head` pointer.
+/// High-level check: given a candidate `_PyRuntime` address and the offsets needed to
+/// walk it, confirm that scanning the runtime for a self-consistent `PyInterpreterState`
+/// recovers exactly the pointer stored in `interpreters_head`. Returns `true` when the
+/// candidate is a valid runtime whose offsets line up with the live process.
+///
+/// A failed read (bogus candidate address landing in unmapped memory, process gone) is
+/// simply "not a valid runtime" ⇒ `false`; the caller tries the next candidate.
 pub fn check_runtime(
     pid: u32,
     runtime_addr: u64,
@@ -69,12 +67,17 @@ pub fn check_runtime(
     runtime_interpreters_head: u64,
     threads_head_offset: u64,
     thread_interp_offset: u64,
-) -> Result<CheckResult> {
-    let expected =
-        reader::read_u64(pid, runtime_addr + runtime_interpreters_head)?;
+) -> bool {
+    let expected = match reader::read_u64(pid, runtime_addr + runtime_interpreters_head) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
 
     let rt_size = runtime_state_size as usize;
-    let bytes = reader::read_memory(pid, runtime_addr, rt_size)?;
+    let bytes = match reader::read_memory(pid, runtime_addr, rt_size) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
 
     let words: &[u64] = unsafe {
         std::slice::from_raw_parts(
@@ -83,22 +86,13 @@ pub fn check_runtime(
         )
     };
 
-    let found = check_interpreter_addresses(
-        pid,
-        words,
-        threads_head_offset,
-        thread_interp_offset,
-    )?;
-
-    Ok(CheckResult {
-        expected,
-        found,
-        match_ok: found == expected,
-    })
+    match check_interpreter_addresses(pid, words, threads_head_offset, thread_interp_offset) {
+        Ok(found) => found == expected,
+        Err(_) => false,
+    }
 }
 
-// The full-chain PID verification that used to live here (`verify_process` +
-// `verify_with_table` + `warn_pre_3_13_once`) moved to `PySession::verify`, so the
-// three-way resolve cascade lives in exactly one place (`PySession::attach`).
-// `check_runtime` above is still used by `PySession::verify`, the offsets fallback
-// validator, and `main.rs`'s `find-runtime --check`.
+// `check_runtime` is the cookie-less anchor for pre-3.13 runtimes: its sole caller is
+// `memory::process::find_runtime_pre_3_13`, which resolves the `_PyRuntime` symbol and
+// then confirms the candidate here. 3.13+ finds the runtime by the `"xdebugpy"` cookie
+// instead and never touches this module.

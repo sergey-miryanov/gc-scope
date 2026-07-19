@@ -49,7 +49,7 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
     let mut pid = match pid {
         Some(p) => p,
         None => {
-            let (processes, pid_info_map) = crate::list_pids::list_python_processes(true)?;
+            let (processes, pid_info_map) = crate::list_pids::list_python_processes()?;
             match super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map)? {
                 Some(p) => p,
                 None => return Ok(()), // user cancelled the picker — exit cleanly
@@ -125,7 +125,7 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
                             glitch_enabled = !glitch_enabled;
                         }
                         KeyCode::Char('p') => {
-                            if let Ok((processes, pid_info_map)) = crate::list_pids::list_python_processes(true) {
+                            if let Ok((processes, pid_info_map)) = crate::list_pids::list_python_processes() {
                                 if let Ok(Some(new_pid)) = super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map) {
                                     // Re-attach to the newly picked PID; only commit
                                     // the switch if it resolves.

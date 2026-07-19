@@ -27,9 +27,6 @@ pub enum Command {
     FindRuntime {
         #[arg(allow_hyphen_values = true)]
         pid: i32,
-        /// Verify result by scanning runtime memory for PyInterpreterState
-        #[arg(short, long)]
-        check: bool,
     },
     /// Read and display the PyRuntime debug offsets
     ReadRuntime {
@@ -75,9 +72,6 @@ pub enum Command {
         /// Hide the Command Line column
         #[arg(short = 'C', long)]
         no_cmdline: bool,
-        /// Verify each process by scanning runtime memory for PyInterpreterState
-        #[arg(short, long)]
-        verify: bool,
     },
     /// Generate SVG diagram of Python runtime memory layout
     Diagram {

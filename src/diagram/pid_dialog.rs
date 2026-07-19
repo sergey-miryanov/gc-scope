@@ -150,14 +150,6 @@ pub fn show_pid_dialog(
     }
 }
 
-fn v_char(row: &FlatRow) -> &'static str {
-    match row.check_ok {
-        Some(true) => "Y",
-        Some(false) => "N",
-        None => "-",
-    }
-}
-
 fn render_dialog(
     frame: &mut Frame,
     flat_rows: &[FlatRow],
@@ -193,13 +185,13 @@ fn render_dialog(
     }
 
     let inner_w = popup_w.saturating_sub(4) as usize;
-    let cmd_w = inner_w.saturating_sub(8 + 2 + 1 + 2 + 1 + 2 + 1 + 2 + 22 + 4);
+    let cmd_w = inner_w.saturating_sub(8 + 2 + 1 + 2 + 1 + 2 + 22 + 4);
 
     let mut lines = Vec::new();
 
     let header = format!(
-        "{:>8}  {}  {}  {}  {:<22}    {}",
-        "PID", "R", "S", "V", "Version/Name", "Command Line"
+        "{:>8}  {}  {}  {:<22}    {}",
+        "PID", "R", "S", "Version/Name", "Command Line"
     );
     lines.push(Line::from(Span::raw(header)));
     lines.push(Line::from(Span::raw("-".repeat(inner_w))));
@@ -213,7 +205,6 @@ fn render_dialog(
         };
         let r_char = if row.is_python && row.runtime_found { "Y" } else if row.is_python { "N" } else { "-" };
         let s_char = if row.is_python && row.offsets_known { "Y" } else if row.is_python { "N" } else { "-" };
-        let v = v_char(row);
         let indent = "  ".repeat(prefix_depth(&row.prefix));
         let full_name = format!("{}{}", indent, display_name);
 
@@ -225,8 +216,8 @@ fn render_dialog(
         };
 
         let row_str = format!(
-            "{:>8}  {}  {}  {}  {:<22}    {}",
-            row.pid, r_char, s_char, v, full_name, cmd_display
+            "{:>8}  {}  {}  {:<22}    {}",
+            row.pid, r_char, s_char, full_name, cmd_display
         );
 
         let supported = row.is_python && row.runtime_found && row.offsets_known;

@@ -125,12 +125,7 @@ pub fn detect(pid: u32) -> Result<PythonVersion> {
             Err(_) => continue,
         };
 
-        let sym_addr = match binary::classify(&bytes) {
-            Some(binary::BinaryKind::Elf) => try_py_version_elf(&bytes, *base_addr),
-            Some(binary::BinaryKind::Pe) => try_py_version_pe(&bytes, *base_addr),
-            Some(binary::BinaryKind::MachO) => try_py_version_macho(&bytes, *base_addr),
-            None => continue,
-        };
+        let sym_addr = resolve_symbol_in_bytes(&bytes, *base_addr, "Py_Version");
 
         if let Some(abs_addr) = sym_addr
             && let Some(ver) = read_version_from_process(pid, abs_addr)
@@ -145,7 +140,14 @@ pub fn detect(pid: u32) -> Result<PythonVersion> {
             Ok(b) => b,
             Err(_) => continue,
         };
-        if let Some(ver) = scan_for_version_string(&bytes)
+        // Scan the read-only data section first (where `PY_VERSION` lives), which
+        // avoids stray `"3.x"` bytes elsewhere in the image; fall back to the whole
+        // image if that section can't be located or holds no match, so no build regresses.
+        let scanned = match read_only_data(&bytes) {
+            Some(ro) => scan_for_version_string(ro).or_else(|| scan_for_version_string(&bytes)),
+            None => scan_for_version_string(&bytes),
+        };
+        if let Some(ver) = scanned
             && ver.major == 3
         {
             return Ok(ver);
@@ -153,6 +155,19 @@ pub fn detect(pid: u32) -> Result<PythonVersion> {
     }
 
     bail!("Could not detect Python version for pid {}", pid);
+}
+
+// ── Symbol resolution ───────────────────────────────────────
+
+/// Resolve `name` to an absolute load address within one already-read module image.
+/// Dispatches on the binary format; returns `None` if the symbol is absent.
+pub fn resolve_symbol_in_bytes(bytes: &[u8], base_addr: usize, name: &str) -> Option<u64> {
+    match binary::classify(bytes) {
+        Some(binary::BinaryKind::Elf) => resolve_symbol_elf(bytes, base_addr, name),
+        Some(binary::BinaryKind::Pe) => resolve_symbol_pe(bytes, base_addr, name),
+        Some(binary::BinaryKind::MachO) => resolve_symbol_macho(bytes, base_addr, name),
+        None => None,
+    }
 }
 
 // ── Internal helpers ────────────────────────────────────────
@@ -173,13 +188,12 @@ fn read_version_from_process(pid: u32, addr: u64) -> Option<PythonVersion> {
     None
 }
 
-fn try_py_version_elf(bytes: &[u8], base_addr: usize) -> Option<u64> {
+fn resolve_symbol_elf(bytes: &[u8], base_addr: usize, sym_name: &str) -> Option<u64> {
     let elf_obj = elf::Elf::parse(bytes).ok()?;
     let load_bias = binary::elf_load_bias(&elf_obj)?;
 
     for sym in elf_obj.dynsyms.iter() {
-        let name = elf_obj.dynstrtab.get_at(sym.st_name)?;
-        if name == "Py_Version" {
+        if elf_obj.dynstrtab.get_at(sym.st_name) == Some(sym_name) {
             return Some(
                 (base_addr as u64).wrapping_add(sym.st_value.wrapping_sub(load_bias)),
             );
@@ -187,8 +201,7 @@ fn try_py_version_elf(bytes: &[u8], base_addr: usize) -> Option<u64> {
     }
 
     for sym in elf_obj.syms.iter() {
-        let name = elf_obj.strtab.get_at(sym.st_name)?;
-        if name == "Py_Version" {
+        if elf_obj.strtab.get_at(sym.st_name) == Some(sym_name) {
             return Some(
                 (base_addr as u64).wrapping_add(sym.st_value.wrapping_sub(load_bias)),
             );
@@ -198,11 +211,11 @@ fn try_py_version_elf(bytes: &[u8], base_addr: usize) -> Option<u64> {
     None
 }
 
-fn try_py_version_pe(bytes: &[u8], base_addr: usize) -> Option<u64> {
+fn resolve_symbol_pe(bytes: &[u8], base_addr: usize, sym_name: &str) -> Option<u64> {
     let pe_obj = pe::PE::parse(bytes).ok()?;
 
     for export in &pe_obj.exports {
-        if export.name == Some("Py_Version") {
+        if export.name == Some(sym_name) {
             return Some((base_addr as u64).wrapping_add(export.rva as u64));
         }
     }
@@ -210,7 +223,7 @@ fn try_py_version_pe(bytes: &[u8], base_addr: usize) -> Option<u64> {
     None
 }
 
-fn try_py_version_macho(bytes: &[u8], base_addr: usize) -> Option<u64> {
+fn resolve_symbol_macho(bytes: &[u8], base_addr: usize, sym_name: &str) -> Option<u64> {
     let macho = mach::MachO::parse(bytes, 0).ok()?;
 
     let text_vmaddr = macho
@@ -227,7 +240,7 @@ fn try_py_version_macho(bytes: &[u8], base_addr: usize) -> Option<u64> {
 
     if let Some(symbols) = &macho.symbols {
         for (name, nlist) in symbols.iter().flatten() {
-            if name == "Py_Version" && !nlist.is_undefined() {
+            if name == sym_name && !nlist.is_undefined() {
                 return Some(
                     (base_addr as u64)
                         .wrapping_add(nlist.n_value.wrapping_sub(text_vmaddr)),
@@ -249,6 +262,52 @@ fn parse_micro_digits(bytes: &[u8], start: usize) -> Option<(u8, usize)> {
     if j == start { None } else { Some((val, j)) }
 }
 
+/// File-offset range of the binary's read-only data section — PE `.rdata`, ELF
+/// `.rodata`, Mach-O `__TEXT,__cstring` — where the `PY_VERSION` string literal is
+/// emitted. `None` if the format isn't recognized or the section isn't present.
+fn ro_data_range(bytes: &[u8]) -> Option<(usize, usize)> {
+    match binary::classify(bytes)? {
+        binary::BinaryKind::Pe => {
+            let pe = pe::PE::parse(bytes).ok()?;
+            let s = pe.sections.iter().find(|s| {
+                s.name().map(|n| n.trim_end_matches('\0') == ".rdata").unwrap_or(false)
+            })?;
+            Some((s.pointer_to_raw_data as usize, s.size_of_raw_data as usize))
+        }
+        binary::BinaryKind::Elf => {
+            let elf = elf::Elf::parse(bytes).ok()?;
+            let s = elf.section_headers.iter().find(|s| {
+                elf.shdr_strtab
+                    .get_at(s.sh_name)
+                    .map(|n| n.trim_end_matches('\0') == ".rodata")
+                    .unwrap_or(false)
+            })?;
+            Some((s.sh_offset as usize, s.sh_size as usize))
+        }
+        binary::BinaryKind::MachO => {
+            let macho = mach::MachO::parse(bytes, 0).ok()?;
+            for seg in &macho.segments {
+                if seg.name().ok()? != "__TEXT" {
+                    continue;
+                }
+                for (sect, _data) in seg.sections().ok()? {
+                    if sect.name().ok()? == "__cstring" {
+                        return Some((sect.offset as usize, sect.size as usize));
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+
+/// The read-only data section as a byte slice, or `None` if it can't be located.
+fn read_only_data(bytes: &[u8]) -> Option<&[u8]> {
+    let (start, len) = ro_data_range(bytes)?;
+    let end = start.saturating_add(len).min(bytes.len());
+    (start < end).then(|| &bytes[start..end])
+}
+
 fn scan_for_version_string(bytes: &[u8]) -> Option<PythonVersion> {
     let mut i = 0;
     while i + 4 < bytes.len() {
@@ -261,34 +320,66 @@ fn scan_for_version_string(bytes: &[u8]) -> Option<PythonVersion> {
             continue;
         }
 
-        // Parse minor
-        let (minor, mut j) = parse_micro_digits(bytes, i + 2)?;
+        // Parse minor. A `"3."` not followed by digits (e.g. `"3.E"` in a float
+        // literal) is not a version string — advance and keep scanning rather than
+        // aborting the whole scan, which would miss the real version further in.
+        let Some((minor, mut j)) = parse_micro_digits(bytes, i + 2) else {
+            i += 1;
+            continue;
+        };
 
-        // Parse .micro if present
-        let micro = if bytes.get(j).copied() == Some(b'.') {
-            let (m, next) = parse_micro_digits(bytes, j + 1)?;
-            j = next;
-            m
-        } else {
-            0
+        // Require a micro component. The embedded `PY_VERSION` is always fully
+        // qualified (`"X.Y.Z"`), so a bare `"3.1"` (e.g. in unrelated text, or a
+        // truncated prefix) is a false positive: skip it and keep scanning for the
+        // real version. Without this, a stray `"3.1 "` shadows the true `"3.10.x"`.
+        if bytes.get(j).copied() != Some(b'.') {
+            i += 1;
+            continue;
+        }
+        let micro = match parse_micro_digits(bytes, j + 1) {
+            Some((m, next)) => {
+                j = next;
+                m
+            }
+            None => {
+                i += 1;
+                continue;
+            }
         };
 
         // Parse optional release suffix: aN, bN, rcN
         let (release_level, serial) = match bytes.get(j).copied() {
-            Some(b'a') => {
-                let (s, next) = parse_micro_digits(bytes, j + 1)?;
-                j = next;
-                (0xA, s)
-            }
-            Some(b'b') => {
-                let (s, next) = parse_micro_digits(bytes, j + 1)?;
-                j = next;
-                (0xB, s)
-            }
+            Some(b'a') => match parse_micro_digits(bytes, j + 1) {
+                Some((s, next)) => {
+                    j = next;
+                    (0xA, s)
+                }
+                None => {
+                    i += 1;
+                    continue;
+                }
+            },
+            Some(b'b') => match parse_micro_digits(bytes, j + 1) {
+                Some((s, next)) => {
+                    j = next;
+                    (0xB, s)
+                }
+                None => {
+                    i += 1;
+                    continue;
+                }
+            },
             Some(b'r') if bytes.get(j + 1).copied() == Some(b'c') => {
-                let (s, next) = parse_micro_digits(bytes, j + 2)?;
-                j = next;
-                (0xC, s)
+                match parse_micro_digits(bytes, j + 2) {
+                    Some((s, next)) => {
+                        j = next;
+                        (0xC, s)
+                    }
+                    None => {
+                        i += 1;
+                        continue;
+                    }
+                }
             }
             _ => (0xF, 0),
         };

@@ -2,6 +2,7 @@ use anyhow::Result;
 use remoteprocess::Process as RemoteProcess;
 
 use crate::memory::{binary, reader};
+use crate::remote_debugging::{check_interpreter, offsets::offset_table::OffsetTable, version};
 
 const COOKIE: &[u8] = b"xdebugpy";
 const MAX_DEPTH: u32 = 3;
@@ -94,6 +95,58 @@ fn find_section_in_macho(bytes: &[u8], region_start: usize) -> Option<u64> {
 fn validate_cookie(pid: u32, addr: u64) -> Result<bool> {
     let data = reader::read_memory(pid, addr, COOKIE.len())?;
     Ok(&data[..] == COOKIE)
+}
+
+// ---------------------------------------------------------------------------
+// Pre-3.13 runtime finding (no cookie exists yet)
+// ---------------------------------------------------------------------------
+
+/// Find `_PyRuntime` for a pre-3.13 interpreter.
+///
+/// The `"xdebugpy"` cookie (and its dedicated `PyRuntime` section) only exist from
+/// 3.13 on, so [`find_runtime_module`]'s cookie anchor cannot be used here. Instead we
+/// resolve the `_PyRuntime` symbol from each Python module's symbol table and confirm
+/// the candidate structurally with the interpreter/thread cross-reference round-trip
+/// (`interpreters_head → threads_head → interp`), which is what the cookie stands in
+/// for on 3.13+. `table` supplies the pre-3.13 field offsets that drive the walk.
+pub fn find_runtime_pre_3_13(pid: u32, table: &OffsetTable) -> Result<(u64, String)> {
+    let modules = binary::find_python_modules(pid)?;
+    if modules.is_empty() {
+        anyhow::bail!("No python-related modules found in process {}", pid);
+    }
+
+    // Pre-3.13 has no `runtime_state.size`; scan a small window past the
+    // interpreters_head field (matches the old `verify_with_table`).
+    let scan_size = table.runtime_interpreters_head + 64;
+
+    for (path, base_addr) in &modules {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        let addr = match version::resolve_symbol_in_bytes(&bytes, *base_addr, "_PyRuntime") {
+            Some(a) => a,
+            None => continue,
+        };
+
+        if check_interpreter::check_runtime(
+            pid,
+            addr,
+            scan_size,
+            table.runtime_interpreters_head,
+            table.interp_threads_head,
+            table.thread_interp,
+        ) {
+            return Ok((addr, path.clone()));
+        }
+    }
+
+    anyhow::bail!(
+        "Could not find a valid pre-3.13 _PyRuntime in process {} \
+         (symbol missing or cross-reference validation failed)",
+        pid
+    );
 }
 
 // ---------------------------------------------------------------------------
