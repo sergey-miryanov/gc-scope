@@ -73,14 +73,6 @@ pub enum Command {
         #[arg(short = 'C', long)]
         no_cmdline: bool,
     },
-    /// Generate SVG diagram of Python runtime memory layout
-    Diagram {
-        #[arg(allow_hyphen_values = true)]
-        pid: i32,
-        /// Output SVG file path (default: diagram.svg)
-        #[arg(short, long, default_value = "diagram.svg")]
-        output: String,
-    },
     /// Live TUI diagram of Python runtime memory layout
     Tui {
         /// PID (0 = show interactive process list)

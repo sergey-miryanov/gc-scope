@@ -77,11 +77,6 @@ fn main() -> Result<()> {
                 list_pids::print_process_table(&processes, no_cmdline);
             }
         }
-        Command::Diagram { pid, output } => {
-            let pid = resolve_pid(pid);
-            let path = std::path::Path::new(&output);
-            diagram::run(pid, path)?;
-        }
         Command::Tui { pid, rate, duration, glitch } => {
             let dur = if duration > 0 { Some(duration) } else { None };
             let pid_opt = if pid == 0 { None } else { Some(resolve_pid(pid)) };

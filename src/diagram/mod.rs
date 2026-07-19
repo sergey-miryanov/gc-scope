@@ -5,7 +5,6 @@ pub mod render;
 pub mod tui_v2;
 
 use anyhow::Result;
-use std::path::Path;
 
 use collect::{avg_collection_time_per_gen, collections_rate_from_slots};
 use crate::remote_debugging::session::PySession;
@@ -19,14 +18,6 @@ fn fmt_duration_ns(d: std::time::Duration) -> String {
     } else {
         format!("{:.0}ns", ns)
     }
-}
-
-pub fn run(pid: u32, output: &Path) -> Result<()> {
-    let session = PySession::attach(pid)?;
-    let data = collect::collect_data(&session)?;
-    render::render_svg(&data, output)?;
-    println!("Diagram saved to {}", output.display());
-    Ok(())
 }
 
 pub fn run_ascii(pid: u32) -> Result<()> {
