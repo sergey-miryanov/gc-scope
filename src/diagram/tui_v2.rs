@@ -899,18 +899,24 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [f64; 3], avg_coll_time_
     )))));
     lines.push(Line::from(Span::raw(top())));
 
-    let item_size = if gc.stats_size > 24 && gc.stats_size < 10000 {
-        ((gc.stats_size - 24) / 17) as usize
-    } else {
-        gc.raw_stats_bytes.len().min(64)
-    };
+    // Version-correct geometry/layout for this build (IO-free): drives the per-slot size,
+    // the per-generation slot counts, and the slot-items field list below.
+    let offset_table = data.offsets.to_offset_table(data.pid, data.runtime_addr);
+    let item_size = if gc.item_size > 0 { gc.item_size } else { gc.raw_stats_bytes.len().min(64) };
+    // Per-generation slot counts come from the collected snapshot (version/layout-derived,
+    // FT-correct) rather than a GIL-assuming literal or a per-frame tally.
+    let slots_per_gen = gc.slots_per_gen;
+    // Version-correct per-slot field layout (name → offset): drives both the hex-dump
+    // highlights and the slot-items table. Using it (not the fixed ring layout) keeps the
+    // 3.13/3.14 inline slots — collections@0/collected@8 — highlighted at the right bytes.
+    let slot_fields: &[(&str, usize)] = offset_table.gc_layout.map(|l| l.fields).unwrap_or(&[]);
 
     // ── Left panel ──
     let mut left: Vec<String> = Vec::new();
     let gen_names = [
-        ("Gen 0 (Young) - 11 slots", rate_per_gen[0], avg_coll_time_per_gen[0]),
-        ("Gen 1 (Middle) - 3 slots", rate_per_gen[1], avg_coll_time_per_gen[1]),
-        ("Gen 2 (Oldest) - 3 slots", rate_per_gen[2], avg_coll_time_per_gen[2]),
+        (format!("Gen 0 (Young) - {} slots", slots_per_gen[0]), rate_per_gen[0], avg_coll_time_per_gen[0]),
+        (format!("Gen 1 (Middle) - {} slots", slots_per_gen[1]), rate_per_gen[1], avg_coll_time_per_gen[1]),
+        (format!("Gen 2 (Oldest) - {} slots", slots_per_gen[2]), rate_per_gen[2], avg_coll_time_per_gen[2]),
     ];
     for (name, rate, avg_coll) in &gen_names {
         let rate_str = fmt_rate(*rate);
@@ -947,17 +953,6 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [f64; 3], avg_coll_time_
     let slot_bytes = &gc.raw_stats_bytes[slot_raw_start..slot_raw_end];
     let display_bytes = slot_bytes.len();
 
-    let slot_field_names = [
-        "ts_start",
-        "ts_stop",
-        "collections",
-        "collected",
-        "uncollectable",
-        "candidates",
-        "duration",
-        "heap_size",
-    ];
-
     let mut right_items: Vec<Vec<Span<'static>>> = Vec::new();
     // Header
     right_items.push(vec![Span::raw(format!(
@@ -966,8 +961,11 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [f64; 3], avg_coll_time_
         pr = PR
     ))]);
 
-    // Hex dump of selected slot bytes with offset_of!-based highlights
-    let slot_highlight_regions = data.offsets.gc_slot_highlight_regions();
+    // Hex dump of selected slot bytes, highlighting each present, colored field at its real
+    // per-version offset (from `slot_fields`). Deriving from the actual layout keeps the
+    // 3.13/3.14 inline slots (collections@0, collected@8) from being painted at the ring
+    // offsets (16/24). Fields without a color entry (uncollectable, candidates, the `+inc`
+    // extras) are left unhighlighted, as before.
     let slot_label_colors: std::collections::HashMap<&str, Color> = [
         ("ts_start", Color::Blue),
         ("ts_stop", Color::Blue),
@@ -976,10 +974,9 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [f64; 3], avg_coll_time_
         ("duration", Color::Yellow),
         ("heap_size", Color::Cyan),
     ].into_iter().collect();
-    let adjusted_highlights: Vec<(usize, u8, Color)> = slot_highlight_regions.iter()
-        .map(|&(off, len, label)| {
-            let c = slot_label_colors.get(label).copied().unwrap_or(Color::White);
-            (off + slot.byte_offset, len, c)
+    let adjusted_highlights: Vec<(usize, u8, Color)> = slot_fields.iter()
+        .filter_map(|&(name, off)| {
+            slot_label_colors.get(name).map(|&c| (off + slot.byte_offset, 8u8, c))
         })
         .collect();
     let hex_rows = hex_dump_rows(slot_bytes, display_bytes, &adjusted_highlights, slot.byte_offset);
@@ -1001,16 +998,22 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [f64; 3], avg_coll_time_
     ))]);
     right_items.push(vec![Span::raw(format!("  +{}+", "-".repeat(dashes)))]);
 
-    for (i, name) in slot_field_names.iter().enumerate() {
-        let offset = i * 8;
+    // Width the name column to the widest field this build actually has, so the `@ +offset`
+    // and value columns stay aligned even for the long `+inc` names (e.g.
+    // `ts_handle_weakref_callbacks_start`). Floored at 15 so short-field builds are unchanged.
+    let name_w = slot_fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(15);
+
+    for (name, offset) in slot_fields {
+        let offset = *offset;
         if offset + 8 > slot_bytes.len() {
-            break;
+            continue;
         }
-        let val = u64::from_le_bytes(slot_bytes[offset..offset + 8].try_into().unwrap());
+        let raw = &slot_bytes[offset..offset + 8];
+        let val = u64::from_le_bytes(raw.try_into().unwrap());
         let val_fmt = if *name == "duration" {
-            let d = f64::from_le_bytes(slot_bytes[offset..offset + 8].try_into().unwrap());
+            let d = f64::from_le_bytes(raw.try_into().unwrap());
             format!("{:.6}", d)
-        } else if *name == "ts_start" || *name == "ts_stop" {
+        } else if name.starts_with("ts_") {
             fmt_thousands(val)
         } else if val > 0xFFFF_FFFF {
             format!("{:#x}", val)
@@ -1018,7 +1021,7 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [f64; 3], avg_coll_time_
             format!("{}", val)
         };
 
-        let content = format!("  {:<15} @ +{:<4}  {}", name, offset, val_fmt);
+        let content = format!("  {:<name_w$} @ +{:<4}  {}", name, offset, val_fmt, name_w = name_w);
         let name_str: &str = name;
         let color = slot_label_colors.get(name_str).copied();
 

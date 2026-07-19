@@ -464,20 +464,6 @@ impl VersionedOffsets {
     }
 }
 
-/// Mirrors the C `_Py_GC_GenerationStats` struct layout.
-/// All fields are pub so external code can use `offset_of!`.
-#[repr(C)]
-pub struct GcGenerationStatsSlot {
-    pub ts_start: u64,
-    pub ts_stop: u64,
-    pub collections: u64,
-    pub collected: u64,
-    pub uncollectable: u64,
-    pub candidates: u64,
-    pub duration: f64,
-    pub heap_size: u64,
-}
-
 /// Configure an `OffsetTable` for an inline-array GC stats layout (3.13.x, 3.14.4):
 /// one slot per generation, laid out contiguously at a fixed offset from the gc state.
 fn set_inline(
@@ -604,21 +590,6 @@ impl VersionedOffsets {
         }
 
         table
-    }
-
-    /// Returns slot-relative (offset, size, label) for highlighted GC generation stats fields.
-    /// Skips `uncollectable` and `candidates` per user preference.
-    pub fn gc_slot_highlight_regions(&self) -> Vec<(usize, u8, &'static str)> {
-        use std::mem::{offset_of, size_of};
-        type S = GcGenerationStatsSlot;
-        vec![
-            (offset_of!(S, ts_start), size_of::<u64>() as u8, "ts_start"),
-            (offset_of!(S, ts_stop), size_of::<u64>() as u8, "ts_stop"),
-            (offset_of!(S, collections), size_of::<u64>() as u8, "collections"),
-            (offset_of!(S, collected), size_of::<u64>() as u8, "collected"),
-            (offset_of!(S, duration), size_of::<f64>() as u8, "duration"),
-            (offset_of!(S, heap_size), size_of::<u64>() as u8, "heap_size"),
-        ]
     }
 }
 

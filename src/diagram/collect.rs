@@ -1,14 +1,9 @@
 #![allow(dead_code)]
 
-use std::mem::offset_of;
 use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crate::{memory::reader, memory::process, remote_debugging::offsets};
 use crate::remote_debugging::version::PythonVersion;
-use crate::remote_debugging::offsets::GcGenerationStatsSlot;
-
-const YOUNG_COUNT: usize = 11;
-const OLD_COUNT: usize = 3;
 
 fn read_u64(pid: u32, addr: u64) -> Result<u64> {
     let bytes = reader::read_memory(pid, addr, 8)?;
@@ -39,6 +34,13 @@ pub struct GcSlot {
 pub struct GcStatsSnapshot {
     pub stats_addr: u64,
     pub stats_size: u64,
+    /// Authoritative per-slot size from the version's `gc_layout` (not re-derived from a
+    /// magic `stats_size` formula) — 24 for inline 3.13/3.14, the ring struct size for 3.15+.
+    pub item_size: usize,
+    /// Per-generation slot counts from the version's layout (`offset_table.gc_slots_per_gen`):
+    /// `[1, 1, 1]` for inline 3.13/3.14 and free-threaded rings, `[11, 3, 3]` for GIL rings.
+    /// Captured here so renderers read it rather than assuming a GIL layout.
+    pub slots_per_gen: [u64; 3],
     pub raw_stats_bytes: Vec<u8>,
     pub slots: Vec<GcSlot>,
 }
@@ -110,18 +112,35 @@ pub fn collect_data(pid: u32, version: &PythonVersion) -> Result<CollectedData> 
     let gc_raw = reader::read_memory(pid, head_addr + gc_offset, gc_size as usize)
         .context("Failed to read GC state")?;
 
-    let gen_stats_field_off = off.gc_generation_stats();
-    let gen_stats_size = off.gc_generation_stats_size();
-    // The generation_stats pointer is at gc_addr + gen_stats_field_off
-    // where gen_stats_field_off is an offset WITHIN the GC sub-struct
-    // (not an offset within _PyRuntime)
-    let stats_ptr = read_u64(pid, head_addr + gc_offset + gen_stats_field_off)
-        .context("Failed to read generation_stats pointer")?;
+    // Resolve the GC generation-stats region by its version-specific shape — same logic as
+    // `gc_stats.rs::read_gc_stats`. 3.13/3.14 (`InlineArray`) store the stats inline in
+    // `_gc_runtime_state` at a fixed offset (no pointer, and `gc.generation_stats*` = 0);
+    // 3.15+ (`RingBuffer`) reach a ring buffer through the `gc.generation_stats` pointer.
+    let offset_table = off.to_offset_table(pid, runtime_addr);
+    let item_size = offset_table.gc_item_size.unwrap_or(0) as usize;
+    let slots_per_gen = offset_table.gc_slots_per_gen.unwrap_or([0, 0, 0]);
+    let (stats_addr, stats_total) = match offset_table.gc_stats_kind {
+        offsets::offset_table::GcStatsKind::None => (0u64, 0usize),
+        offsets::offset_table::GcStatsKind::InlineArray => {
+            let addr = head_addr + gc_offset + offset_table.gc_stats_inline_off;
+            (addr, gc_stats_total_bytes(&offset_table))
+        }
+        offsets::offset_table::GcStatsKind::RingBuffer => {
+            let gen_stats_field_off = off.gc_generation_stats();
+            let ptr = if gen_stats_field_off == 0 {
+                0
+            } else {
+                read_u64(pid, head_addr + gc_offset + gen_stats_field_off)
+                    .context("Failed to read generation_stats pointer")?
+            };
+            (ptr, off.gc_generation_stats_size() as usize)
+        }
+    };
 
-    let (raw_stats_bytes, slots) = if stats_ptr != 0 {
-        let raw = reader::read_memory(pid, stats_ptr, gen_stats_size as usize)
+    let (raw_stats_bytes, slots) = if stats_addr != 0 && stats_total > 0 {
+        let raw = reader::read_memory(pid, stats_addr, stats_total)
             .context("Failed to read GC stats buffer")?;
-        let parsed = parse_gc_slots(&raw, gen_stats_size);
+        let parsed = parse_gc_slots(&raw, &offset_table);
         (raw, parsed)
     } else {
         (Vec::new(), Vec::new())
@@ -130,8 +149,10 @@ pub fn collect_data(pid: u32, version: &PythonVersion) -> Result<CollectedData> 
     let gc = GcSubState {
         raw_bytes: gc_raw,
         generation_stats: GcStatsSnapshot {
-            stats_addr: stats_ptr,
-            stats_size: gen_stats_size,
+            stats_addr,
+            stats_size: stats_total as u64,
+            item_size,
+            slots_per_gen,
             raw_stats_bytes,
             slots,
         },
@@ -178,64 +199,75 @@ impl CollectedData {
     }
 }
 
-// ── GC slot parsing (same logic as gc_stats.rs) ────────────────
-fn parse_gc_slots(raw: &[u8], gen_stats_size: u64) -> Vec<GcSlot> {
-    if raw.is_empty() || gen_stats_size < 64 {
-        return Vec::new();
+// ── GC slot parsing ────────────────────────────────────────────
+/// Total bytes of the (inline) generation-stats region: `bases[last] + slots[last] *
+/// item_size`. Used only for the `InlineArray` kind (ring buffers use the process-reported
+/// `generation_stats_size` directly).
+fn gc_stats_total_bytes(table: &offsets::offset_table::OffsetTable) -> usize {
+    match (table.gc_item_size, table.gc_gen_base_offsets, table.gc_slots_per_gen) {
+        (Some(item), Some(bases), Some(slots)) => (bases[2] + slots[2] * item) as usize,
+        _ => 0,
     }
+}
 
-    let size = gen_stats_size as usize;
-    let item_size = (size - 24) / 17;
-    if item_size < 64 {
+/// Parse GC slots from the raw region using the version's geometry (per-gen slot counts,
+/// gen base offsets, per-slot item size) and per-slot field layout — the same source
+/// `offset_table::read_gc_stats` uses. This handles both inline (3.13/3.14: 1 slot/gen,
+/// 3 fields) and ring-buffer (3.15+: 11/3/3 slots, many fields) layouts uniformly.
+fn parse_gc_slots(raw: &[u8], table: &offsets::offset_table::OffsetTable) -> Vec<GcSlot> {
+    let (Some(item_size), Some(slots_per_gen), Some(bases), Some(layout)) = (
+        table.gc_item_size.map(|v| v as usize),
+        table.gc_slots_per_gen,
+        table.gc_gen_base_offsets,
+        table.gc_layout,
+    ) else {
+        return Vec::new();
+    };
+    if raw.is_empty() || item_size == 0 {
         return Vec::new();
     }
 
     let mut slots = Vec::new();
-
-    for i in 0..YOUNG_COUNT {
-        let offset = i * item_size;
-        if offset + item_size > size { break; }
-        if let Some(s) = parse_slot(&raw[offset..], 0, i, offset) {
-            slots.push(s);
+    for gen_idx in 0..3u32 {
+        let n = slots_per_gen[gen_idx as usize] as usize;
+        let base = bases[gen_idx as usize] as usize;
+        for slot in 0..n {
+            let offset = base + slot * item_size;
+            if offset + item_size > raw.len() { break; }
+            if let Some(s) = parse_slot(&raw[offset..offset + item_size], gen_idx, slot, offset, layout) {
+                slots.push(s);
+            }
         }
     }
-
-    let old0_base = YOUNG_COUNT * item_size + 8;
-    for i in 0..OLD_COUNT {
-        let offset = old0_base + i * item_size;
-        if offset + item_size > size { break; }
-        if let Some(s) = parse_slot(&raw[offset..], 1, i, offset) {
-            slots.push(s);
-        }
-    }
-
-    let old1_base = old0_base + OLD_COUNT * item_size + 8;
-    for i in 0..OLD_COUNT {
-        let offset = old1_base + i * item_size;
-        if offset + item_size > size { break; }
-        if let Some(s) = parse_slot(&raw[offset..], 2, i, offset) {
-            slots.push(s);
-        }
-    }
-
     slots
 }
 
-fn parse_slot(bytes: &[u8], generation: u32, slot: usize, byte_offset: usize) -> Option<GcSlot> {
-    type S = GcGenerationStatsSlot;
+fn parse_slot(
+    bytes: &[u8],
+    generation: u32,
+    slot: usize,
+    byte_offset: usize,
+    layout: &offsets::offset_table::GcItemLayout,
+) -> Option<GcSlot> {
+    let rdi = |name: &str| -> i64 {
+        layout.field_offset(name)
+            .filter(|&o| o + 8 <= bytes.len())
+            .map(|o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap()))
+            .unwrap_or(0)
+    };
+    let rdf = |name: &str| -> f64 {
+        layout.field_offset(name)
+            .filter(|&o| o + 8 <= bytes.len())
+            .map(|o| f64::from_le_bytes(bytes[o..o + 8].try_into().unwrap()))
+            .unwrap_or(0.0)
+    };
 
-    fn rdi(off: usize, b: &[u8]) -> i64 {
-        i64::from_le_bytes(b[off..off + 8].try_into().unwrap())
-    }
-    fn rdf(off: usize, b: &[u8]) -> f64 {
-        f64::from_le_bytes(b[off..off + 8].try_into().unwrap())
-    }
-
-    let stop_ts = rdi(offset_of!(S, ts_stop), bytes);
-    let start_ts = rdi(offset_of!(S, ts_start), bytes);
-    // Skip torn entries: if the ring buffer was being written concurrently,
-    // stop_ts may be stale and less than start_ts.
-    if stop_ts < start_ts {
+    let start_ts = rdi("ts_start");
+    let stop_ts = rdi("ts_stop");
+    // Ring-buffer slots carry timestamps: skip torn entries (a concurrent write left
+    // stop_ts stale and below start_ts). Inline layouts (3.13/3.14) have no timestamps —
+    // both read as 0, so the check is a no-op and every slot is kept.
+    if layout.has_field("ts_start") && layout.has_field("ts_stop") && stop_ts < start_ts {
         return None;
     }
 
@@ -245,12 +277,12 @@ fn parse_slot(bytes: &[u8], generation: u32, slot: usize, byte_offset: usize) ->
         byte_offset,
         start_ts,
         stop_ts,
-        collections: rdi(offset_of!(S, collections), bytes),
-        collected: rdi(offset_of!(S, collected), bytes),
-        uncollectable: rdi(offset_of!(S, uncollectable), bytes),
-        candidates: rdi(offset_of!(S, candidates), bytes),
-        duration: rdf(offset_of!(S, duration), bytes),
-        heap_size: rdi(offset_of!(S, heap_size), bytes),
+        collections: rdi("collections"),
+        collected: rdi("collected"),
+        uncollectable: rdi("uncollectable"),
+        candidates: rdi("candidates"),
+        duration: rdf("duration"),
+        heap_size: rdi("heap_size"),
     })
 }
 

@@ -272,16 +272,18 @@ fn render_gc_stats(mut s: String, data: &CollectedData, rate_per_gen: [f64; 3], 
         return s;
     }
 
-    let item_size = if gc.stats_size > 24 && gc.stats_size < 10000 {
-        ((gc.stats_size - 24) / 17) as usize
-    } else {
-        gc.raw_stats_bytes.len().min(64)
-    };
+    // Version-correct geometry/layout for this build (IO-free): drives the per-slot size,
+    // the per-generation slot counts, and the slot-items field list below.
+    let offset_table = data.offsets.to_offset_table(data.pid, data.runtime_addr);
+    let item_size = if gc.item_size > 0 { gc.item_size } else { gc.raw_stats_bytes.len().min(64) };
+    // Per-generation slot counts come from the collected snapshot (version/layout-derived,
+    // FT-correct) rather than a GIL-assuming literal or a per-frame tally.
+    let slots_per_gen = gc.slots_per_gen;
 
     let gen_names = [
-        ("Gen 0 (Young) - 11 slots", rate_per_gen[0], avg_coll_time_per_gen[0]),
-        ("Gen 1 (Middle) - 3 slots", rate_per_gen[1], avg_coll_time_per_gen[1]),
-        ("Gen 2 (Oldest) - 3 slots", rate_per_gen[2], avg_coll_time_per_gen[2]),
+        (format!("Gen 0 (Young) - {} slots", slots_per_gen[0]), rate_per_gen[0], avg_coll_time_per_gen[0]),
+        (format!("Gen 1 (Middle) - {} slots", slots_per_gen[1]), rate_per_gen[1], avg_coll_time_per_gen[1]),
+        (format!("Gen 2 (Oldest) - {} slots", slots_per_gen[2]), rate_per_gen[2], avg_coll_time_per_gen[2]),
     ];
     for (name, rate, avg_coll) in &gen_names {
         let rate_str = fmt_rate(*rate);
@@ -305,8 +307,11 @@ fn render_gc_stats(mut s: String, data: &CollectedData, rate_per_gen: [f64; 3], 
 
     // right panel: hex dump of first slot
     let display_bytes = item_size.min(gc.raw_stats_bytes.len());
-    let slot_field_names = ["ts_start", "ts_stop", "collections", "collected",
-                            "uncollectable", "candidates", "duration", "heap_size"];
+    // Drive the slot-items table from the version's actual per-slot layout rather than a
+    // hardcoded 8-name list: the `+inc` build's slot has 26 fields (extra size/count/timing
+    // fields appended after `heap_size`), and only `gc_layout.fields` reflects that. Same
+    // `offset_table` computed above.
+    let slot_fields: &[(&str, usize)] = offset_table.gc_layout.map(|l| l.fields).unwrap_or(&[]);
     right_lines.push(format!("{:<pr$}", format!("First slot of stats buffer (~{} bytes/slot):", item_size), pr = PR));
     for chunk in gc.raw_stats_bytes[..gc.raw_stats_bytes.len().min(display_bytes)].chunks(16) {
         let base = chunk.as_ptr() as usize - gc.raw_stats_bytes.as_ptr() as usize;
@@ -327,15 +332,19 @@ fn render_gc_stats(mut s: String, data: &CollectedData, rate_per_gen: [f64; 3], 
     right_lines.push(format!("  | {:<tw$} |",
         format!("GC Generation Stats Slot 1 @ {:#x}", gc.stats_addr), tw = tw));
     right_lines.push(format!("  +{}+", "-".repeat(dashes)));
+    // Width the name column to the widest field this build actually has, so the `@ +offset`
+    // and value columns stay aligned even for the long `+inc` names (e.g.
+    // `ts_handle_weakref_callbacks_start`). Floored at 15 so short-field builds are unchanged.
+    let name_w = slot_fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(15);
     let raw = &gc.raw_stats_bytes;
-    for (i, name) in slot_field_names.iter().enumerate() {
-        let offset = i * 8;
-        if offset + 8 > raw.len() || offset >= display_bytes { break; }
+    for (name, offset) in slot_fields {
+        let offset = *offset;
+        if offset + 8 > raw.len() || offset >= display_bytes { continue; }
         let val = u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap());
         let fmt = if *name == "duration" {
             let d = f64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap());
             format!("{:.6}", d)
-        } else if *name == "ts_start" || *name == "ts_stop" {
+        } else if name.starts_with("ts_") {
             fmt_thousands(val)
         } else if val > 0xFFFF_FFFF {
             format!("{:#x}", val)
@@ -343,7 +352,7 @@ fn render_gc_stats(mut s: String, data: &CollectedData, rate_per_gen: [f64; 3], 
             format!("{}", val)
         };
         right_lines.push(format!("  | {:<tw$} |",
-            format!("  {:<15} @ +{:<4}  {}", name, offset, fmt), tw = tw));
+            format!("  {:<name_w$} @ +{:<4}  {}", name, offset, fmt, name_w = name_w), tw = tw));
     }
     right_lines.push(format!("  +{}+", "-".repeat(dashes)));
 
