@@ -694,7 +694,10 @@ fn section_interpreter(data: &CollectedData) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let interp = &data.interpreter;
     let off = &data.offsets;
-    let hex_end = interp.gc.raw_bytes.len().min(128 + 64);
+    // Show the whole GC state struct (raw_bytes is read to exactly gc.size bytes), so the
+    // dump matches the "GC struct (N bytes)" header. A fixed cap truncated larger structs
+    // like the +inc build's 232-byte state.
+    let hex_end = interp.gc.raw_bytes.len();
 
     lines.push(Line::from(Span::raw(top())));
     lines.push(Line::from(Span::raw(l(&format!(

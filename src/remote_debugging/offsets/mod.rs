@@ -431,25 +431,31 @@ impl VersionedOffsets {
     }
 
     pub fn debug_offsets_highlight_regions(&self) -> Vec<(usize, u8, &'static str, usize)> {
-        // Use any of the 3.15+ struct types for compile-time offset calculations;
-        // the actual in-memory layout is the same for the struct fields we access.
+        // `cookie`/`interpreters_head`/`next` sit in early sub-structs whose positions
+        // are stable across every supported bindgen version (3.13→3.16), so a pinned
+        // 3.15 type computes them correctly.
         type DO = v_3_15_0b1::_Py_DebugOffsets;
         type RS = v_3_15_0b1::_Py_DebugOffsets__runtime_state;
         type IS = v_3_15_0b1::_Py_DebugOffsets__interpreter_state;
-        type GC = v_3_15_0b1::_Py_DebugOffsets__gc;
 
         let head_off = std::mem::offset_of!(DO, runtime_state)
             + std::mem::offset_of!(RS, interpreters_head);
         let next_off = std::mem::offset_of!(DO, interpreter_state)
             + std::mem::offset_of!(IS, next);
-        let gc_off = std::mem::offset_of!(DO, gc);
-        let gc_sz = std::mem::size_of::<GC>();
+
+        // The `gc` sub-struct moves every version (568/648/704/744) and is shorter on
+        // 3.13/3.14, so derive its span from the version-correct `gc_debug_fields()`
+        // rather than a pinned type: first field (`size`) to end of the last present one.
+        let gc_fields = self.gc_debug_fields();
+        let gc_off = gc_fields.first().map(|&(_, o)| o as usize).unwrap_or(0);
+        let gc_end = gc_fields.last().map(|&(_, o)| o as usize + 8).unwrap_or(gc_off);
+        let gc_sz = (gc_end - gc_off) as u8; // 16 on 3.13/3.14, 40 on 3.15+
 
         vec![
             (0, 8, "cookie[8]", 1),
             (head_off, 8, "interpreters_head", 2),
             (next_off, 8, "next", 2),
-            (gc_off, gc_sz as u8, "gc", 2),
+            (gc_off, gc_sz, "gc", 2),
         ]
     }
 

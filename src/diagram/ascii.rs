@@ -165,7 +165,10 @@ fn derived_val(label: &str, gs_size: u64, gs: (u64, u64, u64, u64, u64, u64, u64
 fn render_interpreter(mut s: String, data: &CollectedData) -> String {
     let interp = &data.interpreter;
     let off = &data.offsets;
-    let hex_end = interp.gc.raw_bytes.len().min(128 + 64);
+    // Show the whole GC state struct (raw_bytes is read to exactly gc.size bytes), so the
+    // dump matches the "GC struct (N bytes)" header. A fixed cap truncated larger structs
+    // like the +inc build's 232-byte state.
+    let hex_end = interp.gc.raw_bytes.len();
 
     let mut left_lines: Vec<String> = Vec::new();
     left_lines.push(format!("{:<pl$}", "Key offset values stored in _Py_DebugOffsets:", pl = PL));
