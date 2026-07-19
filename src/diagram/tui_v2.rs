@@ -750,20 +750,30 @@ fn section_interpreter(data: &CollectedData) -> Vec<Line<'static>> {
     )));
     left_items.push(LeftItem::Plain(format!("  +{}+", "-".repeat(INNER_W))));
 
+    // The descriptor `gc` sub-struct is append-only and shorter on older builds (2 fields on
+    // 3.13/3.14, all 5 on 3.15+), so list only the fields this version actually publishes —
+    // otherwise absent fields render as phantom `@ gc+0` / NULL rows. `gc_debug_fields()` is
+    // the same version-correct source Section 1 uses.
+    let present: Vec<&'static str> = off.gc_debug_fields().into_iter().map(|(n, _)| n).collect();
+
     let collecting_off = off.gc_collecting() as usize;
     let collecting_val = interp.gc.raw_bytes.get(collecting_off).copied().unwrap_or(0);
-    left_items.push(LeftItem::Plain(format!(
-        "  | {:<tw$} |",
-        format!("  {:<15} (store)    {}", "size", interp.gc_size),
-        tw = INNER_TW
-    )));
-    left_items.push(LeftItem::Styled(
-        format!(
-            "  {:<15} @ gc+{:<4}  {}",
-            "collecting", collecting_off, collecting_val
-        ),
-        Color::Yellow,
-    ));
+    if present.contains(&"size") {
+        left_items.push(LeftItem::Plain(format!(
+            "  | {:<tw$} |",
+            format!("  {:<15} (store)    {}", "size", interp.gc_size),
+            tw = INNER_TW
+        )));
+    }
+    if present.contains(&"collecting") {
+        left_items.push(LeftItem::Styled(
+            format!(
+                "  {:<15} @ gc+{:<4}  {}",
+                "collecting", collecting_off, collecting_val
+            ),
+            Color::Yellow,
+        ));
+    }
 
     let frame_off = off.gc_frame() as usize;
     let frame_val = if frame_off + 8 <= interp.gc.raw_bytes.len() {
@@ -771,23 +781,27 @@ fn section_interpreter(data: &CollectedData) -> Vec<Line<'static>> {
     } else {
         0
     };
-    left_items.push(LeftItem::Styled(
-        format!(
-            "  {:<15} @ gc+{:<4}  {:#x}",
-            "frame", frame_off, frame_val
-        ),
-        Color::Cyan,
-    ));
+    if present.contains(&"frame") {
+        left_items.push(LeftItem::Styled(
+            format!(
+                "  {:<15} @ gc+{:<4}  {:#x}",
+                "frame", frame_off, frame_val
+            ),
+            Color::Cyan,
+        ));
+    }
 
-    left_items.push(LeftItem::Plain(format!(
-        "  | {:<tw$} |",
-        format!(
-            "  {:<15} (store)    {}",
-            "gen_stats_size",
-            off.gc_generation_stats_size()
-        ),
-        tw = INNER_TW
-    )));
+    if present.contains(&"generation_stats_size") {
+        left_items.push(LeftItem::Plain(format!(
+            "  | {:<tw$} |",
+            format!(
+                "  {:<15} (store)    {}",
+                "gen_stats_size",
+                off.gc_generation_stats_size()
+            ),
+            tw = INNER_TW
+        )));
+    }
 
     let gen_stats_off = off.gc_generation_stats() as usize;
     let gen_stats_ptr = if gen_stats_off + 8 <= interp.gc.raw_bytes.len() {
@@ -800,23 +814,36 @@ fn section_interpreter(data: &CollectedData) -> Vec<Line<'static>> {
     } else {
         "NULL".into()
     };
-    left_items.push(LeftItem::Plain(format!(
-        "  | {:<tw$} |",
-        format!("  {:<15} @ gc+{:<4}  {}", "gen_stats", gen_stats_off, ptr_str),
-        tw = INNER_TW
-    )));
+    if present.contains(&"generation_stats") {
+        left_items.push(LeftItem::Plain(format!(
+            "  | {:<tw$} |",
+            format!("  {:<15} @ gc+{:<4}  {}", "gen_stats", gen_stats_off, ptr_str),
+            tw = INNER_TW
+        )));
+    }
     left_items.push(LeftItem::Plain(format!("  +{}+", "-".repeat(INNER_W))));
 
     // ── Right panel: hex dump ──
     let right_header = format!("{:<pr$}", format!("GC struct ({} bytes) hex dump:", interp.gc_size), pr = PR);
 
-    // GC struct highlights: collecting field (8 bytes) + frame field (8 bytes)
+    // GC struct highlights: collecting field (8 bytes) + frame field (8 bytes). Two separate
+    // gates: the outer one is presence + bounds — it keeps absent fields on 3.13/3.14 (whose
+    // offset accessors return 0, so `frame_val` would read the `size` bytes at offset 0) from
+    // painting a bogus highlight. The inner one is value != 0 — a live signal the GC is
+    // collecting right now, so a region only lights up while it's actually busy.
     let mut gc_highlights: Vec<(usize, u8, Color)> = Vec::new();
+    // Kept as nested ifs (presence/bounds vs. live value) for readability, not collapsed.
+    #[allow(clippy::collapsible_if)]
     if collecting_val != 0 {
-        gc_highlights.push((collecting_off, 8, Color::Yellow));
+        if present.contains(&"collecting") && collecting_off + 8 <= interp.gc.raw_bytes.len() {
+            gc_highlights.push((collecting_off, 8, Color::Yellow));
+        }
     }
+    #[allow(clippy::collapsible_if)]
     if frame_val != 0 {
-        gc_highlights.push((frame_off, 8, Color::Cyan));
+        if present.contains(&"frame") && frame_off + 8 <= interp.gc.raw_bytes.len() {
+            gc_highlights.push((frame_off, 8, Color::Cyan));
+        }
     }
 
     let hex_rows = hex_dump_rows(&interp.gc.raw_bytes, hex_end, &gc_highlights, 0);

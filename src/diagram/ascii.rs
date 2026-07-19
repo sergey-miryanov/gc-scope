@@ -186,27 +186,41 @@ fn render_interpreter(mut s: String, data: &CollectedData) -> String {
     left_lines.push(format!("  | {:<tw$} |", format!("GC State @ {:#x}", gc_addr), tw = inner_w - 2));
     left_lines.push(format!("  +{}+", "-".repeat(inner_w)));
 
+    // The descriptor `gc` sub-struct is append-only and shorter on older builds (2 fields on
+    // 3.13/3.14, all 5 on 3.15+), so list only the fields this version actually publishes —
+    // otherwise absent fields render as phantom `@ gc+0` / NULL rows. `gc_debug_fields()` is
+    // the same version-correct source Section 1 uses.
+    let present: Vec<&'static str> = off.gc_debug_fields().into_iter().map(|(n, _)| n).collect();
+
     // 1. size
-    let line = format!("  {:<15} (store)    {}", "size", interp.gc_size);
-    left_lines.push(format!("  | {:<tw$} |", line, tw = inner_w - 2));
+    if present.contains(&"size") {
+        let line = format!("  {:<15} (store)    {}", "size", interp.gc_size);
+        left_lines.push(format!("  | {:<tw$} |", line, tw = inner_w - 2));
+    }
 
     // 2. collecting
     let collecting_off = off.gc_collecting() as usize;
     let collecting_val = interp.gc.raw_bytes.get(collecting_off).copied().unwrap_or(0);
-    let line = format!("  {:<15} @ gc+{:<4}  {}", "collecting", collecting_off, collecting_val);
-    left_lines.push(format!("  | {:<tw$} |", line, tw = inner_w - 2));
+    if present.contains(&"collecting") {
+        let line = format!("  {:<15} @ gc+{:<4}  {}", "collecting", collecting_off, collecting_val);
+        left_lines.push(format!("  | {:<tw$} |", line, tw = inner_w - 2));
+    }
 
     // 3. frame
     let frame_off = off.gc_frame() as usize;
     let frame_val = if frame_off + 8 <= interp.gc.raw_bytes.len() {
         u64::from_le_bytes(interp.gc.raw_bytes[frame_off..frame_off + 8].try_into().unwrap())
     } else { 0 };
-    let line = format!("  {:<15} @ gc+{:<4}  {:#x}", "frame", frame_off, frame_val);
-    left_lines.push(format!("  | {:<tw$} |", line, tw = inner_w - 2));
+    if present.contains(&"frame") {
+        let line = format!("  {:<15} @ gc+{:<4}  {:#x}", "frame", frame_off, frame_val);
+        left_lines.push(format!("  | {:<tw$} |", line, tw = inner_w - 2));
+    }
 
     // 4. generation_stats_size
-    let line = format!("  {:<15} (store)    {}", "gen_stats_size", off.gc_generation_stats_size());
-    left_lines.push(format!("  | {:<tw$} |", line, tw = inner_w - 2));
+    if present.contains(&"generation_stats_size") {
+        let line = format!("  {:<15} (store)    {}", "gen_stats_size", off.gc_generation_stats_size());
+        left_lines.push(format!("  | {:<tw$} |", line, tw = inner_w - 2));
+    }
 
     // 5. generation_stats
     let gen_stats_off = off.gc_generation_stats() as usize;
@@ -214,8 +228,10 @@ fn render_interpreter(mut s: String, data: &CollectedData) -> String {
         u64::from_le_bytes(interp.gc.raw_bytes[gen_stats_off..gen_stats_off + 8].try_into().unwrap())
     } else { 0 };
     let ptr_str = if gen_stats_ptr != 0 { format!("{:#x}", gen_stats_ptr) } else { "NULL".into() };
-    let line = format!("  {:<15} @ gc+{:<4}  {}", "gen_stats", gen_stats_off, ptr_str);
-    left_lines.push(format!("  | {:<tw$} |", line, tw = inner_w - 2));
+    if present.contains(&"generation_stats") {
+        let line = format!("  {:<15} @ gc+{:<4}  {}", "gen_stats", gen_stats_off, ptr_str);
+        left_lines.push(format!("  | {:<tw$} |", line, tw = inner_w - 2));
+    }
 
     left_lines.push(format!("  +{}+", "-".repeat(inner_w)));
 
