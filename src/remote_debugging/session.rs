@@ -4,11 +4,12 @@
 //! process handle, the `_PyRuntime` address, the Python version, and the offset
 //! layout — and hands out cheap reads through the single held handle. It is the
 //! one "resolve offsets for this PID" facade: every consumer attaches, then
-//! matches on [`Resolved`]/[`Tier`] and degrades uniformly.
+//! matches on [`Resolved`] and degrades uniformly.
 //!
-//! See `docs/pysession-plan.md`. `attach` + reads, the `(exe_path, mtime)`-keyed
-//! layout cache and `revalidate` (§6), plus `gc_stats`/`collect`/`verify`, are
-//! consumed by gc-stats, monitor, the diagram stack, and list-pids.
+//! See `docs/adr/0001-pysession-resolve-once-facade.md`. `attach` + reads, the
+//! `(exe_path, mtime)`-keyed layout cache and `revalidate`, plus
+//! `gc_stats`/`collect`, are consumed by gc-stats, monitor, the diagram stack,
+//! and list-pids.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,7 +30,7 @@ use crate::remote_debugging::version::{self, PythonVersion};
 
 /// Identity of the Python binary a layout was resolved from: its on-disk path
 /// plus mtime. A rebuilt binary (in-place upgrade) gets a new mtime and so a new
-/// cache entry. See `docs/pysession-plan.md` §6.
+/// cache entry. See `docs/adr/0001-pysession-resolve-once-facade.md`.
 type ExeKey = (PathBuf, SystemTime);
 
 /// A resolved layout plus the metadata needed to reuse it safely across PIDs and

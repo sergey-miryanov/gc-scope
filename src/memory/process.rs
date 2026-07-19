@@ -232,7 +232,7 @@ pub fn find_runtime(pid: u32) -> Result<u64> {
 /// Like [`find_runtime`], but also returns the on-disk path of the Python
 /// module (interpreter or libpython) whose `PyRuntime` section validated. That
 /// path — not `argv[0]` — is the correct identity for a layout cache keyed by
-/// binary (see `docs/pysession-plan.md` §6).
+/// binary (see `docs/adr/0001-pysession-resolve-once-facade.md`).
 pub fn find_runtime_module(pid: u32) -> Result<(u64, String)> {
     search_pid_and_children(pid, 0)
 }
