@@ -86,54 +86,15 @@ jobs:
       - name: Build gcscope
         run: cargo build --verbose
 
-      # Same-uid, non-descendant attach needs a permissive ptrace scope. GitHub
-      # runners allow passwordless sudo; best-effort (the job is continue-on-error).
+      # Same-uid, non-descendant attach needs a permissive ptrace scope. Linux-only
+      # by nature (Windows/macOS gate attach differently), and guarded by `runner.os`
+      # so adding OS legs to this matrix stays a one-line change.
       - name: Allow ptrace (best-effort)
+        if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
+      # The whole driver lives in tests/live_smoke.py, not in this step: the same
+      # command has to run on Windows/PowerShell and macOS, and it must be
+      # reproducible by hand off CI. Keep this step a single invocation.
       - name: Attach, detect version, assert non-empty GC stats
-        run: |
-          set -uo pipefail
-          python --version
-          # A spinner that keeps the GC busy so the generation counters advance.
-          python -c '
-          import gc, time
-          while True:
-              [ [0] * 50 for _ in range(2000) ]
-              gc.collect()
-              time.sleep(0.05)
-          ' &
-          PYPID=$!
-          # Give the interpreter a moment to initialize its runtime + run a few GCs.
-          sleep 2
-
-          # find-runtime goes through the same version-aware attach path as gc-stats,
-          # so a failure here localizes the problem to *finding* (e.g. the pre-3.13
-          # symbol lookup) vs. decoding.
-          echo "----- find-runtime -----"
-          if ! ./target/debug/gcscope find-runtime "$PYPID"; then
-            echo "FAIL(py${{ matrix.python }}): could not locate _PyRuntime"
-            kill "$PYPID" 2>/dev/null || true
-            exit 1
-          fi
-
-          # Best-effort version echo for the log (read-runtime uses its own finder,
-          # so don't gate on it — purely informational).
-          echo "----- read-runtime (version, best-effort) -----"
-          ./target/debug/gcscope read-runtime "$PYPID" 2>&1 | head -4 || true
-
-          echo "----- gc-stats -----"
-          OUT="$(./target/debug/gcscope gc-stats "$PYPID" 2>&1)"; RC=$?
-          kill "$PYPID" 2>/dev/null || true
-          echo "$OUT"
-
-          if [ "$RC" -ne 0 ]; then
-            echo "FAIL(py${{ matrix.python }}): gc-stats exited $RC"; exit 1
-          fi
-          if echo "$OUT" | grep -q "No GC stats found."; then
-            echo "FAIL(py${{ matrix.python }}): stats decoded empty"; exit 1
-          fi
-          if ! echo "$OUT" | grep -q "Collections"; then
-            echo "FAIL(py${{ matrix.python }}): no stats table in output"; exit 1
-          fi
-          echo "PASS(py${{ matrix.python }}): attached + detected + decoded non-empty GC stats"
+        run: python tests/live_smoke.py --label py${{ matrix.python }}
