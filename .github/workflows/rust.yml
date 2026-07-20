@@ -83,8 +83,12 @@ jobs:
       fail-fast: false
       matrix:
         # 3.16 omitted: not in the setup-python registry yet.
+        # 3.15t is the one free-threaded leg: it is the only build that reaches the
+        # free-threaded ring geometry (1/1/1 slots per generation instead of 11/3/3),
+        # which every GIL leg leaves unexercised. The other `t` variants would add no
+        # new path — below 3.15 the layout is inline, where the GIL flag is irrelevant.
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
+        python: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14', '3.15', '3.15t']
         # macOS only: 3.13+ ships com.apple.security.get-task-allow (PEP 768) so it
         # attaches unprivileged; 3.8-3.12 does not and needs root. Flagged per
         # version here because GitHub expressions cannot compare versions.
