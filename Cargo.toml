@@ -17,5 +17,3 @@ sysinfo = "0.33"
 
 [dev-dependencies]
 goblin = "0.10.7"
-bindgen-cli = "0.72"
-
