@@ -139,3 +139,61 @@ pub fn gen_stats_layout(gen_stats_size: u64) -> (u64, u64, u64, u64, u64, u64, u
     let index2_off = old1_off + old_bytes;
     (item_size, young_bytes, old_bytes, index0_off, index1_off, index2_off, old0_off)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every layout shares the fixed 0..88 prefix, and the `gc` sub-struct's own
+    /// fields are appended at depth 3. Without a `generation_stats` field (inline
+    /// 3.13/3.14) there is no ring subtree.
+    #[test]
+    fn tree_has_the_fixed_prefix_and_no_ring_subtree_without_generation_stats() {
+        let tree = debug_offsets_tree(&[("size", 96), ("collecting", 104)], None);
+        assert_eq!(tree[0].label, "_Py_DebugOffsets");
+        assert!(tree.iter().any(|e| e.label == "cookie[8]"));
+        assert!(tree.iter().any(|e| e.label == "gc" && e.depth == 2));
+        assert!(tree.iter().any(|e| e.label == "size" && e.depth == 3));
+        assert!(tree.iter().any(|e| e.label == "collecting" && e.depth == 3));
+        assert!(!tree.iter().any(|e| e.label == "young_slots (11)"));
+    }
+
+    /// A `generation_stats` field (ring builds) grows the derived per-generation
+    /// slot subtree, and the resolved slot fields nest under it at depth 6.
+    #[test]
+    fn tree_adds_the_ring_subtree_when_generation_stats_is_present() {
+        let gc_fields = [("size", 96u64), ("collecting", 104), ("generation_stats", 112)];
+        let slot_fields = [("ts_start", 0usize), ("collections", 8)];
+        let tree = debug_offsets_tree(&gc_fields, Some(&slot_fields));
+        assert!(tree.iter().any(|e| e.label == "young_slots (11)" && e.depth == 4));
+        assert!(tree.iter().any(|e| e.label == "old0_slots (3)"));
+        assert!(tree.iter().any(|e| e.label == "ts_start" && e.depth == 6));
+        assert!(tree.iter().any(|e| e.label == "collections" && e.depth == 6));
+    }
+
+    /// Characterization guard: `tree_prefixes` documents a "\-- " last-child
+    /// connector it has never actually emitted — every connector is "+-- ". Lock the
+    /// shipping behavior so changing it (the note calls it the presumable intent) is a
+    /// deliberate, reviewed change that updates this test on purpose.
+    #[test]
+    fn tree_prefixes_always_use_the_plus_connector_never_the_last_child_form() {
+        let tree = debug_offsets_tree(&[("size", 96), ("collecting", 104)], None);
+        let prefixes = tree_prefixes(&tree);
+        assert_eq!(prefixes[0], "", "the root entry has no connector");
+        for (e, p) in tree.iter().zip(&prefixes).skip(1) {
+            assert!(p.ends_with("+-- "), "depth {} prefix was {p:?}", e.depth);
+            assert!(!p.contains("\\-- "), "last-child connector leaked into {p:?}");
+        }
+    }
+
+    /// The derived slot geometry is `(region_size - 24) / 17` for the item size, with
+    /// 11 young + 3 + 3 old slots and 8-byte index gaps. Below the 24-byte header there
+    /// is no geometry (item size 0).
+    #[test]
+    fn gen_stats_layout_derives_slot_geometry_from_the_region_size() {
+        // item_size 40 → 24 + 17*40 = 704.
+        assert_eq!(gen_stats_layout(704), (40, 440, 120, 440, 568, 696, 448));
+        assert_eq!(gen_stats_layout(0).0, 0);
+        assert_eq!(gen_stats_layout(23).0, 0);
+    }
+}

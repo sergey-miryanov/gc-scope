@@ -252,3 +252,82 @@ fn render_dialog(
 
     frame.render_widget(paragraph, popup_rect);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(pid: u32, is_python: bool, runtime_found: bool, supports_stats: bool) -> FlatRow {
+        FlatRow {
+            pid,
+            name: String::new(),
+            prefix: String::new(),
+            cmdline: String::new(),
+            is_python,
+            version: None,
+            runtime_found,
+            supports_stats,
+        }
+    }
+
+    /// A row is a selectable target only when it is python AND its runtime was found
+    /// AND it decodes GC stats — the three gates the picker skips over.
+    #[test]
+    fn is_supported_requires_all_three_gates() {
+        assert!(is_supported(&row(1, true, true, true)));
+        assert!(!is_supported(&row(1, false, true, true)));
+        assert!(!is_supported(&row(1, true, false, true)));
+        assert!(!is_supported(&row(1, true, true, false)));
+    }
+
+    /// Down-navigation lands on the next supported row, skipping unsupported ones, and
+    /// reports `None` once there are none left (so the cursor can't run off the end).
+    #[test]
+    fn supported_at_or_after_skips_unsupported_rows() {
+        let rows = [
+            row(10, true, true, true),   // 0 supported
+            row(11, true, false, false), // 1
+            row(12, false, false, false),// 2
+            row(13, true, true, true),   // 3 supported
+        ];
+        assert_eq!(supported_at_or_after(&rows, 0), Some(0));
+        assert_eq!(supported_at_or_after(&rows, 1), Some(3), "skips 1 and 2");
+        assert_eq!(supported_at_or_after(&rows, 4), None, "past the end");
+        assert_eq!(supported_at_or_after(&[row(1, false, false, false)], 0), None);
+    }
+
+    /// Up-navigation is the mirror: the nearest supported row at or before the cursor.
+    #[test]
+    fn supported_at_or_before_scans_backwards() {
+        let rows = [
+            row(10, true, true, true),   // 0 supported
+            row(11, true, false, false), // 1
+            row(12, false, false, false),// 2
+            row(13, true, true, true),   // 3 supported
+        ];
+        assert_eq!(supported_at_or_before(&rows, 3), Some(3));
+        assert_eq!(supported_at_or_before(&rows, 2), Some(0), "skips 2 and 1 back to 0");
+        assert_eq!(supported_at_or_before(&rows, 0), Some(0));
+        assert_eq!(supported_at_or_before(&[row(1, false, false, false)], 0), None);
+    }
+
+    /// The popup is 85% of terminal width, and its height is one row per entry plus 4
+    /// chrome lines, shrunk to fit the terminal and clamped to [12, 30] — including the
+    /// documented floor at 12 on a terminal too short to honor it.
+    #[test]
+    fn popup_dims_clamp_height_between_12_and_30() {
+        assert_eq!(popup_dims(100, 40, 5), (85, 12), "few rows floor at 12");
+        assert_eq!(popup_dims(100, 40, 50), (85, 30), "many rows cap at 30");
+        assert_eq!(popup_dims(100, 20, 50), (85, 16), "shrinks to area_h - 4");
+        assert_eq!(popup_dims(100, 10, 50), (85, 12), "floors at 12 even when taller than the terminal");
+    }
+
+    /// The visible-row capacity is the popup height minus 4 chrome lines, never below 1.
+    #[test]
+    fn capacity_of_subtracts_chrome_and_never_reaches_zero() {
+        assert_eq!(capacity_of(30), 26);
+        assert_eq!(capacity_of(12), 8);
+        assert_eq!(capacity_of(4), 1, "floors at 1");
+        assert_eq!(capacity_of(0), 1);
+    }
+}
