@@ -91,10 +91,22 @@ pub fn parse_macho(bytes: &[u8]) -> Option<(goblin::mach::MachO<'_>, usize)> {
                 goblin::mach::cputype::CPU_TYPE_X86_64
             };
             for arch in fat.iter_arches().flatten() {
-                if arch.cputype == want {
-                    let at = arch.offset as usize;
-                    return MachO::parse(bytes, at).ok().map(|m| (m, at));
+                if arch.cputype != want {
+                    continue;
                 }
+                let start = arch.offset as usize;
+                let end = start.checked_add(arch.size as usize)?;
+                let slice = bytes.get(start..end)?;
+                // Parse the slice as a standalone image (offset 0), NOT in place
+                // via `MachO::parse(bytes, start)`. A slice's internal file
+                // offsets — `symtab.symoff`/`stroff`, `section.offset` — are
+                // relative to the slice, and goblin indexes them directly into
+                // whatever buffer it is handed. Parsing in place makes it read the
+                // symbol table from the wrong slice and silently yield **no
+                // symbols**, which is invisible to anything that only touches
+                // virtual addresses (`vmaddr`, `n_value`) and breaks everything
+                // that reads the symbol table.
+                return MachO::parse(slice, 0).ok().map(|m| (m, start));
             }
             None
         }
