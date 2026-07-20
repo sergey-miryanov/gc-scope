@@ -480,4 +480,76 @@ mod tests {
             assert_eq!(parsed.to_string(), s);
         }
     }
+
+    // ── binary version-string scan (the on-disk fallback for `detect`) ──
+    // `scan_for_version_string` is the fallback when the `Py_Version` symbol can't
+    // be read; it walks raw rodata bytes. Feeding it byte slices exercises the whole
+    // scanner (and `parse_micro_digits`) without a real binary.
+
+    /// A fully-qualified `PY_VERSION` literal embedded in surrounding bytes is found,
+    /// with every field decoded — including the release suffix.
+    #[test]
+    fn scan_finds_an_embedded_fully_qualified_version() {
+        assert_eq!(
+            scan_for_version_string(b"\x00\x00garbage3.13.1 (main)\x00"),
+            Some(v(3, 13, 1, 0xF, 0))
+        );
+        assert_eq!(
+            scan_for_version_string(b"junk\x003.15.0b1\x00more"),
+            Some(v(3, 15, 0, 0xB, 1))
+        );
+        assert_eq!(
+            scan_for_version_string(b"3.11.7rc2\n"),
+            Some(v(3, 11, 7, 0xC, 2))
+        );
+    }
+
+    /// The micro component is required: a bare `"3.13"` is a truncated/false hit and
+    /// must be skipped so a real `"3.13.1"` further along still wins. Without the
+    /// micro guard the scan would lock onto the first `"3.<minor>"` it sees.
+    #[test]
+    fn scan_skips_a_version_without_a_micro_and_keeps_looking() {
+        assert_eq!(scan_for_version_string(b"3.13 then 3.13.4 "), Some(v(3, 13, 4, 0xF, 0)));
+        // A lone minor-only string yields nothing.
+        assert_eq!(scan_for_version_string(b"python 3.13\x00"), None);
+    }
+
+    /// A version glued to the wrong context is rejected: a trailing digit run past the
+    /// micro (`3.1.23456...`) still parses as its own micro, but a `"3."` embedded in
+    /// a longer number (`13.12.0`, where the leading digit precedes `3.`) must not be
+    /// mistaken for a version.
+    #[test]
+    fn scan_rejects_a_version_embedded_in_a_larger_number() {
+        // The `3.` here is preceded by `1`, so it's part of `13.12` — not a version.
+        assert_eq!(scan_for_version_string(b"lib13.12.0"), None);
+    }
+
+    /// Trailing context must be a terminator (NUL, space, paren, quote, newline). A
+    /// version followed by an identifier char (`3.12.0abc` with no valid suffix) is
+    /// not accepted at that position.
+    #[test]
+    fn scan_requires_a_terminator_after_the_version() {
+        assert_eq!(scan_for_version_string(b"3.12.0\""), Some(v(3, 12, 0, 0xF, 0)));
+        assert_eq!(scan_for_version_string(b"3.12.0("), Some(v(3, 12, 0, 0xF, 0)));
+        // 'z' is neither a release suffix nor a terminator → not a match here.
+        assert_eq!(scan_for_version_string(b"3.12.0z"), None);
+    }
+
+    /// No `3.x.y` anywhere → no version, not a panic on the short-buffer boundary.
+    #[test]
+    fn scan_returns_none_when_absent() {
+        assert_eq!(scan_for_version_string(b""), None);
+        assert_eq!(scan_for_version_string(b"no version here"), None);
+        assert_eq!(scan_for_version_string(b"3."), None);
+    }
+
+    /// `parse_micro_digits` accumulates into a `u8` with checked arithmetic, so a
+    /// run that overflows 255 returns `None` rather than wrapping to a bogus value.
+    #[test]
+    fn parse_micro_digits_reads_a_run_and_guards_overflow() {
+        assert_eq!(parse_micro_digits(b"07x", 0), Some((7, 2)));
+        assert_eq!(parse_micro_digits(b"abc", 0), None); // no digits at start
+        assert_eq!(parse_micro_digits(b"255", 0), Some((255, 3)));
+        assert_eq!(parse_micro_digits(b"256", 0), None); // overflows u8
+    }
 }
