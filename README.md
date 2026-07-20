@@ -13,6 +13,34 @@ Cross-platform CLI tool for reading and analyzing CPython process memory.
 
 `-1` can be used as PID to target the current process.
 
+## Attaching: per-platform permissions
+
+gcscope reads another process's memory, which every OS gates differently.
+
+| Platform | Requirement |
+|---|---|
+| **Windows** | None for a process you own. |
+| **Linux** | Same-uid works when the target is a descendant. Otherwise loosen Yama: `sudo sysctl -w kernel.yama.ptrace_scope=0`. |
+| **macOS** | Depends on the target: **Python 3.13+ attaches unprivileged**; **3.8–3.12 needs `sudo gcscope …`**. |
+
+On macOS the split is the target's doing: framework builds are signed with a
+hardened runtime, and only 3.13+ ships `com.apple.security.get-task-allow` (with
+PEP 768), which is what admits a same-user caller. Granting
+`system.privilege.taskport` does not help. If you don't know the target's version,
+use `sudo`.
+
+To avoid `sudo` there, sign gcscope with `com.apple.security.cs.debugger` — the
+mechanism LLDB's `debugserver` uses:
+
+```bash
+codesign -s "<your-cert>" --entitlements gcscope.entitlements -f target/release/gcscope
+```
+
+The certificate must be trusted for code signing — a **self-signed** one in the
+System keychain works, no Apple Developer account needed — and ad-hoc
+`codesign -s -` will **not** do, since restricted entitlements are ignored on
+ad-hoc signatures. Re-sign after every build; `cargo build` replaces the binary.
+
 ## Testing
 
 The `.gc-gen-3.15+inc` venv provides a custom 3.15+rc Python build
