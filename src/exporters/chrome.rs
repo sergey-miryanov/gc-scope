@@ -195,6 +195,11 @@ fn write_gc_stat_events(
     Ok(())
 }
 
+/// `Default` is derived rather than just `new()`-provided because the split to a
+/// library makes this a public constructor, and clippy's `new_without_default`
+/// applies to public API. All four fields are already `Default`, so the derive is
+/// exactly what `new()` did.
+#[derive(Default)]
 pub struct ChromeTraceExporter {
     file: Option<File>,
     has_written: bool,
@@ -204,12 +209,7 @@ pub struct ChromeTraceExporter {
 
 impl ChromeTraceExporter {
     pub fn new() -> Self {
-        ChromeTraceExporter {
-            file: None,
-            has_written: false,
-            pid_meta_done: HashSet::new(),
-            tid_meta_done: HashSet::new(),
-        }
+        Self::default()
     }
 }
 
