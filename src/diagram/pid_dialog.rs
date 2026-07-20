@@ -31,19 +31,15 @@ fn supported_at_or_before(rows: &[FlatRow], from: usize) -> Option<usize> {
 }
 
 /// Popup width/height for the given terminal size and row count.
-//
-// `manual_clamp` is allowed deliberately: `.min(..).max(12)` and `.clamp(12, ..)` are NOT
-// equivalent here. On a terminal shorter than 16 rows the upper bound
-// (`area_h - 4`, capped at 30) falls below the lower bound of 12, and `Ord::clamp`
-// panics when `min > max`. The min/max chain instead saturates to 12, which is the
-// behavior we want — an oversized popup on a tiny terminal beats a crash.
-#[allow(clippy::manual_clamp)]
 fn popup_dims(area_w: u16, area_h: u16, num_rows: usize) -> (u16, u16) {
     let popup_w = (area_w as f64 * 0.85) as u16;
-    let popup_h = ((num_rows as u16 + 4)
+    // Height wants one row per entry plus 4 chrome rows, shrunk to fit the terminal
+    // (`area_h - 4`), then clamped to [12, 30]. The clamp bounds are constants and
+    // correctly ordered, so it cannot panic; on a terminal shorter than 16 rows the
+    // result floors at 12 and ratatui clips the overflow.
+    let popup_h = (num_rows as u16 + 4)
         .min(area_h.saturating_sub(4))
-        .min(30))
-    .max(12);
+        .clamp(12, 30);
     (popup_w, popup_h)
 }
 
