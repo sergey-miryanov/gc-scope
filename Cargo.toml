@@ -23,4 +23,3 @@ criterion = { version = "5.0.1", package = "codspeed-criterion-compat" }
 [[bench]]
 name = "memory"
 harness = false
-

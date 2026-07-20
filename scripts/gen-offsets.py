@@ -4,7 +4,7 @@
 Usage:
     python scripts/gen-offsets.py X:/path/to/cpython/checkout
 
-Requires bindgen on PATH (install with: cargo install bindgen-cli).
+Requires bindgen on PATH (install with: cargo install bindgen-cli --version 0.72).
 Requires LIBCLANG_PATH set on Windows.
 """
 
@@ -290,6 +290,103 @@ def print_registration_checklist(
 {bar}""", file=sys.stderr)
 
 
+def _short_remote(remote: str | None) -> str:
+    """`https://github.com/python/cpython.git` / `git@…:python/cpython.git` → `python/cpython`."""
+    if not remote:
+        return "cpython"
+    remote = remote.strip()
+    m = re.search(r'[:/]([^/:]+/[^/]+?)(?:\.git)?$', remote)
+    return m.group(1) if m else remote
+
+
+def git_provenance(cpython_path: Path) -> dict | None:
+    """Source provenance for the checkout, or None if it is not a git repo.
+
+    `at_tag` is True only when HEAD is exactly a release tag. A build off a tag is an
+    in-development ("ongoing") layout that keeps drifting; that is what the single-ongoing
+    guard and the "must come from git" rule key on. `commit` is the FULL 40-char SHA so
+    the provenance line greps unambiguously.
+    """
+    def _git(*a: str) -> str | None:
+        r = subprocess.run(["git", "-C", str(cpython_path), *a],
+                           capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    commit = _git("rev-parse", "HEAD")
+    if not commit:
+        return None
+    return {
+        "commit": commit,
+        "remote": _short_remote(_git("remote", "get-url", "origin")),
+        "describe": _git("describe", "--tags", "HEAD"),
+        "at_tag": _git("describe", "--exact-match", "--tags", "HEAD") is not None,
+    }
+
+
+def provenance_comment(prov: dict, *, is_ongoing: bool, version_str: str,
+                       version_hex: int) -> str:
+    """The `// gcscope-source:` block embedded at the top of a generated module.
+
+    The `owner/repo@<40-hex>` shape is a contract: .github/workflows/rust.yml greps the
+    commit out of it to pin the from-source CI build of an ongoing version, so the whole
+    thing is a single source of truth — regenerate and the CI pin moves with it.
+    """
+    desc = f" — describe {prov['describe']}" if prov.get("describe") else ""
+    lines = [
+        f"// gcscope-source: {prov['remote']}@{prov['commit']}",
+        f"//   CPython {version_str} (0x{version_hex:08x}){desc}",
+    ]
+    if is_ongoing:
+        lines += [
+            "//   ONGOING dev build (HEAD is not a release tag): only one such layout may be",
+            "//   registered at a time, and CI pins this exact commit (read from this line by",
+            "//   .github/workflows/rust.yml). Regenerate and the pin moves with it.",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def existing_ongoing(offsets_dir: Path, exclude: Path) -> list[tuple[str, str]]:
+    """(filename, commit) for every OTHER registered module marked ONGOING."""
+    out = []
+    for f in sorted(offsets_dir.glob("v_*.rs")):
+        if f.resolve() == exclude.resolve():
+            continue
+        text = f.read_text()
+        if "ONGOING dev build" in text:
+            m = re.search(r'gcscope-source: \S+@([0-9a-f]{7,40})', text)
+            out.append((f.name, m.group(1) if m else "?"))
+    return out
+
+
+def _debug_offsets_structs(text: str) -> dict[str, str]:
+    """{name: normalized-body} for every `_Py_DebugOffsets*` struct block in `text`.
+
+    This is the ABI-relevant part of a generated module — the nav struct and its
+    sub-structs. `gc_generation_stats` is intentionally excluded: it is exactly what a
+    same-hex `+inc` candidate is *allowed* to differ in.
+    """
+    out = {}
+    for m in re.finditer(r'pub struct (_Py_DebugOffsets\w*)\s*\{', text):
+        o = text.index('{', m.start())
+        e = _brace_end(text, o)
+        if e < 0:
+            continue
+        out[m.group(1)] = re.sub(r'\s+', ' ', text[o:e + 1]).strip()
+    return out
+
+
+def registered_nav_module(version_hex: int, mod_rs_text: str) -> str | None:
+    """The `v_*` module the LAYOUTS row for `version_hex` navigates through, if any."""
+    m = re.search(
+        rf'\(\s*0x{version_hex:08x}\s*,\s*\|p,\s*a\|\s*Ok\(VersionedOffsets::(\w+)\(',
+        mod_rs_text)
+    if not m:
+        return None
+    variant = m.group(1)
+    m2 = re.search(rf'\b{variant}\((v_\w+)::_Py_DebugOffsets\)', mod_rs_text)
+    return m2.group(1) if m2 else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate Rust _Py_DebugOffsets bindings from a CPython checkout.")
@@ -348,6 +445,21 @@ def main() -> None:
     print(f"CPython {raw_version}  ->  0x{version_hex:08x}")
     print(f"Output: {out_file}")
 
+    # Provenance + "ongoing" status. An ongoing (in-development) layout is one built off a
+    # release tag; a --suffix same-hex candidate (e.g. +inc) is never a version of its own,
+    # so it is excluded regardless of tag state.
+    prov = git_provenance(cpython_path)
+    is_ongoing = prov is not None and not prov["at_tag"] and not suffix
+    # A dev-head build with no git repo cannot be pinned, so its layout would be one no CI
+    # leg could reproduce. Refuse rather than record it.
+    looks_dev = (level == 0xA and serial == 0) or raw_version.endswith("+")
+    if prov is None and not suffix and looks_dev:
+        print(f"\nError: {raw_version} looks like an in-development build, but "
+              f"{cpython_path}\n  is not a git checkout. An ongoing layout must be "
+              f"generated from git so its exact\n  commit can be recorded and pinned by "
+              f"CI — generate from a clone, not a tarball.", file=sys.stderr)
+        sys.exit(1)
+
     # Never silently clobber an existing layout. A clean release and a gc-instrumented
     # `+inc` build can share a PY_VERSION_HEX and thus derive the SAME filename, so a bare
     # regen of the second would overwrite the first. Require an explicit choice.
@@ -367,6 +479,20 @@ def main() -> None:
             print(f"  Re-run with --force to regenerate it in place, or --suffix <tag> to\n"
                   f"  write a distinct v_{ver_tag}_<tag>.rs.", file=sys.stderr)
         sys.exit(1)
+
+    # At most one in-development layout may be registered: two dev snapshots drift and
+    # there is no oracle for which is current. Regenerating THIS build in place is fine
+    # (its own file is excluded); a DIFFERENT ongoing version must wait until the current
+    # one is retired. --force overrides for the rare deliberate overlap.
+    if is_ongoing and not args.force:
+        others = existing_ongoing(out_file.parent, out_file)
+        if others:
+            listed = "\n".join(f"      {name}  (commit {c})" for name, c in others)
+            print(f"\nError: an ongoing dev layout is already registered:\n{listed}\n"
+                  f"  Only one in-development (off-tag) version may be registered at a "
+                  f"time. Retire it\n  (delete the module + its mod.rs rows) before adding "
+                  f"{raw_version}, or pass --force.", file=sys.stderr)
+            sys.exit(1)
 
     include_internal = cpython_path / "Include" / "internal"
     include_pc = cpython_path / "PC"
@@ -478,8 +604,54 @@ typedef long long PyTime_t;
             print(f"bindgen failed with exit code {result.returncode}", file=sys.stderr)
             sys.exit(1)
 
+    # Embed source provenance right after bindgen's autogen header (line 1), so every
+    # module records the exact commit it came from; for an ongoing build CI reads the pin
+    # from here.
+    if prov is not None:
+        text = out_file.read_text()
+        nl = text.index("\n") + 1
+        out_file.write_text(
+            text[:nl]
+            + provenance_comment(prov, is_ongoing=is_ongoing,
+                                 version_str=version_str, version_hex=version_hex)
+            + text[nl:])
+
     # Read bindgen output to discover which sub-structs were generated
     generated = out_file.read_text()
+
+    # Same-hex nav-struct guard. A --suffix build shares the registered hex's nav variant
+    # (only its GC layout is new), so its `_Py_DebugOffsets` MUST be byte-identical to that
+    # variant's. That holds automatically for a frozen base (a tagged 3.15.0b1) but NOT for
+    # an ongoing one (3.16 dev): a +inc built on a drifted commit would silently navigate
+    # with the wrong offsets. Verify rather than assume.
+    if suffix and hex_already_registered(version_hex):
+        mod_rs = Path("src") / "remote_debugging" / "offsets" / "mod.rs"
+        nav_mod = registered_nav_module(version_hex, mod_rs.read_text())
+        nav_file = (out_file.parent / f"{nav_mod}.rs") if nav_mod else None
+        if nav_file and nav_file.exists():
+            nav = _debug_offsets_structs(nav_file.read_text())
+            new = _debug_offsets_structs(generated)
+            if nav != new:
+                differing = sorted(n for n in set(nav) | set(new)
+                                   if nav.get(n) != new.get(n))
+                print(f"\nError: this build's _Py_DebugOffsets does not match the "
+                      f"registered nav variant {nav_mod}.\n"
+                      f"  Differing structs: {', '.join(differing) or '(struct set differs)'}\n\n"
+                      f"  A same-hex (--suffix) build contributes only a GC layout and "
+                      f"navigates through\n  {nav_mod}'s offsets, so the two must share a "
+                      f"byte-identical _Py_DebugOffsets — they\n  don't, so the builds are "
+                      f"on different base commits. Rebuild this one on the\n  SAME commit as "
+                      f"{nav_mod}; for an ongoing base, regenerate {nav_mod} and this build\n"
+                      f"  together from one commit. ({out_file.name} was left for inspection.)",
+                      file=sys.stderr)
+                sys.exit(1)
+            print(f"  nav-struct check: _Py_DebugOffsets matches {nav_mod} ✓",
+                  file=sys.stderr)
+        else:
+            print(f"  Warning: could not locate the registered nav module for "
+                  f"0x{version_hex:08x}; skipped the nav-struct match check.",
+                  file=sys.stderr)
+
     sub_structs = re.findall(r'pub struct (_Py_DebugOffsets__\w+)', generated)
 
     # Emit the full Display/validation macros only when this build has the full set

@@ -39,29 +39,30 @@ pub fn debug_offsets_tree(
     gc_fields: &[(&'static str, u64)],
     slot_fields: Option<&[(&'static str, usize)]>,
 ) -> Vec<TreeEntry> {
-    let mut e = Vec::new();
+    // The fixed prefix of the tree: offsets 0..88 are identical in every
+    // `_Py_DebugOffsets` layout, so they are literals rather than table lookups.
+    let mut e = vec![
+        // depth 0
+        TreeEntry { depth: 0, label: "_Py_DebugOffsets", kind: TreeEntryKind::Group },
+        // depth 1
+        TreeEntry { depth: 1, label: "cookie[8]",          kind: TreeEntryKind::RawValue { offset: 0 } },
+        TreeEntry { depth: 1, label: "version",            kind: TreeEntryKind::RawValue { offset: 8 } },
+        TreeEntry { depth: 1, label: "free_threaded",      kind: TreeEntryKind::RawValue { offset: 16 } },
+        TreeEntry { depth: 1, label: "runtime_state",      kind: TreeEntryKind::Group },
+        // depth 2 under runtime_state
+        TreeEntry { depth: 2, label: "size",               kind: TreeEntryKind::RawValue { offset: 24 } },
+        TreeEntry { depth: 2, label: "finalizing",         kind: TreeEntryKind::RawValue { offset: 32 } },
+        TreeEntry { depth: 2, label: "interpreters_head",  kind: TreeEntryKind::RawValue { offset: 40 } },
 
-    // depth 0
-    e.push(TreeEntry { depth: 0, label: "_Py_DebugOffsets", kind: TreeEntryKind::Group });
-
-    // depth 1
-    e.push(TreeEntry { depth: 1, label: "cookie[8]",          kind: TreeEntryKind::RawValue { offset: 0 } });
-    e.push(TreeEntry { depth: 1, label: "version",            kind: TreeEntryKind::RawValue { offset: 8 } });
-    e.push(TreeEntry { depth: 1, label: "free_threaded",      kind: TreeEntryKind::RawValue { offset: 16 } });
-    e.push(TreeEntry { depth: 1, label: "runtime_state",      kind: TreeEntryKind::Group });
-    // depth 2 under runtime_state
-    e.push(TreeEntry { depth: 2, label: "size",               kind: TreeEntryKind::RawValue { offset: 24 } });
-    e.push(TreeEntry { depth: 2, label: "finalizing",         kind: TreeEntryKind::RawValue { offset: 32 } });
-    e.push(TreeEntry { depth: 2, label: "interpreters_head",  kind: TreeEntryKind::RawValue { offset: 40 } });
-
-    e.push(TreeEntry { depth: 1, label: "interpreter_state",  kind: TreeEntryKind::Group });
-    // depth 2 under interpreter_state
-    e.push(TreeEntry { depth: 2, label: "size",               kind: TreeEntryKind::RawValue { offset: 48 } });
-    e.push(TreeEntry { depth: 2, label: "id",                 kind: TreeEntryKind::RawValue { offset: 56 } });
-    e.push(TreeEntry { depth: 2, label: "next",               kind: TreeEntryKind::RawValue { offset: 64 } });
-    e.push(TreeEntry { depth: 2, label: "threads_head",       kind: TreeEntryKind::RawValue { offset: 72 } });
-    e.push(TreeEntry { depth: 2, label: "threads_main",       kind: TreeEntryKind::RawValue { offset: 80 } });
-    e.push(TreeEntry { depth: 2, label: "gc",                 kind: TreeEntryKind::RawValue { offset: 88 } });
+        TreeEntry { depth: 1, label: "interpreter_state",  kind: TreeEntryKind::Group },
+        // depth 2 under interpreter_state
+        TreeEntry { depth: 2, label: "size",               kind: TreeEntryKind::RawValue { offset: 48 } },
+        TreeEntry { depth: 2, label: "id",                 kind: TreeEntryKind::RawValue { offset: 56 } },
+        TreeEntry { depth: 2, label: "next",               kind: TreeEntryKind::RawValue { offset: 64 } },
+        TreeEntry { depth: 2, label: "threads_head",       kind: TreeEntryKind::RawValue { offset: 72 } },
+        TreeEntry { depth: 2, label: "threads_main",       kind: TreeEntryKind::RawValue { offset: 80 } },
+        TreeEntry { depth: 2, label: "gc",                 kind: TreeEntryKind::RawValue { offset: 88 } },
+    ];
 
     // depth 3 under gc: actual gc sub-struct fields at their real offsets.
     for &(name, offset) in gc_fields {
@@ -114,11 +115,12 @@ pub fn tree_prefixes(entries: &[TreeEntry]) -> Vec<String> {
             }
         }
         if e.depth > 0 {
-            if has_sibling_after(entries, i, e.depth) {
-                prefix.push_str("+-- ");
-            } else {
-                prefix.push_str("+-- ");
-            }
+            // NOTE: both branches of the original `if has_sibling_after(..)` here pushed
+            // "+-- ", so the last-child connector "\-- " promised by this function's doc
+            // comment has never actually been emitted. Collapsed to match the behavior
+            // that ships; emitting "\\-- " in the else branch is the presumable intent,
+            // but it changes rendered output in the SVG, ASCII and TUI views.
+            prefix.push_str("+-- ");
         }
         prefixes.push(prefix);
     }

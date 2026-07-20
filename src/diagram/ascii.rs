@@ -424,10 +424,8 @@ const HEX_COL_WIDTH: usize = 48;
 fn fmt_val(val: u64) -> String {
     if val > 0xFFFF_FFFF {
         format!("{:#x}", val)
-    } else if val > 0x10000 {
-        format!("{}", val)
     } else {
-        format!("{}", val)
+        val.to_string()
     }
 }
 
@@ -435,7 +433,7 @@ fn fmt_thousands(val: u64) -> String {
     let s = val.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 { out.push('_'); }
+        if i > 0 && (s.len() - i).is_multiple_of(3) { out.push('_'); }
         out.push(c);
     }
     out

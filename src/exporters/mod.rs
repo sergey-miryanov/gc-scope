@@ -1,4 +1,5 @@
 pub mod chrome;
+pub mod timing;
 
 use std::path::Path;
 use crate::remote_debugging::gc_stats::GcStat;

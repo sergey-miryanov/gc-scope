@@ -7,6 +7,10 @@ use crate::memory::process;
 use crate::remote_debugging::session::PySession;
 use crate::remote_debugging::version;
 
+/// PID → (process name, parent PID), for every process on the system. Built once and
+/// consulted when walking a target's ancestry (the venv-launcher chain).
+pub type PidInfoMap = HashMap<u32, (String, u32)>;
+
 pub struct ProcessInfo {
     pub pid: u32,
     pub ppid: u32,
@@ -39,12 +43,12 @@ struct ProcessEntry {
     supports_stats: bool,
 }
 
-pub fn list_python_processes() -> Result<(Vec<ProcessInfo>, HashMap<u32, (String, u32)>)> {
+pub fn list_python_processes() -> Result<(Vec<ProcessInfo>, PidInfoMap)> {
     let sys = System::new_all();
 
     // Build PID info map for ALL processes: pid → (name, ppid)
-    let mut pid_info_map: HashMap<u32, (String, u32)> = HashMap::new();
-    for (_, process) in sys.processes() {
+    let mut pid_info_map: PidInfoMap = HashMap::new();
+    for process in sys.processes().values() {
         let pid = process.pid().as_u32();
         let ppid = process.parent().map(|p| p.as_u32()).unwrap_or(0);
         let name = process.name().to_string_lossy().to_string();
@@ -52,7 +56,7 @@ pub fn list_python_processes() -> Result<(Vec<ProcessInfo>, HashMap<u32, (String
     }
 
     let mut result = Vec::new();
-    for (_pid, process) in sys.processes() {
+    for process in sys.processes().values() {
         let name = process.name().to_string_lossy().to_lowercase();
         if !name.contains("python") {
             continue;
@@ -109,7 +113,7 @@ pub fn print_process_table(processes: &[ProcessInfo], no_cmdline: bool) {
             println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25}", p.pid, p.ppid, p.name, rnt, off, ver);
         }
     } else {
-        println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25} {}", "PID", "PPID", "Name", "R", "S", "Version", "Command Line");
+        println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25} Command Line", "PID", "PPID", "Name", "R", "S", "Version");
         println!("{}", "-".repeat(128));
         for p in processes {
             let ver = p.version.as_deref().unwrap_or("-");
@@ -124,7 +128,7 @@ pub fn print_process_table(processes: &[ProcessInfo], no_cmdline: bool) {
 
 pub fn build_flat_rows(
     processes: &[ProcessInfo],
-    pid_info_map: &HashMap<u32, (String, u32)>,
+    pid_info_map: &PidInfoMap,
 ) -> Vec<FlatRow> {
     let python_pids: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
 
@@ -153,19 +157,19 @@ pub fn build_flat_rows(
                 break;
             }
         }
-        if current_ppid > 4 && !entries.contains_key(&current_ppid) {
-            if let Some((name, ppid)) = pid_info_map.get(&current_ppid) {
-                entries.insert(current_ppid, ProcessEntry {
-                    pid: current_ppid,
-                    ppid: *ppid,
-                    name: name.clone(),
-                    cmdline: String::new(),
-                    is_python: false,
-                    version: None,
-                    runtime_found: false,
-                    supports_stats: false,
-                });
-            }
+        if current_ppid > 4 && !entries.contains_key(&current_ppid)
+            && let Some((name, ppid)) = pid_info_map.get(&current_ppid)
+        {
+            entries.insert(current_ppid, ProcessEntry {
+                pid: current_ppid,
+                ppid: *ppid,
+                name: name.clone(),
+                cmdline: String::new(),
+                is_python: false,
+                version: None,
+                runtime_found: false,
+                supports_stats: false,
+            });
         }
     }
 
@@ -257,7 +261,7 @@ fn write_row(no_cmdline: bool, row: &FlatRow) {
     }
 }
 
-pub fn print_process_tree(processes: &[ProcessInfo], pid_info_map: &HashMap<u32, (String, u32)>, no_cmdline: bool) {
+pub fn print_process_tree(processes: &[ProcessInfo], pid_info_map: &PidInfoMap, no_cmdline: bool) {
     if processes.is_empty() {
         println!("No Python processes found.");
         return;
@@ -266,10 +270,10 @@ pub fn print_process_tree(processes: &[ProcessInfo], pid_info_map: &HashMap<u32,
     let flat_rows = build_flat_rows(processes, pid_info_map);
 
     if no_cmdline {
-        println!("{:>8}  {}  {}  {:<22}", "PID", "R", "S", "Version/Name");
+        println!("{:>8}  R  S  {:<22}", "PID", "Version/Name");
         println!("{}", "-".repeat(50));
     } else {
-        println!("{:>8}  {}  {}  {:<22}    {}", "PID", "R", "S", "Version/Name", "Command Line");
+        println!("{:>8}  R  S  {:<22}    Command Line", "PID", "Version/Name");
         println!("{}", "-".repeat(80));
     }
 

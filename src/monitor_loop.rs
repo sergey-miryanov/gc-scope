@@ -124,7 +124,7 @@ where
             let status = ctx.poll(current_pid);
 
             let policy = pid_policies.entry(current_pid)
-                .or_insert_with(|| wait_policy_factory());
+                .or_insert_with(&mut wait_policy_factory);
 
             if policy.wait(status) {
                 any_alive = true;
