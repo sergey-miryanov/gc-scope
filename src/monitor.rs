@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::exporters::{EventsExporter, ProcessLifecycle};
 use crate::monitor_loop::PollStatus;
+use crate::remote_debugging::gc_stats::GcStat;
 use crate::remote_debugging::session::{PySession, Revalidated};
 
 /// Per-process polling context.
@@ -88,21 +89,7 @@ impl<'a> MonitorContext<'a> {
                 .mark_process_lifecycle(pid, ProcessLifecycle::Started, 0);
         }
 
-        // Select events fresher than the last seen ts for their OWN slot, then
-        // emit them in timestamp order so the trace stays ordered regardless of
-        // the generation-major order the slots arrive in. `ts_start == 0` means an
-        // untouched slot (never collected) — never emitted (the initial mark is 0).
-        let seen = self.seen.entry(pid).or_default();
-        let mut fresh: Vec<&_> = Vec::new();
-        for stat in &stats {
-            let mark = seen.entry((stat.generation, stat.slot)).or_insert(0);
-            if stat.ts_start > *mark {
-                *mark = stat.ts_start;
-                fresh.push(stat);
-            }
-        }
-        fresh.sort_by_key(|s| s.ts_start);
-        for stat in fresh {
+        for stat in select_fresh(&stats, self.seen.entry(pid).or_default()) {
             self.exporter.add_event(pid, stat);
         }
         PollStatus::Ok
@@ -139,5 +126,110 @@ impl<'a> MonitorContext<'a> {
     /// Close the underlying exporter.
     pub fn close(&mut self) -> std::io::Result<()> {
         self.exporter.close()
+    }
+}
+
+/// Select the stats fresher than the last seen ts for their OWN `(generation, slot)`,
+/// returned in timestamp order so the trace stays ordered regardless of the
+/// generation-major order the slots arrive in (C4). Advances `seen` to the new marks.
+///
+/// `ts_start == 0` means an untouched slot (never collected) and is never selected —
+/// the initial mark is 0 and selection is strictly greater-than.
+fn select_fresh<'s>(
+    stats: &'s [GcStat],
+    seen: &mut HashMap<(u32, usize), i64>,
+) -> Vec<&'s GcStat> {
+    let mut fresh: Vec<&GcStat> = Vec::new();
+    for stat in stats {
+        let mark = seen.entry((stat.generation, stat.slot)).or_insert(0);
+        if stat.ts_start > *mark {
+            *mark = stat.ts_start;
+            fresh.push(stat);
+        }
+    }
+    fresh.sort_by_key(|s| s.ts_start);
+    fresh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stat(generation: u32, slot: usize, ts_start: i64) -> GcStat {
+        GcStat { generation, slot, ts_start, ..Default::default() }
+    }
+
+    fn fresh_ts(stats: &[GcStat], seen: &mut HashMap<(u32, usize), i64>) -> Vec<i64> {
+        select_fresh(stats, seen).into_iter().map(|s| s.ts_start).collect()
+    }
+
+    /// Slots that have never been collected read back as zero. The initial mark is
+    /// also zero and selection is strictly greater-than, so they must never be
+    /// emitted — otherwise every attach floods the trace with phantom events at t=0.
+    #[test]
+    fn untouched_slots_are_never_emitted() {
+        let mut seen = HashMap::new();
+        let stats = vec![stat(0, 0, 0), stat(1, 0, 0), stat(2, 0, 0)];
+        assert!(fresh_ts(&stats, &mut seen).is_empty());
+        // Still nothing on a second poll of the same untouched slots.
+        assert!(fresh_ts(&stats, &mut seen).is_empty());
+    }
+
+    #[test]
+    fn a_slot_is_emitted_once_per_new_timestamp() {
+        let mut seen = HashMap::new();
+        assert_eq!(fresh_ts(&[stat(0, 0, 100)], &mut seen), vec![100]);
+        // Same reading on the next tick: already seen.
+        assert!(fresh_ts(&[stat(0, 0, 100)], &mut seen).is_empty());
+        // The slot was overwritten by a newer collection.
+        assert_eq!(fresh_ts(&[stat(0, 0, 150)], &mut seen), vec![150]);
+    }
+
+    /// The C4 regression. `read_gc_stats` yields slots generation-major, not in
+    /// timestamp order, so a single per-PID high-water mark lets a high-timestamped
+    /// generation-2 event swallow a genuinely new — but older — generation-0 event.
+    /// The mark is per `(generation, slot)` precisely to stop that.
+    #[test]
+    fn a_high_timestamp_in_one_generation_does_not_mask_another() {
+        let mut seen = HashMap::new();
+        // Tick 1: only generation 2 has run, and it ran late.
+        assert_eq!(fresh_ts(&[stat(2, 0, 900)], &mut seen), vec![900]);
+        // Tick 2: generation 0 collected at t=100 — older than the gen-2 mark, but
+        // new for its own slot. A per-PID mark would drop it.
+        assert_eq!(fresh_ts(&[stat(0, 0, 100), stat(2, 0, 900)], &mut seen), vec![100]);
+    }
+
+    /// Same hazard inside one generation: the ring's slots are overwritten in turn,
+    /// so slot 7 can hold an older timestamp than slot 3 and still be unreported.
+    #[test]
+    fn slots_within_a_generation_are_tracked_independently() {
+        let mut seen = HashMap::new();
+        assert_eq!(fresh_ts(&[stat(0, 3, 500)], &mut seen), vec![500]);
+        assert_eq!(fresh_ts(&[stat(0, 3, 500), stat(0, 7, 200)], &mut seen), vec![200]);
+    }
+
+    /// Slots arrive generation-major but the trace must be ordered by time, or
+    /// Perfetto renders the begin/end pairs out of sequence.
+    #[test]
+    fn output_is_sorted_by_timestamp_regardless_of_input_order() {
+        let mut seen = HashMap::new();
+        let stats = vec![
+            stat(0, 0, 300),
+            stat(0, 1, 100),
+            stat(1, 0, 400),
+            stat(2, 0, 200),
+        ];
+        assert_eq!(fresh_ts(&stats, &mut seen), vec![100, 200, 300, 400]);
+    }
+
+    #[test]
+    fn marks_advance_only_for_the_slots_that_were_selected() {
+        let mut seen = HashMap::new();
+        let _ = fresh_ts(&[stat(0, 0, 100), stat(1, 0, 0)], &mut seen);
+        assert_eq!(seen.get(&(0, 0)), Some(&100));
+        // The zero-timestamp slot was still recorded (at 0) but never emitted, so a
+        // later real collection in it is not suppressed.
+        assert_eq!(seen.get(&(1, 0)), Some(&0));
+        assert_eq!(fresh_ts(&[stat(1, 0, 50)], &mut seen), vec![50]);
     }
 }

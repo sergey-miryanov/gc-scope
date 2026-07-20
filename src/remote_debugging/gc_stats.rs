@@ -1,4 +1,8 @@
 #[allow(dead_code)]
+// `Default` is test-only on purpose: it lets tests build a stat by naming just the
+// couple of fields they care about, without offering production code a zero-valued
+// `GcStat` that could stand in for a failed decode.
+#[cfg_attr(test, derive(Default))]
 pub struct GcStat {
     pub generation: u32,
     pub slot: usize,

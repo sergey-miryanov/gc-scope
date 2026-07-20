@@ -683,3 +683,205 @@ mod gc_candidate_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    /// Build every `LAYOUTS` variant from a zeroed buffer in our own address space.
+    ///
+    /// The generated `layout_version()` / `gc_stats_shape()` impls are hardcoded
+    /// constants that never read `self` (e.g. `v_3_15_0b1.rs`), so a zeroed instance
+    /// answers them correctly — which is what makes the registry checkable without a
+    /// live interpreter. Self-read is the same capability `-1` targeting relies on.
+    fn build_all() -> Vec<(u64, VersionedOffsets)> {
+        // Comfortably larger than any `_Py_DebugOffsets`; `read_struct` reads
+        // exactly `size_of::<T>()` bytes from it.
+        let buf = vec![0u8; 64 * 1024];
+        LAYOUTS
+            .iter()
+            .map(|(hex, ctor)| {
+                let vo = ctor(std::process::id(), buf.as_ptr() as u64)
+                    .unwrap_or_else(|e| panic!("self-read failed for {hex:#010x}: {e}"));
+                assert!(
+                    vo.debug_offsets_total_size() as usize <= buf.len(),
+                    "{hex:#010x} struct outgrew the test buffer"
+                );
+                (*hex, vo)
+            })
+            .collect()
+    }
+
+    /// Each `LAYOUTS` row must construct the variant whose own `layout_version()`
+    /// equals the row's key. This is the ONE registration step the compiler does not
+    /// enforce (see CLAUDE.md): a copy-pasted row that keeps the previous variant
+    /// builds fine and then decodes a live process through the wrong struct.
+    #[test]
+    fn every_layouts_row_builds_its_own_version() {
+        for (hex, vo) in build_all() {
+            assert_eq!(
+                vo.expected_version(),
+                hex,
+                "LAYOUTS row {hex:#010x} builds a variant that reports {:#010x} — \
+                 the row and the variant disagree",
+                vo.expected_version()
+            );
+        }
+    }
+
+    #[test]
+    fn layouts_hexes_are_unique_sorted_and_in_range() {
+        let hexes: Vec<u64> = LAYOUTS.iter().map(|(h, _)| *h).collect();
+
+        let mut deduped = hexes.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(deduped.len(), hexes.len(), "duplicate hex in LAYOUTS");
+        assert_eq!(hexes, deduped, "LAYOUTS must stay sorted by hex");
+
+        for hex in hexes {
+            let v = PythonVersion::from_hex(hex)
+                .unwrap_or_else(|| panic!("{hex:#010x} is not a decodable PY_VERSION_HEX"));
+            // `_Py_DebugOffsets` only exists from 3.13; anything older belongs in
+            // `pre_3_13.rs`, not here.
+            assert!(
+                (v.major, v.minor) >= (MIN_DEBUG_OFFSETS_MAJOR, MIN_DEBUG_OFFSETS_MINOR),
+                "{hex:#010x} ({v}) predates _Py_DebugOffsets"
+            );
+            assert!(has_exact_layout(hex), "{hex:#010x} is in LAYOUTS but not exact-matched");
+        }
+    }
+
+    #[test]
+    fn has_exact_layout_rejects_an_unregistered_build() {
+        // A plausible 3.13 micro we have never generated offsets for.
+        assert!(!has_exact_layout(0x030d02f0));
+    }
+
+    /// Two 3.13 layouts are compiled (micro 1 and micro 13), so "nearest micro" is a
+    /// real discrimination here rather than a tautology over a single candidate.
+    #[test]
+    fn fallback_picks_the_nearest_micro_within_the_same_minor() {
+        assert_eq!(resolve_fallback_layout(0x030d02f0).unwrap(), 0x030d01f0, "micro 2 -> 1");
+        assert_eq!(resolve_fallback_layout(0x030d0cf0).unwrap(), 0x030d0df0, "micro 12 -> 13");
+    }
+
+    /// Known limitation, pinned so a change to it is deliberate: the distance metric
+    /// is micro ONLY. Every 3.15 pre-release shares micro 0, so they are all equally
+    /// near and `min_by_key` keeps the first — the a8 layout — even for a target that
+    /// is closer to b3. Harmless today because `read_offsets` tries an exact match
+    /// first and only falls back for builds we have no layout for at all; it matters
+    /// if release level ever starts changing `_Py_DebugOffsets` within a minor.
+    #[test]
+    fn fallback_does_not_tie_break_on_release_level() {
+        // An unregistered 3.15 pre-release resolves to the first compiled 3.15 row.
+        assert_eq!(resolve_fallback_layout(0x030f00b4).unwrap(), 0x030f00a8);
+        // ...and so does a hex that IS registered, if asked directly. This is why
+        // `read_offsets` must keep checking `has_exact_layout` before calling here.
+        assert_eq!(resolve_fallback_layout(0x030f00b3).unwrap(), 0x030f00a8);
+        assert!(has_exact_layout(0x030f00b3), "the exact-match path is what protects b3");
+    }
+
+    #[test]
+    fn fallback_refuses_an_unknown_minor() {
+        // 3.11 has no bindgen layout at all (it is a `pre_3_13.rs` version), and
+        // silently borrowing a 3.13 layout for it would mis-decode every field.
+        assert!(resolve_fallback_layout(0x030b00f0).is_err());
+        assert!(resolve_fallback_layout(0x031100a0).is_err(), "a future 3.17");
+    }
+}
+
+#[cfg(test)]
+mod gc_shape_tests {
+    use super::*;
+
+    /// A stand-in for "the nav variant's own shape" that no candidate can equal, so a
+    /// test can tell "fell through to the default" apart from "selected a candidate".
+    const SENTINEL: GcStatsShape = GcStatsShape {
+        kind: offset_table::GcStatsKind::None,
+        item_size: 0xDEAD,
+        layout: None,
+    };
+
+    fn is_sentinel(s: &GcStatsShape) -> bool {
+        s.kind == SENTINEL.kind && s.item_size == SENTINEL.item_size && s.layout.is_none()
+    }
+
+    /// The whole point of `select_gc_shape`: for a hex with several compiled GC
+    /// layouts, the size the process publishes must select that layout and no other.
+    /// This is what keeps a clean 3.15.0b1 from being decoded through the `+inc`
+    /// build's stats struct, and vice versa.
+    #[test]
+    fn reported_ring_size_selects_its_own_candidate() {
+        for (hex, cands) in GC_CANDIDATES {
+            for ft in [0u64, 1] {
+                for c in *cands {
+                    let reported = expected_ring_size(c.item_size, ft);
+                    let picked = select_gc_shape(*hex, reported, ft, SENTINEL);
+                    assert_eq!(
+                        picked.item_size, c.item_size,
+                        "{hex:#010x} (free_threaded={ft}): reported {reported} bytes \
+                         should select the {}-byte layout",
+                        c.item_size
+                    );
+                    assert_eq!(picked.kind, c.kind);
+                    assert!(picked.layout.is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_reported_size_keeps_the_nav_variants_own_shape() {
+        // Inline and pre-ring builds publish no ring size; there is nothing to
+        // disambiguate and selection must not touch the default.
+        for (hex, _) in GC_CANDIDATES {
+            assert!(is_sentinel(&select_gc_shape(*hex, 0, 0, SENTINEL)));
+        }
+    }
+
+    #[test]
+    fn unknown_hex_or_unmatched_size_falls_through_to_the_default() {
+        // A hex with a single compiled layout skips selection entirely.
+        assert!(is_sentinel(&select_gc_shape(0x030e04f0, 4096, 0, SENTINEL)));
+        // A registered hex whose reported size matches no candidate: fall through, so
+        // the size guard in `gc_stats.rs` emits the regenerate hint rather than a
+        // silently wrong layout being used.
+        for (hex, _) in GC_CANDIDATES {
+            assert!(is_sentinel(&select_gc_shape(*hex, 12345, 0, SENTINEL)));
+        }
+    }
+
+    #[test]
+    fn every_gc_candidate_hex_is_a_registered_layout() {
+        for (hex, _) in GC_CANDIDATES {
+            assert!(
+                has_exact_layout(*hex),
+                "{hex:#010x} has GC candidates but no _Py_DebugOffsets layout to reach them"
+            );
+        }
+    }
+
+    /// Ring geometry is written twice — `expected_ring_size` (used for selection) and
+    /// `set_ring` (used for decoding). If they drift, selection picks a layout the
+    /// decoder then reads with different bases, and every stat is silently wrong.
+    #[test]
+    fn expected_ring_size_agrees_with_set_ring() {
+        for (_, cands) in GC_CANDIDATES {
+            for c in *cands {
+                for ft in [0u64, 1] {
+                    let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+                    set_ring(&mut table, c.item_size, c.layout, ft);
+                    let slots = table.gc_slots_per_gen.unwrap();
+                    let bases = table.gc_gen_base_offsets.unwrap();
+                    assert_eq!(
+                        bases[2] + slots[2] * c.item_size + 8,
+                        expected_ring_size(c.item_size, ft),
+                        "ring geometry drifted (item_size={}, free_threaded={ft})",
+                        c.item_size
+                    );
+                }
+            }
+        }
+    }
+}

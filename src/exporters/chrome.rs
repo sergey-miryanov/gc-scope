@@ -3,12 +3,9 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
+use super::timing::ts_us;
 use super::{EventsExporter, ProcessLifecycle};
 use crate::remote_debugging::gc_stats::GcStat;
-
-fn ts_us(ts_ns: i64) -> i64 {
-    ts_ns / 1000
-}
 
 fn write_event(f: &mut File, first: &mut bool, json: &str) -> std::io::Result<()> {
     if *first {
