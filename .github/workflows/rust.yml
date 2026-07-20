@@ -166,6 +166,105 @@ jobs:
           sudo -E "$PY" tests/live_smoke.py \
             --label ${{ matrix.os }}-py${{ matrix.python }}
 
+  # Interpreters setup-python cannot supply: build CPython from source, then run the
+  # SAME live_smoke driver. Linux-only on purpose -- these legs add version/decode
+  # coverage (same-hex candidate selection, an unreleased layout), which is
+  # OS-independent; the per-OS *finding* paths are already exercised by the stock
+  # live-smoke matrix above. A blocking gate, like live-smoke.
+  #
+  #   - 3.15+inc: sergey-miryanov/cpython@feat/gc-gen-3.15+inc. Shares hex 0x030f00b1
+  #     with clean 3.15.0b1 and is told apart only by generation_stats_size, so it is
+  #     the one live check of the +inc candidate selector. --expect-extended asserts
+  #     the IncrSize/AliveSize columns that prove the +inc candidate (not the clean
+  #     one) was decoded; a wrong pick already hard-errors on the ring-size mismatch.
+  #   - 3.16.0a0: python/cpython pinned to an exact commit, but the SHA is NOT written
+  #     here -- it is read from the `gcscope-source:` provenance line that
+  #     scripts/gen-offsets.py stamps into v_3_16_0a0.rs. That layout file is the single
+  #     source of truth: regenerate the 3.16 offsets and the pin moves with them, no YAML
+  #     edit. Pinned rather than floating `main` so unrelated CPython drift cannot block
+  #     PRs; retire this leg for a stock setup-python row once 3.16.0a1 reaches the registry.
+  custom-build-smoke:
+    name: gc-stats smoke (source ${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ref: a branch/SHA to build directly. provenance_file: read the pinned commit
+          # from a generated layout's `gcscope-source:` line instead (leave ref empty).
+          - label: '3.15+inc'
+            repo: sergey-miryanov/cpython
+            ref: 'feat/gc-gen-3.15+inc'
+            provenance_file: ''
+            expect_extended: 'yes'
+          - label: '3.16.0a0'
+            repo: python/cpython
+            ref: ''
+            provenance_file: 'src/remote_debugging/offsets/v_3_16_0a0.rs'
+            expect_extended: 'no'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Resolve to an exact commit. An empty `ref` means "read the pin from the layout
+      # file's gcscope-source: line" (single source of truth for an ongoing version).
+      # Cache key = exact commit, so a moving branch (+inc) re-keys when it advances while
+      # a pinned SHA stays a permanent hit. ls-remote yields nothing for a raw SHA, so
+      # fall back to the ref itself.
+      - name: Resolve interpreter commit
+        id: rev
+        run: |
+          REF="${{ matrix.ref }}"
+          if [ -z "$REF" ]; then
+            REF=$(grep -oE 'gcscope-source: [^@]+@[0-9a-f]{40}' "${{ matrix.provenance_file }}" \
+                  | head -1 | grep -oE '[0-9a-f]{40}')
+            [ -z "$REF" ] && { echo "::error::no gcscope-source pin in ${{ matrix.provenance_file }}"; exit 1; }
+            echo "Pinned from ${{ matrix.provenance_file }}: $REF"
+          fi
+          SHA=$(git ls-remote "https://github.com/${{ matrix.repo }}" "$REF" | cut -f1)
+          [ -z "$SHA" ] && SHA="$REF"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Building ${{ matrix.label }} @ $SHA"
+
+      - name: Cache built interpreter
+        id: cache-py
+        uses: actions/cache@v4
+        with:
+          path: ~/cpython-build
+          key: cpython-${{ matrix.label }}-${{ steps.rev.outputs.sha }}
+
+      # Fetch by resolved SHA (works for both a branch and a pinned commit; GitHub
+      # allows fetching an arbitrary reachable SHA). Only the C build deps are needed --
+      # spin.py imports gc/os/sys/time only, so the optional stdlib C modules are
+      # irrelevant and the interpreter boots without libssl/libffi at runtime.
+      - name: Build CPython from source
+        if: steps.cache-py.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev zlib1g-dev libffi-dev
+          git init src && cd src
+          git remote add origin "https://github.com/${{ matrix.repo }}"
+          git fetch --depth 1 origin "${{ steps.rev.outputs.sha }}"
+          git checkout FETCH_HEAD
+          ./configure --prefix="$HOME/cpython-build"
+          make -j"$(nproc)"
+          make install
+
+      - name: Build gcscope
+        run: cargo build --verbose
+
+      - name: Allow ptrace (best-effort)
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+
+      - name: Attach, detect version, assert GC stats
+        run: |
+          PY="$HOME/cpython-build/bin/python3"
+          "$PY" --version
+          EXTRA=""
+          [ "${{ matrix.expect_extended }}" = "yes" ] && EXTRA="--expect-extended"
+          python3 tests/live_smoke.py --python "$PY" --label "${{ matrix.label }}" $EXTRA
+
   # grcov (not cargo-llvm-cov) in both coverage paths on purpose: with `-s .` it
   # emits repo-relative, forward-slash paths on every OS, so the Windows uploads
   # merge with the Linux/macOS ones instead of appearing as a second set of files.
