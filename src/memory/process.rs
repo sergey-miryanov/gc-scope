@@ -37,7 +37,11 @@ fn find_section_in_elf(bytes: &[u8], region_start: usize) -> Option<u64> {
             .get_at(s.sh_name)
             .and_then(|name| {
                 let s = name.trim_end_matches('\0');
-                if s == "PyRuntime" { Some(true) } else { None }
+                // CPython's GENERATE_DEBUG_SECTION prefixes a dot on Linux
+                // (`__attribute__((section("." #name)))`, pycore_debug_offsets.h)
+                // but not on Windows/macOS, so ELF carries `.PyRuntime`. Accept
+                // the undotted spelling too for any toolchain that drops it.
+                if s == ".PyRuntime" || s == "PyRuntime" { Some(true) } else { None }
             })
             .unwrap_or(false)
     })?;
