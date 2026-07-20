@@ -124,15 +124,28 @@ pub fn find_runtime_pre_3_13(pid: u32, table: &OffsetTable) -> Result<(u64, Stri
     // interpreters_head field (matches the old `verify_with_table`).
     let scan_size = table.runtime_interpreters_head + 64;
 
+    // Record why each module was rejected. "Symbol missing" and "symbol found but
+    // the structural walk disagreed" have completely different causes — a symbol
+    // table that is absent or decorated differently, versus wrong field offsets
+    // for this build — and collapsing them into one message makes the failure
+    // undiagnosable from a user's (or a CI leg's) output alone.
+    let mut tried: Vec<String> = Vec::new();
+
     for (path, base_addr) in &modules {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(e) => {
+                tried.push(format!("{}: unreadable on disk ({})", path, e));
+                continue;
+            }
         };
 
         let addr = match version::resolve_symbol_in_bytes(&bytes, *base_addr, "_PyRuntime") {
             Some(a) => a,
-            None => continue,
+            None => {
+                tried.push(format!("{}: no _PyRuntime symbol", path));
+                continue;
+            }
         };
 
         if check_interpreter::check_runtime(
@@ -145,12 +158,25 @@ pub fn find_runtime_pre_3_13(pid: u32, table: &OffsetTable) -> Result<(u64, Stri
         ) {
             return Ok((addr, path.clone()));
         }
+
+        tried.push(format!(
+            "{}: _PyRuntime at {:#018x} (module base {:#018x}) failed the \
+             interpreters_head->threads_head->interp cross-reference \
+             (scanned {} bytes; offsets ih={} th={} ti={})",
+            path,
+            addr,
+            base_addr,
+            scan_size,
+            table.runtime_interpreters_head,
+            table.interp_threads_head,
+            table.thread_interp,
+        ));
     }
 
     anyhow::bail!(
-        "Could not find a valid pre-3.13 _PyRuntime in process {} \
-         (symbol missing or cross-reference validation failed)",
-        pid
+        "Could not find a valid pre-3.13 _PyRuntime in process {}.\nTried:\n  {}",
+        pid,
+        tried.join("\n  ")
     );
 }
 
