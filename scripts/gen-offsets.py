@@ -4,7 +4,7 @@
 Usage:
     python scripts/gen-offsets.py X:/path/to/cpython/checkout
 
-Requires bindgen on PATH (install with: cargo install bindgen-cli).
+Requires bindgen on PATH (install with: cargo install bindgen-cli --version 0.72).
 Requires LIBCLANG_PATH set on Windows.
 """
 

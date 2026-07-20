@@ -25,6 +25,17 @@ pub static LEGACY_GC_LAYOUT: GcItemLayout = GcItemLayout {
     ],
 };
 
+// A private constructor for the hand-extracted legacy tables: it fills the ~20 constant
+// `OffsetTable` fields (identical across 3.8–3.12) so the per-version call sites below
+// only supply the nine that vary — each one raw byte offset from a CPython header.
+//
+// The nine are passed positionally, kept as a compact table of magic numbers. The honest
+// tradeoff of the `#[allow]`: a named-field struct would make the trailing `// label`
+// comments compiler-checked against transposition — a real gain for correctness-critical
+// offsets. It is not taken because (a) any transposition is caught end-to-end by the
+// 3.8–3.12 live-smoke legs, and (b) the aligned-comment table is the clearer form for
+// hand-extracted offsets. If the live coverage ever narrows, revisit this.
+#[allow(clippy::too_many_arguments)]
 fn table(version_hex: u64, runtime_ih: u64, interp_next: u64, interp_id: u64,
          interp_ts_head: u64, interp_gc: Option<u64>, thread_interp: u64,
          gc_gen: u64, runtime_gc: Option<u64>) -> OffsetTable {

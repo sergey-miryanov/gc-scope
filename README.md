@@ -166,8 +166,14 @@ typedef unsigned long long uint64_t;
 
 **Full support** (bindgen — recommended for production releases):
 
+This is a maintainer-only step — building, testing, and running gcscope need none of it,
+since the generated `v_*.rs` are checked in. `gen-offsets.py` shells out to a `bindgen`
+binary on PATH; it is not a crate dependency.
+
 ```powershell
-# One-time: set LIBCLANG_PATH to VS-bundled LLVM
+# One-time: install the bindgen CLI (puts `bindgen` on PATH) and point LIBCLANG_PATH
+# at the VS-bundled LLVM.
+cargo install bindgen-cli --version 0.72
 $env:LIBCLANG_PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin"
 
 # Generate bindgen struct

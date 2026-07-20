@@ -1,17 +1,7 @@
-mod cli;
-mod cli_monitor;
-mod cli_monitor_options;
-mod diagram;
-mod list_pids;
-mod exporters;
-mod memory;
-mod monitor;
-mod monitor_loop;
-mod remote_debugging;
-
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command};
+use gcscope::cli::{Cli, Command};
+use gcscope::{cli_monitor, diagram, list_pids, memory, remote_debugging};
 
 fn resolve_pid(pid: i32) -> u32 {
     if pid == -1 { std::process::id() } else { pid as u32 }

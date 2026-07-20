@@ -649,7 +649,7 @@ where T: BasicOffsets {
     let version_ok = off.offsets_version() == expected_version;
     let mut checks = Vec::new();
     checks.push(validation::Check::new("cookie", cookie_ok, if cookie_ok { "\"xdebugpy\"" } else { &cookie_str }));
-    checks.push(validation::Check::new("version", version_ok, &format!("{:#x}", off.offsets_version())));
+    checks.push(validation::Check::new("version", version_ok, format!("{:#x}", off.offsets_version())));
     validation::ValidationReport { checks }
 }
 
