@@ -110,6 +110,19 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
+      - name: Configure macOS taskport permissions
+        if: runner.os == 'macOS'
+        run: |
+          echo "1. Read"
+          id $(whoami)
+          sudo security authorizationdb read system.privilege.taskport
+
+          echo "2. Write"
+          sudo security authorizationdb write system.privilege.taskport is-developer
+
+          echo "3. Check"
+          sudo security authorizationdb read system.privilege.taskport
+
       # The whole driver lives in tests/live_smoke.py, not in this step: the same
       # command has to run on Windows/PowerShell and macOS, and it must be
       # reproducible by hand off CI. Keep this step a single invocation.
