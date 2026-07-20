@@ -108,16 +108,26 @@ static FALLBACK_CACHE: std::sync::LazyLock<
 /// Graceful degradation for a 3.13+ build with no exact compiled layout: pick the
 /// closest same-(major,minor) layout. `_Py_DebugOffsets` is self-describing and stable
 /// within a minor, so a same-minor layout normally matches the target's real offsets.
+///
+/// Ordering is over the **whole** version hex (micro, then release level, then serial)
+/// and prefers the nearest **lower** version, breaking ties downward. Comparing micro
+/// alone used to tie every pre-release of a minor — all of 3.15.0a8/b1/b3 have micro 0 —
+/// so `min_by_key` silently kept whichever came first in the table. That picked a8 for a
+/// 3.15.0b4 target, and CPython had changed `gc_generation_stats` from 96 bytes/13 fields
+/// to 64/9 at b1: gcscope then read a 64-byte-stride ring with a 96-byte stride and
+/// reported garbage. Preferring the nearest lower version picks b3 there, whose geometry
+/// does match. A newer layout is used only when nothing older exists, since a struct
+/// change lands going *forward* in a release cycle.
 fn resolve_fallback_layout(stored: u64) -> Result<u64> {
     let tgt_mm = stored & MAJOR_MINOR_MASK;
-    let tgt_micro = ((stored >> 8) & 0xff) as i64;
 
     LAYOUTS
         .iter()
         .map(|(h, _)| *h)
         .filter(|h| h & MAJOR_MINOR_MASK == tgt_mm)
-        // nearest micro wins
-        .min_by_key(|h| ((((*h >> 8) & 0xff) as i64) - tgt_micro).unsigned_abs())
+        // (is-newer, distance): all lower candidates sort ahead of any higher one, and
+        // within each group the closest wins.
+        .min_by_key(|h| (*h > stored, h.abs_diff(stored)))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Unsupported Python version {:#010x}: no exact layout and no same-minor \
@@ -170,8 +180,9 @@ pub fn read_offsets(pid: u32, version: &PythonVersion) -> Result<(u64, u64, Vers
         let h = resolve_fallback_layout(stored)?;
         eprintln!(
             "warning: no exact offsets for Python {:#010x}; using the closest known \
-             layout {:#010x} (same {}.{}). GC-stat offsets are approximate — a \
-             buffer-size warning will appear if they don't match this build.",
+             layout {:#010x} (same {}.{}). GC-stat offsets are approximate — if the \
+             ring geometry doesn't match, `gc-stats` fails with a size mismatch rather \
+             than reporting garbage.",
             stored, h, (stored >> 24) & 0xff, (stored >> 16) & 0xff
         );
         FALLBACK_CACHE.lock().unwrap().insert((pid, stored), h);
@@ -758,28 +769,31 @@ mod registry_tests {
         assert!(!has_exact_layout(0x030d02f0));
     }
 
-    /// Two 3.13 layouts are compiled (micro 1 and micro 13), so "nearest micro" is a
-    /// real discrimination here rather than a tautology over a single candidate.
+    /// Regression test for a shipped bug. The metric used to be micro ONLY, so every
+    /// 3.15 pre-release tied at micro 0 and `min_by_key` kept whichever row came first
+    /// — a8. CPython shrank `gc_generation_stats` from 96 bytes to 64 at b1, so a
+    /// 3.15.0b4 target decoded through a8's layout reported pure garbage, and the CI
+    /// matrix stayed green because nothing checked the SHAPE of the output.
     #[test]
-    fn fallback_picks_the_nearest_micro_within_the_same_minor() {
-        assert_eq!(resolve_fallback_layout(0x030d02f0).unwrap(), 0x030d01f0, "micro 2 -> 1");
-        assert_eq!(resolve_fallback_layout(0x030d0cf0).unwrap(), 0x030d0df0, "micro 12 -> 13");
+    fn fallback_prefers_the_nearest_lower_prerelease() {
+        // b4 must reach b3 (64-byte slots), never a8 (96-byte).
+        assert_eq!(resolve_fallback_layout(0x030f00b4).unwrap(), 0x030f00b3);
+        // rc1 is past every compiled beta; still the newest lower one.
+        assert_eq!(resolve_fallback_layout(0x030f00c1).unwrap(), 0x030f00b3);
+        // Between a8 and b1 there is nothing lower but a8.
+        assert_eq!(resolve_fallback_layout(0x030f00a9).unwrap(), 0x030f00a8);
+        // Below every compiled 3.15 layout, the nearest higher one is all there is.
+        assert_eq!(resolve_fallback_layout(0x030f00a1).unwrap(), 0x030f00a8);
     }
 
-    /// Known limitation, pinned so a change to it is deliberate: the distance metric
-    /// is micro ONLY. Every 3.15 pre-release shares micro 0, so they are all equally
-    /// near and `min_by_key` keeps the first — the a8 layout — even for a target that
-    /// is closer to b3. Harmless today because `read_offsets` tries an exact match
-    /// first and only falls back for builds we have no layout for at all; it matters
-    /// if release level ever starts changing `_Py_DebugOffsets` within a minor.
+    /// Ordering is over the whole hex, so micro still dominates release level.
     #[test]
-    fn fallback_does_not_tie_break_on_release_level() {
-        // An unregistered 3.15 pre-release resolves to the first compiled 3.15 row.
-        assert_eq!(resolve_fallback_layout(0x030f00b4).unwrap(), 0x030f00a8);
-        // ...and so does a hex that IS registered, if asked directly. This is why
-        // `read_offsets` must keep checking `has_exact_layout` before calling here.
-        assert_eq!(resolve_fallback_layout(0x030f00b3).unwrap(), 0x030f00a8);
-        assert!(has_exact_layout(0x030f00b3), "the exact-match path is what protects b3");
+    fn fallback_prefers_a_lower_micro_over_a_nearer_release_level() {
+        // 3.13.2final: 3.13.1final is lower and closer than 3.13.13.
+        assert_eq!(resolve_fallback_layout(0x030d02f0).unwrap(), 0x030d01f0);
+        // 3.13.12: below 3.13.13, so it takes the lower 3.13.1 rather than the
+        // numerically-nearer-but-higher 3.13.13.
+        assert_eq!(resolve_fallback_layout(0x030d0cf0).unwrap(), 0x030d01f0);
     }
 
     #[test]

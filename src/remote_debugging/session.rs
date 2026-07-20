@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use read_process_memory::ProcessHandle;
 
 use crate::memory::{process, reader};
@@ -289,11 +289,18 @@ impl PySession {
             {
                 let expected = bases[2] + slots[2] * item + 8;
                 if reported != 0 && reported != expected {
-                    eprintln!(
-                        "warning: gc_generation_stats size mismatch for {:#010x}: the process \
-                         reports {reported} bytes but gcscope's compiled layout expects {expected}. \
-                         This build's GC ring layout may differ from the registered one — \
-                         regenerate offsets with scripts/gen-offsets.py against this exact build.",
+                    // Fail closed. The process publishes the true byte size of its ring
+                    // region; a disagreement means the per-slot stride or the field
+                    // offsets are wrong, so every number we could decode would be
+                    // garbage. This used to warn and carry on, which is how a 3.15.0b4
+                    // target silently decoded through the 3.15.0a8 layout (96-byte slots
+                    // vs 64) while every CI leg stayed green.
+                    bail!(
+                        "gc_generation_stats size mismatch for {:#010x}: the process reports \
+                         {reported} bytes but gcscope's compiled layout expects {expected}. \
+                         This build's GC ring layout differs from the registered one; decoding \
+                         it would report garbage. Regenerate offsets with scripts/gen-offsets.py \
+                         against this exact build.",
                         table.version_hex
                     );
                 }
