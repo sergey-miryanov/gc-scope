@@ -59,8 +59,7 @@ A session holds fields with different lifetimes, so caching is split in two:
     distinction (see [ADR 0003](0003-layout-driven-gc-stats-decode.md)).
   - `PySession::verify` was **removed** when the navigation heuristic left the
     user-facing surface (see [ADR 0002](0002-version-split-runtime-finding.md)).
-- Open item: the smoke half of the regression gate now exists — `live-smoke` runs
-  `gc-stats` against a live interpreter on every (OS, version) pair. The
-  **layout-cache-hit** and **soft-reattach** paths are still unobserved: both need
-  in-process access to `PySession`, which a CLI-driven test cannot reach. Scoped in
-  [tests-harness-plan.md](../tests-harness-plan.md).
+- ~~Open item: the **layout-cache-hit** and **soft-reattach** paths are unobserved.~~
+  **Closed (2026-07-21):** both now have `#[ignore]`d in-process tests
+  (`tests/lifecycle.rs`), reached via the lib/bin split and a small public signal
+  `PySession::layout_source()`. See [ADR 0005](0005-testing-strategy.md).

@@ -5,7 +5,7 @@
 //! through `CARGO_BIN_EXE_gcscope`, which is enough for the CLI-level smoke
 //! assertions but cannot observe the layout-cache hit or the soft-reattach
 //! revalidation path — both are in-process state with no CLI surface. See
-//! `docs/tests-harness-plan.md` §3.4.
+//! `docs/adr/0005-testing-strategy.md`.
 //!
 //! `src/main.rs` is a thin CLI dispatcher over this crate and holds no logic
 //! beyond argument parsing.

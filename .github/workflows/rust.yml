@@ -152,7 +152,7 @@ jobs:
 
   # Build custom interpreters setup-python can't supply, then run the live_smoke driver.
   # Linux-only (version/decode coverage is OS-independent). Blocking gate. Rationale:
-  # docs/tests-harness-plan.md.
+  # docs/adr/0006-layout-registration-integrity.md.
   #   - 3.15+inc: shares hex 0x030f00b1 with clean 3.15.0b1; --expect-extended proves the
   #     +inc candidate (not the clean one) was decoded.
   #   - 3.16.0a0: pinned commit read from the gcscope-source: line in v_3_16_0a0.rs, so

@@ -98,5 +98,5 @@ format spec.**
 ## Verification
 
 The live smoke matrix — 3 OSes × Python 3.8–3.15, one leg per pair; see
-`docs/tests-harness-plan.md`. A platform assumption that regresses fails the
+[ADR 0005](0005-testing-strategy.md). A platform assumption that regresses fails the
 specific `(os, version)` leg that depends on it.

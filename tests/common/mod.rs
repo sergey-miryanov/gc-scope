@@ -1,4 +1,4 @@
-//! Shared helpers for the live integration tests (§4.2 of docs/tests-harness-plan.md).
+//! Shared helpers for the live integration tests (see docs/adr/0005-testing-strategy.md).
 //!
 //! [`SpawnedPython`] is the RAII spawn guard: it launches the checked-in `spin.py`
 //! fixture, blocks until its `READY <pid>` marker, and **kills the child on drop** so a
