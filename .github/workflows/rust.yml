@@ -21,8 +21,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy, rustfmt, llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@grcov
 
       - name: Build
         run: cargo build --verbose
@@ -30,6 +31,37 @@ jobs:
       # Unit tests only; live-smoke below is the integration gate.
       - name: Test
         run: cargo test --verbose
+
+      # A second, instrumented run rather than replacing `Test` above: that keeps a
+      # coverage-tool failure from ever being mistaken for a test failure, and keeps
+      # the gate itself running an uninstrumented binary. RUSTFLAGS is scoped to this
+      # step so it cannot leak into the steps above.
+      - name: Coverage (unit tests)
+        continue-on-error: true
+        shell: bash
+        env:
+          RUSTFLAGS: -Cinstrument-coverage
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/target/profraw/gcscope-%p-%m.profraw
+        run: |
+          cargo test --quiet
+          grcov target/profraw \
+            --binary-path target/debug \
+            -s . -t lcov --branch --ignore-not-existing \
+            --ignore '../*' --ignore '/*' --ignore 'C:/Users/*' \
+            -o lcov.info
+          echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
+
+      - name: Upload coverage to Codecov
+        continue-on-error: true
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          flags: unit,${{ matrix.os }}
+          name: unit-${{ matrix.os }}
+          # Explicit path; searching the tree would also pick up stale local reports.
+          disable_search: true
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
       # Non-blocking until the existing warning/format baseline is cleaned up.
       - name: Clippy (non-blocking)
@@ -120,3 +152,104 @@ jobs:
           PY="$(command -v python)"
           sudo -E "$PY" tests/live_smoke.py \
             --label ${{ matrix.os }}-py${{ matrix.python }}
+
+  # grcov (not cargo-llvm-cov) in both coverage paths on purpose: with `-s .` it
+  # emits repo-relative, forward-slash paths on every OS, so the Windows uploads
+  # merge with the Linux/macOS ones instead of appearing as a second set of files.
+  # `cargo llvm-cov --lcov` emits absolute native paths (`SF:X:\Work\...`), which
+  # Codecov may or may not normalize — and when it doesn't, coverage silently
+  # double-counts rather than erroring.
+  #
+  # Coverage-only sibling of live-smoke, kept separate on purpose: the gate above
+  # must keep asserting against an UNINSTRUMENTED binary (what actually ships), and
+  # coverage needs only enough legs to reach each decode path, not all 24. The three
+  # versions cover every GcStatsKind route — 3.8 global GC, 3.12 legacy per-interp,
+  # 3.15 ring buffer — across all three binary formats.
+  # Every step is non-blocking: live-smoke is the gate, this job never is.
+  coverage-smoke:
+    name: coverage smoke (${{ matrix.os }} py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    # Job-level, so an instrumented-build or tool-install failure cannot block a
+    # merge either. Note this masks the job's `conclusion` in the API — judge these
+    # legs by whether a report reached Codecov, not by their GitHub status.
+    continue-on-error: true
+    env:
+      # live_smoke.py drives gcscope as a subprocess, so coverage has to come from
+      # the process itself rather than a test harness. Each invocation drops its own
+      # profile (%p = pid, %m = binary signature).
+      RUSTFLAGS: -Cinstrument-coverage
+      LLVM_PROFILE_FILE: ${{ github.workspace }}/target/profraw/gcscope-%p-%m.profraw
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.8', '3.12', '3.15']
+        include:
+          - { python: '3.8',  macos_needs_root: 'yes' }
+          - { python: '3.12', macos_needs_root: 'yes' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@grcov
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+
+      # No rust-cache here: RUSTFLAGS forces a full instrumented rebuild anyway.
+      - name: Build instrumented gcscope
+        run: cargo build
+
+      - name: Allow ptrace (best-effort)
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+
+      - name: Configure macOS taskport permissions
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: sudo security authorizationdb write system.privilege.taskport is-developer
+
+      - name: Smoke run
+        if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
+        continue-on-error: true
+        run: python tests/live_smoke.py --label cov-${{ matrix.os }}-py${{ matrix.python }}
+
+      - name: Smoke run (sudo)
+        if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
+        continue-on-error: true
+        run: |
+          PY="$(command -v python)"
+          sudo -E "$PY" tests/live_smoke.py \
+            --label cov-${{ matrix.os }}-py${{ matrix.python }}
+
+      # The sudo legs write root-owned .profraw that grcov then cannot read.
+      - name: Make profiles readable
+        if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
+        continue-on-error: true
+        run: sudo chown -R "$(whoami)" target/profraw || true
+
+      - name: Generate lcov
+        continue-on-error: true
+        shell: bash
+        run: |
+          # RUSTFLAGS instruments dependencies too; --ignore drops registry sources
+          # so only this crate's files reach the report.
+          grcov target/profraw \
+            --binary-path target/debug \
+            -s . -t lcov --branch --ignore-not-existing \
+            --ignore '../*' --ignore '/*' --ignore 'C:/Users/*' \
+            -o lcov.info
+          echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
+
+      - name: Upload coverage to Codecov
+        continue-on-error: true
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          flags: smoke,${{ matrix.os }}
+          name: smoke-${{ matrix.os }}-py${{ matrix.python }}
+          disable_search: true
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
