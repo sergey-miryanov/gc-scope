@@ -48,6 +48,24 @@ pub fn test_python() -> Option<PathBuf> {
         .find(|p| runs(p))
 }
 
+/// Best-effort `(major, minor)` of `python`, parsed from `python --version`
+/// (e.g. `"Python 3.13.1"` → `(3, 13)`). `None` if it can't be determined.
+///
+/// Used to gate tests that touch machinery only present in newer interpreters —
+/// e.g. the `_PyRuntime`/`"xdebugpy"` section that `find_runtime` needs exists
+/// only from 3.13 on. 3.4+ prints the version to stdout; check stderr too for the
+/// rare toolchain that still uses it.
+pub fn python_version(python: &Path) -> Option<(u8, u8)> {
+    let out = Command::new(python).arg("--version").output().ok()?;
+    let text = if out.stdout.is_empty() { out.stderr } else { out.stdout };
+    let s = String::from_utf8_lossy(&text);
+    let ver = s.split_whitespace().nth(1)?; // "Python" "3.13.1"
+    let mut parts = ver.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
 /// Whether `python --version` runs and exits 0 (i.e. the interpreter is usable).
 fn runs(python: &Path) -> bool {
     Command::new(python)
