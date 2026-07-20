@@ -110,8 +110,17 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
+      # macOS gates attach through task_for_pid rather than ptrace scope.
+      # Non-blocking on purpose: if this fails the smoke step must still run, so
+      # a macOS failure tells us whether the blocker is the permission or the
+      # Mach-O symbol lookup. A failing setup step would skip it and confound the two.
+      #
+      # `is-developer` grants taskport to members of the `_developer` group — hence
+      # the `id` echo, which shows whether the runner user is actually in it. If it
+      # is not, this rule is a no-op and the value needs to be `allow` instead.
       - name: Configure macOS taskport permissions
         if: runner.os == 'macOS'
+        continue-on-error: true
         run: |
           echo "1. Read"
           id $(whoami)
@@ -122,6 +131,25 @@ jobs:
 
           echo "3. Check"
           sudo security authorizationdb read system.privilege.taskport
+
+      # Ground truth about the macOS image, so a failure is diagnosable from the
+      # log alone instead of costing a round-trip. Answers, in order: is it a fat
+      # binary (which slices), does it carry the PyRuntime section and in which
+      # segment, and how is the _PyRuntime symbol actually spelled.
+      - name: Describe the macOS Python image
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          PYBIN="$(python -c 'import sys; print(sys.executable)')"
+          # The executable is a stub; the runtime lives in the framework dylib.
+          FW="$(python -c 'import sysconfig,os; print(os.path.join(sysconfig.get_config_var("prefix"), "Python"))')"
+          for f in "$PYBIN" "$FW"; do
+            echo "===== $f ====="
+            [ -e "$f" ] || { echo "(absent)"; continue; }
+            file "$f"
+            otool -l "$f" 2>/dev/null | grep -B2 -A4 'PyRuntime' || echo "(no PyRuntime section)"
+            nm -m "$f" 2>/dev/null | grep -i 'pyruntime\|py_version' || echo "(no matching symbols)"
+          done
 
       # The whole driver lives in tests/live_smoke.py, not in this step: the same
       # command has to run on Windows/PowerShell and macOS, and it must be

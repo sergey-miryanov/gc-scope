@@ -66,7 +66,8 @@ fn find_section_in_pe(bytes: &[u8], region_start: usize) -> Option<u64> {
 }
 
 fn find_section_in_macho(bytes: &[u8], region_start: usize) -> Option<u64> {
-    let macho = goblin::mach::MachO::parse(bytes, 0).ok()?;
+    // Section addresses are virtual, so the fat-slice offset is not needed here.
+    let (macho, _) = binary::parse_macho(bytes)?;
 
     let mut text_vmaddr: Option<u64> = None;
     let mut runtime_addr: Option<u64> = None;
