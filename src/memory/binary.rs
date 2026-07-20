@@ -37,9 +37,26 @@ pub fn find_python_modules(pid: u32) -> Result<Vec<(String, usize)>> {
             None => continue,
         };
         let lower = path.to_lowercase();
-        if lower.contains("python")
-            && !modules.iter().any(|(p, _)| *p == path)
-        {
+        if !lower.contains("python") {
+            continue;
+        }
+        // Which mapping is the image *base* differs by platform, and the answer
+        // is not "the lowest one" everywhere:
+        //
+        //  * ELF/PE — the first mapping is the load base, and section addresses
+        //    are rebased off it (see `elf_load_bias`).
+        //  * Mach-O — the kernel attributes several unrelated low-address
+        //    reservations to the image path, so the first mapping is typically a
+        //    no-access `---` range well below the real image. The Mach-O header
+        //    sits at the start of __TEXT, which is the executable mapping, and
+        //    every section `vmaddr` is relative to that. Anchoring on the first
+        //    mapping instead lands ~14 MB low — still inside *some* mapped
+        //    region, so the read succeeds and silently returns garbage rather
+        //    than failing cleanly.
+        if cfg!(target_os = "macos") && !m.is_exec() {
+            continue;
+        }
+        if !modules.iter().any(|(p, _)| *p == path) {
             modules.push((path.to_string(), m.start()));
         }
     }
