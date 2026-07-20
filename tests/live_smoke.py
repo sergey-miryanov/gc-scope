@@ -54,10 +54,13 @@ def target_version(python):
     """(major, minor) of the interpreter under test, or None if unparseable."""
     rc, out = run([python, "-c",
                    "import sys; print('%d %d' % sys.version_info[:2])"])
-    if rc != 0:
+    if rc != 0 or not out.strip():
         return None
     try:
-        major, minor = out.split()[:2]
+        # Last line only: a .pth/site warning at interpreter startup prints to stdout
+        # *before* the -c code runs, and parsing from the front would swallow it and
+        # silently skip the shape check (fail-open). The version is always the last line.
+        major, minor = out.strip().splitlines()[-1].split()[:2]
         return int(major), int(minor)
     except (ValueError, IndexError):
         return None
@@ -207,6 +210,10 @@ def main():
                         help="interpreter to attach to (default: this one)")
     parser.add_argument("--label", default=None,
                         help="tag for PASS/FAIL lines (default: the target's version)")
+    parser.add_argument("--expect-extended", action="store_true",
+                        help="require the extended +inc GC columns (IncrSize/AliveSize); "
+                             "the tell that the same-hex +inc candidate was selected, not "
+                             "the clean layout it shares a version with")
     parser.add_argument("--tmpdir", default=os.environ.get("RUNNER_TEMP") or
                         os.path.join(REPO, ".temp"),
                         help="scratch dir for the fixture log")
@@ -312,6 +319,16 @@ def main():
             rows = parse_stats_table(out)
             if check_stats(rows, kind, slots, fail):
                 return 1
+
+        # For a same-hex collision build (gc-gen-3.15+inc shares 0x030f00b1 with clean
+        # 3.15.0b1), a correct decode is not enough -- it must be decoded through the
+        # +inc *candidate*, whose extra fields surface as these columns. A wrong candidate
+        # already hard-errors on the ring-size mismatch (fail-closed), so this is the
+        # positive half: proof the RIGHT candidate was picked, not merely that no wrong
+        # one was.
+        if args.expect_extended and "IncrSize" not in out:
+            return fail("expected extended GC columns (IncrSize/AliveSize); the +inc "
+                        "candidate was not selected -- decoded through the base layout")
 
         print("PASS(%s): attached + detected + decoded %s stats, shape %s"
               % (label, kind or "?", slots or "?"))
