@@ -95,25 +95,112 @@ impl OffsetTable {
             Some(a) => a,
             None => return Ok(vec![]),
         };
-        let item_size = self.gc_item_size.unwrap_or(0) as usize;
-        if item_size == 0 { return Ok(vec![]); }
-        let slots = match self.gc_slots_per_gen {
-            Some(s) => s,
+        let total = match self.stats_buffer_len() {
+            Some(t) => t,
             None => return Ok(vec![]),
         };
-        let bases = match self.gc_gen_base_offsets {
-            Some(b) => b,
-            None => return Ok(vec![]),
-        };
-
-        // total data = last gen's base + its slots
-        let total = (bases[2] as usize) + (slots[2] as usize) * item_size;
         let raw = reader::read_memory_h(handle, addr, total)
             .with_context(|| format!("Failed to read gc_stats buffer at {addr:#x} ({total} bytes)"))?;
+        Ok(self.decode_gc_stats(&raw, iid))
+    }
 
+    /// Human-readable dump of every number this table will decode GC stats with.
+    ///
+    /// Exists so a failure is diagnosable without guessing which layout was picked or
+    /// where a stride came from — the question that made a 3.15.0b4 mis-decode take
+    /// several CI rounds to pin down.
+    pub fn describe_gc_geometry(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("  kind             : {:?}\n", self.gc_stats_kind));
+        match (self.gc_item_size, self.gc_slots_per_gen, self.gc_gen_base_offsets) {
+            (Some(item), Some(slots), Some(bases)) => {
+                s.push_str(&format!("  slot size        : {item} bytes\n"));
+                s.push_str(&format!("  slots/generation : {slots:?}\n"));
+                s.push_str(&format!("  generation bases : {bases:?}\n"));
+                s.push_str(&format!(
+                    "  bytes read       : {} (bases[2] + slots[2]*size)\n",
+                    self.stats_buffer_len().unwrap_or(0)
+                ));
+                if self.gc_stats_kind == GcStatsKind::RingBuffer {
+                    // Not the same number as `bytes read`: each generation's ring is
+                    // followed by an 8-byte cursor, and the process counts the last
+                    // one while the decoder has no reason to read it.
+                    s.push_str(&format!(
+                        "  region size      : {} (what the process should report)\n",
+                        self.gc_stats_region_size()
+                    ));
+                }
+            }
+            _ => s.push_str("  (no slot geometry — this build decodes no GC stats)\n"),
+        }
+        if self.gc_stats_inline_off != 0 {
+            s.push_str(&format!(
+                "  inline offset    : {:#x} (from each interpreter's gc state)\n",
+                self.gc_stats_inline_off
+            ));
+        }
+        match self.gc_layout {
+            Some(l) => {
+                s.push_str(&format!("  per-slot fields  : {} in {} bytes\n",
+                                    l.fields.len(), l.item_size));
+                for (name, off) in l.fields {
+                    s.push_str(&format!("      {off:>4}  {name}\n"));
+                }
+            }
+            None => s.push_str("  per-slot fields  : (none registered)\n"),
+        }
+        s
+    }
+
+    /// Total size of the ring region as the *process* reports it in
+    /// `gc.generation_stats_size` — including the trailing per-generation cursor word
+    /// that the decoder never reads. The single definition of this formula, so the
+    /// mismatch guard and the diagnostic dump cannot drift apart. `0` for non-ring
+    /// kinds, which publish no size.
+    pub fn gc_stats_region_size(&self) -> u64 {
+        if self.gc_stats_kind != GcStatsKind::RingBuffer {
+            return 0;
+        }
+        match (self.gc_item_size, self.gc_slots_per_gen, self.gc_gen_base_offsets) {
+            (Some(item), Some(slots), Some(bases)) => bases[2] + slots[2] * item + 8,
+            _ => 0,
+        }
+    }
+
+    /// Byte length of one interpreter's stats region — the last generation's base
+    /// plus its slots. `None` when this build exposes no decodable stats (those are
+    /// shape facts, not failures; see [`Self::read_gc_stats`]).
+    fn stats_buffer_len(&self) -> Option<usize> {
+        let item_size = self.gc_item_size? as usize;
+        if item_size == 0 {
+            return None;
+        }
+        let slots = self.gc_slots_per_gen?;
+        let bases = self.gc_gen_base_offsets?;
+        self.gc_layout?;
+        Some((bases[2] as usize) + (slots[2] as usize) * item_size)
+    }
+
+    /// Decode an already-read stats buffer. Pure — no process access — so the
+    /// per-version slot geometry and field offsets are testable without a target.
+    ///
+    /// Returns an empty vec for the same "no decodable stats" shapes as
+    /// [`Self::read_gc_stats`], and for a `raw` shorter than the shape requires
+    /// (a short read is a plausible teardown race, not a reason to panic).
+    pub fn decode_gc_stats(&self, raw: &[u8], iid: i64) -> Vec<GcStat> {
+        let total = match self.stats_buffer_len() {
+            Some(t) => t,
+            None => return vec![],
+        };
+        if raw.len() < total {
+            return vec![];
+        }
+        let item_size = self.gc_item_size.unwrap_or(0) as usize;
+        let slots = self.gc_slots_per_gen.unwrap_or([0; 3]);
+        let bases = self.gc_gen_base_offsets.unwrap_or([0; 3]);
         let layout = match self.gc_layout {
             Some(l) => l,
-            None => return Ok(vec![]),
+            None => return vec![],
         };
 
         let mut stats = Vec::new();
@@ -124,18 +211,18 @@ impl OffsetTable {
                 let off = base + slot * item_size;
                 macro_rules! opt {
                     ($name:expr) => {
-                        layout.field_offset($name).map(|o| raw_i64(&raw, off + o))
+                        layout.field_offset($name).map(|o| raw_i64(raw, off + o))
                     };
                 }
                 stats.push(GcStat {
                     generation: gidx, slot, interpreter_id: iid,
                     ts_start: opt!("ts_start").unwrap_or(0),
                     ts_stop: opt!("ts_stop").unwrap_or(0),
-                    collections: raw_i64(&raw, off + layout.field_offset("collections").unwrap()),
-                    collected: raw_i64(&raw, off + layout.field_offset("collected").unwrap()),
-                    uncollectable: raw_i64(&raw, off + layout.field_offset("uncollectable").unwrap()),
+                    collections: raw_i64(raw, off + layout.field_offset("collections").unwrap()),
+                    collected: raw_i64(raw, off + layout.field_offset("collected").unwrap()),
+                    uncollectable: raw_i64(raw, off + layout.field_offset("uncollectable").unwrap()),
                     candidates: opt!("candidates").unwrap_or(0),
-                    duration: layout.field_offset("duration").map(|o| raw_f64(&raw, off + o)).unwrap_or(0.0),
+                    duration: layout.field_offset("duration").map(|o| raw_f64(raw, off + o)).unwrap_or(0.0),
                     heap_size: opt!("heap_size").unwrap_or(0),
                     increment_size: opt!("increment_size"),
                     alive_size: opt!("alive_size"),
@@ -158,7 +245,7 @@ impl OffsetTable {
                 });
             }
         }
-        Ok(stats)
+        stats
     }
 }
 
@@ -200,4 +287,202 @@ pub fn compute_ring_base_offsets(item_size: u64, slots: &[u64; 3]) -> [u64; 3] {
         slots[0] * item_size + 8,
         slots[0] * item_size + 8 + slots[1] * item_size + 8,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote_debugging::offsets::{pre_3_13, set_ring};
+
+    /// A synthetic ring-slot layout with an extended field, so the tests exercise
+    /// both the required fields and the `Option` ones without pinning any real
+    /// build's struct (those are covered by the registry tests in `offsets/mod.rs`).
+    static RING_LAYOUT: GcItemLayout = GcItemLayout {
+        item_size: 40,
+        fields: &[
+            ("ts_start", 0),
+            ("collections", 8),
+            ("collected", 16),
+            ("uncollectable", 24),
+            ("increment_size", 32),
+        ],
+    };
+
+    fn put_i64(buf: &mut [u8], off: usize, v: i64) {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    // ── geometry ────────────────────────────────────────────────
+
+    /// Generations are separated by an 8-byte gap (the ring's own write cursor), so
+    /// a base is NOT simply `slots_so_far * item_size`. Dropping the pad shifts every
+    /// generation after the first onto the wrong slot.
+    #[test]
+    fn ring_base_offsets_include_the_inter_generation_pad() {
+        let bases = compute_ring_base_offsets(40, &[11, 3, 3]);
+        assert_eq!(bases, [0, 11 * 40 + 8, 11 * 40 + 8 + 3 * 40 + 8]);
+        assert!(bases[0] < bases[1] && bases[1] < bases[2]);
+
+        // Free-threaded builds carry one slot per generation, same pad.
+        let ft = compute_ring_base_offsets(40, &[1, 1, 1]);
+        assert_eq!(ft, [0, 48, 96]);
+    }
+
+    #[test]
+    fn field_offset_reports_presence_and_position() {
+        assert_eq!(RING_LAYOUT.field_offset("collections"), Some(8));
+        assert_eq!(RING_LAYOUT.field_offset("heap_size"), None);
+        assert!(RING_LAYOUT.has_field("increment_size"));
+        assert!(!RING_LAYOUT.has_field("heap_size"));
+    }
+
+    // ── inline decode (3.8-3.12 and 3.13/3.14) ──────────────────
+
+    /// Three 24-byte slots back to back. Each generation must read from its own
+    /// slot: an off-by-one base or stride silently reports generation N's counters
+    /// under generation N-1.
+    #[test]
+    fn inline_decode_maps_each_generation_to_its_own_slot() {
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        table.gc_stats_addr = Some(0x1000); // any non-None value; decode never reads it
+
+        let mut buf = vec![0u8; 72];
+        for g in 0..3usize {
+            let base = g * 24;
+            put_i64(&mut buf, base, 100 * g as i64 + 1); // collections
+            put_i64(&mut buf, base + 8, 100 * g as i64 + 2); // collected
+            put_i64(&mut buf, base + 16, 100 * g as i64 + 3); // uncollectable
+        }
+
+        let stats = table.decode_gc_stats(&buf, 7);
+        assert_eq!(stats.len(), 3, "one slot per generation");
+        for (g, s) in stats.iter().enumerate() {
+            assert_eq!(s.generation, g as u32);
+            assert_eq!(s.slot, 0);
+            assert_eq!(s.interpreter_id, 7);
+            assert_eq!(s.collections, 100 * g as i64 + 1);
+            assert_eq!(s.collected, 100 * g as i64 + 2);
+            assert_eq!(s.uncollectable, 100 * g as i64 + 3);
+        }
+    }
+
+    /// A field the build does not have must stay `None`, not become `Some(0)`.
+    /// `gc_stats::print_stats` keys its whole column set on
+    /// `increment_size.is_some()`, so blurring the two changes the CLI's output for
+    /// every pre-3.13 target.
+    #[test]
+    fn absent_fields_decode_to_none_not_zero() {
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        table.gc_stats_addr = Some(0x1000);
+
+        let stats = table.decode_gc_stats(&[0u8; 72], 0);
+        let s = &stats[0];
+        // The legacy layout has only collections/collected/uncollectable.
+        assert_eq!(s.increment_size, None);
+        assert_eq!(s.alive_size, None);
+        assert_eq!(s.ts_mark_alive_start, None);
+        // Non-Option fields with no layout entry fall back to zero.
+        assert_eq!(s.ts_start, 0);
+        assert_eq!(s.heap_size, 0);
+        assert_eq!(s.duration, 0.0);
+    }
+
+    // ── ring-buffer decode (3.15.0a8+) ──────────────────────────
+
+    fn ring_table(free_threaded: u64) -> OffsetTable {
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        set_ring(&mut table, RING_LAYOUT.item_size as u64, &RING_LAYOUT, free_threaded);
+        table.gc_stats_addr = Some(0x1000);
+        table
+    }
+
+    /// GIL builds keep 11 young slots and 3 per old generation; the decode must
+    /// produce every one, indexed by its own generation and slot.
+    #[test]
+    fn ring_decode_walks_every_slot_of_every_generation() {
+        let table = ring_table(0);
+        let slots = table.gc_slots_per_gen.unwrap();
+        let bases = table.gc_gen_base_offsets.unwrap();
+        assert_eq!(slots, [11, 3, 3], "GIL ring geometry");
+
+        let item = RING_LAYOUT.item_size;
+        let mut buf = vec![0u8; bases[2] as usize + slots[2] as usize * item];
+        for g in 0..3usize {
+            for slot in 0..slots[g] as usize {
+                let off = bases[g] as usize + slot * item;
+                put_i64(&mut buf, off, 1000 * (g as i64 + 1) + slot as i64); // ts_start
+                put_i64(&mut buf, off + 32, 10 * g as i64 + slot as i64); // increment_size
+            }
+        }
+
+        let stats = table.decode_gc_stats(&buf, 3);
+        assert_eq!(stats.len(), 11 + 3 + 3);
+        for s in &stats {
+            assert_eq!(
+                s.ts_start,
+                1000 * (s.generation as i64 + 1) + s.slot as i64,
+                "generation {} slot {} read from the wrong offset",
+                s.generation, s.slot
+            );
+            assert_eq!(s.increment_size, Some(10 * s.generation as i64 + s.slot as i64));
+        }
+
+        // Generation 1 starts one 8-byte pad past the end of generation 0's slots;
+        // reading it at `11 * item` instead would land inside the pad and return 0.
+        let gen1_first = stats.iter().find(|s| s.generation == 1 && s.slot == 0).unwrap();
+        assert_eq!(gen1_first.ts_start, 2000);
+    }
+
+    #[test]
+    fn free_threaded_ring_has_one_slot_per_generation() {
+        let table = ring_table(1);
+        assert_eq!(table.gc_slots_per_gen.unwrap(), [1, 1, 1]);
+
+        let bases = table.gc_gen_base_offsets.unwrap();
+        let buf = vec![0u8; bases[2] as usize + RING_LAYOUT.item_size];
+        let stats = table.decode_gc_stats(&buf, 0);
+        assert_eq!(stats.len(), 3);
+        assert!(stats.iter().all(|s| s.slot == 0));
+    }
+
+    // ── shape guards ────────────────────────────────────────────
+
+    /// A buffer shorter than the shape requires means the read was truncated (a
+    /// plausible teardown race). Return nothing rather than index-panicking mid-walk.
+    #[test]
+    fn short_buffer_decodes_to_nothing() {
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        table.gc_stats_addr = Some(0x1000);
+        assert!(table.decode_gc_stats(&[], 0).is_empty());
+        assert!(table.decode_gc_stats(&[0u8; 71], 0).is_empty(), "one byte short");
+        assert_eq!(table.decode_gc_stats(&[0u8; 72], 0).len(), 3);
+    }
+
+    /// "This build exposes no decodable stats" is a shape fact, not a failure —
+    /// each missing piece of the shape independently yields an empty result.
+    #[test]
+    fn missing_shape_information_decodes_to_nothing() {
+        let base = pre_3_13::table_for_version(3, 12).unwrap();
+        let buf = vec![0u8; 72];
+
+        let mut no_layout = base.clone();
+        no_layout.gc_layout = None;
+        assert!(no_layout.decode_gc_stats(&buf, 0).is_empty());
+
+        let mut no_item_size = base.clone();
+        no_item_size.gc_item_size = None;
+        assert!(no_item_size.decode_gc_stats(&buf, 0).is_empty());
+
+        let mut zero_item_size = base.clone();
+        zero_item_size.gc_item_size = Some(0);
+        assert!(zero_item_size.decode_gc_stats(&buf, 0).is_empty());
+
+        let mut no_slots = base.clone();
+        no_slots.gc_slots_per_gen = None;
+        assert!(no_slots.decode_gc_stats(&buf, 0).is_empty());
+
+        let mut no_bases = base.clone();
+        no_bases.gc_gen_base_offsets = None;
+        assert!(no_bases.decode_gc_stats(&buf, 0).is_empty());
+    }
 }

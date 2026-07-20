@@ -125,3 +125,40 @@ pub fn elf_load_bias(elf: &goblin::elf::Elf) -> Option<u64> {
         .find(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD)?;
     Some(first_load.p_vaddr - (first_load.p_vaddr % first_load.p_align))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kind(bytes: &[u8]) -> Option<&'static str> {
+        classify(bytes).map(|k| match k {
+            BinaryKind::Elf => "elf",
+            BinaryKind::Pe => "pe",
+            BinaryKind::MachO => "macho",
+        })
+    }
+
+    /// The magic table is the first fork in every finder, and each platform's real
+    /// image was only ever confirmed by a live CI leg (ADR 0004). Pin the bytes.
+    #[test]
+    fn classifies_each_format_magic() {
+        assert_eq!(kind(b"\x7fELF\x02\x01\x01\x00"), Some("elf"));
+        assert_eq!(kind(b"MZ\x90\x00"), Some("pe"));
+        // Mach-O 32/64-bit, both byte orders.
+        assert_eq!(kind(&0xfeedfaceu32.to_le_bytes()), Some("macho"));
+        assert_eq!(kind(&0xcefaedfeu32.to_le_bytes()), Some("macho"));
+        assert_eq!(kind(&0xfeedfacfu32.to_le_bytes()), Some("macho"));
+        assert_eq!(kind(&0xcffaedfeu32.to_le_bytes()), Some("macho"));
+        // Universal ("fat") — what every macOS framework build actually is.
+        assert_eq!(kind(&0xcafebabeu32.to_le_bytes()), Some("macho"));
+        assert_eq!(kind(&0xbebafecau32.to_le_bytes()), Some("macho"));
+    }
+
+    #[test]
+    fn rejects_short_and_unknown_input() {
+        assert!(kind(b"").is_none());
+        assert!(kind(b"\x7fEL").is_none(), "3 bytes is below the 4-byte magic");
+        assert!(kind(b"not a binary").is_none());
+        assert!(kind(&[0u8; 4]).is_none());
+    }
+}

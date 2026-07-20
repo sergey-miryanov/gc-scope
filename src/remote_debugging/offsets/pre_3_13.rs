@@ -139,3 +139,89 @@ fn v3_12(version_hex: u64) -> OffsetTable {
         None,    // runtime_gc
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote_debugging::version::PythonVersion;
+
+    const SUPPORTED: [(u8, u8); 5] = [(3, 8), (3, 9), (3, 10), (3, 11), (3, 12)];
+
+    #[test]
+    fn covers_exactly_3_8_through_3_12() {
+        for (major, minor) in SUPPORTED {
+            assert!(
+                table_for_version(major, minor).is_some(),
+                "{major}.{minor} should have a legacy table"
+            );
+        }
+        // 3.7 predates support; 3.13+ goes through the bindgen `LAYOUTS` registry.
+        for (major, minor) in [(3, 7), (3, 13), (3, 16), (4, 0), (2, 7)] {
+            assert!(
+                table_for_version(major, minor).is_none(),
+                "{major}.{minor} must not resolve to a legacy table"
+            );
+        }
+    }
+
+    /// 3.8 keeps GC state global in `_PyRuntime`; 3.9+ moved it per-interpreter.
+    /// This single bit routes the global-GC branch in `PySession::gc_stats`, and
+    /// the two branches do different address math (ADR 0003) — so getting it wrong
+    /// reads a valid-but-wrong address and returns garbage rather than failing.
+    #[test]
+    fn only_3_8_has_global_gc_state() {
+        let t38 = table_for_version(3, 8).unwrap();
+        assert!(t38.runtime_gc.is_some(), "3.8 GC state lives in _PyRuntime");
+        assert!(t38.interp_gc.is_none(), "3.8 has no per-interpreter GC state");
+
+        for (major, minor) in [(3, 9), (3, 10), (3, 11), (3, 12)] {
+            let t = table_for_version(major, minor).unwrap();
+            assert!(t.runtime_gc.is_none(), "{major}.{minor} must not use the global-GC branch");
+            assert!(t.interp_gc.is_some(), "{major}.{minor} has per-interpreter GC state");
+        }
+    }
+
+    /// Every legacy build decodes through the SAME inline `gc_generation_stats`
+    /// layout as 3.13/3.14 — that shared path is why `pre_3_13.rs` needs no decode
+    /// logic of its own.
+    #[test]
+    fn all_legacy_tables_share_the_inline_stats_shape() {
+        for (major, minor) in SUPPORTED {
+            let t = table_for_version(major, minor).unwrap();
+            let at = format!("{major}.{minor}");
+            assert_eq!(t.gc_stats_kind, GcStatsKind::InlineArray, "{at}");
+            assert_eq!(t.gc_item_size, Some(24), "{at}");
+            assert_eq!(t.gc_slots_per_gen, Some([1, 1, 1]), "{at}");
+            assert_eq!(t.gc_gen_base_offsets, Some([0, 24, 48]), "{at}");
+            assert_eq!(t.gc_stats_inline_off, 0x80, "{at}");
+            assert!(t.gc_layout.is_some(), "{at}");
+            assert!(t.gc_stats_addr_is_per_interp, "{at}");
+            // Filled in per-interpreter by the stats loop, never baked into the table.
+            assert_eq!(t.gc_stats_addr, None, "{at}");
+            // 3.15-only field.
+            assert_eq!(t.gc_frame, None, "{at}");
+        }
+    }
+
+    #[test]
+    fn version_hex_round_trips_to_the_requested_version() {
+        for (major, minor) in SUPPORTED {
+            let t = table_for_version(major, minor).unwrap();
+            let parsed = PythonVersion::from_hex(t.version_hex).unwrap();
+            assert_eq!((parsed.major, parsed.minor), (major, minor));
+        }
+    }
+
+    #[test]
+    fn legacy_layout_exposes_exactly_the_three_pre_3_13_fields() {
+        assert_eq!(LEGACY_GC_LAYOUT.item_size, GC_ITEM_SIZE as usize);
+        assert_eq!(LEGACY_GC_LAYOUT.field_offset("collections"), Some(0));
+        assert_eq!(LEGACY_GC_LAYOUT.field_offset("collected"), Some(8));
+        assert_eq!(LEGACY_GC_LAYOUT.field_offset("uncollectable"), Some(16));
+        // Fields introduced in later builds must be absent, so the decoder leaves
+        // their `Option`s as None rather than reading past the 24-byte item.
+        for absent in ["ts_start", "duration", "heap_size", "increment_size"] {
+            assert!(!LEGACY_GC_LAYOUT.has_field(absent), "{absent} must not be in the legacy layout");
+        }
+    }
+}

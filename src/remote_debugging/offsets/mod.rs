@@ -9,6 +9,7 @@ mod v_3_15_0a8;
 mod v_3_15_0b1;
 mod v_3_15_0b1_gcinc;
 mod v_3_15_0b3;
+mod v_3_15_0b4;
 mod v_3_16_0a0;
 
 use std::fmt;
@@ -43,6 +44,7 @@ const LAYOUTS: &[(u64, fn(u32, u64) -> Result<VersionedOffsets>)] = &[
     (0x030f00a8, |p, a| Ok(VersionedOffsets::V3_15_0a8(read_struct(p, a)?))),
     (0x030f00b1, |p, a| Ok(VersionedOffsets::V3_15_0b1(read_struct(p, a)?))),
     (0x030f00b3, |p, a| Ok(VersionedOffsets::V3_15_0b3(read_struct(p, a)?))),
+    (0x030f00b4, |p, a| Ok(VersionedOffsets::V3_15_0b4(read_struct(p, a)?))),
     (0x031000a0, |p, a| Ok(VersionedOffsets::V3_16_0a0(read_struct(p, a)?))),
 ];
 
@@ -105,25 +107,57 @@ static FALLBACK_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<(u32, u64), u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Graceful degradation for a 3.13+ build with no exact compiled layout: pick the
-/// closest same-(major,minor) layout. `_Py_DebugOffsets` is self-describing and stable
-/// within a minor, so a same-minor layout normally matches the target's real offsets.
-fn resolve_fallback_layout(stored: u64) -> Result<u64> {
-    let tgt_mm = stored & MAJOR_MINOR_MASK;
-    let tgt_micro = ((stored >> 8) & 0xff) as i64;
+/// `PY_RELEASE_LEVEL_FINAL` — the level nibble of a released (non-pre-release) build.
+const RELEASE_LEVEL_FINAL: u64 = 0xF;
 
+fn release_level(hex: u64) -> u64 {
+    (hex >> 4) & 0xf
+}
+
+/// Graceful degradation for a 3.13+ build with no exact compiled layout — **only
+/// between patch releases of the same minor**.
+///
+/// The boundary is CPython's own stability rule, not a heuristic. Within a released
+/// line (3.15.0, 3.15.1, 3.15.2 …) the structs `_Py_DebugOffsets` describes are
+/// ABI-frozen, so any final same-minor layout describes the target correctly. During a
+/// pre-release cycle they are not: 3.15.0b1 shrank `gc_generation_stats` from 96 bytes
+/// to 64, and 3.15.0b4 inserted `last_profiled_frame_seq` into `_thread_state`, shifting
+/// every later field by 8 bytes. Substituting *any* other layout for a pre-release is
+/// therefore guesswork that fails open — it reads mapped memory and returns plausible
+/// nonsense — so an alpha/beta/rc with no exact layout is refused outright.
+///
+/// This also means a final build never borrows a pre-release layout: 3.15.0 final may
+/// differ from 3.15.0rc1, and only an exact entry can say otherwise.
+fn resolve_fallback_layout(stored: u64) -> Result<u64> {
+    if release_level(stored) != RELEASE_LEVEL_FINAL {
+        bail!(
+            "Unsupported Python version {:#010x}: this is a pre-release (alpha/beta/rc), \
+             and `_Py_DebugOffsets` changes between pre-releases — no other {}.{} layout \
+             can stand in for it. Generate offsets for this exact build with \
+             scripts/gen-offsets.py.",
+            stored,
+            (stored >> 24) & 0xff,
+            (stored >> 16) & 0xff
+        );
+    }
+
+    let tgt_mm = stored & MAJOR_MINOR_MASK;
     LAYOUTS
         .iter()
         .map(|(h, _)| *h)
         .filter(|h| h & MAJOR_MINOR_MASK == tgt_mm)
-        // nearest micro wins
-        .min_by_key(|h| ((((*h >> 8) & 0xff) as i64) - tgt_micro).unsigned_abs())
+        .filter(|h| release_level(*h) == RELEASE_LEVEL_FINAL)
+        // Any final same-minor layout is equally correct; pick deterministically —
+        // nearest, preferring the lower one on a tie.
+        .min_by_key(|h| (*h > stored, h.abs_diff(stored)))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Unsupported Python version {:#010x}: no exact layout and no same-minor \
-                 layout is compiled in. Generate offsets for this exact build with \
-                 scripts/gen-offsets.py.",
-                stored
+                "Unsupported Python version {:#010x}: no exact layout, and no *released* \
+                 {}.{}.x layout is compiled in to fall back to. Generate offsets for this \
+                 build with scripts/gen-offsets.py.",
+                stored,
+                (stored >> 24) & 0xff,
+                (stored >> 16) & 0xff
             )
         })
 }
@@ -169,9 +203,8 @@ pub fn read_offsets(pid: u32, version: &PythonVersion) -> Result<(u64, u64, Vers
     } else {
         let h = resolve_fallback_layout(stored)?;
         eprintln!(
-            "warning: no exact offsets for Python {:#010x}; using the closest known \
-             layout {:#010x} (same {}.{}). GC-stat offsets are approximate — a \
-             buffer-size warning will appear if they don't match this build.",
+            "warning: no exact offsets for Python {:#010x}; using released layout \
+             {:#010x} (same {}.{} line, where `_Py_DebugOffsets` is ABI-frozen).",
             stored, h, (stored >> 24) & 0xff, (stored >> 16) & 0xff
         );
         FALLBACK_CACHE.lock().unwrap().insert((pid, stored), h);
@@ -191,6 +224,7 @@ pub enum VersionedOffsets {
     V3_15_0a8(v_3_15_0a8::_Py_DebugOffsets),
     V3_15_0b1(v_3_15_0b1::_Py_DebugOffsets),
     V3_15_0b3(v_3_15_0b3::_Py_DebugOffsets),
+    V3_15_0b4(v_3_15_0b4::_Py_DebugOffsets),
     V3_16_0a0(v_3_16_0a0::_Py_DebugOffsets),
 }
 
@@ -247,6 +281,7 @@ macro_rules! for_each_variant {
             Self::V3_15_0a8($o) => $body,
             Self::V3_15_0b1($o) => $body,
             Self::V3_15_0b3($o) => $body,
+            Self::V3_15_0b4($o) => $body,
             Self::V3_16_0a0($o) => $body,
         }
     };
@@ -269,6 +304,7 @@ impl VersionedOffsets {
             // 3.15.0b1+ has the full validate macro
             Self::V3_15_0b1(o) => v_3_15_0b1::validate_offsets(o, expected),
             Self::V3_15_0b3(o) => v_3_15_0b3::validate_offsets(o, expected),
+            Self::V3_15_0b4(o) => v_3_15_0b4::validate_offsets(o, expected),
             Self::V3_16_0a0(o) => v_3_16_0a0::validate_offsets(o, expected),
         }
     }
@@ -400,6 +436,10 @@ impl VersionedOffsets {
             Self::V3_15_0b3(_) => build(
                 offset_of!(v_3_15_0b3::_Py_DebugOffsets, gc),
                 size_of::<v_3_15_0b3::_Py_DebugOffsets__gc>(),
+            ),
+            Self::V3_15_0b4(_) => build(
+                offset_of!(v_3_15_0b4::_Py_DebugOffsets, gc),
+                size_of::<v_3_15_0b4::_Py_DebugOffsets__gc>(),
             ),
             Self::V3_16_0a0(_) => build(
                 offset_of!(v_3_16_0a0::_Py_DebugOffsets, gc),
@@ -646,6 +686,7 @@ impl fmt::Display for VersionedOffsets {
             Self::V3_15_0a8(o) => fmt_debug_offsets_basic(o, f),
             Self::V3_15_0b1(o) => fmt::Display::fmt(o, f),
             Self::V3_15_0b3(o) => fmt::Display::fmt(o, f),
+            Self::V3_15_0b4(o) => fmt::Display::fmt(o, f),
             Self::V3_16_0a0(o) => fmt::Display::fmt(o, f),
         }
     }
@@ -679,6 +720,231 @@ mod gc_candidate_tests {
                      (free_threaded={ft}); they cannot be distinguished out-of-process — \
                      one must be dropped."
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    /// Build every `LAYOUTS` variant from a zeroed buffer in our own address space.
+    ///
+    /// The generated `layout_version()` / `gc_stats_shape()` impls are hardcoded
+    /// constants that never read `self` (e.g. `v_3_15_0b1.rs`), so a zeroed instance
+    /// answers them correctly — which is what makes the registry checkable without a
+    /// live interpreter. Self-read is the same capability `-1` targeting relies on.
+    fn build_all() -> Vec<(u64, VersionedOffsets)> {
+        // Comfortably larger than any `_Py_DebugOffsets`; `read_struct` reads
+        // exactly `size_of::<T>()` bytes from it.
+        let buf = vec![0u8; 64 * 1024];
+        LAYOUTS
+            .iter()
+            .map(|(hex, ctor)| {
+                let vo = ctor(std::process::id(), buf.as_ptr() as u64)
+                    .unwrap_or_else(|e| panic!("self-read failed for {hex:#010x}: {e}"));
+                assert!(
+                    vo.debug_offsets_total_size() as usize <= buf.len(),
+                    "{hex:#010x} struct outgrew the test buffer"
+                );
+                (*hex, vo)
+            })
+            .collect()
+    }
+
+    /// Each `LAYOUTS` row must construct the variant whose own `layout_version()`
+    /// equals the row's key. This is the ONE registration step the compiler does not
+    /// enforce (see CLAUDE.md): a copy-pasted row that keeps the previous variant
+    /// builds fine and then decodes a live process through the wrong struct.
+    #[test]
+    fn every_layouts_row_builds_its_own_version() {
+        for (hex, vo) in build_all() {
+            assert_eq!(
+                vo.expected_version(),
+                hex,
+                "LAYOUTS row {hex:#010x} builds a variant that reports {:#010x} — \
+                 the row and the variant disagree",
+                vo.expected_version()
+            );
+        }
+    }
+
+    #[test]
+    fn layouts_hexes_are_unique_sorted_and_in_range() {
+        let hexes: Vec<u64> = LAYOUTS.iter().map(|(h, _)| *h).collect();
+
+        let mut deduped = hexes.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(deduped.len(), hexes.len(), "duplicate hex in LAYOUTS");
+        assert_eq!(hexes, deduped, "LAYOUTS must stay sorted by hex");
+
+        for hex in hexes {
+            let v = PythonVersion::from_hex(hex)
+                .unwrap_or_else(|| panic!("{hex:#010x} is not a decodable PY_VERSION_HEX"));
+            // `_Py_DebugOffsets` only exists from 3.13; anything older belongs in
+            // `pre_3_13.rs`, not here.
+            assert!(
+                (v.major, v.minor) >= (MIN_DEBUG_OFFSETS_MAJOR, MIN_DEBUG_OFFSETS_MINOR),
+                "{hex:#010x} ({v}) predates _Py_DebugOffsets"
+            );
+            assert!(has_exact_layout(hex), "{hex:#010x} is in LAYOUTS but not exact-matched");
+        }
+    }
+
+    #[test]
+    fn has_exact_layout_rejects_an_unregistered_build() {
+        // A plausible 3.13 micro we have never generated offsets for.
+        assert!(!has_exact_layout(0x030d02f0));
+    }
+
+    /// The permitted case: an unregistered **patch** release of a shipped line.
+    /// `_Py_DebugOffsets` is ABI-frozen across 3.13.0/3.13.1/3.13.2…, so any released
+    /// same-minor layout describes the target correctly.
+    #[test]
+    fn fallback_substitutes_between_released_patch_versions() {
+        assert_eq!(resolve_fallback_layout(0x030d02f0).unwrap(), 0x030d01f0, "3.13.2");
+        assert_eq!(resolve_fallback_layout(0x030d0cf0).unwrap(), 0x030d01f0, "3.13.12");
+        assert_eq!(resolve_fallback_layout(0x030e09f0).unwrap(), 0x030e04f0, "3.14.9");
+    }
+
+    /// Regression test for a shipped bug, and for the rule that replaced the fix.
+    ///
+    /// The metric was once micro ONLY, so every 3.15 pre-release tied at micro 0 and the
+    /// first row won — a8, whose `gc_generation_stats` is 96 bytes against b1+'s 64. A
+    /// 3.15.0b4 target decoded through it reported pure garbage while CI stayed green.
+    /// Ordering the candidates was not enough either: b4 inserted
+    /// `last_profiled_frame_seq` into `_thread_state`, shifting every later field by 8
+    /// bytes, so *no* neighbouring layout fits. Pre-releases must be registered exactly.
+    #[test]
+    fn fallback_refuses_every_prerelease() {
+        for hex in [
+            0x030f00b5u64, // beta after our newest beta
+            0x030f00a9,    // alpha
+            0x030f00c1,    // release candidate
+            0x031000a1,    // 3.16 alpha
+        ] {
+            assert!(
+                resolve_fallback_layout(hex).is_err(),
+                "{hex:#010x} is a pre-release and must not borrow another layout"
+            );
+        }
+    }
+
+    /// A released build must not borrow a pre-release layout either: 3.15.0 final may
+    /// differ from any of the 3.15 betas, and only an exact entry could say otherwise.
+    /// Every compiled 3.15 layout is a pre-release today, so 3.15.0 final has nothing
+    /// legitimate to fall back to.
+    #[test]
+    fn a_released_build_never_borrows_a_prerelease_layout() {
+        assert!(LAYOUTS
+            .iter()
+            .any(|(h, _)| h & MAJOR_MINOR_MASK == 0x030f_0000),
+            "test assumes some 3.15 layout is registered");
+        assert!(resolve_fallback_layout(0x030f00f0).is_err(), "3.15.0 final");
+        assert!(resolve_fallback_layout(0x030f01f0).is_err(), "3.15.1 final");
+    }
+
+    #[test]
+    fn fallback_refuses_an_unknown_minor() {
+        // 3.11 has no bindgen layout at all (it is a `pre_3_13.rs` version), and
+        // silently borrowing a 3.13 layout for it would mis-decode every field.
+        assert!(resolve_fallback_layout(0x030b00f0).is_err());
+        assert!(resolve_fallback_layout(0x031100a0).is_err(), "a future 3.17");
+    }
+}
+
+#[cfg(test)]
+mod gc_shape_tests {
+    use super::*;
+
+    /// A stand-in for "the nav variant's own shape" that no candidate can equal, so a
+    /// test can tell "fell through to the default" apart from "selected a candidate".
+    const SENTINEL: GcStatsShape = GcStatsShape {
+        kind: offset_table::GcStatsKind::None,
+        item_size: 0xDEAD,
+        layout: None,
+    };
+
+    fn is_sentinel(s: &GcStatsShape) -> bool {
+        s.kind == SENTINEL.kind && s.item_size == SENTINEL.item_size && s.layout.is_none()
+    }
+
+    /// The whole point of `select_gc_shape`: for a hex with several compiled GC
+    /// layouts, the size the process publishes must select that layout and no other.
+    /// This is what keeps a clean 3.15.0b1 from being decoded through the `+inc`
+    /// build's stats struct, and vice versa.
+    #[test]
+    fn reported_ring_size_selects_its_own_candidate() {
+        for (hex, cands) in GC_CANDIDATES {
+            for ft in [0u64, 1] {
+                for c in *cands {
+                    let reported = expected_ring_size(c.item_size, ft);
+                    let picked = select_gc_shape(*hex, reported, ft, SENTINEL);
+                    assert_eq!(
+                        picked.item_size, c.item_size,
+                        "{hex:#010x} (free_threaded={ft}): reported {reported} bytes \
+                         should select the {}-byte layout",
+                        c.item_size
+                    );
+                    assert_eq!(picked.kind, c.kind);
+                    assert!(picked.layout.is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_reported_size_keeps_the_nav_variants_own_shape() {
+        // Inline and pre-ring builds publish no ring size; there is nothing to
+        // disambiguate and selection must not touch the default.
+        for (hex, _) in GC_CANDIDATES {
+            assert!(is_sentinel(&select_gc_shape(*hex, 0, 0, SENTINEL)));
+        }
+    }
+
+    #[test]
+    fn unknown_hex_or_unmatched_size_falls_through_to_the_default() {
+        // A hex with a single compiled layout skips selection entirely.
+        assert!(is_sentinel(&select_gc_shape(0x030e04f0, 4096, 0, SENTINEL)));
+        // A registered hex whose reported size matches no candidate: fall through, so
+        // the size guard in `gc_stats.rs` emits the regenerate hint rather than a
+        // silently wrong layout being used.
+        for (hex, _) in GC_CANDIDATES {
+            assert!(is_sentinel(&select_gc_shape(*hex, 12345, 0, SENTINEL)));
+        }
+    }
+
+    #[test]
+    fn every_gc_candidate_hex_is_a_registered_layout() {
+        for (hex, _) in GC_CANDIDATES {
+            assert!(
+                has_exact_layout(*hex),
+                "{hex:#010x} has GC candidates but no _Py_DebugOffsets layout to reach them"
+            );
+        }
+    }
+
+    /// Ring geometry is written twice — `expected_ring_size` (used for selection) and
+    /// `set_ring` (used for decoding). If they drift, selection picks a layout the
+    /// decoder then reads with different bases, and every stat is silently wrong.
+    #[test]
+    fn expected_ring_size_agrees_with_set_ring() {
+        for (_, cands) in GC_CANDIDATES {
+            for c in *cands {
+                for ft in [0u64, 1] {
+                    let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+                    set_ring(&mut table, c.item_size, c.layout, ft);
+                    let slots = table.gc_slots_per_gen.unwrap();
+                    let bases = table.gc_gen_base_offsets.unwrap();
+                    assert_eq!(
+                        bases[2] + slots[2] * c.item_size + 8,
+                        expected_ring_size(c.item_size, ft),
+                        "ring geometry drifted (item_size={}, free_threaded={ft})",
+                        c.item_size
+                    );
+                }
             }
         }
     }

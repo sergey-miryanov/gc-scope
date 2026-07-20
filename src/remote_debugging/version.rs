@@ -401,3 +401,83 @@ fn scan_for_version_string(bytes: &[u8]) -> Option<PythonVersion> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(major: u8, minor: u8, micro: u8, release_level: u8, serial: u8) -> PythonVersion {
+        PythonVersion { major, minor, micro, release_level, serial }
+    }
+
+    #[test]
+    fn hex_round_trips_every_release_level() {
+        // One per level, including every hex the LAYOUTS registry can hold.
+        for hex in [
+            0x030800f0u64, // 3.8.0 final
+            0x030d01f0,    // 3.13.1 final
+            0x030f00a8,    // 3.15.0a8
+            0x030f00b1,    // 3.15.0b1
+            0x030f00c2,    // 3.15.0rc2
+            0x031000a0,    // 3.16.0a0
+        ] {
+            let parsed = PythonVersion::from_hex(hex).expect("valid hex");
+            assert_eq!(parsed.to_hex(), hex, "round-trip failed for {hex:#010x}");
+        }
+    }
+
+    #[test]
+    fn hex_decodes_each_field() {
+        let parsed = PythonVersion::from_hex(0x030f00b1).unwrap();
+        assert_eq!(parsed, v(3, 15, 0, 0xB, 1));
+    }
+
+    #[test]
+    fn hex_rejects_absent_major_and_minor() {
+        // The guard is on major AND minor both being zero — a zeroed read.
+        assert_eq!(PythonVersion::from_hex(0), None);
+        assert_eq!(PythonVersion::from_hex(0x0000_00f0), None);
+        // A zero major with a non-zero minor is still decoded (not our call to reject).
+        assert!(PythonVersion::from_hex(0x0001_0000).is_some());
+    }
+
+    #[test]
+    fn from_string_parses_the_shapes_detect_actually_sees() {
+        assert_eq!(PythonVersion::from_string("3.15.0a8"), Some(v(3, 15, 0, 0xA, 8)));
+        assert_eq!(PythonVersion::from_string("3.12.0"), Some(v(3, 12, 0, 0xF, 0)));
+        assert_eq!(PythonVersion::from_string("3.11.0rc1"), Some(v(3, 11, 0, 0xC, 1)));
+        assert_eq!(PythonVersion::from_string("Python 3.11.0"), Some(v(3, 11, 0, 0xF, 0)));
+        // Trailing content is allowed: this is what `python --version` and the
+        // binary's embedded version string look like.
+        assert_eq!(
+            PythonVersion::from_string("3.12.0 (tags/v3.12.0, Oct  2 2023)"),
+            Some(v(3, 12, 0, 0xF, 0))
+        );
+        // Micro is optional.
+        assert_eq!(PythonVersion::from_string("3.12"), Some(v(3, 12, 0, 0xF, 0)));
+    }
+
+    #[test]
+    fn from_string_rejects_non_versions() {
+        for s in ["", "3", "3.x", "x3.12", "..", "3."] {
+            assert_eq!(PythonVersion::from_string(s), None, "should reject {s:?}");
+        }
+    }
+
+    #[test]
+    fn from_string_rejects_overflowing_component() {
+        // parse_digits accumulates into a u8 with checked_mul/checked_add. Without
+        // those guards "3.999.0" would wrap to a plausible-looking minor and gcscope
+        // would silently resolve the wrong layout.
+        assert_eq!(PythonVersion::from_string("3.999.0"), None);
+        assert_eq!(PythonVersion::from_string("3.12.999"), None);
+    }
+
+    #[test]
+    fn display_round_trips_from_string() {
+        for s in ["3.15.0a8", "3.15.0b1", "3.15.0rc1", "3.12.0", "3.8.19"] {
+            let parsed = PythonVersion::from_string(s).expect(s);
+            assert_eq!(parsed.to_string(), s);
+        }
+    }
+}

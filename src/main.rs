@@ -49,7 +49,37 @@ fn main() -> Result<()> {
             let report = offsets.validate();
             println!("PyRuntime at {:#018x}  (version {})", addr, version);
             println!("(stored version: 0x{:08x})\n", stored);
-            println!("{}", offsets);
+
+            // Which compiled layout is actually in play, and how it was chosen. A
+            // fallback silently substituting a differently-shaped struct is the one
+            // failure mode that looks like a decode bug but isn't.
+            let exact = remote_debugging::offsets::has_exact_layout(stored);
+            println!(
+                "layout selected: 0x{:08x} ({})",
+                offsets.expected_version(),
+                if exact {
+                    "exact match".to_string()
+                } else {
+                    format!("FALLBACK — no compiled layout for 0x{stored:08x}")
+                }
+            );
+
+            // The derived GC-stats geometry, so a size/stride mismatch is readable
+            // rather than inferred.
+            let table = offsets.to_offset_table(pid, addr);
+            println!("\nGC stats geometry (how gcscope will decode):");
+            print!("{}", table.describe_gc_geometry());
+            let reported = offsets.gc_generation_stats_size();
+            let expected = table.gc_stats_region_size();
+            println!("  process reports  : {reported} bytes (gc.generation_stats_size)");
+            if reported != 0 && expected != 0 && reported != expected {
+                println!(
+                    "  *** MISMATCH: process {reported} vs gcscope {expected} — \
+                     gc-stats will refuse to decode this build ***"
+                );
+            }
+
+            println!("\n{}", offsets);
             println!("{}", report);
         }
         Command::GcStats { pid, all } => {
