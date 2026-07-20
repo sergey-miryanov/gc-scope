@@ -17,3 +17,9 @@ sysinfo = "0.33"
 
 [dev-dependencies]
 goblin = "0.10.7"
+bindgen-cli = "0.72"
+criterion = { version = "5.0.1", package = "codspeed-criterion-compat" }
+
+[[bench]]
+name = "memory"
+harness = false

@@ -1,0 +1,44 @@
+name: CodSpeed
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  # Allow CodSpeed to trigger backtest performance analysis to generate
+  # initial baseline data.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write # for OpenID Connect authentication with CodSpeed
+
+jobs:
+  codspeed:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup rust toolchain, cache and cargo-codspeed binary
+        uses: moonrepo/setup-rust@v0
+        with:
+          channel: stable
+          cache-target: release
+          bins: cargo-codspeed
+
+      - name: Build the benchmark target(s)
+        run: cargo codspeed build
+
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          mode: simulation
+          run: cargo codspeed run

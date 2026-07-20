@@ -1,5 +1,6 @@
 # gcscope — CPython process memory analysis
 
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/sergey-miryanov/gc-scope?utm_source=badge)
 [![codecov](https://codecov.io/gh/sergey-miryanov/gc-scope/graph/badge.svg)](https://codecov.io/gh/sergey-miryanov/gc-scope)
 
 Cross-platform CLI tool for reading and analyzing CPython process memory.
