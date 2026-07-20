@@ -13,6 +13,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(feature = "test-hooks")]
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
@@ -62,6 +64,38 @@ pub enum Revalidated {
     Changed,
     /// The process is gone / unreadable.
     Dead,
+}
+
+/// What the command-line comparison alone can conclude, before the
+/// `soft_reattach` backstop runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CmdlineCheck {
+    /// The new read came back `None` — the process is gone.
+    Gone,
+    /// Both command lines are known and differ — definitely a different program.
+    Differs,
+    /// Inconclusive (identical, or either side unreadable) — defer to the backstop.
+    Inconclusive,
+}
+
+/// Decide the revalidation from the command line alone.
+///
+/// `read_cmdline` is best-effort: it returns `Some("")` when the OS still has the
+/// process but its command line can't be read right now — a transient access
+/// failure, or a process caught mid-teardown (and `revalidate` runs precisely
+/// after a failed read). An empty string is therefore *unknown*, NOT evidence of a
+/// different program: concluding `Changed` from it would spuriously drop a still
+/// valid session and its dedup marks. A definite `Changed` needs *both* sides
+/// non-empty and differing; every other case defers to the exe-key/version
+/// backstop in `soft_reattach`.
+fn classify_cmdline(old: Option<&str>, new: Option<&str>) -> CmdlineCheck {
+    match (old, new) {
+        (_, None) => CmdlineCheck::Gone,
+        (Some(old), Some(new)) if !old.is_empty() && !new.is_empty() && old != new => {
+            CmdlineCheck::Differs
+        }
+        _ => CmdlineCheck::Inconclusive,
+    }
 }
 
 /// Where an [`PySession`]'s layout came from on `attach`. Exposed so a caller — or a
@@ -133,6 +167,13 @@ pub struct PySession {
     cmdline: Option<String>,
     /// Whether this attach re-parsed the binary or reused the cache (§6).
     layout_source: LayoutSource,
+    /// Test-only fault seam: number of upcoming `gc_stats` calls to fail before
+    /// reading for real. Present only under the `test-hooks` feature, so production
+    /// builds carry neither the field nor its read-path check. Lets a test drive the
+    /// monitor's read-fail → `revalidate` → retry orchestration against a genuinely
+    /// live process. See [`PySession::inject_gc_stats_faults`].
+    #[cfg(feature = "test-hooks")]
+    gc_fault_countdown: AtomicU32,
 }
 
 impl PySession {
@@ -182,6 +223,8 @@ impl PySession {
             exe_key,
             cmdline,
             layout_source,
+            #[cfg(feature = "test-hooks")]
+            gc_fault_countdown: AtomicU32::new(0),
         })
     }
 
@@ -190,11 +233,15 @@ impl PySession {
     /// session has been soft re-attached (fresh handle + runtime address) and the
     /// caller should retry the read; on `Changed`/`Dead` the caller gives up.
     pub fn revalidate(&mut self) -> Revalidated {
-        // Different command line ⇒ definitely a different program on this PID.
-        match (self.cmdline.as_deref(), process::read_cmdline(self.pid)) {
-            (_, None) => return Revalidated::Dead,
-            (Some(old), Some(new)) if old != new => return Revalidated::Changed,
-            _ => {}
+        // Different command line ⇒ definitely a different program on this PID. An
+        // unreadable (empty) command line is inconclusive — not a difference — so
+        // it defers to the soft-reattach backstop instead of falsely reporting
+        // Changed (see `classify_cmdline`).
+        let current = process::read_cmdline(self.pid);
+        match classify_cmdline(self.cmdline.as_deref(), current.as_deref()) {
+            CmdlineCheck::Gone => return Revalidated::Dead,
+            CmdlineCheck::Differs => return Revalidated::Changed,
+            CmdlineCheck::Inconclusive => {}
         }
         // Same argv ⇒ same-program relaunch (reused PID) or a transient glitch.
         // Soft re-attach, backstopped by the exe (path, mtime) and version word so
@@ -293,7 +340,33 @@ impl PySession {
     /// A NULL stats pointer is a normal transient state (stats not yet allocated,
     /// or teardown): that interpreter is skipped and the walk still advances — it
     /// never hangs (C1). A failed buffer read propagates as `Err` (C6).
+    /// Test hook: force the next `n` `gc_stats` calls on this session to fail with
+    /// an error, then read normally. Arms the fault seam so a test can reproduce a
+    /// transient read failure on a live process and exercise the monitor's
+    /// `revalidate`/retry path deterministically. Compiled only under the
+    /// `test-hooks` feature; not part of the supported API.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn inject_gc_stats_faults(&self, n: u32) {
+        self.gc_fault_countdown.store(n, Ordering::Relaxed);
+    }
+
+    /// Consume one armed fault, if any. Returns `true` exactly when a fault was
+    /// pending (and decrements it). A no-op single atomic load when unarmed.
+    #[cfg(feature = "test-hooks")]
+    fn take_injected_fault(&self) -> bool {
+        self.gc_fault_countdown
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+    }
+
     pub fn gc_stats(&self, all_interpreters: bool) -> Result<Vec<GcStat>> {
+        #[cfg(feature = "test-hooks")]
+        if self.take_injected_fault() {
+            bail!("gc_stats: injected fault (test hook)");
+        }
         let table = self.resolved.table();
 
         // Catch-all guard for an unregistered build: the process's own
@@ -485,5 +558,69 @@ fn resolve_layout(pid: u32, runtime_addr: u64, detected: PythonVersion) -> Resul
             version: detected,
             stored_hex: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two different, readable command lines are the one case that lets the fast
+    /// path short-circuit to a definite Changed — a genuinely reused PID.
+    #[test]
+    fn distinct_nonempty_cmdlines_are_a_definite_change() {
+        assert_eq!(
+            classify_cmdline(Some("python spin.py"), Some("python other.py")),
+            CmdlineCheck::Differs
+        );
+    }
+
+    /// A `None` new read means the process is gone, whatever the old cmdline was.
+    #[test]
+    fn a_none_new_read_is_gone() {
+        assert_eq!(classify_cmdline(Some("python spin.py"), None), CmdlineCheck::Gone);
+        assert_eq!(classify_cmdline(None, None), CmdlineCheck::Gone);
+    }
+
+    /// Identical command lines settle nothing on their own — a same-argv relaunch
+    /// looks identical too, so the backstop must decide.
+    #[test]
+    fn identical_cmdlines_are_inconclusive() {
+        assert_eq!(
+            classify_cmdline(Some("python spin.py"), Some("python spin.py")),
+            CmdlineCheck::Inconclusive
+        );
+    }
+
+    /// The regression guard for the Windows `read_cmdline` fix: a still-live
+    /// process whose command line momentarily reads back empty must NOT be judged
+    /// Changed — that empty is "unknown", not a difference. Before the guard, a
+    /// populated baseline vs. an empty re-read would have short-circuited to
+    /// Changed and dropped a valid session.
+    #[test]
+    fn an_empty_read_is_inconclusive_not_a_change() {
+        // New read unreadable while the baseline is known.
+        assert_eq!(
+            classify_cmdline(Some("python spin.py"), Some("")),
+            CmdlineCheck::Inconclusive
+        );
+        // Baseline was unreadable at attach; a later real cmdline still can't be
+        // called a *change* with nothing to compare against.
+        assert_eq!(
+            classify_cmdline(Some(""), Some("python spin.py")),
+            CmdlineCheck::Inconclusive
+        );
+        // Both unreadable.
+        assert_eq!(classify_cmdline(Some(""), Some("")), CmdlineCheck::Inconclusive);
+    }
+
+    /// No baseline captured at attach ⇒ nothing to compare, so a new read alone
+    /// can't prove a change; defer. (Only a `None` *new* read means gone.)
+    #[test]
+    fn a_missing_baseline_is_inconclusive() {
+        assert_eq!(
+            classify_cmdline(None, Some("python spin.py")),
+            CmdlineCheck::Inconclusive
+        );
     }
 }

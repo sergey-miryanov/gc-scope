@@ -234,16 +234,20 @@ jobs:
           [ "${{ matrix.expect_extended }}" = "yes" ] && EXTRA="--expect-extended"
           python3 tests/live_smoke.py --python "$PY" --label "${{ matrix.label }}" $EXTRA
 
-  # tests/lifecycle.rs attaches to a live interpreter, so those tests are #[ignore]d and
-  # skipped by the default `cargo test`. This leg grants attach permission and runs them.
-  # Linux/single-version: the logic is OS- and version-independent. Blocking gate.
+  # The integration suites (lifecycle, memory, monitor, remote_debugging, diagram) are
+  # #[ignore]d because they attach to a live interpreter; this leg grants attach
+  # permission and runs them all. --features test-hooks is required by tests/monitor.rs
+  # and a no-op elsewhere. Linux/py3.13. Blocking gate.
   lifecycle-tests:
     name: lifecycle tests (attach)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@grcov
       # Guarantees an interpreter, so the tests run rather than skip (a false green).
       - uses: actions/setup-python@v5
         with:
@@ -252,8 +256,39 @@ jobs:
       - name: Allow ptrace (best-effort)
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      - name: "Run the #[ignore]d lifecycle tests"
-        run: cargo test --test lifecycle -- --ignored
+      # Blocking gate, uninstrumented (ADR 0005: assert against a clean binary).
+      - name: "Run the 'ignored' integration tests"
+        run: cargo test --features test-hooks --tests -- --ignored
+
+      # Separate instrumented re-run so the integration suites' live-attach code
+      # paths (find_runtime, read_offsets, session reads, collect/render, the monitor
+      # retry) are measured — the unit-coverage leg never runs the #[ignore]d tests.
+      # Non-blocking so a coverage-tool failure can't fail the gate above.
+      - name: Coverage (integration tests)
+        continue-on-error: true
+        shell: bash
+        env:
+          RUSTFLAGS: -Cinstrument-coverage
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/target/profraw/gcscope-%p-%m.profraw
+        run: |
+          cargo test --features test-hooks --tests -- --ignored
+          grcov target/profraw \
+            --binary-path target/debug \
+            -s . -t lcov --branch --ignore-not-existing \
+            --ignore '../*' --ignore '/*' --ignore 'C:/Users/*' \
+            -o lcov.info
+          echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
+
+      - name: Upload coverage to Codecov
+        continue-on-error: true
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          flags: integration,ubuntu-latest
+          name: integration-ubuntu-latest
+          disable_search: true
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   # grcov (not cargo-llvm-cov): `-s .` emits repo-relative paths so Windows uploads merge
   # with Linux/macOS instead of double-counting under absolute paths.

@@ -9,17 +9,33 @@
 mod common;
 
 use common::{pid_alive, test_python, SpawnedPython};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use gcscope::remote_debugging::session::{LayoutSource, PySession, Revalidated};
+
+/// Both tests attach to the *same* interpreter binary, so they share the
+/// process-wide `LAYOUT_CACHE`. Run concurrently — the default under `cargo test`
+/// — one test's attach can re-parse and `insert`-overwrite the cached layout `Arc`
+/// between the other's two attaches, so `layout_cache_hit_on_reattach`'s identity
+/// check sees two different Arcs and fails (issue #7). The shared-Arc property only
+/// holds absent a concurrent attack to the same binary, which is a precondition the
+/// harness's parallelism violates — so serialize the attach-heavy tests here.
+static ATTACH_SERIAL: Mutex<()> = Mutex::new(());
+
+/// Take the serialization lock, tolerating poisoning: a panicking test still
+/// releases the lock, and the guard's only job is mutual exclusion, not guarding data.
+fn attach_serial() -> MutexGuard<'static, ()> {
+    ATTACH_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Second attach to the same live binary reuses the process-wide layout cache instead of
 /// re-parsing (ADR 0001, E1/E2). A one-shot `gc-stats` attaches once and never sees this.
 #[test]
 #[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
 fn layout_cache_hit_on_reattach() {
+    let _serial = attach_serial();
     let Some(python) = test_python() else {
         eprintln!("SKIP layout_cache_hit_on_reattach: no Python found (set GCSCOPE_TEST_PYTHON)");
         return;
@@ -52,6 +68,7 @@ fn layout_cache_hit_on_reattach() {
 #[test]
 #[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
 fn revalidate_is_clean_after_process_exits() {
+    let _serial = attach_serial();
     let Some(python) = test_python() else {
         eprintln!("SKIP revalidate_is_clean_after_process_exits: no Python found");
         return;

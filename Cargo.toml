@@ -20,6 +20,19 @@ goblin = "0.10.7"
 sysinfo = "0.33"
 criterion = { version = "5.0.1", package = "codspeed-criterion-compat" }
 
+[features]
+# Compiles the test-only fault-injection seam (PySession::inject_gc_stats_faults,
+# MonitorContext::insert_session_for_test). Off by default, so production builds
+# carry none of it. The monitor integration test requires it — run that suite with
+#   cargo test --features test-hooks --test monitor -- --ignored
+test-hooks = []
+
 [[bench]]
 name = "memory"
 harness = false
+
+# Only builds when `test-hooks` is enabled; without it, cargo silently skips this
+# target (the fault-seam API it drives does not exist in a default build).
+[[test]]
+name = "monitor"
+required-features = ["test-hooks"]

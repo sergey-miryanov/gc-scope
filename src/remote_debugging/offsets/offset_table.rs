@@ -485,4 +485,90 @@ mod tests {
         no_bases.gc_gen_base_offsets = None;
         assert!(no_bases.decode_gc_stats(&buf, 0).is_empty());
     }
+
+    // ── region size (the ring-mismatch guard's formula) ─────────
+
+    /// `gc_stats_region_size` is what the process publishes in
+    /// `gc.generation_stats_size` and what the `gc_stats` guard compares against, so
+    /// its formula must match the ring geometry exactly: the last generation's base
+    /// plus its slots, PLUS the trailing 8-byte cursor the decoder never reads. A
+    /// drift here would either spuriously reject a valid build or wave a mis-decode
+    /// through. It is exactly `stats_buffer_len() + 8` for a ring.
+    #[test]
+    fn ring_region_size_is_the_decoded_length_plus_the_trailing_cursor() {
+        let table = ring_table(0);
+        let bases = table.gc_gen_base_offsets.unwrap();
+        let slots = table.gc_slots_per_gen.unwrap();
+        let item = RING_LAYOUT.item_size as u64;
+
+        let expected = bases[2] + slots[2] * item + 8;
+        assert_eq!(table.gc_stats_region_size(), expected);
+        // ...and that trailing +8 is the whole difference from what the decoder reads.
+        assert_eq!(
+            table.gc_stats_region_size(),
+            table.stats_buffer_len().unwrap() as u64 + 8
+        );
+    }
+
+    /// Inline builds (3.8–3.14) publish no ring region, so the size is reported as 0
+    /// — the guard only runs for `RingBuffer` kinds.
+    #[test]
+    fn inline_region_size_is_zero() {
+        let table = pre_3_13::table_for_version(3, 12).unwrap();
+        assert_ne!(table.gc_stats_kind, GcStatsKind::RingBuffer);
+        assert_eq!(table.gc_stats_region_size(), 0);
+    }
+
+    /// A ring build missing its slot geometry can't state a region size; 0, not a panic.
+    #[test]
+    fn ring_region_size_without_geometry_is_zero() {
+        let mut table = ring_table(0);
+        table.gc_item_size = None;
+        assert_eq!(table.gc_stats_region_size(), 0);
+    }
+
+    // ── geometry description (diagnostic dump) ──────────────────
+
+    /// The ring dump surfaces the numbers a mis-decode investigation needs: the slot
+    /// size, the decoded length, and the published region size — the last drawn from
+    /// the same `gc_stats_region_size` the guard uses, so the dump can't disagree with
+    /// the check.
+    #[test]
+    fn describe_ring_geometry_reports_slot_size_and_region_size() {
+        let table = ring_table(0);
+        let out = table.describe_gc_geometry();
+        assert!(out.contains("RingBuffer"), "{out}");
+        assert!(out.contains("slot size        : 40 bytes"), "{out}");
+        assert!(
+            out.contains(&format!("region size      : {}", table.gc_stats_region_size())),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("bytes read       : {}", table.stats_buffer_len().unwrap())),
+            "{out}"
+        );
+        // Registered per-slot fields are listed for offset diagnosis.
+        assert!(out.contains("ts_start"), "{out}");
+        assert!(out.contains("increment_size"), "{out}");
+    }
+
+    /// The inline dump shows the slot geometry but NO "region size" line — that line
+    /// is ring-only, since inline builds publish no region size to compare against.
+    #[test]
+    fn describe_inline_geometry_omits_the_region_size_line() {
+        let table = pre_3_13::table_for_version(3, 12).unwrap();
+        let out = table.describe_gc_geometry();
+        assert!(out.contains("slot size"), "{out}");
+        assert!(!out.contains("region size"), "{out}");
+    }
+
+    /// A build with no slot geometry says so explicitly rather than printing a
+    /// half-filled dump — the "decodes no GC stats" shape must be legible.
+    #[test]
+    fn describe_geometry_without_a_shape_says_so() {
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        table.gc_item_size = None;
+        let out = table.describe_gc_geometry();
+        assert!(out.contains("no slot geometry"), "{out}");
+    }
 }

@@ -466,3 +466,109 @@ fn fmt_rate(rate: f64) -> String {
         "0.0/s".to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::super::collect::{
+        CollectedData, GcSlot, GcStatsSnapshot, GcSubState, InterpreterSnapshot,
+    };
+    use crate::remote_debugging::offsets::pre_3_13;
+    use crate::remote_debugging::session::Resolved;
+
+    /// A synthetic pre-3.13 (`Legacy`) snapshot — the one tier constructible without a
+    /// live process, since it needs only a flat `OffsetTable`, not a bindgen struct.
+    /// `stats_addr`/`slots` are populated so the GC-stats section renders its table.
+    fn legacy_data(with_slots: bool) -> CollectedData {
+        let table = pre_3_13::table_for_version(3, 12).unwrap();
+        let slots = if with_slots {
+            vec![GcSlot {
+                generation: 0,
+                slot: 0,
+                byte_offset: 0,
+                start_ts: 0,
+                stop_ts: 0,
+                collections: 5,
+                collected: 10,
+                uncollectable: 0,
+                candidates: 3,
+                duration: 0.0,
+                heap_size: 0,
+            }]
+        } else {
+            Vec::new()
+        };
+        CollectedData {
+            pid: 4321,
+            runtime_addr: 0x5000,
+            runtime_version: 0x030c0000,
+            runtime_raw_bytes: Vec::new(),
+            debug_offsets_size: 0,
+            resolved: Arc::new(Resolved::Legacy { table }),
+            interpreter: InterpreterSnapshot {
+                addr: 0x6000,
+                raw_bytes: vec![0u8; 256],
+                gc: GcSubState {
+                    raw_bytes: vec![0u8; 64],
+                    generation_stats: GcStatsSnapshot {
+                        stats_addr: if with_slots { 0x7000 } else { 0 },
+                        stats_size: 72,
+                        item_size: 24,
+                        slots_per_gen: [1, 1, 1],
+                        has_timestamps: false,
+                        has_duration: false,
+                        raw_stats_bytes: vec![0u8; 72],
+                        slots,
+                    },
+                },
+                gc_offset: 0x80,
+                gc_size: 64,
+                id: 0,
+                next_addr: 0,
+            },
+            collect_duration: Duration::from_millis(1),
+        }
+    }
+
+    /// The pre-3.13 render must: name the PID and version word in the header, flag the
+    /// absent `_Py_DebugOffsets`, and render the GC-stats table with each generation's
+    /// slot count — using "n/a" for the rate/avg when the caller passes `None` (an
+    /// inline layout with no timestamps or duration).
+    #[test]
+    fn render_ascii_legacy_shows_header_and_gc_generation_table() {
+        let out = render_ascii(&legacy_data(true), [None; 3], [None; 3]);
+        assert!(out.contains("PID 4321"), "{out}");
+        assert!(out.contains("0x030c0000"), "version word in header: {out}");
+        assert!(out.contains("pre-3.13: no _Py_DebugOffsets"), "{out}");
+        assert!(out.contains("0x5000"), "runtime addr: {out}");
+        assert!(out.contains("Gen 0 (Young) - 1 slots"), "{out}");
+        assert!(out.contains("n/a"), "None rate/avg must render n/a: {out}");
+        assert!(out.contains("slot size: 24 bytes"), "{out}");
+    }
+
+    /// With no stats address / no slots, the GC section must degrade to an explicit
+    /// "not available" rather than an empty or malformed table.
+    #[test]
+    fn render_ascii_legacy_reports_absent_gc_stats() {
+        let out = render_ascii(&legacy_data(false), [None; 3], [None; 3]);
+        assert!(out.contains("GC Generation Stats: not available"), "{out}");
+    }
+
+    /// Every rendered line is exactly the fixed frame width, so the ASCII box stays
+    /// aligned in a terminal. A drift in any panel's padding would break this.
+    #[test]
+    fn render_ascii_lines_share_a_consistent_frame_width() {
+        let out = render_ascii(&legacy_data(true), [None; 3], [None; 3]);
+        // The full-width border/content lines are OUTER_W+2 chars ("+---...---+").
+        let border = format!("+{}+", "-".repeat(OUTER_W));
+        assert!(out.lines().any(|line| line == border), "a full-width border must appear");
+        // No line exceeds the frame width (panels + borders are all <= OUTER_W+2).
+        assert!(
+            out.lines().all(|line| line.chars().count() <= OUTER_W + 2),
+            "a line exceeded the frame width"
+        );
+    }
+}

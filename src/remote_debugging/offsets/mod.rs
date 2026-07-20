@@ -949,3 +949,176 @@ mod gc_shape_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use crate::remote_debugging::offsets::validation::Check;
+
+    fn find<'a>(checks: &'a [Check], name: &str) -> &'a Check {
+        checks
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no check named {name:?}"))
+    }
+
+    fn all_pass(checks: &[Check]) -> bool {
+        checks.iter().all(|c| c.passed)
+    }
+
+    /// A synthetic, fully-valid full-tier (`_Py_DebugOffsets` with the validate
+    /// macro) layout, built in our own address space. `zeroed()` is sound: every
+    /// field is a `u64` or a `[c_char; 8]`, for which all-zero is a valid value.
+    /// Field offsets stay 0 so every `field + 8 <= size` bounds check passes; only
+    /// the sub-struct sizes and the cookie/version need setting.
+    fn valid_full() -> v_3_15_0b1::_Py_DebugOffsets {
+        let mut off: v_3_15_0b1::_Py_DebugOffsets = unsafe { std::mem::zeroed() };
+        off.cookie = (*b"xdebugpy").map(|b| b as std::os::raw::c_char);
+        off.version = 0x030f00b1; // must equal V3_15_0b1's layout_version()
+        off.free_threaded = 0;
+        // Every sub-struct the macro size-checks must report a non-zero size, and
+        // must be large enough that the zero-valued field offsets stay in bounds.
+        off.runtime_state.size = 1024;
+        off.interpreter_state.size = 1024;
+        off.thread_state.size = 1024;
+        off.interpreter_frame.size = 1024;
+        off.code_object.size = 1024;
+        off.pyobject.size = 1024;
+        off.type_object.size = 1024;
+        off.heap_type_object.size = 1024;
+        off.tuple_object.size = 1024;
+        off.list_object.size = 1024;
+        off.set_object.size = 1024;
+        off.dict_object.size = 1024;
+        off.float_object.size = 1024;
+        off.long_object.size = 1024;
+        off.bytes_object.size = 1024;
+        off.unicode_object.size = 1024;
+        off.gc.size = 1024;
+        off.gen_object.size = 1024;
+        off
+    }
+
+    fn validate_full(off: v_3_15_0b1::_Py_DebugOffsets) -> Vec<Check> {
+        VersionedOffsets::V3_15_0b1(off).validate().checks
+    }
+
+    /// The all-valid baseline must pass every check. If this fails, the failure
+    /// tests below can't be trusted to isolate the field they flip.
+    #[test]
+    fn a_fully_valid_full_tier_layout_passes_every_check() {
+        assert!(all_pass(&validate_full(valid_full())));
+    }
+
+    /// A cookie that isn't `"xdebugpy"` fails the cookie check and only that check —
+    /// the cookie is the one signal that we're even looking at a `_Py_DebugOffsets`.
+    #[test]
+    fn a_bad_cookie_fails_only_the_cookie_check() {
+        let mut off = valid_full();
+        off.cookie[0] = b'Z' as std::os::raw::c_char;
+        let checks = validate_full(off);
+        assert!(!find(&checks, "cookie").passed);
+        assert!(checks.iter().filter(|c| c.name != "cookie").all(|c| c.passed));
+    }
+
+    /// A version field that disagrees with the layout the bytes were decoded through
+    /// means we picked the wrong struct — the version check must catch it.
+    #[test]
+    fn a_version_mismatch_fails_only_the_version_check() {
+        let mut off = valid_full();
+        off.version = 0x030f00b3; // a different released layout
+        let checks = validate_full(off);
+        assert!(!find(&checks, "version").passed);
+        assert!(checks.iter().filter(|c| c.name != "version").all(|c| c.passed));
+    }
+
+    /// gcscope only decodes GIL builds through these layouts; a free-threaded build
+    /// reports `free_threaded = 1` and has a different ABI, so it must be flagged.
+    #[test]
+    fn a_free_threaded_flag_fails_only_that_check() {
+        let mut off = valid_full();
+        off.free_threaded = 1;
+        let checks = validate_full(off);
+        assert!(!find(&checks, "free_threaded").passed);
+        assert!(checks.iter().filter(|c| c.name != "free_threaded").all(|c| c.passed));
+    }
+
+    /// A zero sub-struct size means that section was never populated — a decode that
+    /// read past the published struct. The size check for that section must fail.
+    #[test]
+    fn a_zero_section_size_fails_its_size_check() {
+        let mut off = valid_full();
+        off.gc.size = 0;
+        let checks = validate_full(off);
+        assert!(!find(&checks, "gc.size").passed);
+        // Zeroing the size also drops every gc field out of bounds, so the gc.*
+        // bounds checks fail too; no *other* section is affected.
+        assert!(checks
+            .iter()
+            .filter(|c| !c.name.starts_with("gc."))
+            .all(|c| c.passed));
+    }
+
+    /// A field whose offset lands past the end of its sub-struct would read another
+    /// section's bytes. The `field + 8 <= size` bounds check must reject it.
+    #[test]
+    fn an_out_of_bounds_field_fails_only_its_bounds_check() {
+        let mut off = valid_full();
+        off.gc.generation_stats = 2000; // > gc.size (1024)
+        let checks = validate_full(off);
+        assert!(!find(&checks, "gc.generation_stats").passed);
+        assert!(checks
+            .iter()
+            .filter(|c| c.name != "gc.generation_stats")
+            .all(|c| c.passed));
+    }
+
+    /// A field exactly at the boundary — `offset + 8 == size` — is the last legal
+    /// position and must pass; one byte further must not.
+    #[test]
+    fn a_field_at_the_exact_boundary_is_in_bounds() {
+        let mut off = valid_full();
+        off.gc.generation_stats = off.gc.size - 8; // 1016 + 8 == 1024
+        assert!(find(&validate_full(off), "gc.generation_stats").passed);
+
+        let mut off = valid_full();
+        off.gc.generation_stats = off.gc.size - 7; // 1017 + 8 == 1025 > 1024
+        assert!(!find(&validate_full(off), "gc.generation_stats").passed);
+    }
+
+    // ── Basic tier (validate_basic: cookie + version only) ──────────────────
+
+    fn valid_basic() -> v_3_13_1::_Py_DebugOffsets {
+        let mut off: v_3_13_1::_Py_DebugOffsets = unsafe { std::mem::zeroed() };
+        off.cookie = (*b"xdebugpy").map(|b| b as std::os::raw::c_char);
+        off.version = 0x030d01f0; // V3_13_1's layout_version()
+        off
+    }
+
+    fn validate_basic_checks(off: v_3_13_1::_Py_DebugOffsets) -> Vec<Check> {
+        VersionedOffsets::V3_13_1(off).validate().checks
+    }
+
+    /// The basic tier runs exactly two checks — cookie and version. A valid layout
+    /// passes both, and nothing else is inspected.
+    #[test]
+    fn a_valid_basic_tier_layout_passes_its_two_checks() {
+        let checks = validate_basic_checks(valid_basic());
+        assert_eq!(checks.len(), 2);
+        assert!(all_pass(&checks));
+    }
+
+    #[test]
+    fn basic_tier_catches_a_bad_cookie() {
+        let mut off = valid_basic();
+        off.cookie[0] = b'Z' as std::os::raw::c_char;
+        assert!(!find(&validate_basic_checks(off), "cookie").passed);
+    }
+
+    #[test]
+    fn basic_tier_catches_a_version_mismatch() {
+        let mut off = valid_basic();
+        off.version = 0x030d0df0; // 3.13.13's hex, not 3.13.1's
+        assert!(!find(&validate_basic_checks(off), "version").passed);
+    }
+}
