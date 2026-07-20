@@ -149,25 +149,29 @@ jobs:
             file "$f"
             otool -l "$f" 2>/dev/null | grep -B2 -A4 'PyRuntime' || echo "(no PyRuntime section)"
             nm -m "$f" 2>/dev/null | grep -i 'pyruntime\|py_version' || echo "(no matching symbols)"
+            # A `runtime` code-signing flag means hardened runtime, which refuses
+            # task_for_pid to a non-root caller. That is why pre-3.13 legs need
+            # sudo and 3.13+ do not — a property of the target build, not of us.
+            codesign -dv --entitlements - "$f" 2>&1 | grep -i 'flags\|runtime\|get-task-allow' \
+              || echo "(unsigned / no signing info)"
           done
 
       # The whole driver lives in tests/live_smoke.py, not in this step: the same
       # command has to run on Windows/PowerShell and macOS, and it must be
       # reproducible by hand off CI. Keep this step a single invocation.
       - name: Attach, detect version, assert non-empty GC stats
+        if: runner.os != 'macOS'
         run: python tests/live_smoke.py --label ${{ matrix.os }}-py${{ matrix.python }}
 
-      # Diagnostic, macOS only. `always()` so it runs even when the step above
-      # failed — the point is to compare the two. macOS gates memory reads behind
-      # task_for_pid, which root does not need, so:
-      #   unprivileged fails + sudo passes -> purely a permission problem
-      #   both fail                        -> a real code/layout problem
-      # Running both in one job keeps them from being confounded, which is what
-      # would happen if sudo were simply added to the step above.
-      - name: Retry under sudo (macOS permission probe)
-        if: always() && runner.os == 'macOS'
-        continue-on-error: true
+      # macOS runs under sudo because attaching there goes through task_for_pid,
+      # and a Python built with a hardened runtime refuses it to a non-root caller
+      # regardless of the taskport authorization above. Measured: unprivileged
+      # passes on 3.13+ but fails on 3.8–3.12, while sudo passes on all eight — so
+      # this is a property of how each Python build is signed, not of gcscope.
+      # Root is simply the supported way to attach on macOS (same as py-spy).
+      - name: Attach, detect version, assert non-empty GC stats (sudo)
+        if: runner.os == 'macOS'
         run: |
           PY="$(command -v python)"
           sudo -E "$PY" tests/live_smoke.py \
-            --label ${{ matrix.os }}-py${{ matrix.python }}-sudo
+            --label ${{ matrix.os }}-py${{ matrix.python }}
