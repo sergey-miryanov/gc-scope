@@ -284,11 +284,9 @@ impl PySession {
             && let Some(vo) = self.resolved.offsets()
         {
             let reported = vo.gc_generation_stats_size();
-            if let (Some(item), Some(bases), Some(slots)) =
-                (table.gc_item_size, table.gc_gen_base_offsets, table.gc_slots_per_gen)
             {
-                let expected = bases[2] + slots[2] * item + 8;
-                if reported != 0 && reported != expected {
+                let expected = table.gc_stats_region_size();
+                if reported != 0 && expected != 0 && reported != expected {
                     // Fail closed. The process publishes the true byte size of its ring
                     // region; a disagreement means the per-slot stride or the field
                     // offsets are wrong, so every number we could decode would be
@@ -299,8 +297,9 @@ impl PySession {
                         "gc_generation_stats size mismatch for {:#010x}: the process reports \
                          {reported} bytes but gcscope's compiled layout expects {expected}. \
                          This build's GC ring layout differs from the registered one; decoding \
-                         it would report garbage. Regenerate offsets with scripts/gen-offsets.py \
-                         against this exact build.",
+                         it would report garbage. Run `gcscope read-runtime <pid>` to see the \
+                         selected layout and its geometry, then regenerate offsets with \
+                         scripts/gen-offsets.py against this exact build.",
                         table.version_hex
                     );
                 }

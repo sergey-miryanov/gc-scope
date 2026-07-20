@@ -104,6 +104,69 @@ impl OffsetTable {
         Ok(self.decode_gc_stats(&raw, iid))
     }
 
+    /// Human-readable dump of every number this table will decode GC stats with.
+    ///
+    /// Exists so a failure is diagnosable without guessing which layout was picked or
+    /// where a stride came from — the question that made a 3.15.0b4 mis-decode take
+    /// several CI rounds to pin down.
+    pub fn describe_gc_geometry(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("  kind             : {:?}\n", self.gc_stats_kind));
+        match (self.gc_item_size, self.gc_slots_per_gen, self.gc_gen_base_offsets) {
+            (Some(item), Some(slots), Some(bases)) => {
+                s.push_str(&format!("  slot size        : {item} bytes\n"));
+                s.push_str(&format!("  slots/generation : {slots:?}\n"));
+                s.push_str(&format!("  generation bases : {bases:?}\n"));
+                s.push_str(&format!(
+                    "  bytes read       : {} (bases[2] + slots[2]*size)\n",
+                    self.stats_buffer_len().unwrap_or(0)
+                ));
+                if self.gc_stats_kind == GcStatsKind::RingBuffer {
+                    // Not the same number as `bytes read`: each generation's ring is
+                    // followed by an 8-byte cursor, and the process counts the last
+                    // one while the decoder has no reason to read it.
+                    s.push_str(&format!(
+                        "  region size      : {} (what the process should report)\n",
+                        self.gc_stats_region_size()
+                    ));
+                }
+            }
+            _ => s.push_str("  (no slot geometry — this build decodes no GC stats)\n"),
+        }
+        if self.gc_stats_inline_off != 0 {
+            s.push_str(&format!(
+                "  inline offset    : {:#x} (from each interpreter's gc state)\n",
+                self.gc_stats_inline_off
+            ));
+        }
+        match self.gc_layout {
+            Some(l) => {
+                s.push_str(&format!("  per-slot fields  : {} in {} bytes\n",
+                                    l.fields.len(), l.item_size));
+                for (name, off) in l.fields {
+                    s.push_str(&format!("      {off:>4}  {name}\n"));
+                }
+            }
+            None => s.push_str("  per-slot fields  : (none registered)\n"),
+        }
+        s
+    }
+
+    /// Total size of the ring region as the *process* reports it in
+    /// `gc.generation_stats_size` — including the trailing per-generation cursor word
+    /// that the decoder never reads. The single definition of this formula, so the
+    /// mismatch guard and the diagnostic dump cannot drift apart. `0` for non-ring
+    /// kinds, which publish no size.
+    pub fn gc_stats_region_size(&self) -> u64 {
+        if self.gc_stats_kind != GcStatsKind::RingBuffer {
+            return 0;
+        }
+        match (self.gc_item_size, self.gc_slots_per_gen, self.gc_gen_base_offsets) {
+            (Some(item), Some(slots), Some(bases)) => bases[2] + slots[2] * item + 8,
+            _ => 0,
+        }
+    }
+
     /// Byte length of one interpreter's stats region — the last generation's base
     /// plus its slots. `None` when this build exposes no decodable stats (those are
     /// shape facts, not failures; see [`Self::read_gc_stats`]).

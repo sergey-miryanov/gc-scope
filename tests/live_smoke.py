@@ -227,10 +227,18 @@ def main():
     free_threaded = is_free_threaded(args.python)
     print("target: %s (%s)" % (ver, args.python))
 
+    # Filled in once read-runtime has run; replayed in full on any later failure so a
+    # red leg carries the selected layout and its geometry, instead of leaving the
+    # reader to guess which offsets produced the bad numbers.
+    diagnostics = {}
+
     def fail(reason, detail=""):
         print("FAIL(%s): %s" % (label, reason))
         if detail:
             print(detail)
+        for name, text in diagnostics.items():
+            print("\n----- %s (diagnostic, full) -----" % name)
+            print(text)
         return 1
 
     if not os.path.isdir(args.tmpdir):
@@ -250,6 +258,21 @@ def main():
                 return fail("fixture never reported READY", fh.read())
         print("spin.py ready as pid %d" % pid)
 
+        # Runs first, and its output is stashed rather than gated on, so that EVERY
+        # later failure replays the selected layout and its geometry. It uses its own
+        # finder (not attach), so it stays informational -- a non-zero exit here is
+        # not itself a failure.
+        print("----- read-runtime (version + layout, best-effort) -----")
+        _, runtime_out = run([args.gcscope, "read-runtime", str(pid)])
+        diagnostics["read-runtime"] = runtime_out
+        head = runtime_out.splitlines()
+        print("\n".join(head[:4]))
+        # Surface the layout/mismatch lines even on success: a FALLBACK is the single
+        # most useful thing to notice early.
+        for line in head:
+            if line.startswith("layout selected:") or "MISMATCH" in line:
+                print(line)
+
         # Same attach path as gc-stats, so a failure here isolates *finding* from
         # decoding.
         print("----- find-runtime -----")
@@ -266,14 +289,10 @@ def main():
                        "module enumeration is the problem)")
             return fail("could not locate _PyRuntime")
 
-        # Informational: read-runtime uses its own finder, not attach.
-        print("----- read-runtime (version, best-effort) -----")
-        _, out = run([args.gcscope, "read-runtime", str(pid)])
-        print("\n".join(out.splitlines()[:4]))
-
         print("----- gc-stats -----")
         rc, out = run([args.gcscope, "gc-stats", str(pid)])
         print(out)
+        diagnostics["gc-stats"] = out
         if rc != 0:
             return fail("gc-stats exited %d" % rc)
         if "No GC stats found." in out:
