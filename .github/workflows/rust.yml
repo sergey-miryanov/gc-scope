@@ -50,27 +50,44 @@ jobs:
         continue-on-error: true
         run: cargo fmt --all --check
 
-  # End-to-end proof the attach + version-detect + decode pipeline works against
-  # a REAL interpreter, one leg per Python minor 3.8 → 3.15 (all that setup-python
-  # ships; 3.15 is beta-only, 3.16 does not exist yet). This exercises both finding
-  # paths (symbol/cross-reference for 3.8–3.12, "xdebugpy" cookie for 3.13+), the
-  # 3.8 global-GC branch, and both decode kinds (InlineArray ≤3.14, RingBuffer 3.15).
+  # End-to-end proof the attach + version-detect + decode pipeline works against a
+  # REAL interpreter, on every (OS, Python minor) pair setup-python ships. Covers
+  # both finding paths (symbol lookup for 3.8–3.12, "xdebugpy" cookie for 3.13+)
+  # against all three binary parsers (ELF/PE/Mach-O), the 3.8 global-GC branch,
+  # and both decode kinds (InlineArray ≤3.14, RingBuffer 3.15).
   #
-  # NON-BLOCKING (continue-on-error) until the first real run confirms the two
-  # things that can't be verified from a dev box: (a) runner ptrace permissions,
-  # and (b) that setup-python's build keeps `_PyRuntime`/`Py_Version` resolvable
-  # (dynsym for pre-3.13) and ships the PyRuntime cookie section (3.13+). A leg
-  # that can't resolve the symbol goes yellow and pinpoints exactly which version
-  # to fix, without reddening the build.
+  # NON-BLOCKING (continue-on-error) while the per-OS paths are still being proven.
+  # This job has already earned its keep: it found that the ELF branch looked for a
+  # section named "PyRuntime" when CPython emits ".PyRuntime" on Linux (dotted by
+  # GENERATE_DEBUG_SECTION), so 3.13+ had never worked there. A leg that fails goes
+  # yellow and pinpoints exactly which (os, version) pair to fix without reddening
+  # the build. Flip to false once every leg is green.
   live-smoke:
-    name: gc-stats smoke (py${{ matrix.python }})
-    runs-on: ubuntu-latest
+    name: gc-stats smoke (${{ matrix.os }} py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
     continue-on-error: true
     strategy:
       fail-fast: false
+      # Full cross-product, deliberately. A sparse "one leg either side of 3.13
+      # per OS" sample would cover the obvious per-OS forks (find_section_in_*,
+      # resolve_symbol_*), but it assumes those are the ONLY things that vary by
+      # (os, version) — and module *packaging* varies too: whether libpython is a
+      # separate .so/.dll/.dylib or linked into the executable, and how it is
+      # named, differs by version within a platform. Module enumeration is exactly
+      # what the finder depends on, so that assumption is not safe to make.
+      #
+      # Cost is not a reason to sample here: the repo is public, so Actions
+      # minutes are free and macOS carries no billing multiplier.
+      #
+      # Note the OS legs also cover different *patch* releases — setup-python
+      # resolves a minor to the newest patch built for that platform, e.g. '3.12'
+      # is 3.12.13 on Linux but 3.12.10 on Windows/macOS. That is free extra
+      # coverage, and a reason a version can behave differently per OS.
       matrix:
         # 3.16 omitted: not in the setup-python registry (unreleased — 3.15 is
         # still beta). It needs a self-built runner artifact; out of scope here.
+        # Every minor below is available on all three platforms.
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
     steps:
       - uses: actions/checkout@v4
@@ -97,4 +114,4 @@ jobs:
       # command has to run on Windows/PowerShell and macOS, and it must be
       # reproducible by hand off CI. Keep this step a single invocation.
       - name: Attach, detect version, assert non-empty GC stats
-        run: python tests/live_smoke.py --label py${{ matrix.python }}
+        run: python tests/live_smoke.py --label ${{ matrix.os }}-py${{ matrix.python }}
