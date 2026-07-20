@@ -9,6 +9,7 @@ mod v_3_15_0a8;
 mod v_3_15_0b1;
 mod v_3_15_0b1_gcinc;
 mod v_3_15_0b3;
+mod v_3_15_0b4;
 mod v_3_16_0a0;
 
 use std::fmt;
@@ -43,6 +44,7 @@ const LAYOUTS: &[(u64, fn(u32, u64) -> Result<VersionedOffsets>)] = &[
     (0x030f00a8, |p, a| Ok(VersionedOffsets::V3_15_0a8(read_struct(p, a)?))),
     (0x030f00b1, |p, a| Ok(VersionedOffsets::V3_15_0b1(read_struct(p, a)?))),
     (0x030f00b3, |p, a| Ok(VersionedOffsets::V3_15_0b3(read_struct(p, a)?))),
+    (0x030f00b4, |p, a| Ok(VersionedOffsets::V3_15_0b4(read_struct(p, a)?))),
     (0x031000a0, |p, a| Ok(VersionedOffsets::V3_16_0a0(read_struct(p, a)?))),
 ];
 
@@ -105,35 +107,57 @@ static FALLBACK_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<(u32, u64), u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Graceful degradation for a 3.13+ build with no exact compiled layout: pick the
-/// closest same-(major,minor) layout. `_Py_DebugOffsets` is self-describing and stable
-/// within a minor, so a same-minor layout normally matches the target's real offsets.
-///
-/// Ordering is over the **whole** version hex (micro, then release level, then serial)
-/// and prefers the nearest **lower** version, breaking ties downward. Comparing micro
-/// alone used to tie every pre-release of a minor — all of 3.15.0a8/b1/b3 have micro 0 —
-/// so `min_by_key` silently kept whichever came first in the table. That picked a8 for a
-/// 3.15.0b4 target, and CPython had changed `gc_generation_stats` from 96 bytes/13 fields
-/// to 64/9 at b1: gcscope then read a 64-byte-stride ring with a 96-byte stride and
-/// reported garbage. Preferring the nearest lower version picks b3 there, whose geometry
-/// does match. A newer layout is used only when nothing older exists, since a struct
-/// change lands going *forward* in a release cycle.
-fn resolve_fallback_layout(stored: u64) -> Result<u64> {
-    let tgt_mm = stored & MAJOR_MINOR_MASK;
+/// `PY_RELEASE_LEVEL_FINAL` — the level nibble of a released (non-pre-release) build.
+const RELEASE_LEVEL_FINAL: u64 = 0xF;
 
+fn release_level(hex: u64) -> u64 {
+    (hex >> 4) & 0xf
+}
+
+/// Graceful degradation for a 3.13+ build with no exact compiled layout — **only
+/// between patch releases of the same minor**.
+///
+/// The boundary is CPython's own stability rule, not a heuristic. Within a released
+/// line (3.15.0, 3.15.1, 3.15.2 …) the structs `_Py_DebugOffsets` describes are
+/// ABI-frozen, so any final same-minor layout describes the target correctly. During a
+/// pre-release cycle they are not: 3.15.0b1 shrank `gc_generation_stats` from 96 bytes
+/// to 64, and 3.15.0b4 inserted `last_profiled_frame_seq` into `_thread_state`, shifting
+/// every later field by 8 bytes. Substituting *any* other layout for a pre-release is
+/// therefore guesswork that fails open — it reads mapped memory and returns plausible
+/// nonsense — so an alpha/beta/rc with no exact layout is refused outright.
+///
+/// This also means a final build never borrows a pre-release layout: 3.15.0 final may
+/// differ from 3.15.0rc1, and only an exact entry can say otherwise.
+fn resolve_fallback_layout(stored: u64) -> Result<u64> {
+    if release_level(stored) != RELEASE_LEVEL_FINAL {
+        bail!(
+            "Unsupported Python version {:#010x}: this is a pre-release (alpha/beta/rc), \
+             and `_Py_DebugOffsets` changes between pre-releases — no other {}.{} layout \
+             can stand in for it. Generate offsets for this exact build with \
+             scripts/gen-offsets.py.",
+            stored,
+            (stored >> 24) & 0xff,
+            (stored >> 16) & 0xff
+        );
+    }
+
+    let tgt_mm = stored & MAJOR_MINOR_MASK;
     LAYOUTS
         .iter()
         .map(|(h, _)| *h)
         .filter(|h| h & MAJOR_MINOR_MASK == tgt_mm)
-        // (is-newer, distance): all lower candidates sort ahead of any higher one, and
-        // within each group the closest wins.
+        .filter(|h| release_level(*h) == RELEASE_LEVEL_FINAL)
+        // Any final same-minor layout is equally correct; pick deterministically —
+        // nearest, preferring the lower one on a tie.
         .min_by_key(|h| (*h > stored, h.abs_diff(stored)))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Unsupported Python version {:#010x}: no exact layout and no same-minor \
-                 layout is compiled in. Generate offsets for this exact build with \
-                 scripts/gen-offsets.py.",
-                stored
+                "Unsupported Python version {:#010x}: no exact layout, and no *released* \
+                 {}.{}.x layout is compiled in to fall back to. Generate offsets for this \
+                 build with scripts/gen-offsets.py.",
+                stored,
+                (stored >> 24) & 0xff,
+                (stored >> 16) & 0xff
             )
         })
 }
@@ -179,10 +203,8 @@ pub fn read_offsets(pid: u32, version: &PythonVersion) -> Result<(u64, u64, Vers
     } else {
         let h = resolve_fallback_layout(stored)?;
         eprintln!(
-            "warning: no exact offsets for Python {:#010x}; using the closest known \
-             layout {:#010x} (same {}.{}). GC-stat offsets are approximate — if the \
-             ring geometry doesn't match, `gc-stats` fails with a size mismatch rather \
-             than reporting garbage.",
+            "warning: no exact offsets for Python {:#010x}; using released layout \
+             {:#010x} (same {}.{} line, where `_Py_DebugOffsets` is ABI-frozen).",
             stored, h, (stored >> 24) & 0xff, (stored >> 16) & 0xff
         );
         FALLBACK_CACHE.lock().unwrap().insert((pid, stored), h);
@@ -202,6 +224,7 @@ pub enum VersionedOffsets {
     V3_15_0a8(v_3_15_0a8::_Py_DebugOffsets),
     V3_15_0b1(v_3_15_0b1::_Py_DebugOffsets),
     V3_15_0b3(v_3_15_0b3::_Py_DebugOffsets),
+    V3_15_0b4(v_3_15_0b4::_Py_DebugOffsets),
     V3_16_0a0(v_3_16_0a0::_Py_DebugOffsets),
 }
 
@@ -258,6 +281,7 @@ macro_rules! for_each_variant {
             Self::V3_15_0a8($o) => $body,
             Self::V3_15_0b1($o) => $body,
             Self::V3_15_0b3($o) => $body,
+            Self::V3_15_0b4($o) => $body,
             Self::V3_16_0a0($o) => $body,
         }
     };
@@ -280,6 +304,7 @@ impl VersionedOffsets {
             // 3.15.0b1+ has the full validate macro
             Self::V3_15_0b1(o) => v_3_15_0b1::validate_offsets(o, expected),
             Self::V3_15_0b3(o) => v_3_15_0b3::validate_offsets(o, expected),
+            Self::V3_15_0b4(o) => v_3_15_0b4::validate_offsets(o, expected),
             Self::V3_16_0a0(o) => v_3_16_0a0::validate_offsets(o, expected),
         }
     }
@@ -411,6 +436,10 @@ impl VersionedOffsets {
             Self::V3_15_0b3(_) => build(
                 offset_of!(v_3_15_0b3::_Py_DebugOffsets, gc),
                 size_of::<v_3_15_0b3::_Py_DebugOffsets__gc>(),
+            ),
+            Self::V3_15_0b4(_) => build(
+                offset_of!(v_3_15_0b4::_Py_DebugOffsets, gc),
+                size_of::<v_3_15_0b4::_Py_DebugOffsets__gc>(),
             ),
             Self::V3_16_0a0(_) => build(
                 offset_of!(v_3_16_0a0::_Py_DebugOffsets, gc),
@@ -657,6 +686,7 @@ impl fmt::Display for VersionedOffsets {
             Self::V3_15_0a8(o) => fmt_debug_offsets_basic(o, f),
             Self::V3_15_0b1(o) => fmt::Display::fmt(o, f),
             Self::V3_15_0b3(o) => fmt::Display::fmt(o, f),
+            Self::V3_15_0b4(o) => fmt::Display::fmt(o, f),
             Self::V3_16_0a0(o) => fmt::Display::fmt(o, f),
         }
     }
@@ -769,31 +799,51 @@ mod registry_tests {
         assert!(!has_exact_layout(0x030d02f0));
     }
 
-    /// Regression test for a shipped bug. The metric used to be micro ONLY, so every
-    /// 3.15 pre-release tied at micro 0 and `min_by_key` kept whichever row came first
-    /// — a8. CPython shrank `gc_generation_stats` from 96 bytes to 64 at b1, so a
-    /// 3.15.0b4 target decoded through a8's layout reported pure garbage, and the CI
-    /// matrix stayed green because nothing checked the SHAPE of the output.
+    /// The permitted case: an unregistered **patch** release of a shipped line.
+    /// `_Py_DebugOffsets` is ABI-frozen across 3.13.0/3.13.1/3.13.2…, so any released
+    /// same-minor layout describes the target correctly.
     #[test]
-    fn fallback_prefers_the_nearest_lower_prerelease() {
-        // b4 must reach b3 (64-byte slots), never a8 (96-byte).
-        assert_eq!(resolve_fallback_layout(0x030f00b4).unwrap(), 0x030f00b3);
-        // rc1 is past every compiled beta; still the newest lower one.
-        assert_eq!(resolve_fallback_layout(0x030f00c1).unwrap(), 0x030f00b3);
-        // Between a8 and b1 there is nothing lower but a8.
-        assert_eq!(resolve_fallback_layout(0x030f00a9).unwrap(), 0x030f00a8);
-        // Below every compiled 3.15 layout, the nearest higher one is all there is.
-        assert_eq!(resolve_fallback_layout(0x030f00a1).unwrap(), 0x030f00a8);
+    fn fallback_substitutes_between_released_patch_versions() {
+        assert_eq!(resolve_fallback_layout(0x030d02f0).unwrap(), 0x030d01f0, "3.13.2");
+        assert_eq!(resolve_fallback_layout(0x030d0cf0).unwrap(), 0x030d01f0, "3.13.12");
+        assert_eq!(resolve_fallback_layout(0x030e09f0).unwrap(), 0x030e04f0, "3.14.9");
     }
 
-    /// Ordering is over the whole hex, so micro still dominates release level.
+    /// Regression test for a shipped bug, and for the rule that replaced the fix.
+    ///
+    /// The metric was once micro ONLY, so every 3.15 pre-release tied at micro 0 and the
+    /// first row won — a8, whose `gc_generation_stats` is 96 bytes against b1+'s 64. A
+    /// 3.15.0b4 target decoded through it reported pure garbage while CI stayed green.
+    /// Ordering the candidates was not enough either: b4 inserted
+    /// `last_profiled_frame_seq` into `_thread_state`, shifting every later field by 8
+    /// bytes, so *no* neighbouring layout fits. Pre-releases must be registered exactly.
     #[test]
-    fn fallback_prefers_a_lower_micro_over_a_nearer_release_level() {
-        // 3.13.2final: 3.13.1final is lower and closer than 3.13.13.
-        assert_eq!(resolve_fallback_layout(0x030d02f0).unwrap(), 0x030d01f0);
-        // 3.13.12: below 3.13.13, so it takes the lower 3.13.1 rather than the
-        // numerically-nearer-but-higher 3.13.13.
-        assert_eq!(resolve_fallback_layout(0x030d0cf0).unwrap(), 0x030d01f0);
+    fn fallback_refuses_every_prerelease() {
+        for hex in [
+            0x030f00b5u64, // beta after our newest beta
+            0x030f00a9,    // alpha
+            0x030f00c1,    // release candidate
+            0x031000a1,    // 3.16 alpha
+        ] {
+            assert!(
+                resolve_fallback_layout(hex).is_err(),
+                "{hex:#010x} is a pre-release and must not borrow another layout"
+            );
+        }
+    }
+
+    /// A released build must not borrow a pre-release layout either: 3.15.0 final may
+    /// differ from any of the 3.15 betas, and only an exact entry could say otherwise.
+    /// Every compiled 3.15 layout is a pre-release today, so 3.15.0 final has nothing
+    /// legitimate to fall back to.
+    #[test]
+    fn a_released_build_never_borrows_a_prerelease_layout() {
+        assert!(LAYOUTS
+            .iter()
+            .any(|(h, _)| h & MAJOR_MINOR_MASK == 0x030f_0000),
+            "test assumes some 3.15 layout is registered");
+        assert!(resolve_fallback_layout(0x030f00f0).is_err(), "3.15.0 final");
+        assert!(resolve_fallback_layout(0x030f01f0).is_err(), "3.15.1 final");
     }
 
     #[test]
