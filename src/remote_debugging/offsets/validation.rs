@@ -201,3 +201,53 @@ macro_rules! impl_validate_debug_offsets {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// When every check passes, the report prints the summary line and no `✗`
+    /// marker — the summary is the human's at-a-glance "this build is good" signal.
+    #[test]
+    fn all_passing_report_prints_the_summary_line() {
+        let report = ValidationReport::new(vec![
+            Check::new("cookie", true, "\"xdebugpy\""),
+            Check::new("version", true, "0x030f00b1"),
+        ]);
+        let out = report.to_string();
+        assert!(out.contains("all checks passed ✓"), "output: {out}");
+        assert!(!out.contains('✗'), "output: {out}");
+    }
+
+    /// A single failing check must suppress the "all passed" summary and surface a
+    /// `✗` — otherwise a wrong offset would validate as healthy.
+    #[test]
+    fn a_single_failure_suppresses_the_summary_and_marks_the_row() {
+        let report = ValidationReport::new(vec![
+            Check::new("cookie", true, "\"xdebugpy\""),
+            Check::new("gc.size", false, "0 (expected > 0)"),
+        ]);
+        let out = report.to_string();
+        assert!(!out.contains("all checks passed"), "output: {out}");
+        assert!(out.contains('✗'), "output: {out}");
+        // The failing check's name and detail are both rendered for diagnosis.
+        assert!(out.contains("gc.size"), "output: {out}");
+        assert!(out.contains("0 (expected > 0)"), "output: {out}");
+    }
+
+    /// An empty report has nothing to fail, so it reports success — the `all_passed`
+    /// flag starts true and stays true with no rows to flip it.
+    #[test]
+    fn an_empty_report_counts_as_all_passed() {
+        let out = ValidationReport::new(vec![]).to_string();
+        assert!(out.contains("all checks passed ✓"), "output: {out}");
+    }
+
+    #[test]
+    fn check_new_accepts_str_and_string_and_stores_fields() {
+        let c = Check::new("version", false, format!("got {:#x}", 0x030d01f0u64));
+        assert_eq!(c.name, "version");
+        assert!(!c.passed);
+        assert_eq!(c.detail, "got 0x30d01f0");
+    }
+}
