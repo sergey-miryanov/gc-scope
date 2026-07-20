@@ -64,6 +64,18 @@ pub enum Revalidated {
     Dead,
 }
 
+/// Where an [`PySession`]'s layout came from on `attach`. Exposed so a caller — or a
+/// lifecycle test — can tell whether the binary was re-parsed or the process-wide cache
+/// was reused (ADR 0001's E1/E2 fast path). Purely informational: both tiers behave
+/// identically for reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LayoutSource {
+    /// Resolved fresh this attach (the full cascade + parse), then cached.
+    Parsed,
+    /// Reused from the process-wide layout cache — no re-parse.
+    Cached,
+}
+
 /// The resolved offset layout for an attached process.
 ///
 /// The three variants are the support tiers. `Full` and `LayoutOnly` both carry the
@@ -119,6 +131,8 @@ pub struct PySession {
     exe_key: Option<ExeKey>,
     /// Command line at attach time — the `revalidate` change-detector (§6.3).
     cmdline: Option<String>,
+    /// Whether this attach re-parsed the binary or reused the cache (§6).
+    layout_source: LayoutSource,
 }
 
 impl PySession {
@@ -147,14 +161,14 @@ impl PySession {
             None => None,
         };
 
-        let cached = match cached {
-            Some(entry) => entry,
+        let (cached, layout_source) = match cached {
+            Some(entry) => (entry, LayoutSource::Cached),
             None => {
                 let entry = resolve_layout(pid, runtime_addr, version)?;
                 if let Some(key) = &exe_key {
                     LAYOUT_CACHE.lock().unwrap().insert(key.clone(), entry.clone());
                 }
-                entry
+                (entry, LayoutSource::Parsed)
             }
         };
 
@@ -167,6 +181,7 @@ impl PySession {
             stored_hex: cached.stored_hex,
             exe_key,
             cmdline,
+            layout_source,
         })
     }
 
@@ -238,6 +253,13 @@ impl PySession {
     /// The `_Py_DebugOffsets` version word for 3.13+ (`None` for pre-3.13).
     pub fn stored_hex(&self) -> Option<u64> {
         self.stored_hex
+    }
+
+    /// Whether this attach re-parsed the binary ([`LayoutSource::Parsed`]) or reused the
+    /// process-wide layout cache ([`LayoutSource::Cached`]). The second attach to a still-
+    /// live binary is a cache hit; see the lifecycle tests.
+    pub fn layout_source(&self) -> LayoutSource {
+        self.layout_source
     }
 
     /// Whether this build exposes decodable GC generation stats. True for 3.13+
