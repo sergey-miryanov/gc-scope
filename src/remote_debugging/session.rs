@@ -64,6 +64,38 @@ pub enum Revalidated {
     Dead,
 }
 
+/// What the command-line comparison alone can conclude, before the
+/// `soft_reattach` backstop runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CmdlineCheck {
+    /// The new read came back `None` — the process is gone.
+    Gone,
+    /// Both command lines are known and differ — definitely a different program.
+    Differs,
+    /// Inconclusive (identical, or either side unreadable) — defer to the backstop.
+    Inconclusive,
+}
+
+/// Decide the revalidation from the command line alone.
+///
+/// `read_cmdline` is best-effort: it returns `Some("")` when the OS still has the
+/// process but its command line can't be read right now — a transient access
+/// failure, or a process caught mid-teardown (and `revalidate` runs precisely
+/// after a failed read). An empty string is therefore *unknown*, NOT evidence of a
+/// different program: concluding `Changed` from it would spuriously drop a still
+/// valid session and its dedup marks. A definite `Changed` needs *both* sides
+/// non-empty and differing; every other case defers to the exe-key/version
+/// backstop in `soft_reattach`.
+fn classify_cmdline(old: Option<&str>, new: Option<&str>) -> CmdlineCheck {
+    match (old, new) {
+        (_, None) => CmdlineCheck::Gone,
+        (Some(old), Some(new)) if !old.is_empty() && !new.is_empty() && old != new => {
+            CmdlineCheck::Differs
+        }
+        _ => CmdlineCheck::Inconclusive,
+    }
+}
+
 /// Where an [`PySession`]'s layout came from on `attach`. Exposed so a caller — or a
 /// lifecycle test — can tell whether the binary was re-parsed or the process-wide cache
 /// was reused (ADR 0001's E1/E2 fast path). Purely informational: both tiers behave
@@ -190,11 +222,15 @@ impl PySession {
     /// session has been soft re-attached (fresh handle + runtime address) and the
     /// caller should retry the read; on `Changed`/`Dead` the caller gives up.
     pub fn revalidate(&mut self) -> Revalidated {
-        // Different command line ⇒ definitely a different program on this PID.
-        match (self.cmdline.as_deref(), process::read_cmdline(self.pid)) {
-            (_, None) => return Revalidated::Dead,
-            (Some(old), Some(new)) if old != new => return Revalidated::Changed,
-            _ => {}
+        // Different command line ⇒ definitely a different program on this PID. An
+        // unreadable (empty) command line is inconclusive — not a difference — so
+        // it defers to the soft-reattach backstop instead of falsely reporting
+        // Changed (see `classify_cmdline`).
+        let current = process::read_cmdline(self.pid);
+        match classify_cmdline(self.cmdline.as_deref(), current.as_deref()) {
+            CmdlineCheck::Gone => return Revalidated::Dead,
+            CmdlineCheck::Differs => return Revalidated::Changed,
+            CmdlineCheck::Inconclusive => {}
         }
         // Same argv ⇒ same-program relaunch (reused PID) or a transient glitch.
         // Soft re-attach, backstopped by the exe (path, mtime) and version word so
@@ -485,5 +521,69 @@ fn resolve_layout(pid: u32, runtime_addr: u64, detected: PythonVersion) -> Resul
             version: detected,
             stored_hex: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two different, readable command lines are the one case that lets the fast
+    /// path short-circuit to a definite Changed — a genuinely reused PID.
+    #[test]
+    fn distinct_nonempty_cmdlines_are_a_definite_change() {
+        assert_eq!(
+            classify_cmdline(Some("python spin.py"), Some("python other.py")),
+            CmdlineCheck::Differs
+        );
+    }
+
+    /// A `None` new read means the process is gone, whatever the old cmdline was.
+    #[test]
+    fn a_none_new_read_is_gone() {
+        assert_eq!(classify_cmdline(Some("python spin.py"), None), CmdlineCheck::Gone);
+        assert_eq!(classify_cmdline(None, None), CmdlineCheck::Gone);
+    }
+
+    /// Identical command lines settle nothing on their own — a same-argv relaunch
+    /// looks identical too, so the backstop must decide.
+    #[test]
+    fn identical_cmdlines_are_inconclusive() {
+        assert_eq!(
+            classify_cmdline(Some("python spin.py"), Some("python spin.py")),
+            CmdlineCheck::Inconclusive
+        );
+    }
+
+    /// The regression guard for the Windows `read_cmdline` fix: a still-live
+    /// process whose command line momentarily reads back empty must NOT be judged
+    /// Changed — that empty is "unknown", not a difference. Before the guard, a
+    /// populated baseline vs. an empty re-read would have short-circuited to
+    /// Changed and dropped a valid session.
+    #[test]
+    fn an_empty_read_is_inconclusive_not_a_change() {
+        // New read unreadable while the baseline is known.
+        assert_eq!(
+            classify_cmdline(Some("python spin.py"), Some("")),
+            CmdlineCheck::Inconclusive
+        );
+        // Baseline was unreadable at attach; a later real cmdline still can't be
+        // called a *change* with nothing to compare against.
+        assert_eq!(
+            classify_cmdline(Some(""), Some("python spin.py")),
+            CmdlineCheck::Inconclusive
+        );
+        // Both unreadable.
+        assert_eq!(classify_cmdline(Some(""), Some("")), CmdlineCheck::Inconclusive);
+    }
+
+    /// No baseline captured at attach ⇒ nothing to compare, so a new read alone
+    /// can't prove a change; defer. (Only a `None` *new* read means gone.)
+    #[test]
+    fn a_missing_baseline_is_inconclusive() {
+        assert_eq!(
+            classify_cmdline(None, Some("python spin.py")),
+            CmdlineCheck::Inconclusive
+        );
     }
 }

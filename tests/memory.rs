@@ -21,14 +21,14 @@ use std::time::{Duration, Instant};
 use gcscope::memory::{binary, process, reader, regions};
 
 /// `read_cmdline` is the reused-PID change-detector behind `PySession::revalidate`.
-/// Its contract is a live/gone signal — `Some` while the PID is running, `None`
-/// once it's gone — and, when the platform can read it, the text names the program.
+/// It must both name the running program and track liveness: `Some(text naming the
+/// program)` while the PID runs, `None` once it's gone. The naming half is the
+/// regression guard for the Windows fix — the plain `refresh_processes` left `cmd`
+/// empty there, so the text must now come back populated on every platform, not
+/// just the Unixes.
 ///
 /// Uses `sysinfo`, so — like tests/spawn.rs — it needs no attach permission and
-/// runs in the plain build job. The command-line *text* is best-effort per platform
-/// (Windows can return an empty string without extra access), so the text is only
-/// asserted when populated; the live→Some / gone→None transition is the portable
-/// property that `revalidate` actually depends on.
+/// runs in the plain build job.
 #[test]
 fn read_cmdline_tracks_liveness_and_names_the_fixture() {
     let Some(python) = test_python() else {
@@ -39,12 +39,10 @@ fn read_cmdline_tracks_liveness_and_names_the_fixture() {
     let pid = proc.pid();
 
     let cmd = process::read_cmdline(pid).expect("a live PID must resolve to a command line");
-    if !cmd.is_empty() {
-        assert!(
-            cmd.contains("spin.py") || cmd.to_lowercase().contains("python"),
-            "read_cmdline, when populated, should name the running fixture, got: {cmd:?}"
-        );
-    }
+    assert!(
+        cmd.contains("spin.py"),
+        "read_cmdline should name the running fixture, got: {cmd:?}"
+    );
 
     drop(proc); // kill + reap the interpreter
     let deadline = Instant::now() + Duration::from_secs(5);

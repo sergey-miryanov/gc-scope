@@ -274,11 +274,19 @@ pub fn find_runtime_module(pid: u32) -> Result<(u64, String)> {
 /// never on the hot read path. Returns `None` if the process is gone or its
 /// command line is unavailable.
 pub fn read_cmdline(pid: u32) -> Option<String> {
-    use sysinfo::{Pid, ProcessesToUpdate, System};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     let mut sys = System::new();
     let spid = Pid::from_u32(pid);
-    sys.refresh_processes(ProcessesToUpdate::Some(&[spid]), true);
+    // Request the command line explicitly. The plain `refresh_processes` does not
+    // populate `cmd` on Windows — reading it there means reading the target's PEB,
+    // which sysinfo only does when the refresh kind asks for it — so `cmd()` came
+    // back empty and the reused-PID check silently compared "" against "".
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[spid]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
     let process = sys.process(spid)?;
     let cmd = process
         .cmd()
