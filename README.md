@@ -32,8 +32,9 @@ PEP 768), which is what admits a same-user caller. Granting
 `system.privilege.taskport` does not help. If you don't know the target's version,
 use `sudo`.
 
-To avoid `sudo` there, sign gcscope with `com.apple.security.cs.debugger` — the
-mechanism LLDB's `debugserver` uses:
+To avoid `sudo` there, sign gcscope with `com.apple.security.cs.debugger` (the
+`gcscope.entitlements` file in the repo root grants it) — the mechanism LLDB's
+`debugserver` uses:
 
 ```bash
 codesign -s "<your-cert>" --entitlements gcscope.entitlements -f target/release/gcscope

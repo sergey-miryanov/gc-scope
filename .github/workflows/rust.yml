@@ -32,10 +32,8 @@ jobs:
       - name: Test
         run: cargo test --verbose
 
-      # A second, instrumented run rather than replacing `Test` above: that keeps a
-      # coverage-tool failure from ever being mistaken for a test failure, and keeps
-      # the gate itself running an uninstrumented binary. RUSTFLAGS is scoped to this
-      # step so it cannot leak into the steps above.
+      # Separate instrumented run so a coverage-tool failure isn't mistaken for a test
+      # failure and the gate keeps running an uninstrumented binary. RUSTFLAGS is step-scoped.
       - name: Coverage (unit tests)
         continue-on-error: true
         shell: bash
@@ -72,35 +70,23 @@ jobs:
         continue-on-error: true
         run: cargo fmt --all --check
 
-  # Attach to a real interpreter and decode its GC stats, per (OS, Python minor).
-  # Covers both finding paths (symbol lookup ≤3.12, "xdebugpy" cookie 3.13+) across
-  # all three binary parsers. Rationale for the full cross-product, and the
-  # platform defects it found, are in docs/adr/0004-per-platform-image-layout.md.
+  # Attach to a real interpreter and decode its GC stats, per (OS, Python minor). Covers
+  # both finding paths across all three binary parsers. See ADR 0004 for the full cross-product.
   live-smoke:
     name: gc-stats smoke (${{ matrix.os }} py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # 3.16 omitted: not in the setup-python registry yet.
-        # 3.15t is the one free-threaded leg: it is the only build that reaches the
-        # free-threaded ring geometry (1/1/1 slots per generation instead of 11/3/3),
-        # which every GIL leg leaves unexercised. The other `t` variants would add no
-        # new path — below 3.15 the layout is inline, where the GIL flag is irrelevant.
-        #
-        # `3.15` is left FLOATING, not pinned to a beta, on purpose. setup-python
-        # resolves it to the newest pre-release, and gcscope refuses to decode a
-        # pre-release it has no exact layout for (`_Py_DebugOffsets` is only ABI-frozen
-        # across patch releases — 3.15.0b4 inserted a field into `_thread_state` and
-        # shifted everything after it). So these legs go red when CPython ships the next
-        # beta/rc, which is the intended early warning that a new layout needs
-        # generating. Do not "fix" a red 3.15 leg by pinning the version — run
-        # scripts/gen-offsets.py against that build and register it.
+        # 3.16 omitted (not in the setup-python registry yet). 3.15t is the one
+        # free-threaded leg — the only build reaching the 1/1/1 ring geometry.
+        # 3.15 is left FLOATING: setup-python picks the newest pre-release and gcscope
+        # refuses one it has no exact layout for, so these legs go red when a new beta/rc
+        # ships. Don't fix a red 3.15 by pinning — regenerate offsets and register.
         os: [ubuntu-latest, windows-latest, macos-latest]
         python: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14', '3.15', '3.15t']
-        # macOS only: 3.13+ ships com.apple.security.get-task-allow (PEP 768) so it
-        # attaches unprivileged; 3.8-3.12 does not and needs root. Flagged per
-        # version here because GitHub expressions cannot compare versions.
+        # macOS: 3.13+ attaches unprivileged (PEP 768 get-task-allow); 3.8-3.12 needs root.
+        # Flagged per-version because GitHub expressions can't compare versions.
         include:
           - { python: '3.8',  macos_needs_root: 'yes' }
           - { python: '3.9',  macos_needs_root: 'yes' }
@@ -114,7 +100,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-          # Required for 3.15, which is beta-only; no effect on stable minors.
+          # Required for the beta-only 3.15.
           allow-prereleases: true
 
       - name: Build gcscope
@@ -124,8 +110,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      # macOS gates attach behind task_for_pid. Non-blocking so a failure here
-      # cannot skip the steps below and hide their result.
+      # macOS gates attach behind task_for_pid. Non-blocking so it can't mask a code failure.
       - name: Configure macOS taskport permissions
         if: runner.os == 'macOS'
         continue-on-error: true
@@ -134,8 +119,7 @@ jobs:
           sudo security authorizationdb write system.privilege.taskport is-developer
           sudo security authorizationdb read system.privilege.taskport
 
-      # Dumps image facts (fat slices, PyRuntime section, symbol spelling, code
-      # signature) so a macOS failure is diagnosable without another CI round-trip.
+      # Dump image facts so a macOS failure is diagnosable without another CI round-trip.
       - name: Describe the macOS Python image
         if: runner.os == 'macOS'
         continue-on-error: true
@@ -153,8 +137,8 @@ jobs:
               || echo "(unsigned / no signing info)"
           done
 
-      # Kept unprivileged where it works, so a target that stops shipping
-      # get-task-allow fails here instead of being masked by blanket sudo.
+      # Unprivileged where it works, so a target that drops get-task-allow fails here
+      # instead of being masked by blanket sudo.
       - name: Attach, detect version, assert non-empty GC stats
         if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
         run: python tests/live_smoke.py --label ${{ matrix.os }}-py${{ matrix.python }}
@@ -166,23 +150,13 @@ jobs:
           sudo -E "$PY" tests/live_smoke.py \
             --label ${{ matrix.os }}-py${{ matrix.python }}
 
-  # Interpreters setup-python cannot supply: build CPython from source, then run the
-  # SAME live_smoke driver. Linux-only on purpose -- these legs add version/decode
-  # coverage (same-hex candidate selection, an unreleased layout), which is
-  # OS-independent; the per-OS *finding* paths are already exercised by the stock
-  # live-smoke matrix above. A blocking gate, like live-smoke.
-  #
-  #   - 3.15+inc: sergey-miryanov/cpython@feat/gc-gen-3.15+inc. Shares hex 0x030f00b1
-  #     with clean 3.15.0b1 and is told apart only by generation_stats_size, so it is
-  #     the one live check of the +inc candidate selector. --expect-extended asserts
-  #     the IncrSize/AliveSize columns that prove the +inc candidate (not the clean
-  #     one) was decoded; a wrong pick already hard-errors on the ring-size mismatch.
-  #   - 3.16.0a0: python/cpython pinned to an exact commit, but the SHA is NOT written
-  #     here -- it is read from the `gcscope-source:` provenance line that
-  #     scripts/gen-offsets.py stamps into v_3_16_0a0.rs. That layout file is the single
-  #     source of truth: regenerate the 3.16 offsets and the pin moves with them, no YAML
-  #     edit. Pinned rather than floating `main` so unrelated CPython drift cannot block
-  #     PRs; retire this leg for a stock setup-python row once 3.16.0a1 reaches the registry.
+  # Build custom interpreters setup-python can't supply, then run the live_smoke driver.
+  # Linux-only (version/decode coverage is OS-independent). Blocking gate. Rationale:
+  # docs/adr/0006-layout-registration-integrity.md.
+  #   - 3.15+inc: shares hex 0x030f00b1 with clean 3.15.0b1; --expect-extended proves the
+  #     +inc candidate (not the clean one) was decoded.
+  #   - 3.16.0a0: pinned commit read from the gcscope-source: line in v_3_16_0a0.rs, so
+  #     regenerating 3.16 moves the pin with no YAML edit.
   custom-build-smoke:
     name: gc-stats smoke (source ${{ matrix.label }})
     runs-on: ubuntu-latest
@@ -190,8 +164,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ref: a branch/SHA to build directly. provenance_file: read the pinned commit
-          # from a generated layout's `gcscope-source:` line instead (leave ref empty).
+          # ref: branch/SHA to build. provenance_file: read the pin from a layout's
+          # gcscope-source: line instead (leave ref empty).
           - label: '3.15+inc'
             repo: sergey-miryanov/cpython
             ref: 'feat/gc-gen-3.15+inc'
@@ -207,11 +181,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # Resolve to an exact commit. An empty `ref` means "read the pin from the layout
-      # file's gcscope-source: line" (single source of truth for an ongoing version).
-      # Cache key = exact commit, so a moving branch (+inc) re-keys when it advances while
-      # a pinned SHA stays a permanent hit. ls-remote yields nothing for a raw SHA, so
-      # fall back to the ref itself.
+      # Resolve to an exact commit (empty ref → read the pin from provenance_file). The
+      # cache key is that commit, so a moving branch re-keys and a pinned SHA stays a hit.
       - name: Resolve interpreter commit
         id: rev
         run: |
@@ -234,10 +205,8 @@ jobs:
           path: ~/cpython-build
           key: cpython-${{ matrix.label }}-${{ steps.rev.outputs.sha }}
 
-      # Fetch by resolved SHA (works for both a branch and a pinned commit; GitHub
-      # allows fetching an arbitrary reachable SHA). Only the C build deps are needed --
-      # spin.py imports gc/os/sys/time only, so the optional stdlib C modules are
-      # irrelevant and the interpreter boots without libssl/libffi at runtime.
+      # Fetch the resolved SHA (branch or pinned commit both work). Only C build deps
+      # needed; spin.py imports gc/os/sys/time only.
       - name: Build CPython from source
         if: steps.cache-py.outputs.cache-hit != 'true'
         run: |
@@ -265,30 +234,40 @@ jobs:
           [ "${{ matrix.expect_extended }}" = "yes" ] && EXTRA="--expect-extended"
           python3 tests/live_smoke.py --python "$PY" --label "${{ matrix.label }}" $EXTRA
 
-  # grcov (not cargo-llvm-cov) in both coverage paths on purpose: with `-s .` it
-  # emits repo-relative, forward-slash paths on every OS, so the Windows uploads
-  # merge with the Linux/macOS ones instead of appearing as a second set of files.
-  # `cargo llvm-cov --lcov` emits absolute native paths (`SF:X:\Work\...`), which
-  # Codecov may or may not normalize — and when it doesn't, coverage silently
-  # double-counts rather than erroring.
-  #
-  # Coverage-only sibling of live-smoke, kept separate on purpose: the gate above
-  # must keep asserting against an UNINSTRUMENTED binary (what actually ships), and
-  # coverage needs only enough legs to reach each decode path, not all 24. The three
-  # versions cover every GcStatsKind route — 3.8 global GC, 3.12 legacy per-interp,
-  # 3.15 ring buffer — across all three binary formats.
-  # Every step is non-blocking: live-smoke is the gate, this job never is.
+  # tests/lifecycle.rs attaches to a live interpreter, so those tests are #[ignore]d and
+  # skipped by the default `cargo test`. This leg grants attach permission and runs them.
+  # Linux/single-version: the logic is OS- and version-independent. Blocking gate.
+  lifecycle-tests:
+    name: lifecycle tests (attach)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Guarantees an interpreter, so the tests run rather than skip (a false green).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Allow ptrace (best-effort)
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+
+      - name: "Run the #[ignore]d lifecycle tests"
+        run: cargo test --test lifecycle -- --ignored
+
+  # grcov (not cargo-llvm-cov): `-s .` emits repo-relative paths so Windows uploads merge
+  # with Linux/macOS instead of double-counting under absolute paths.
+  # Coverage-only sibling of live-smoke: the gate must assert against an UNINSTRUMENTED
+  # binary, and coverage needs only enough legs (3.8/3.12/3.15 × 3 OS) to reach each decode
+  # path. Every step is non-blocking — live-smoke is the gate, not this.
   coverage-smoke:
     name: coverage smoke (${{ matrix.os }} py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
-    # Job-level, so an instrumented-build or tool-install failure cannot block a
-    # merge either. Note this masks the job's `conclusion` in the API — judge these
-    # legs by whether a report reached Codecov, not by their GitHub status.
+    # Job-level: an instrumented-build/tool failure can't block a merge. This masks the
+    # job's API `conclusion` — judge by whether a report reached Codecov, not GitHub status.
     continue-on-error: true
     env:
-      # live_smoke.py drives gcscope as a subprocess, so coverage has to come from
-      # the process itself rather than a test harness. Each invocation drops its own
-      # profile (%p = pid, %m = binary signature).
+      # Coverage comes from the gcscope subprocess itself (%p = pid, %m = binary signature).
       RUSTFLAGS: -Cinstrument-coverage
       LLVM_PROFILE_FILE: ${{ github.workspace }}/target/profraw/gcscope-%p-%m.profraw
     strategy:
@@ -346,8 +325,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          # RUSTFLAGS instruments dependencies too; --ignore drops registry sources
-          # so only this crate's files reach the report.
+          # --ignore drops registry sources so only this crate's files reach the report.
           grcov target/profraw \
             --binary-path target/debug \
             -s . -t lcov --branch --ignore-not-existing \
