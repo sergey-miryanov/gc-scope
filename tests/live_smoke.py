@@ -138,6 +138,16 @@ def main():
         rc, out = run([args.gcscope, "find-runtime", str(pid)])
         print(out)
         if rc != 0:
+            # "Not found" is ambiguous: the module list may be missing the real
+            # library (nothing to scan), or scanning may have found the section
+            # but failed the cookie read (a memory-access permission problem).
+            # The region list separates those without another CI round-trip.
+            print("----- mapped python regions (diagnostic) -----")
+            _, regions = run([args.gcscope, "list", str(pid)])
+            shown = [ln for ln in regions.splitlines() if "ython" in ln]
+            print("\n".join(shown[:25]) if shown
+                  else "(no mapped region has a python path — "
+                       "module enumeration is the problem)")
             return fail("could not locate _PyRuntime")
 
         # Informational only: read-runtime uses its own finder, not attach, so a
