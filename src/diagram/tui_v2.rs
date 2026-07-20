@@ -300,9 +300,11 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
     result
 }
 
-// Nine arguments, all of them independent scalars read straight off the render loop's
-// local state. Bundling them into a struct would just relocate the same nine fields and
-// add a construction site per frame, so the lint is allowed rather than worked around.
+// Nine heterogeneous scalars, all read off the render loop's local state at the single
+// call site below. A struct would relocate the same nine fields and add a per-frame
+// construction site; the only safety it would add — guarding the three adjacent bools
+// against transposition — is moot for a status bar, where a swap is cosmetic and visible
+// on screen at once. Allowed rather than worked around.
 #[allow(clippy::too_many_arguments)]
 fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, rate_ms: u64, glitch_active: bool, cl_active: bool, glitch_enabled: bool, collect_dur: Duration) -> Paragraph<'static> {
     let style = Style::new().bg(Color::Blue).fg(Color::White);
