@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use goblin::{elf, mach, pe};
+use goblin::{elf, pe};
 
 use crate::memory::{binary, reader};
 
@@ -224,7 +224,8 @@ fn resolve_symbol_pe(bytes: &[u8], base_addr: usize, sym_name: &str) -> Option<u
 }
 
 fn resolve_symbol_macho(bytes: &[u8], base_addr: usize, sym_name: &str) -> Option<u64> {
-    let macho = mach::MachO::parse(bytes, 0).ok()?;
+    // Virtual addresses only below, so the slice offset is not needed here.
+    let (macho, _) = binary::parse_macho(bytes)?;
 
     let text_vmaddr = macho
         .segments
@@ -240,7 +241,11 @@ fn resolve_symbol_macho(bytes: &[u8], base_addr: usize, sym_name: &str) -> Optio
 
     if let Some(symbols) = &macho.symbols {
         for (name, nlist) in symbols.iter().flatten() {
-            if name == sym_name && !nlist.is_undefined() {
+            // Mach-O prefixes C symbols with an underscore, so `_PyRuntime` is
+            // stored as `__PyRuntime` and `Py_Version` as `_Py_Version`. Accept
+            // the undecorated spelling too rather than assuming either form.
+            let matches = name == sym_name || name.strip_prefix('_') == Some(sym_name);
+            if matches && !nlist.is_undefined() {
                 return Some(
                     (base_addr as u64)
                         .wrapping_add(nlist.n_value.wrapping_sub(text_vmaddr)),
@@ -285,14 +290,15 @@ fn ro_data_range(bytes: &[u8]) -> Option<(usize, usize)> {
             Some((s.sh_offset as usize, s.sh_size as usize))
         }
         binary::BinaryKind::MachO => {
-            let macho = mach::MachO::parse(bytes, 0).ok()?;
+            let (macho, slice_at) = binary::parse_macho(bytes)?;
             for seg in &macho.segments {
                 if seg.name().ok()? != "__TEXT" {
                     continue;
                 }
                 for (sect, _data) in seg.sections().ok()? {
                     if sect.name().ok()? == "__cstring" {
-                        return Some((sect.offset as usize, sect.size as usize));
+                        // File offset, so it needs rebasing onto the fat slice.
+                        return Some((slice_at + sect.offset as usize, sect.size as usize));
                     }
                 }
             }

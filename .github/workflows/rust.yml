@@ -1,4 +1,4 @@
-name: Rust
+name: CI
 
 on:
   push:
@@ -11,12 +11,112 @@ env:
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
-
+    name: Build & test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --verbose
+
+      # Unit tests only; live-smoke below is the integration gate.
+      - name: Test
+        run: cargo test --verbose
+
+      # Non-blocking until the existing warning/format baseline is cleaned up.
+      - name: Clippy (non-blocking)
+        continue-on-error: true
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format check (non-blocking)
+        continue-on-error: true
+        run: cargo fmt --all --check
+
+  # Attach to a real interpreter and decode its GC stats, per (OS, Python minor).
+  # Covers both finding paths (symbol lookup ≤3.12, "xdebugpy" cookie 3.13+) across
+  # all three binary parsers. Rationale for the full cross-product, and the
+  # platform defects it found, are in docs/adr/0004-per-platform-image-layout.md.
+  live-smoke:
+    name: gc-stats smoke (${{ matrix.os }} py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.16 omitted: not in the setup-python registry yet.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
+        # macOS only: 3.13+ ships com.apple.security.get-task-allow (PEP 768) so it
+        # attaches unprivileged; 3.8-3.12 does not and needs root. Flagged per
+        # version here because GitHub expressions cannot compare versions.
+        include:
+          - { python: '3.8',  macos_needs_root: 'yes' }
+          - { python: '3.9',  macos_needs_root: 'yes' }
+          - { python: '3.10', macos_needs_root: 'yes' }
+          - { python: '3.11', macos_needs_root: 'yes' }
+          - { python: '3.12', macos_needs_root: 'yes' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          # Required for 3.15, which is beta-only; no effect on stable minors.
+          allow-prereleases: true
+
+      - name: Build gcscope
+        run: cargo build --verbose
+
+      - name: Allow ptrace (best-effort)
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+
+      # macOS gates attach behind task_for_pid. Non-blocking so a failure here
+      # cannot skip the steps below and hide their result.
+      - name: Configure macOS taskport permissions
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          id $(whoami)
+          sudo security authorizationdb write system.privilege.taskport is-developer
+          sudo security authorizationdb read system.privilege.taskport
+
+      # Dumps image facts (fat slices, PyRuntime section, symbol spelling, code
+      # signature) so a macOS failure is diagnosable without another CI round-trip.
+      - name: Describe the macOS Python image
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          PYBIN="$(python -c 'import sys; print(sys.executable)')"
+          # The executable is a stub; the runtime lives in the framework dylib.
+          FW="$(python -c 'import sysconfig,os; print(os.path.join(sysconfig.get_config_var("prefix"), "Python"))')"
+          for f in "$PYBIN" "$FW"; do
+            echo "===== $f ====="
+            [ -e "$f" ] || { echo "(absent)"; continue; }
+            file "$f"
+            otool -l "$f" 2>/dev/null | grep -B2 -A4 'PyRuntime' || echo "(no PyRuntime section)"
+            nm -m "$f" 2>/dev/null | grep -i 'pyruntime\|py_version' || echo "(no matching symbols)"
+            codesign -dv --entitlements - "$f" 2>&1 | grep -i 'flags\|runtime\|get-task-allow' \
+              || echo "(unsigned / no signing info)"
+          done
+
+      # Kept unprivileged where it works, so a target that stops shipping
+      # get-task-allow fails here instead of being masked by blanket sudo.
+      - name: Attach, detect version, assert non-empty GC stats
+        if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
+        run: python tests/live_smoke.py --label ${{ matrix.os }}-py${{ matrix.python }}
+
+      - name: Attach, detect version, assert non-empty GC stats (sudo)
+        if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
+        run: |
+          PY="$(command -v python)"
+          sudo -E "$PY" tests/live_smoke.py \
+            --label ${{ matrix.os }}-py${{ matrix.python }}

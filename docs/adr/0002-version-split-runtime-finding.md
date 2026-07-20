@@ -41,10 +41,11 @@ picks the nearest micro). `check_runtime`'s sole caller is the pre-3.13 finder;
 ## Consequences
 
 - `find-runtime` / `list-pids` / `diagram` / `tui` resolve pre-3.13 runtimes and
-  versions. On Windows/PE `_PyRuntime` is exported across 3.8–3.12, so no scan
-  fallback is needed there. **ELF/Mach-O symbol visibility is unverified** — Mach-O
-  underscore-prefixes C symbols (`__PyRuntime`), PE export presence varies; confirm
-  when those platforms are exercised.
+  versions. ~~**ELF/Mach-O symbol visibility is unverified**~~ — **resolved
+  2026-07-20** by the live smoke matrix: `_PyRuntime` is exported on all three
+  formats, so the blind data-segment scan fallback stays unnecessary. Mach-O took
+  two fixes to get there, and attaching to 3.8–3.12 on macOS needs root; see
+  [ADR 0004](0004-per-platform-image-layout.md).
 - Known blind spot — **venv launcher shims**: a Windows redirector `python.exe`
   runs the real interpreter as a child, whose `_PyRuntime` lives in a separate
   address space, so a single-shot `attach` on the launcher PID fails. Target the

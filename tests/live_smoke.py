@@ -1,0 +1,164 @@
+"""Live smoke driver: spawn a real interpreter, attach with gcscope, assert stats.
+
+Exercises the end-to-end pipeline (find `_PyRuntime` -> detect version -> read
+offsets -> decode GC generation stats) against a live process. Used by the
+`live-smoke` CI job and runnable by hand on any OS:
+
+    python tests/live_smoke.py                       # uses this interpreter
+    python tests/live_smoke.py --python C:/py38/python.exe --label py3.8
+
+Exit code 0 = PASS, 1 = FAIL (with the reason and the captured output).
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+SPIN = os.path.join(HERE, "fixtures", "spin.py")
+
+SPIN_LIFETIME_SECS = 120
+READY_TIMEOUT_SECS = 20
+CMD_TIMEOUT_SECS = 60
+
+
+def default_gcscope():
+    exe = "gcscope.exe" if os.name == "nt" else "gcscope"
+    return os.path.join(REPO, "target", "debug", exe)
+
+
+def run(argv, timeout=CMD_TIMEOUT_SECS):
+    """Run a command, capturing merged output as text. Returns (rc, output)."""
+    try:
+        proc = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            # Explicit: the default locale encoding chokes on gcscope's
+            # box-drawing output under a non-UTF-8 Windows code page.
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout or ""
+    except subprocess.TimeoutExpired:
+        # A hang is a real failure mode here (bad pointer walk on an unknown
+        # layout), so report it rather than letting CI stall.
+        return 124, "TIMEOUT after %ds: %s" % (timeout, " ".join(argv))
+
+
+def wait_for_ready(proc, log_path):
+    """Poll spin.py's log for READY; return the interpreter's PID, or None.
+
+    The PID comes from the marker rather than proc.pid so it stays correct if a
+    launcher or shim sits between us and the real interpreter.
+    """
+    deadline = time.monotonic() + READY_TIMEOUT_SECS
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return None  # died on startup; caller prints the log
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("READY "):
+                        return int(line.split()[1])
+        except IOError:
+            pass  # not created yet
+        time.sleep(0.25)
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--gcscope", default=default_gcscope(),
+                        help="path to the gcscope binary (default: target/debug)")
+    parser.add_argument("--python", default=sys.executable,
+                        help="interpreter to attach to (default: this one)")
+    parser.add_argument("--label", default=None,
+                        help="tag for PASS/FAIL lines (default: the target's version)")
+    parser.add_argument("--tmpdir", default=os.environ.get("RUNNER_TEMP") or
+                        os.path.join(REPO, ".temp"),
+                        help="scratch dir for the fixture log")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.gcscope):
+        print("FAIL: gcscope binary not found at %s (run `cargo build` first)"
+              % args.gcscope)
+        return 1
+
+    rc, ver = run([args.python, "--version"])
+    if rc != 0:
+        print("FAIL: target interpreter is not runnable: %s" % ver.strip())
+        return 1
+    ver = ver.strip()
+    label = args.label or ver.replace("Python ", "py")
+    print("target: %s (%s)" % (ver, args.python))
+
+    def fail(reason, detail=""):
+        print("FAIL(%s): %s" % (label, reason))
+        if detail:
+            print(detail)
+        return 1
+
+    if not os.path.isdir(args.tmpdir):
+        os.makedirs(args.tmpdir)
+    log_path = os.path.join(args.tmpdir, "spin-%s.log" % label)
+
+    log = open(log_path, "w+", encoding="utf-8")
+    proc = subprocess.Popen(
+        [args.python, SPIN, str(SPIN_LIFETIME_SECS)],
+        stdout=log, stderr=subprocess.STDOUT,
+    )
+    try:
+        pid = wait_for_ready(proc, log_path)
+        if pid is None:
+            log.flush()
+            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                return fail("fixture never reported READY", fh.read())
+        print("spin.py ready as pid %d" % pid)
+
+        # Same attach path as gc-stats, so a failure here isolates *finding* from
+        # decoding.
+        print("----- find-runtime -----")
+        rc, out = run([args.gcscope, "find-runtime", str(pid)])
+        print(out)
+        if rc != 0:
+            # Separates "no python module was mapped" from "found it but the
+            # cookie/cross-reference check failed".
+            print("----- mapped python regions (diagnostic) -----")
+            _, regions = run([args.gcscope, "list", str(pid)])
+            shown = [ln for ln in regions.splitlines() if "ython" in ln]
+            print("\n".join(shown[:25]) if shown
+                  else "(no mapped region has a python path — "
+                       "module enumeration is the problem)")
+            return fail("could not locate _PyRuntime")
+
+        # Informational: read-runtime uses its own finder, not attach.
+        print("----- read-runtime (version, best-effort) -----")
+        _, out = run([args.gcscope, "read-runtime", str(pid)])
+        print("\n".join(out.splitlines()[:4]))
+
+        print("----- gc-stats -----")
+        rc, out = run([args.gcscope, "gc-stats", str(pid)])
+        print(out)
+        if rc != 0:
+            return fail("gc-stats exited %d" % rc)
+        if "No GC stats found." in out:
+            return fail("stats decoded empty")
+        if "Collections" not in out:
+            return fail("no stats table in output")
+
+        print("PASS(%s): attached + detected + decoded non-empty GC stats" % label)
+        return 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        log.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

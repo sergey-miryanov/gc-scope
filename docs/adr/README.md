@@ -13,3 +13,4 @@ next to this folder, not here (e.g. `docs/venv-launcher-child-retarget.md`).
 | [0001](0001-pysession-resolve-once-facade.md) | `PySession`: resolve a process once, expose it through a tiered `Resolved` enum |
 | [0002](0002-version-split-runtime-finding.md) | Runtime finding splits by version: `xdebugpy` cookie (3.13+) vs `_PyRuntime` symbol + navigation heuristic (pre-3.13) |
 | [0003](0003-layout-driven-gc-stats-decode.md) | GC-stats decode is keyed by layout *kind*, letting 3.8–3.12 reuse the inline path |
+| [0004](0004-per-platform-image-layout.md) | Per-platform image layout (section names, fat binaries, symbol decoration, image base) is discovered and CI-verified, not assumed |
