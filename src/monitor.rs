@@ -36,6 +36,16 @@ impl<'a> MonitorContext<'a> {
         }
     }
 
+    /// Test hook: install a pre-built (and possibly fault-armed) session for `pid`
+    /// so a test can drive [`poll`](Self::poll) against a known live session
+    /// instead of one lazily attached inside `poll`. Compiled only under the
+    /// `test-hooks` feature; not part of the supported API.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn insert_session_for_test(&mut self, pid: u32, session: PySession) {
+        self.sessions.insert(pid, session);
+    }
+
     /// Read GC stats for `pid` and emit new events to the exporter.
     ///
     /// Returns `PollStatus::Ok` on success, `PollStatus::InvalidProcess`

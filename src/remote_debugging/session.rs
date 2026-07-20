@@ -13,6 +13,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(feature = "test-hooks")]
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
@@ -165,6 +167,13 @@ pub struct PySession {
     cmdline: Option<String>,
     /// Whether this attach re-parsed the binary or reused the cache (§6).
     layout_source: LayoutSource,
+    /// Test-only fault seam: number of upcoming `gc_stats` calls to fail before
+    /// reading for real. Present only under the `test-hooks` feature, so production
+    /// builds carry neither the field nor its read-path check. Lets a test drive the
+    /// monitor's read-fail → `revalidate` → retry orchestration against a genuinely
+    /// live process. See [`PySession::inject_gc_stats_faults`].
+    #[cfg(feature = "test-hooks")]
+    gc_fault_countdown: AtomicU32,
 }
 
 impl PySession {
@@ -214,6 +223,8 @@ impl PySession {
             exe_key,
             cmdline,
             layout_source,
+            #[cfg(feature = "test-hooks")]
+            gc_fault_countdown: AtomicU32::new(0),
         })
     }
 
@@ -329,7 +340,33 @@ impl PySession {
     /// A NULL stats pointer is a normal transient state (stats not yet allocated,
     /// or teardown): that interpreter is skipped and the walk still advances — it
     /// never hangs (C1). A failed buffer read propagates as `Err` (C6).
+    /// Test hook: force the next `n` `gc_stats` calls on this session to fail with
+    /// an error, then read normally. Arms the fault seam so a test can reproduce a
+    /// transient read failure on a live process and exercise the monitor's
+    /// `revalidate`/retry path deterministically. Compiled only under the
+    /// `test-hooks` feature; not part of the supported API.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn inject_gc_stats_faults(&self, n: u32) {
+        self.gc_fault_countdown.store(n, Ordering::Relaxed);
+    }
+
+    /// Consume one armed fault, if any. Returns `true` exactly when a fault was
+    /// pending (and decrements it). A no-op single atomic load when unarmed.
+    #[cfg(feature = "test-hooks")]
+    fn take_injected_fault(&self) -> bool {
+        self.gc_fault_countdown
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+    }
+
     pub fn gc_stats(&self, all_interpreters: bool) -> Result<Vec<GcStat>> {
+        #[cfg(feature = "test-hooks")]
+        if self.take_injected_fault() {
+            bail!("gc_stats: injected fault (test hook)");
+        }
         let table = self.resolved.table();
 
         // Catch-all guard for an unregistered build: the process's own
