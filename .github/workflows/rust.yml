@@ -244,7 +244,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@grcov
       # Guarantees an interpreter, so the tests run rather than skip (a false green).
       - uses: actions/setup-python@v5
         with:
@@ -253,8 +256,39 @@ jobs:
       - name: Allow ptrace (best-effort)
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
+      # Blocking gate, uninstrumented (ADR 0005: assert against a clean binary).
       - name: "Run the 'ignored' integration tests"
         run: cargo test --features test-hooks --tests -- --ignored
+
+      # Separate instrumented re-run so the integration suites' live-attach code
+      # paths (find_runtime, read_offsets, session reads, collect/render, the monitor
+      # retry) are measured — the unit-coverage leg never runs the #[ignore]d tests.
+      # Non-blocking so a coverage-tool failure can't fail the gate above.
+      - name: Coverage (integration tests)
+        continue-on-error: true
+        shell: bash
+        env:
+          RUSTFLAGS: -Cinstrument-coverage
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/target/profraw/gcscope-%p-%m.profraw
+        run: |
+          cargo test --features test-hooks --tests -- --ignored
+          grcov target/profraw \
+            --binary-path target/debug \
+            -s . -t lcov --branch --ignore-not-existing \
+            --ignore '../*' --ignore '/*' --ignore 'C:/Users/*' \
+            -o lcov.info
+          echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
+
+      - name: Upload coverage to Codecov
+        continue-on-error: true
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          flags: integration,ubuntu-latest
+          name: integration-ubuntu-latest
+          disable_search: true
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   # grcov (not cargo-llvm-cov): `-s .` emits repo-relative paths so Windows uploads merge
   # with Linux/macOS instead of double-counting under absolute paths.
