@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::Stdout;
 use std::time::Duration;
 
@@ -13,7 +12,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use ratatui::Terminal;
 
-use crate::list_pids::{build_flat_rows, FlatRow, ProcessInfo};
+use crate::list_pids::{build_flat_rows, FlatRow, PidInfoMap, ProcessInfo};
 
 fn is_supported(r: &FlatRow) -> bool {
     r.is_python && r.runtime_found && r.supports_stats
@@ -32,6 +31,13 @@ fn supported_at_or_before(rows: &[FlatRow], from: usize) -> Option<usize> {
 }
 
 /// Popup width/height for the given terminal size and row count.
+//
+// `manual_clamp` is allowed deliberately: `.min(..).max(12)` and `.clamp(12, ..)` are NOT
+// equivalent here. On a terminal shorter than 16 rows the upper bound
+// (`area_h - 4`, capped at 30) falls below the lower bound of 12, and `Ord::clamp`
+// panics when `min > max`. The min/max chain instead saturates to 12, which is the
+// behavior we want — an oversized popup on a tiny terminal beats a crash.
+#[allow(clippy::manual_clamp)]
 fn popup_dims(area_w: u16, area_h: u16, num_rows: usize) -> (u16, u16) {
     let popup_w = (area_w as f64 * 0.85) as u16;
     let popup_h = ((num_rows as u16 + 4)
@@ -53,7 +59,7 @@ fn capacity_of(popup_h: u16) -> usize {
 pub fn show_pid_dialog(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     processes: &[ProcessInfo],
-    pid_info_map: &HashMap<u32, (String, u32)>,
+    pid_info_map: &PidInfoMap,
 ) -> Result<Option<u32>> {
     if processes.is_empty() {
         anyhow::bail!("No Python processes found");
@@ -88,63 +94,60 @@ pub fn show_pid_dialog(
             capacity_of(popup_dims(size.width, size.height, flat_rows.len()).1)
         };
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if selected > 0 {
-                                if let Some(n) = supported_at_or_before(&flat_rows, selected - 1) {
-                                    selected = n;
-                                }
-                            }
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if let Some(n) = supported_at_or_after(&flat_rows, selected + 1) {
-                                selected = n;
-                            }
-                        }
-                        KeyCode::PageUp => {
-                            let target = selected.saturating_sub(page);
-                            selected = supported_at_or_before(&flat_rows, target)
-                                .or_else(|| supported_at_or_after(&flat_rows, target))
-                                .unwrap_or(selected);
-                        }
-                        KeyCode::PageDown => {
-                            let target = (selected + page).min(flat_rows.len() - 1);
-                            selected = supported_at_or_after(&flat_rows, target)
-                                .or_else(|| supported_at_or_before(&flat_rows, target))
-                                .unwrap_or(selected);
-                        }
-                        KeyCode::Home => {
-                            if let Some(n) = supported_at_or_after(&flat_rows, 0) {
-                                selected = n;
-                            }
-                        }
-                        KeyCode::End => {
-                            if let Some(n) =
-                                supported_at_or_before(&flat_rows, flat_rows.len() - 1)
-                            {
-                                selected = n;
-                            }
-                        }
-                        KeyCode::Left => {
-                            cmdline_scroll = cmdline_scroll.saturating_sub(4);
-                        }
-                        KeyCode::Right => {
-                            cmdline_scroll = cmdline_scroll.saturating_add(4);
-                        }
-                        KeyCode::Enter => {
-                            if is_supported(&flat_rows[selected]) {
-                                return Ok(Some(flat_rows[selected].pid));
-                            }
-                        }
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            return Ok(None);
-                        }
-                        _ => {}
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if selected > 0
+                        && let Some(n) = supported_at_or_before(&flat_rows, selected - 1)
+                    {
+                        selected = n;
                     }
                 }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(n) = supported_at_or_after(&flat_rows, selected + 1) {
+                        selected = n;
+                    }
+                }
+                KeyCode::PageUp => {
+                    let target = selected.saturating_sub(page);
+                    selected = supported_at_or_before(&flat_rows, target)
+                        .or_else(|| supported_at_or_after(&flat_rows, target))
+                        .unwrap_or(selected);
+                }
+                KeyCode::PageDown => {
+                    let target = (selected + page).min(flat_rows.len() - 1);
+                    selected = supported_at_or_after(&flat_rows, target)
+                        .or_else(|| supported_at_or_before(&flat_rows, target))
+                        .unwrap_or(selected);
+                }
+                KeyCode::Home => {
+                    if let Some(n) = supported_at_or_after(&flat_rows, 0) {
+                        selected = n;
+                    }
+                }
+                KeyCode::End => {
+                    if let Some(n) = supported_at_or_before(&flat_rows, flat_rows.len() - 1) {
+                        selected = n;
+                    }
+                }
+                KeyCode::Left => {
+                    cmdline_scroll = cmdline_scroll.saturating_sub(4);
+                }
+                KeyCode::Right => {
+                    cmdline_scroll = cmdline_scroll.saturating_add(4);
+                }
+                KeyCode::Enter => {
+                    if is_supported(&flat_rows[selected]) {
+                        return Ok(Some(flat_rows[selected].pid));
+                    }
+                }
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    return Ok(None);
+                }
+                _ => {}
             }
         }
     }

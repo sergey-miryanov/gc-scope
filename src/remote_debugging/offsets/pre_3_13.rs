@@ -25,6 +25,12 @@ pub static LEGACY_GC_LAYOUT: GcItemLayout = GcItemLayout {
     ],
 };
 
+// A private, positional constructor for the hand-extracted legacy offset tables: each
+// argument is one raw byte offset from a CPython header. The positional form is
+// deliberate — the per-version call sites below line up as a compact table where a
+// struct with nine named fields would obscure the row-per-version layout, and the
+// argument order is fixed by that table, not a candidate for reordering.
+#[allow(clippy::too_many_arguments)]
 fn table(version_hex: u64, runtime_ih: u64, interp_next: u64, interp_id: u64,
          interp_ts_head: u64, interp_gc: Option<u64>, thread_interp: u64,
          gc_gen: u64, runtime_gc: Option<u64>) -> OffsetTable {

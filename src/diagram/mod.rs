@@ -71,9 +71,9 @@ pub fn run_ascii_watch(pid: u32, rate_ms: u64) -> Result<()> {
 
         frame += 1;
         write!(out, "\x1b[2J\x1b[H")?;                  // clear entire screen + home
-        write!(
+        writeln!(
             out,
-            "[Frame {} @ {:.1}s]  Rate: {}ms  Collect: {}\n",
+            "[Frame {} @ {:.1}s]  Rate: {}ms  Collect: {}",
             frame,
             elapsed.as_secs_f64(),
             rate_ms,
@@ -90,7 +90,7 @@ pub fn run_ascii_watch(pid: u32, rate_ms: u64) -> Result<()> {
 
     drop(out);
     let mut out = std::io::stdout().lock();
-    write!(out, "\x1b[?25h\n")?;
+    writeln!(out, "\x1b[?25h")?;
     out.flush()?;
     result
 }

@@ -87,70 +87,69 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
     let mut cl_last_jitter = Instant::now();
 
     let result = loop {
-        if event::poll(Duration::from_millis(rate_ms))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            selected_slot = selected_slot.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            selected_slot = selected_slot.saturating_add(1);
-                        }
-                        KeyCode::Char('t') => {
-                            debug_offsets_show_tree = !debug_offsets_show_tree;
-                        }
-                        KeyCode::Char('h') => {
-                            debug_offsets_show_hex = !debug_offsets_show_hex;
-                        }
-                        KeyCode::Char('o') => {
-                            if debug_offsets_show_tree || debug_offsets_show_hex {
-                                debug_offsets_show_tree = false;
-                                debug_offsets_show_hex = false;
-                            } else {
-                                debug_offsets_show_tree = true;
-                                debug_offsets_show_hex = true;
-                            }
-                        }
-                        KeyCode::Char('d') => {
-                            show_runtime_hex = !show_runtime_hex;
-                        }
-                        KeyCode::Char('r') => {
-                            rate_ms = rate_ms.saturating_sub(10).max(10);
-                        }
-                        KeyCode::Char('R') => {
-                            rate_ms = rate_ms.saturating_add(10);
-                        }
-                        KeyCode::Char('g') => {
-                            glitch_enabled = !glitch_enabled;
-                        }
-                        KeyCode::Char('p') => {
-                            if let Ok((processes, pid_info_map)) = crate::list_pids::list_python_processes() {
-                                if let Ok(Some(new_pid)) = super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map) {
-                                    // Re-attach to the newly picked PID; only commit
-                                    // the switch if it resolves.
-                                    if let Ok(new_session) = crate::remote_debugging::session::PySession::attach(new_pid) {
-                                        session = new_session;
-                                        pid = new_pid;
-                                        start = Instant::now();
-                                        scroll = 0;
-                                        selected_slot = 0;
-                                        frame = 0;
-                                        debug_offsets_show_tree = true;
-                                        debug_offsets_show_hex = true;
-                                        show_runtime_hex = false;
-                                    }
-                                }
-                            }
-                        }
-                        KeyCode::PageUp => scroll = scroll.saturating_sub(10),
-                        KeyCode::PageDown => scroll = scroll.saturating_add(10),
-                        KeyCode::Home => scroll = 0,
-                        KeyCode::End => scroll = u16::MAX,
-                        _ => {}
+        if event::poll(Duration::from_millis(rate_ms))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected_slot = selected_slot.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected_slot = selected_slot.saturating_add(1);
+                }
+                KeyCode::Char('t') => {
+                    debug_offsets_show_tree = !debug_offsets_show_tree;
+                }
+                KeyCode::Char('h') => {
+                    debug_offsets_show_hex = !debug_offsets_show_hex;
+                }
+                KeyCode::Char('o') => {
+                    if debug_offsets_show_tree || debug_offsets_show_hex {
+                        debug_offsets_show_tree = false;
+                        debug_offsets_show_hex = false;
+                    } else {
+                        debug_offsets_show_tree = true;
+                        debug_offsets_show_hex = true;
                     }
                 }
+                KeyCode::Char('d') => {
+                    show_runtime_hex = !show_runtime_hex;
+                }
+                KeyCode::Char('r') => {
+                    rate_ms = rate_ms.saturating_sub(10).max(10);
+                }
+                KeyCode::Char('R') => {
+                    rate_ms = rate_ms.saturating_add(10);
+                }
+                KeyCode::Char('g') => {
+                    glitch_enabled = !glitch_enabled;
+                }
+                KeyCode::Char('p') => {
+                    if let Ok((processes, pid_info_map)) = crate::list_pids::list_python_processes()
+                        && let Ok(Some(new_pid)) = super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map)
+                    {
+                        // Re-attach to the newly picked PID; only commit
+                        // the switch if it resolves.
+                        if let Ok(new_session) = crate::remote_debugging::session::PySession::attach(new_pid) {
+                            session = new_session;
+                            pid = new_pid;
+                            start = Instant::now();
+                            scroll = 0;
+                            selected_slot = 0;
+                            frame = 0;
+                            debug_offsets_show_tree = true;
+                            debug_offsets_show_hex = true;
+                            show_runtime_hex = false;
+                        }
+                    }
+                }
+                KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                KeyCode::PageDown => scroll = scroll.saturating_add(10),
+                KeyCode::Home => scroll = 0,
+                KeyCode::End => scroll = u16::MAX,
+                _ => {}
             }
         }
 
@@ -179,10 +178,10 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
         frame += 1;
 
         // Auto-exit if duration exceeded
-        if let Some(max_dur) = duration_secs {
-            if elapsed.as_secs() >= max_dur {
-                break Ok(());
-            }
+        if let Some(max_dur) = duration_secs
+            && elapsed.as_secs() >= max_dur
+        {
+            break Ok(());
         }
 
         // Glitch + connection-lost timer logic (wall-clock based)
@@ -197,17 +196,17 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
                         let msg_dur = rand_range(&mut rng_state, 4000, 8000);
                         cl_end = now + Duration::from_millis(msg_dur as u64);
                     }
-                } else if cl_phase == 2 {
-                    if now >= cl_end {
-                        cl_active = false;
-                        cl_phase = 0;
-                        // Double next normal glitch cooldown
-                        let delay = rand_range(&mut rng_state, 1000, 8000) * 2;
-                        next_glitch_at = now + Duration::from_millis(delay as u64);
-                        // Schedule next sequence in ~30 s
-                        let interval = rand_range(&mut rng_state, 25000, 35000);
-                        next_cl_show = now + Duration::from_millis(interval as u64);
-                    }
+                } else if cl_phase == 2
+                    && now >= cl_end
+                {
+                    cl_active = false;
+                    cl_phase = 0;
+                    // Double next normal glitch cooldown
+                    let delay = rand_range(&mut rng_state, 1000, 8000) * 2;
+                    next_glitch_at = now + Duration::from_millis(delay as u64);
+                    // Schedule next sequence in ~30 s
+                    let interval = rand_range(&mut rng_state, 25000, 35000);
+                    next_cl_show = now + Duration::from_millis(interval as u64);
                 }
             } else if now >= next_cl_show {
                 cl_active = true;
@@ -301,12 +300,18 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
     result
 }
 
+// Nine arguments, all of them independent scalars read straight off the render loop's
+// local state. Bundling them into a struct would just relocate the same nine fields and
+// add a construction site per frame, so the lint is allowed rather than worked around.
+#[allow(clippy::too_many_arguments)]
 fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, rate_ms: u64, glitch_active: bool, cl_active: bool, glitch_enabled: bool, collect_dur: Duration) -> Paragraph<'static> {
     let style = Style::new().bg(Color::Blue).fg(Color::White);
-    let scroll_pct = if max_scroll > 0 {
-        format!(" {:>3}%", scroll * 100 / max_scroll)
-    } else {
-        " 100%".to_string()
+    // u32 math on purpose: `scroll` is a u16 and `scroll * 100` overflows it once the
+    // scrollback passes 655 rows — a debug-build panic in a view that can easily be
+    // longer than that. `checked_div` covers the max_scroll == 0 (nothing to scroll) case.
+    let scroll_pct = match (scroll as u32 * 100).checked_div(max_scroll as u32) {
+        Some(pct) => format!(" {pct:>3}%"),
+        None => " 100%".to_string(),
     };
     let slot_text = if slot_count > 0 {
         format!(" slot {}/{} ", slot + 1, slot_count)
@@ -451,7 +456,7 @@ fn hex_dump_rows(
                 global_off >= off && global_off < off + len as usize
             });
             let hl_color = hl.map(|&(_, _, c)| c);
-            let next_in_same = hl.map_or(false, |&(off, len, _)| {
+            let next_in_same = hl.is_some_and(|&(off, len, _)| {
                 global_off + 1 < off + len as usize
             });
 
@@ -657,7 +662,7 @@ fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets, show_tree
                 }
             };
             left_owned.push(line);
-            let label: &str = &entry.label;
+            let label: &str = entry.label;
             if let Some(&color) = tree_row_colors.get(label) {
                 tree_highlight_rows.push((left_owned.len() - 1, color));
             }
@@ -884,7 +889,7 @@ fn section_interpreter(data: &CollectedData, off: &VersionedOffsets) -> Vec<Line
         let ri = i.saturating_sub(1);
         let right = if i == 0 {
             // Header row: left header + right header
-            let lv = match left_items.get(0) {
+            let lv = match left_items.first() {
                 Some(LeftItem::Plain(s)) => s.as_str(),
                 _ => "",
             };
@@ -1102,10 +1107,8 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
 fn fmt_val(val: u64) -> String {
     if val > 0xFFFF_FFFF {
         format!("{:#x}", val)
-    } else if val > 0x10000 {
-        format!("{}", val)
     } else {
-        format!("{}", val)
+        val.to_string()
     }
 }
 
@@ -1113,7 +1116,7 @@ fn fmt_thousands(val: u64) -> String {
     let s = val.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.char_indices() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push('_');
         }
         out.push(c);
@@ -1243,9 +1246,7 @@ fn apply_one_glitch(buffer: &mut ratatui::buffer::Buffer, rng: &mut u32) {
                 for x in bx..bx + bw {
                     let idx = row_base + x;
                     let cell = &mut buffer.content[idx];
-                    let tmp = cell.fg;
-                    cell.fg = cell.bg;
-                    cell.bg = tmp;
+                    std::mem::swap(&mut cell.fg, &mut cell.bg);
                 }
             }
         }
@@ -1274,7 +1275,7 @@ fn apply_connection_lost_buildup(buffer: &mut ratatui::buffer::Buffer, rng: &mut
             let bw = (w as f64 * 0.6) as usize;
             let bx = rand_range(rng, 0, (w - bw) as u32) as usize;
             for dy in 0..bh {
-                let y = (h - bh + dy).max(0).min(h - 1);
+                let y = (h - bh + dy).min(h - 1);
                 let row_base = y * w;
                 for x in bx..bx + bw {
                     buffer.content[row_base + x]
