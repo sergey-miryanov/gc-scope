@@ -1165,6 +1165,31 @@ fn fmt_rate(rate: f64) -> String {
     }
 }
 
+/// Renders the TUI body for a snapshot to plain strings (spans flattened), so the live
+/// integration test can exercise the **Full-tier** section builders
+/// (`section_debug_offsets` / `section_interpreter`) that only run against a real 3.13+
+/// `_Py_DebugOffsets` struct and so can't be reached from the synthetic-Legacy unit tests.
+/// Mirrors what `run_tui` feeds into the content `Paragraph`. Test-only seam, like
+/// `MonitorContext::insert_session_for_test`.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn render_frame_for_test(
+    data: &CollectedData,
+    selected_slot: usize,
+    show_tree: bool,
+    show_hex: bool,
+    show_runtime_hex: bool,
+) -> Vec<String> {
+    let stats = &data.interpreter.gc.generation_stats;
+    let rate = collections_rate_from_slots(&stats.slots, stats.has_timestamps);
+    let avg = avg_collection_time_per_gen(&stats.slots, stats.has_duration);
+    let (lines, _) = build_lines(data, rate, avg, selected_slot, show_tree, show_hex, show_runtime_hex);
+    lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect()
+}
+
 // ── Glitch effects ─────────────────────────────────────────────────
 fn xorshift32(state: &mut u32) -> u32 {
     let mut x = *state;
@@ -1321,5 +1346,356 @@ fn draw_connection_lost_box(buffer: &mut ratatui::buffer::Buffer, jx: i32, jy: i
             }
             buffer.content[idx].set_char(ch);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    use super::super::collect::{
+        GcSlot, GcStatsSnapshot, GcSubState, InterpreterSnapshot,
+    };
+    use crate::remote_debugging::offsets::pre_3_13;
+    use crate::remote_debugging::session::Resolved;
+
+    // ── Format helpers ────────────────────────────────────────────
+    // Leaf input→string logic every section depends on; the thresholds and units are
+    // the contract, so pin them exactly.
+
+    #[test]
+    fn fmt_val_switches_to_hex_only_above_u32_max() {
+        assert_eq!(fmt_val(0), "0");
+        assert_eq!(fmt_val(255), "255");
+        // Exactly u32::MAX still renders decimal (the guard is strictly greater).
+        assert_eq!(fmt_val(0xFFFF_FFFF), "4294967295");
+        assert_eq!(fmt_val(0x1_0000_0000), "0x100000000");
+    }
+
+    #[test]
+    fn fmt_thousands_groups_from_the_right() {
+        assert_eq!(fmt_thousands(0), "0");
+        assert_eq!(fmt_thousands(123), "123");
+        assert_eq!(fmt_thousands(1234), "1_234");
+        assert_eq!(fmt_thousands(1_234_567), "1_234_567");
+    }
+
+    #[test]
+    fn fmt_bytes_scales_at_the_k_and_m_thresholds() {
+        assert_eq!(fmt_bytes(0), "0");
+        assert_eq!(fmt_bytes(999), "999");
+        assert_eq!(fmt_bytes(1000), "1.0K");
+        assert_eq!(fmt_bytes(1500), "1.5K");
+        assert_eq!(fmt_bytes(1_000_000), "1.0M");
+        assert_eq!(fmt_bytes(2_500_000), "2.5M");
+    }
+
+    #[test]
+    fn fmt_duration_crosses_from_ms_to_s_at_one_second() {
+        assert_eq!(fmt_duration(0.0), "0.000ms");
+        assert_eq!(fmt_duration(0.001), "1.000ms");
+        assert_eq!(fmt_duration(0.5), "500.000ms");
+        // 1.0 is NOT < 1.0, so it renders in seconds.
+        assert_eq!(fmt_duration(1.0), "1.000s");
+        assert_eq!(fmt_duration(2.5), "2.500s");
+    }
+
+    #[test]
+    fn fmt_duration_ns_picks_ns_us_ms_by_magnitude() {
+        assert_eq!(fmt_duration_ns(Duration::from_nanos(0)), "0ns");
+        assert_eq!(fmt_duration_ns(Duration::from_nanos(500)), "500ns");
+        assert_eq!(fmt_duration_ns(Duration::from_nanos(999)), "999ns");
+        assert_eq!(fmt_duration_ns(Duration::from_nanos(1000)), "1.0\u{00b5}s");
+        assert_eq!(fmt_duration_ns(Duration::from_micros(2)), "2.0\u{00b5}s");
+        assert_eq!(fmt_duration_ns(Duration::from_nanos(1_500_000)), "1.500ms");
+        assert_eq!(fmt_duration_ns(Duration::from_millis(5)), "5.000ms");
+    }
+
+    #[test]
+    fn fmt_rate_uses_one_decimal_high_two_decimals_mid_and_floors_low_to_zero() {
+        assert_eq!(fmt_rate(15.0), "15.0/s");
+        assert_eq!(fmt_rate(10.0), "10.0/s");
+        assert_eq!(fmt_rate(9.99), "9.99/s");
+        assert_eq!(fmt_rate(1.5), "1.50/s");
+        assert_eq!(fmt_rate(0.01), "0.01/s");
+        // Below 0.01 collapses to the sentinel rather than "0.00/s".
+        assert_eq!(fmt_rate(0.009), "0.0/s");
+        assert_eq!(fmt_rate(0.0), "0.0/s");
+    }
+
+    // ── PRNG ──────────────────────────────────────────────────────
+    // Seeded and pure, so both the exact first value and the whole sequence are
+    // reproducible — that determinism is what makes the glitch effects testable.
+
+    #[test]
+    fn xorshift32_is_deterministic_and_advances_state() {
+        // Hand-computed for seed 1: 1 ^ (1<<13) = 8193; ^ (8193>>17)=0; ^ (8193<<5) = 0x42021.
+        let mut s = 1u32;
+        assert_eq!(xorshift32(&mut s), 0x42021);
+        assert_eq!(s, 0x42021, "state must be updated to the returned value");
+
+        // Same seed → identical sequence from two independent states.
+        let (mut a, mut b) = (42u32, 42u32);
+        let seq_a: Vec<u32> = (0..5).map(|_| xorshift32(&mut a)).collect();
+        let seq_b: Vec<u32> = (0..5).map(|_| xorshift32(&mut b)).collect();
+        assert_eq!(seq_a, seq_b);
+        assert!(seq_a.iter().any(|&v| v != seq_a[0]), "sequence must vary");
+    }
+
+    #[test]
+    fn rand_range_stays_within_bounds_and_returns_min_when_empty() {
+        // Degenerate ranges short-circuit to min without consuming the rng.
+        let mut s = 7u32;
+        assert_eq!(rand_range(&mut s, 5, 5), 5);
+        assert_eq!(rand_range(&mut s, 10, 5), 10);
+        assert_eq!(s, 7, "empty range must not advance the rng");
+
+        // Real ranges always land inside [min, max], inclusive.
+        let mut s = 123u32;
+        for _ in 0..500 {
+            let v = rand_range(&mut s, 3, 9);
+            assert!((3..=9).contains(&v), "out of range: {v}");
+        }
+    }
+
+    // ── Hex helpers ───────────────────────────────────────────────
+
+    #[test]
+    fn hex_col_emitted_matches_the_documented_widths() {
+        assert_eq!(hex_col_emitted(0), 0);
+        assert_eq!(hex_col_emitted(1), 3);
+        assert_eq!(hex_col_emitted(8), 25);
+        assert_eq!(hex_col_emitted(15), 46);
+        // A full 16-byte row is 48 chars wide (per the doc comment).
+        assert_eq!(hex_col_emitted(16), 48);
+    }
+
+    fn row_text(row: &[Span]) -> String {
+        row.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn hex_dump_rows_lays_out_offset_bytes_and_ascii() {
+        let bytes = b"Hello, World!\x00\xff\x7f"; // 16 bytes
+        let rows = hex_dump_rows(bytes, bytes.len(), &[], 0x1000);
+        assert_eq!(rows.len(), 1);
+        let text = row_text(&rows[0]);
+        assert!(text.contains("00001000"), "base offset in row: {text:?}");
+        // Non-graphic bytes collapse to '.' in the ascii gutter.
+        assert!(text.contains("Hello, World!..."), "ascii gutter: {text:?}");
+    }
+
+    #[test]
+    fn hex_dump_rows_wraps_at_16_and_honours_the_limit() {
+        assert_eq!(hex_dump_rows(&[0u8; 17], 17, &[], 0).len(), 2);
+        // `limit` truncates the input before chunking.
+        assert_eq!(hex_dump_rows(&[0u8; 32], 16, &[], 0).len(), 1);
+    }
+
+    #[test]
+    fn hex_dump_rows_styles_the_highlighted_bytes() {
+        let rows = hex_dump_rows(&[0xAAu8; 8], 8, &[(0, 4, Color::Green)], 0);
+        assert!(
+            rows[0].iter().any(|s| s.style.bg == Some(Color::Green)),
+            "highlighted bytes must carry the region colour"
+        );
+    }
+
+    // ── Synthetic Legacy snapshot ─────────────────────────────────
+    // The pre-3.13 (`Legacy`) tier is the only one constructible without a live process
+    // (flat `OffsetTable`, no bindgen struct). Same trick as `ascii::tests::legacy_data`.
+
+    fn legacy_data(with_slots: bool) -> CollectedData {
+        let table = pre_3_13::table_for_version(3, 12).unwrap();
+        let slots = if with_slots {
+            vec![GcSlot {
+                generation: 0,
+                slot: 0,
+                byte_offset: 0,
+                start_ts: 0,
+                stop_ts: 0,
+                collections: 5,
+                collected: 10,
+                uncollectable: 0,
+                candidates: 3,
+                duration: 0.0,
+                heap_size: 0,
+            }]
+        } else {
+            Vec::new()
+        };
+        CollectedData {
+            pid: 4321,
+            runtime_addr: 0x5000,
+            runtime_version: 0x030c0000,
+            runtime_raw_bytes: Vec::new(),
+            debug_offsets_size: 0,
+            resolved: Arc::new(Resolved::Legacy { table }),
+            interpreter: InterpreterSnapshot {
+                addr: 0x6000,
+                raw_bytes: vec![0u8; 256],
+                gc: GcSubState {
+                    raw_bytes: vec![0u8; 64],
+                    generation_stats: GcStatsSnapshot {
+                        stats_addr: if with_slots { 0x7000 } else { 0 },
+                        stats_size: 72,
+                        item_size: 24,
+                        slots_per_gen: [1, 1, 1],
+                        has_timestamps: false,
+                        has_duration: false,
+                        raw_stats_bytes: vec![0u8; 72],
+                        slots,
+                    },
+                },
+                gc_offset: 0x80,
+                gc_size: 64,
+                id: 0,
+                next_addr: 0,
+            },
+            collect_duration: Duration::from_millis(1),
+        }
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn join_lines(lines: &[Line]) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    // ── Section builders (Legacy tier) ────────────────────────────
+
+    #[test]
+    fn section_interpreter_legacy_names_the_interpreter_and_flags_the_missing_struct() {
+        let data = legacy_data(true);
+        let out = join_lines(&section_interpreter_legacy(&data));
+        assert!(out.contains("PyInterpreterState @ 0x6000  (id: 0)"), "{out}");
+        assert!(out.contains("pre-3.13: no _Py_DebugOffsets"), "{out}");
+    }
+
+    #[test]
+    fn section_gc_stats_renders_the_generation_table_with_na_summaries() {
+        let data = legacy_data(true);
+        let out = join_lines(&section_gc_stats(&data, [None; 3], [None; 3], 0));
+        assert!(out.contains("GC Generation Stats Buffer @ 0x7000"), "{out}");
+        assert!(out.contains("Gen 0 (Young) - 1 slots"), "{out}");
+        assert!(out.contains("slot size: 24 bytes"), "{out}");
+        // None rate/avg must degrade to "n/a", not "0" or a panic.
+        assert!(out.contains("n/a"), "{out}");
+        // The one slot's decoded counters appear in the left table.
+        assert!(out.contains("GC Generation Stats Slot #1"), "right-panel slot box: {out}");
+    }
+
+    #[test]
+    fn section_gc_stats_reports_absent_stats_when_there_are_no_slots() {
+        let data = legacy_data(false);
+        let out = join_lines(&section_gc_stats(&data, [None; 3], [None; 3], 0));
+        assert!(out.contains("GC Generation Stats: not available"), "{out}");
+    }
+
+    #[test]
+    fn build_lines_on_a_legacy_snapshot_skips_the_debug_offsets_section() {
+        let data = legacy_data(true);
+        let (lines, _slot_idx) = build_lines(&data, [None; 3], [None; 3], 0, true, true, false);
+        let out = join_lines(&lines);
+        // Pre-3.13 → no _Py_DebugOffsets section, straight to the legacy header + GC table.
+        assert!(!out.contains("_Py_DebugOffsets (embedded"), "legacy must skip section 1: {out}");
+        assert!(out.contains("pre-3.13: no _Py_DebugOffsets"), "{out}");
+        assert!(out.contains("Gen 0 (Young) - 1 slots"), "{out}");
+    }
+
+    // ── status_bar ────────────────────────────────────────────────
+    // A `Paragraph` doesn't expose its text directly, so render it into a `Buffer` and
+    // read the cells back.
+
+    fn render_status(
+        scroll: u16,
+        max_scroll: u16,
+        slot: usize,
+        slot_count: usize,
+        glitch_active: bool,
+        cl_active: bool,
+        glitch_enabled: bool,
+    ) -> String {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 220, 1));
+        status_bar(scroll, max_scroll, slot, slot_count, 100, glitch_active, cl_active, glitch_enabled, Duration::from_millis(1))
+            .render(buf.area, &mut buf);
+        buf.content.iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn status_bar_shows_slot_position_and_the_100_percent_sentinel_when_unscrollable() {
+        let out = render_status(0, 0, 0, 1, false, false, true);
+        assert!(out.contains("[q] quit"), "{out}");
+        assert!(out.contains("[p] pick pid"), "{out}");
+        assert!(out.contains("slot 1/1"), "{out}");
+        // max_scroll == 0 → checked_div is None → the "100%" branch.
+        assert!(out.contains("100%"), "{out}");
+        assert!(out.contains("[g] on"), "glitch-enabled label: {out}");
+    }
+
+    #[test]
+    fn status_bar_reflects_no_slots_disabled_glitch_and_the_badges() {
+        assert!(render_status(0, 0, 0, 0, false, false, true).contains("no slots"));
+        assert!(render_status(0, 0, 0, 1, false, false, false).contains("[g] off"));
+        // Connection-lost outranks the ordinary glitch badge.
+        assert!(render_status(0, 0, 0, 1, true, true, true).contains("[CL]"));
+        assert!(render_status(0, 0, 0, 1, true, false, true).contains("[G]"));
+    }
+
+    // ── Glitch effects (buffer-mutating) ──────────────────────────
+    // Seeded, so deterministic. We assert on invariants — no out-of-buffer writes (a bad
+    // index would panic), dimensions preserved — not on exact glyphs.
+
+    #[test]
+    fn apply_glitch_never_writes_out_of_bounds_across_seeds() {
+        for seed in [1u32, 2, 999, 0x1234_5678, u32::MAX] {
+            let mut rng = seed;
+            let mut buf = Buffer::empty(Rect::new(0, 0, 80, 24));
+            for _ in 0..200 {
+                apply_glitch(&mut buf, &mut rng);
+            }
+            assert_eq!(buf.area, Rect::new(0, 0, 80, 24), "glitch must not resize the buffer");
+        }
+    }
+
+    #[test]
+    fn apply_glitch_is_a_noop_on_a_too_small_buffer() {
+        let mut rng = 5u32;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1)); // below the w>=4/h>=2 floor
+        let before: Vec<String> = buf.content.iter().map(|c| c.symbol().to_string()).collect();
+        apply_glitch(&mut buf, &mut rng);
+        let after: Vec<String> = buf.content.iter().map(|c| c.symbol().to_string()).collect();
+        assert_eq!(before, after, "no cell should change below the size floor");
+    }
+
+    #[test]
+    fn apply_connection_lost_buildup_runs_at_both_ends_of_progress() {
+        let mut rng = 77u32;
+        for progress in [0.0f64, 0.5, 0.85, 1.0] {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+            apply_connection_lost_buildup(&mut buf, &mut rng, progress);
+            assert_eq!(buf.area, Rect::new(0, 0, 100, 30));
+        }
+        // Too-small buffer is a clean no-op.
+        let mut small = Buffer::empty(Rect::new(0, 0, 2, 1));
+        apply_connection_lost_buildup(&mut small, &mut rng, 1.0);
+    }
+
+    #[test]
+    fn draw_connection_lost_box_paints_the_message_and_tolerates_jitter() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 12));
+        draw_connection_lost_box(&mut buf, 0, 0);
+        let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("CONNECTION LOST"), "box message must be drawn: {text:?}");
+        // Jitter offsets and a clamped-tiny buffer must not write out of bounds.
+        draw_connection_lost_box(&mut buf, 1, -1);
+        draw_connection_lost_box(&mut Buffer::empty(Rect::new(0, 0, 10, 3)), 0, 0);
     }
 }
