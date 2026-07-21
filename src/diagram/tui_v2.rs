@@ -181,18 +181,19 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
             }
 
             let title = format!(
-                " gcscope tui — PID {} — Frame {} @ {:.1}s — Rate {}ms{} ",
+                " gcscope tui — PID {} — Frame {} @ {:.1}s — Rate {}ms — Poll {}{} ",
                 pid,
                 frame,
                 elapsed.as_secs_f64(),
                 rate_ms,
+                fmt_duration_ns(data.collect_duration),
                 duration_secs.map_or(String::new(), |d| format!(" — Dur {d}s"))
             );
             let content = Paragraph::new(Text::from(styled_lines))
                 .block(Block::bordered().border_type(BorderType::Plain).title(title))
                 .scroll((scroll, 0));
 
-            let status = status_bar(scroll, max_scroll, selected_slot, slot_count, rate_ms, glitch_badge_active, cl_active, glitch_enabled, data.collect_duration);
+            let status = status_bar(scroll, max_scroll, selected_slot, slot_count, glitch_badge_active, cl_active, glitch_enabled);
             f.render_widget(content, chunks[0]);
             f.render_widget(status, chunks[1]);
             if should_buildup {
@@ -402,13 +403,10 @@ impl GlitchState {
     }
 }
 
-// Nine heterogeneous scalars, all read off the render loop's local state at the single
-// call site below. A struct would relocate the same nine fields and add a per-frame
-// construction site; the only safety it would add — guarding the three adjacent bools
-// against transposition — is moot for a status bar, where a swap is cosmetic and visible
-// on screen at once. Allowed rather than worked around.
-#[allow(clippy::too_many_arguments)]
-fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, rate_ms: u64, glitch_active: bool, cl_active: bool, glitch_enabled: bool, collect_dur: Duration) -> Paragraph<'static> {
+// Seven heterogeneous scalars, all read off the render loop's local state at the single
+// call site below. Poll rate and poll time live in the header title instead, so they don't
+// appear here twice.
+fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, glitch_active: bool, cl_active: bool, glitch_enabled: bool) -> Paragraph<'static> {
     let style = Style::new().bg(Color::Blue).fg(Color::White);
     // u32 math on purpose: `scroll` is a u16 and `scroll * 100` overflows it once the
     // scrollback passes 655 rows — a debug-build panic in a view that can easily be
@@ -422,7 +420,6 @@ fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, rate
     } else {
         " no slots ".to_string()
     };
-    let rate_text = format!(" {}ms ", rate_ms);
     let badge = if cl_active {
         Span::styled(" [CL] ", style.bg(Color::Red).fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD))
     } else if glitch_active {
@@ -438,8 +435,6 @@ fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, rate
         Span::styled(" [t] tree [h] hex [o] collapse [d] Dbg/Rt", style),
         Span::styled(" [r/R] rate", style),
         Span::styled(format!(" [g] {}", glitch_label), glitch_style),
-        Span::styled(format!(" {} ", fmt_duration_ns(collect_dur)), style.bg(Color::DarkGray)),
-        Span::styled(rate_text, style.bg(Color::DarkGray)),
         badge,
         Span::styled(" [\u{2191}\u{2193}/jk] ", style),
         Span::styled(slot_text, style.bg(Color::DarkGray)),
@@ -1777,7 +1772,7 @@ mod tests {
         glitch_enabled: bool,
     ) -> String {
         let mut buf = Buffer::empty(Rect::new(0, 0, 220, 1));
-        status_bar(scroll, max_scroll, slot, slot_count, 100, glitch_active, cl_active, glitch_enabled, Duration::from_millis(1))
+        status_bar(scroll, max_scroll, slot, slot_count, glitch_active, cl_active, glitch_enabled)
             .render(buf.area, &mut buf);
         buf.content.iter().map(|c| c.symbol()).collect()
     }
