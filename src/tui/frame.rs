@@ -25,6 +25,13 @@ const PR: usize = 90;
 const INNER_W: usize = PL - 4;      // 61
 const INNER_TW: usize = INNER_W - 2; // 59
 
+// The GC-stats buffer view splits the same 160-col frame differently from the full view: a
+// 16-byte hexdump row is exactly 78 cols wide, so the right column is pinned to that and the
+// left gets the rest (`| L | R |` = 1+77+3+78+1 = 160). The left is wider than the full view's
+// `PL` so a `+inc` build's long field names (`ts_handle_weakref_callbacks_start`, …) fit.
+const GC_PR: usize = 78;
+const GC_PL: usize = OUTER_W + 2 - GC_PR - 5; // 77 (frame 160 minus the `| … | … |` framing)
+
 
 /// Restores the terminal (raw mode, alternate screen, cursor) on drop, so it is cleaned
 /// up on every exit path — including an early `?` return from the PID dialog or setup —
@@ -133,7 +140,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         if pending_dump {
             pending_dump = false;
             let path = format!("{}.txt", poller.pid());
-            let frame = render_snapshot(&data, state.selected_slot, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex);
+            let frame = render_snapshot(&data, state.selected_slot, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex, state.gc_only);
             dump_note = Some(match std::fs::write(&path, frame) {
                 Ok(()) => format!(" — Saved {path}"),
                 Err(e) => format!(" — Save failed: {e}"),
@@ -163,7 +170,11 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
             collections_rate_from_slots(slots, stats.has_timestamps),
             avg_collection_time_per_gen(slots, stats.has_duration),
         );
-        let (styled_lines, _slot_line) = build_lines(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_slot, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex);
+        let styled_lines = if state.gc_only {
+            build_gc_only_lines(&data, state.selected_slot)
+        } else {
+            build_lines(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_slot, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex).0
+        };
 
         // Pre-compute glitch draw conditions for this frame.
         let should_glitch = glitch.should_glitch(state.glitch_enabled);
@@ -243,6 +254,8 @@ struct TuiState {
     debug_offsets_show_tree: bool,
     debug_offsets_show_hex: bool,
     show_runtime_hex: bool,
+    /// `true` = the GC-stats-only buffer view; `false` = the full layout. Toggled by `g`.
+    gc_only: bool,
     rate_ms: u64,
     glitch_enabled: bool,
 }
@@ -266,6 +279,7 @@ impl TuiState {
             debug_offsets_show_tree: true,
             debug_offsets_show_hex: true,
             show_runtime_hex: false,
+            gc_only: false,
             rate_ms,
             glitch_enabled,
         }
@@ -279,6 +293,7 @@ impl TuiState {
         self.debug_offsets_show_tree = true;
         self.debug_offsets_show_hex = true;
         self.show_runtime_hex = false;
+        self.gc_only = false;
     }
 
     /// Pulls `selected_slot` back into `[0, slot_count)` when a new snapshot has fewer slots.
@@ -311,7 +326,8 @@ impl TuiState {
             KeyCode::Char('d') => self.show_runtime_hex = !self.show_runtime_hex,
             KeyCode::Char('r') => self.rate_ms = self.rate_ms.saturating_sub(10).max(10),
             KeyCode::Char('R') => self.rate_ms = self.rate_ms.saturating_add(10),
-            KeyCode::Char('g') => self.glitch_enabled = !self.glitch_enabled,
+            KeyCode::Char('g') => self.gc_only = !self.gc_only,
+            KeyCode::Char('G') => self.glitch_enabled = !self.glitch_enabled,
             KeyCode::Char('s') => return KeyOutcome::DumpSnapshot,
             KeyCode::Char('p') => return KeyOutcome::PickPid,
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
@@ -447,7 +463,7 @@ fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, glit
     let badge = if cl_active {
         Span::styled(" [CL] ", style.bg(Color::Red).fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD))
     } else if glitch_active {
-        Span::styled(" [G] ", style.bg(Color::Red).fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD))
+        Span::styled(" [FX] ", style.bg(Color::Red).fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD))
     } else {
         Span::raw("")
     };
@@ -457,9 +473,10 @@ fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, glit
         Span::styled(" [q] quit ", style.bg(Color::DarkGray)),
         Span::styled(" [s] save ", style),
         Span::styled(" [p] pick pid ", style),
+        Span::styled(" [g] gc-view ", style),
         Span::styled(" [t] tree [h] hex [o] collapse [d] Dbg/Rt", style),
         Span::styled(" [r/R] rate", style),
-        Span::styled(format!(" [g] {}", glitch_label), glitch_style),
+        Span::styled(format!(" [G] glitch:{}", glitch_label), glitch_style),
         badge,
         Span::styled(" [\u{2191}\u{2193}/jk] ", style),
         Span::styled(slot_text, style.bg(Color::DarkGray)),
@@ -537,6 +554,26 @@ fn span_line(left_spans: Vec<Span<'static>>, right_spans: Vec<Span<'static>>) ->
     spans.extend(right_spans);
     if rw < PR {
         spans.push(Span::raw(" ".repeat(PR - rw)));
+    }
+    spans.push(Span::raw("|"));
+    Line::from(spans)
+}
+
+/// Two-column body row for the GC-stats buffer view: `|<left> | <right>|`, padding each
+/// column to `GC_PL`/`GC_PR` so the frame borders line up. Like [`span_line`] but with the
+/// buffer view's wider-left split instead of the full view's `PL`/`PR`.
+fn gc_two_col(left: Vec<Span<'static>>, right: Vec<Span<'static>>) -> Line<'static> {
+    let mut spans = vec![Span::raw("|")];
+    let lw: usize = left.iter().map(|s| s.content.len()).sum();
+    spans.extend(left);
+    if lw < GC_PL {
+        spans.push(Span::raw(" ".repeat(GC_PL - lw)));
+    }
+    spans.push(Span::raw(" | "));
+    let rw: usize = right.iter().map(|s| s.content.len()).sum();
+    spans.extend(right);
+    if rw < GC_PR {
+        spans.push(Span::raw(" ".repeat(GC_PR - rw)));
     }
     spans.push(Span::raw("|"));
     Line::from(spans)
@@ -1138,18 +1175,10 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
     // 3.13/3.14 inline slots (collections@0, collected@8) from being painted at the ring
     // offsets (16/24). Fields without a color entry (uncollectable, candidates, the `+inc`
     // extras) are left unhighlighted, as before.
-    let slot_label_colors: std::collections::HashMap<&str, Color> = [
-        ("ts_start", Color::Blue),
-        ("ts_stop", Color::Blue),
-        ("collections", Color::Green),
-        ("collected", Color::Magenta),
-        ("duration", Color::Yellow),
-        ("heap_size", Color::Cyan),
-    ].into_iter().collect();
     let adjusted_highlights: Vec<(usize, u8, Color)> = slot_view.iter()
         .flat_map(|v| v.iter_fields())
         .filter_map(|(name, off, _)| {
-            slot_label_colors.get(name).map(|&c| (off + slot.byte_offset, 8u8, c))
+            slot_field_color(name).map(|c| (off + slot.byte_offset, 8u8, c))
         })
         .collect();
     let hex_rows = hex_dump_rows(slot_bytes, display_bytes, &adjusted_highlights, slot.byte_offset);
@@ -1188,8 +1217,7 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
         };
 
         let content = format!("  {:<name_w$} @ +{:<4}  {}", name, offset, val_fmt, name_w = name_w);
-        let name_str: &str = name;
-        let color = slot_label_colors.get(name_str).copied();
+        let color = slot_field_color(name);
 
         if let Some(c) = color {
             let prefix_span = Span::raw("  | ".to_string());
@@ -1227,6 +1255,143 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
         } else {
             lines.push(full_line(lv, right));
         }
+    }
+
+    lines.push(Line::from(Span::raw(top())));
+    lines
+}
+
+/// The color a GC-stat field is painted in, in both the hexdump highlights and the field
+/// table. `None` = left unhighlighted (uncollectable, candidates, the `+inc` extras). Shared
+/// by the full view (`section_gc_stats`) and the buffer view (`build_gc_only_lines`) so the
+/// two never drift.
+fn slot_field_color(name: &str) -> Option<Color> {
+    match name {
+        "ts_start" | "ts_stop" => Some(Color::Blue),
+        "collections" => Some(Color::Green),
+        "collected" => Some(Color::Magenta),
+        "duration" => Some(Color::Yellow),
+        "heap_size" => Some(Color::Cyan),
+        _ => None,
+    }
+}
+
+/// The GC-stats-only "buffer view" (`g` toggles it). Left column: the slot table (top,
+/// arrow-selectable) over the selected slot's decoded field→value list (bottom). Right
+/// column: a hexdump of the *whole* stats buffer, with the selected slot's byte range shaded
+/// (`DarkGray`) and its decoded fields colored in place — so the active slot stands out
+/// within the full buffer while other slots stay plain. Reuses the two-column box, the hex
+/// renderer, and `slot_field_color` from the full view; the one difference from
+/// `section_gc_stats` is that the hexdump spans the entire buffer, not one slot.
+fn build_gc_only_lines(data: &CollectedData, selected_slot: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let gc = &data.interpreter.gc.generation_stats;
+
+    lines.push(Line::from(Span::raw(top())));
+    lines.push(Line::from(Span::raw(l("GC Stats Buffer View  ([g] back to full layout)"))));
+    lines.push(Line::from(Span::raw(top())));
+
+    if gc.stats_addr == 0 || gc.slots.is_empty() {
+        lines.push(Line::from(Span::raw(l("GC Generation Stats: not available"))));
+        lines.push(Line::from(Span::raw(top())));
+        return lines;
+    }
+
+    let offset_table = data.resolved.table().clone();
+    let item_size = if gc.item_size > 0 { gc.item_size } else { gc.raw_stats_bytes.len().min(64) };
+    let slot_fields: &[(&str, usize)] = offset_table.gc_layout.map(|l| l.fields).unwrap_or(&[]);
+    let selected = selected_slot.min(gc.slots.len() - 1);
+    let sel = &gc.slots[selected];
+
+    // ── Left column ──
+    let mut left: Vec<Vec<Span<'static>>> = Vec::new();
+    left.push(vec![Span::raw(format!(
+        "Buffer @ {:#x}  (size: {} bytes, slot: {} bytes)",
+        gc.stats_addr, gc.stats_size, item_size
+    ))]);
+    left.push(vec![Span::raw(String::new())]);
+
+    // Slot table (top) — one row per slot, the selected row shaded. Same columns/format as the
+    // full view's left table so the two read identically.
+    let hdr = format!(
+        "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11}",
+        "gen", "slot", "collections", "collected", "heap", "duration(s)"
+    );
+    let hdr_len = hdr.len();
+    left.push(vec![Span::raw(hdr)]);
+    left.push(vec![Span::raw(format!("  {}", "-".repeat(hdr_len - 2)))]);
+    for (i, slot) in gc.slots.iter().enumerate() {
+        let heap = fmt_bytes(slot.heap_size as u64);
+        let content = format!(
+            "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11.3}",
+            slot.generation, slot.slot, slot.collections, slot.collected, heap, slot.duration
+        );
+        if i == selected {
+            left.push(vec![Span::styled(
+                format!("{:<pl$}", content, pl = GC_PL),
+                Style::new().bg(Color::DarkGray).fg(Color::White),
+            )]);
+        } else {
+            left.push(vec![Span::raw(content)]);
+        }
+    }
+
+    // Slot table (bottom) — the selected slot decoded field→value, each colored field shaded
+    // to match the hexdump. Clamp the slice: an uncollected raw buffer leaves `slots` populated
+    // but `raw_stats_bytes` empty, so `byte_offset + item_size` can exceed it.
+    let slot_raw_start = sel.byte_offset.min(gc.raw_stats_bytes.len());
+    let slot_raw_end = (slot_raw_start + item_size).min(gc.raw_stats_bytes.len());
+    let slot_bytes = &gc.raw_stats_bytes[slot_raw_start..slot_raw_end];
+    let slot_view = offset_table
+        .gc_layout
+        .map(|l| GcStat::from_slot(slot_bytes, l, sel.generation, sel.slot, 0));
+
+    left.push(vec![Span::raw(String::new())]);
+    left.push(vec![Span::raw(format!(
+        "Slot #{} (gen {}, slot {}) @ {:#x}",
+        selected + 1, sel.generation, sel.slot, gc.stats_addr + sel.byte_offset as u64
+    ))]);
+    let name_w = slot_fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(12);
+    for (name, offset, valbits) in slot_view.iter().flat_map(|v| v.iter_fields()) {
+        let val_fmt = if name == "duration" {
+            format!("{:.6}", f64::from_bits(valbits))
+        } else if name.starts_with("ts_") {
+            fmt_thousands(valbits)
+        } else if valbits > 0xFFFF_FFFF {
+            format!("{:#x}", valbits)
+        } else {
+            format!("{}", valbits)
+        };
+        let content = format!("  {:<name_w$} @ +{:<4}  {}", name, offset, val_fmt, name_w = name_w);
+        match slot_field_color(name) {
+            Some(c) => left.push(vec![Span::styled(
+                format!("{:<pl$}", content, pl = GC_PL),
+                Style::new().bg(c).fg(Color::Black),
+            )]),
+            None => left.push(vec![Span::raw(content)]),
+        }
+    }
+
+    // ── Right column: whole-buffer hexdump ──
+    // Field highlights first so `.find` picks a field color over the whole-slot shade; the
+    // trailing range highlight shades the rest of the selected slot. `item_size` is small
+    // (24 inline, the ring-struct size otherwise) but capped to the `u8` highlight length.
+    let mut highlights: Vec<(usize, u8, Color)> = slot_view
+        .iter()
+        .flat_map(|v| v.iter_fields())
+        .filter_map(|(name, off, _)| slot_field_color(name).map(|c| (off + sel.byte_offset, 8u8, c)))
+        .collect();
+    highlights.push((sel.byte_offset, item_size.min(255) as u8, Color::DarkGray));
+
+    // A 16-byte hexdump row is exactly `GC_PR` wide; `gc_two_col` pads the short final row.
+    let right = hex_dump_rows(&gc.raw_stats_bytes, gc.raw_stats_bytes.len(), &highlights, 0);
+
+    // ── Combine ──
+    let max_rows = left.len().max(right.len());
+    for i in 0..max_rows {
+        let lv = left.get(i).cloned().unwrap_or_default();
+        let rv = right.get(i).cloned().unwrap_or_default();
+        lines.push(gc_two_col(lv, rv));
     }
 
     lines.push(Line::from(Span::raw(top())));
@@ -1309,11 +1474,16 @@ pub fn render_snapshot(
     show_tree: bool,
     show_hex: bool,
     show_runtime_hex: bool,
+    gc_only: bool,
 ) -> String {
     let stats = &data.interpreter.gc.generation_stats;
     let rate = collections_rate_from_slots(&stats.slots, stats.has_timestamps);
     let avg = avg_collection_time_per_gen(&stats.slots, stats.has_duration);
-    let (lines, _) = build_lines(data, rate, avg, selected_slot, show_tree, show_hex, show_runtime_hex);
+    let lines = if gc_only {
+        build_gc_only_lines(data, selected_slot)
+    } else {
+        build_lines(data, rate, avg, selected_slot, show_tree, show_hex, show_runtime_hex).0
+    };
     let mut out = format!(
         "gcscope tui — PID {} — Python 0x{:08x}\n",
         data.pid, data.runtime_version
@@ -1750,6 +1920,42 @@ mod tests {
     }
 
     #[test]
+    fn build_gc_only_lines_shows_the_slot_table_field_list_and_whole_buffer_hexdump() {
+        let data = legacy_data(true);
+        let lines = build_gc_only_lines(&data, 0);
+        let out = join_lines(&lines);
+        assert!(out.contains("GC Stats Buffer View"), "mode header: {out}");
+        assert!(out.contains("Buffer @ 0x7000"), "buffer address line: {out}");
+        // Left: the slot table row and the selected slot's decoded field list.
+        assert!(out.contains("collections"), "field table: {out}");
+        assert!(out.contains("Slot #1 (gen 0, slot 0)"), "selected-slot header: {out}");
+        // Right: a whole-buffer hexdump — the 72-byte buffer spans past the first slot, so an
+        // offset row beyond the first 16 bytes proves it dumps the whole buffer, not one slot.
+        assert!(out.contains("00000010"), "hexdump must cover the whole buffer: {out}");
+        // No line overflows the fixed frame width.
+        let border = format!("+{}+", "-".repeat(OUTER_W));
+        assert!(out.lines().any(|l| l == border), "a full-width border must appear");
+        assert!(
+            out.lines().all(|l| l.chars().count() <= OUTER_W + 2),
+            "a line exceeded the frame width: {out}"
+        );
+    }
+
+    #[test]
+    fn build_gc_only_lines_reports_absent_stats_and_never_panics_on_an_empty_buffer() {
+        // No slots → the not-available short-circuit.
+        let out = join_lines(&build_gc_only_lines(&legacy_data(false), 0));
+        assert!(out.contains("GC Generation Stats: not available"), "{out}");
+        // Slots but an empty raw buffer with a past-the-end offset must clamp, not panic.
+        let mut data = legacy_data(true);
+        let stats = &mut data.interpreter.gc.generation_stats;
+        stats.raw_stats_bytes = Vec::new();
+        stats.slots[0].byte_offset = 48;
+        let out = join_lines(&build_gc_only_lines(&data, 0));
+        assert!(out.contains("Slot #1 (gen 0, slot 0)"), "{out}");
+    }
+
+    #[test]
     fn build_lines_on_a_legacy_snapshot_skips_the_debug_offsets_section() {
         let data = legacy_data(true);
         let (lines, _slot_idx) = build_lines(&data, [None; 3], [None; 3], 0, true, true, false);
@@ -1766,7 +1972,7 @@ mod tests {
     /// only the prepended header is shorter.
     #[test]
     fn render_snapshot_prepends_header_and_flattens_the_frame() {
-        let out = render_snapshot(&legacy_data(true), 0, true, true, false);
+        let out = render_snapshot(&legacy_data(true), 0, true, true, false, false);
         assert!(
             out.lines().next().unwrap().contains("PID 4321")
                 && out.lines().next().unwrap().contains("0x030c0000"),
@@ -1810,16 +2016,18 @@ mod tests {
         assert!(out.contains("slot 1/1"), "{out}");
         // max_scroll == 0 → checked_div is None → the "100%" branch.
         assert!(out.contains("100%"), "{out}");
-        assert!(out.contains("[g] on"), "glitch-enabled label: {out}");
+        assert!(out.contains("[g] gc-view"), "gc-view mode hint: {out}");
+        assert!(out.contains("glitch:on"), "glitch-enabled label: {out}");
     }
 
     #[test]
     fn status_bar_reflects_no_slots_disabled_glitch_and_the_badges() {
         assert!(render_status(0, 0, 0, 0, false, false, true).contains("no slots"));
-        assert!(render_status(0, 0, 0, 1, false, false, false).contains("[g] off"));
+        assert!(render_status(0, 0, 0, 1, false, false, false).contains("glitch:off"));
         // Connection-lost outranks the ordinary glitch badge.
         assert!(render_status(0, 0, 0, 1, true, true, true).contains("[CL]"));
-        assert!(render_status(0, 0, 0, 1, true, false, true).contains("[G]"));
+        // The firing-glitch badge is `[FX]`, distinct from the `[G]` (mode) / `[G] glitch` keys.
+        assert!(render_status(0, 0, 0, 1, true, false, true).contains("[FX]"));
     }
 
     // ── Glitch effects (buffer-mutating) ──────────────────────────
@@ -1955,8 +2163,20 @@ mod tests {
         assert_eq!(s.scroll, u16::MAX);
         s.handle_key(KeyCode::Home);
         assert_eq!(s.scroll, 0);
-        s.handle_key(KeyCode::Char('g'));
+        // Shift-`G` toggles the glitch effect (lower-case `g` is the view toggle below).
+        s.handle_key(KeyCode::Char('G'));
         assert!(!s.glitch_enabled);
+    }
+
+    #[test]
+    fn handle_key_g_toggles_the_gc_only_view_leaving_glitch_alone() {
+        let mut s = TuiState::new(100, true);
+        assert!(!s.gc_only, "full layout by default");
+        s.handle_key(KeyCode::Char('g'));
+        assert!(s.gc_only, "`g` switches to the GC-stats buffer view");
+        assert!(s.glitch_enabled, "`g` must not touch the glitch effect");
+        s.handle_key(KeyCode::Char('g'));
+        assert!(!s.gc_only, "`g` toggles back to the full layout");
     }
 
     #[test]

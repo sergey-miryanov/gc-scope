@@ -38,7 +38,7 @@ fn collect_and_render_snapshot_on_a_live_interpreter() {
     assert_ne!(data.runtime_addr, 0, "_PyRuntime address must be non-zero");
     assert_ne!(data.interpreter.addr, 0, "interpreter head address must be non-zero");
 
-    let out = render_snapshot(&data, 0, true, true, false);
+    let out = render_snapshot(&data, 0, true, true, false, false);
 
     assert!(out.contains(&format!("PID {pid}")), "header must name the PID:\n{out}");
     // The frame stays within its fixed width even on the wider Full-tier panels.
@@ -161,7 +161,7 @@ fn tui_frame_renders_the_full_tier_sections_on_a_live_interpreter() {
     // Exercise the toggle combinations the loop can drive: full tree+hex, both collapsed,
     // and the runtime-hex view. None may panic and all must produce a non-empty frame.
     for (tree, hex, rt_hex) in [(true, true, false), (false, false, false), (true, true, true)] {
-        let out = render_snapshot(&data, 0, tree, hex, rt_hex);
+        let out = render_snapshot(&data, 0, tree, hex, rt_hex, false);
         assert!(!out.is_empty(), "frame must have content for ({tree},{hex},{rt_hex})");
         assert!(out.contains("GC Generation Stats"), "GC section must render:\n{out}");
         if is_3_13_plus {
@@ -171,4 +171,8 @@ fn tui_frame_renders_the_full_tier_sections_on_a_live_interpreter() {
             );
         }
     }
+
+    // The GC-stats-only buffer view (`g`) renders on the same live snapshot for every tier.
+    let gc_view = render_snapshot(&data, 0, true, true, false, true);
+    assert!(gc_view.contains("GC Stats Buffer View"), "buffer view must render:\n{gc_view}");
 }

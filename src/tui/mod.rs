@@ -19,7 +19,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
 pub fn run_tui_snapshot(pid: u32, path: &str) -> Result<()> {
     let mut poller = SnapshotPoller::attach_with(pid, CollectRequest::tui())?;
     let data = poller.poll()?;
-    let frame = frame::render_snapshot(&data, 0, true, true, false);
+    let frame = frame::render_snapshot(&data, 0, true, true, false, false);
     std::fs::write(path, frame).with_context(|| format!("writing TUI snapshot to {path}"))?;
     Ok(())
 }
