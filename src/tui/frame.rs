@@ -794,13 +794,6 @@ fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets, show_tree
         format!("{}{}{}", before, " ".repeat(pad), value_str)
     };
 
-    use std::collections::HashMap;
-    let tree_row_colors: HashMap<&str, Color> = [
-        ("cookie[8]", Color::Green),
-        ("interpreters_head", Color::Cyan),
-        ("next", Color::Yellow),
-        ("gc", Color::Magenta),
-    ].into_iter().collect();
     let mut tree_highlight_rows: Vec<(usize, Color)> = Vec::new();
 
     let mut left_owned: Vec<String> = Vec::new();
@@ -827,8 +820,7 @@ fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets, show_tree
                 }
             };
             left_owned.push(line);
-            let label: &str = entry.label;
-            if let Some(&color) = tree_row_colors.get(label) {
+            if let Some(color) = debug_tree_row_color(entry.label, entry.kind) {
                 tree_highlight_rows.push((left_owned.len() - 1, color));
             }
         }
@@ -1237,6 +1229,22 @@ fn slot_field_color(name: &str) -> Option<Color> {
         "duration" => Some(Color::Yellow),
         "heap_size" => Some(Color::Cyan),
         _ => None,
+    }
+}
+
+/// Highlight color for one `_Py_DebugOffsets` tree row, or `None` to leave it unshaded. The
+/// named runtime fields match their hexdump-region colors (see the `hex_highlights` mapping);
+/// every first-slot field item (`Layout` kind — the per-slot `gc_generation_stats` fields on
+/// ring builds) shares one color so the slot's layout reads as a single group. That group is
+/// tree-only: those items have no hexdump region of their own.
+fn debug_tree_row_color(label: &str, kind: super::tree::TreeEntryKind) -> Option<Color> {
+    use super::tree::TreeEntryKind;
+    match label {
+        "cookie[8]" => Some(Color::Green),
+        "interpreters_head" => Some(Color::Cyan),
+        "next" => Some(Color::Yellow),
+        "gc" => Some(Color::Magenta),
+        _ => matches!(kind, TreeEntryKind::Layout { .. }).then_some(Color::Blue),
     }
 }
 
@@ -2175,6 +2183,21 @@ mod tests {
             !lines.iter().flat_map(|l| &l.spans).any(|s| s.style.bg == Some(Color::Red)),
             "inline/legacy has no ring index to highlight"
         );
+    }
+
+    #[test]
+    fn debug_tree_row_color_shades_named_fields_and_every_first_slot_item() {
+        use crate::tui::tree::TreeEntryKind;
+        // Named runtime fields keep their hexdump-region colors.
+        assert_eq!(debug_tree_row_color("cookie[8]", TreeEntryKind::RawValue { offset: 0 }), Some(Color::Green));
+        assert_eq!(debug_tree_row_color("gc", TreeEntryKind::RawValue { offset: 88 }), Some(Color::Magenta));
+        // Every first-slot field item (Layout) shares one color, whatever its field name.
+        let layout = |off| TreeEntryKind::Layout { field_type: "", field_offset: off };
+        assert_eq!(debug_tree_row_color("ts_start", layout(0)), Some(Color::Blue));
+        assert_eq!(debug_tree_row_color("increment_size", layout(32)), Some(Color::Blue));
+        // Groups, derived rows, and unnamed raw values stay unshaded.
+        assert_eq!(debug_tree_row_color("young_slots (11)", TreeEntryKind::Derived), None);
+        assert_eq!(debug_tree_row_color("version", TreeEntryKind::RawValue { offset: 8 }), None);
     }
 
     #[test]
