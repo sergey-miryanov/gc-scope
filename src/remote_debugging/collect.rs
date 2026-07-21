@@ -128,14 +128,10 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
         .context("Failed to read interpreters_head pointer")?;
 
     let gc_offset = offset_table.interp_gc.unwrap_or(0);
-    // Absolute address of `_gc_runtime_state`: per-interpreter (`interp_gc`) for 3.9+
-    // and every 3.13+ build, or global in `_PyRuntime` (`runtime_gc`) for 3.8 — mirrors
-    // the global-GC branch in `PySession::gc_stats`. Without this, 3.8 would read the
-    // stats at `interpreter + 0x80` (garbage) instead of `runtime + runtime_gc + 0x80`.
-    let gc_addr = match (offset_table.interp_gc, offset_table.runtime_gc) {
-        (None, Some(r)) => runtime_addr + r,
-        _ => head_addr + gc_offset,
-    };
+    // Absolute address of `_gc_runtime_state` (global in `_PyRuntime` for 3.8, per-interpreter
+    // otherwise) — resolved by the shared reader-layer helper so the monitor and the diagram
+    // agree. Without it, 3.8 would read stats at `interpreter + 0x80` (garbage).
+    let gc_addr = offset_table.gc_state_addr(runtime_addr, head_addr);
     // Exact `gc` sub-struct span on 3.13+; on Legacy synthesize the inline stats region
     // (only used for the section-2 hexdump, which Legacy skips).
     let gc_size = match off_opt {

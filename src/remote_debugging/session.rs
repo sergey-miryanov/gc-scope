@@ -310,9 +310,10 @@ impl PySession {
     }
 
     /// Whether this build exposes decodable GC generation stats. True for 3.13+
-    /// (`Full`/`LayoutOnly`) and pre-3.13 3.9–3.12 (`Legacy` with the inline layout);
-    /// false for 3.8 (global GC, not yet decoded) or any build without a stats layout.
-    /// This is the capability the TUI picker and `list-pids` "S" column report.
+    /// (`Full`/`LayoutOnly`) and all pre-3.13 3.8–3.12 (`Legacy` with the inline layout —
+    /// 3.8 through its global GC, 3.9–3.12 per-interpreter); false only for a build with no
+    /// stats layout (`GcStatsKind::None`). This is the capability the TUI picker and
+    /// `list-pids` "S" column report.
     pub fn supports_gc_stats(&self) -> bool {
         self.resolved.table().gc_stats_kind != GcStatsKind::None
     }
@@ -360,14 +361,6 @@ impl PySession {
         }
     }
 
-    /// Read GC generation stats for the first (or, with `all_interpreters`, every)
-    /// interpreter. Walks the interpreter chain and resolves each interpreter's
-    /// stats region by its shape (`InlineArray` at a fixed offset, `RingBuffer`
-    /// via the `gc.generation_stats` pointer). Reads go through the held handle.
-    ///
-    /// A NULL stats pointer is a normal transient state (stats not yet allocated,
-    /// or teardown): that interpreter is skipped and the walk still advances — it
-    /// never hangs (C1). A failed buffer read propagates as `Err` (C6).
     /// Test hook: force the next `n` `gc_stats` calls on this session to fail with
     /// an error, then read normally. Arms the fault seam so a test can reproduce a
     /// transient read failure on a live process and exercise the monitor's
@@ -390,85 +383,129 @@ impl PySession {
             .is_ok()
     }
 
+    /// Read GC generation stats for the first (or, with `all_interpreters`, every)
+    /// interpreter. Dispatches on this build's stats-region shape; each kind has its own
+    /// reader below. Reads go through the held handle. A NULL / absent stats region is a
+    /// normal transient state and is skipped without hanging (C1); a failed buffer read
+    /// propagates as `Err` (C6).
     pub fn gc_stats(&self, all_interpreters: bool) -> Result<Vec<GcStat>> {
         #[cfg(feature = "test-hooks")]
         if self.take_injected_fault() {
             bail!("gc_stats: injected fault (test hook)");
         }
-        let table = self.resolved.table();
-
-        // Catch-all guard for an unregistered build: the process's own
-        // `gc.generation_stats_size` records the TOTAL byte size of the ring-buffer
-        // region. `attach` already SELECTED the best-matching layout, so for any
-        // recognized build the reconstructed total equals `reported` and this stays
-        // silent. It fires only when selection fell through with no matching
-        // candidate — emitting a regeneration hint (C12). Ring-buffer versions only.
-        if table.gc_stats_kind == GcStatsKind::RingBuffer
-            && let Some(vo) = self.resolved.offsets()
-        {
-            let reported = vo.gc_generation_stats_size();
-            {
-                let expected = table.gc_stats_region_size();
-                if reported != 0 && expected != 0 && reported != expected {
-                    // Fail closed. The process publishes the true byte size of its ring
-                    // region; a disagreement means the per-slot stride or the field
-                    // offsets are wrong, so every number we could decode would be
-                    // garbage. This used to warn and carry on, which is how a 3.15.0b4
-                    // target silently decoded through the 3.15.0a8 layout (96-byte slots
-                    // vs 64) while every CI leg stayed green.
-                    bail!(
-                        "gc_generation_stats size mismatch for {:#010x}: the process reports \
-                         {reported} bytes but gcscope's compiled layout expects {expected}. \
-                         This build's GC ring layout differs from the registered one; decoding \
-                         it would report garbage. Run `gcscope read-runtime <pid>` to see the \
-                         selected layout and its geometry, then regenerate offsets with \
-                         scripts/gen-offsets.py against this exact build.",
-                        table.version_hex
-                    );
-                }
-            }
+        match self.resolved.table().gc_stats_kind {
+            GcStatsKind::None => Ok(Vec::new()),
+            GcStatsKind::InlineArray => self.gc_stats_inline(all_interpreters),
+            GcStatsKind::RingBuffer => self.gc_stats_ring(all_interpreters),
         }
+    }
 
-        let head_addr = self.read_u64(self.runtime_addr + table.runtime_interpreters_head())?;
+    /// `InlineArray` builds (3.8–3.14): the stats sit at a fixed offset inside
+    /// `_gc_runtime_state`. 3.8 keeps that state global in `_PyRuntime` (no per-interpreter
+    /// `gc`); 3.9+ has it per interpreter.
+    fn gc_stats_inline(&self, all_interpreters: bool) -> Result<Vec<GcStat>> {
+        let head_addr = self.read_interpreters_head()?;
+        if self.resolved.table().has_global_gc() {
+            return self.gc_stats_global(head_addr);
+        }
+        self.gc_stats_per_interpreter(head_addr, all_interpreters)
+    }
+
+    /// `RingBuffer` builds (3.15+): the stats hang off the `gc.generation_stats` pointer,
+    /// always per interpreter. The process-published ring size is verified first (fail
+    /// closed on an unregistered build) so a wrong layout can't decode into garbage.
+    fn gc_stats_ring(&self, all_interpreters: bool) -> Result<Vec<GcStat>> {
+        self.verify_ring_stats_size()?;
+        let head_addr = self.read_interpreters_head()?;
+        self.gc_stats_per_interpreter(head_addr, all_interpreters)
+    }
+
+    /// Address of the interpreter-list head (`_PyRuntime.interpreters.head`).
+    fn read_interpreters_head(&self) -> Result<u64> {
+        let head_off = self.resolved.table().runtime_interpreters_head();
+        self.read_u64(self.runtime_addr + head_off)
+    }
+
+    /// Fail-closed size guard for a ring-buffer build (called only from [`gc_stats_ring`]).
+    /// The process publishes the true byte size of its ring region in
+    /// `gc.generation_stats_size`; `attach` has already selected the best-matching layout,
+    /// so for any recognized build the reconstructed size equals what the process reports
+    /// and this stays silent. A mismatch means the per-slot stride or the field offsets are
+    /// wrong — every number we could decode would be garbage — so bail with a regenerate
+    /// hint (C12) rather than decode nonsense. (This is how a 3.15.0b4 target silently
+    /// decoded through the 3.15.0a8 layout, 96-byte slots vs 64, while every CI leg stayed
+    /// green.)
+    fn verify_ring_stats_size(&self) -> Result<()> {
+        let table = self.resolved.table();
+        let Some(vo) = self.resolved.offsets() else {
+            return Ok(());
+        };
+        let reported = vo.gc_generation_stats_size();
+        let expected = table.gc_stats_region_size();
+        if reported != 0 && expected != 0 && reported != expected {
+            bail!(
+                "gc_generation_stats size mismatch for {:#010x}: the process reports \
+                 {reported} bytes but gcscope's compiled layout expects {expected}. \
+                 This build's GC ring layout differs from the registered one; decoding \
+                 it would report garbage. Run `gcscope read-runtime <pid>` to see the \
+                 selected layout and its geometry, then regenerate offsets with \
+                 scripts/gen-offsets.py against this exact build.",
+                table.version_hex
+            );
+        }
+        Ok(())
+    }
+
+    /// 3.8 global-GC path: the GC state lives in `_PyRuntime` itself, not per interpreter.
+    /// Resolve the stats region once from the runtime and read it a single time — reading it
+    /// inside the interpreter walk would emit the same global generations once per
+    /// interpreter under `--all`. The caller has already confirmed the global-GC shape.
+    fn gc_stats_global(&self, head_addr: u64) -> Result<Vec<GcStat>> {
+        let table = self.resolved.table();
+        let iid = if head_addr != 0 {
+            self.read_i64(head_addr + table.interp_id())?
+        } else {
+            0
+        };
+        // Global GC: the interpreter address is irrelevant, so `head_addr` is only a
+        // placeholder here — `gc_state_addr` resolves to `runtime_addr + runtime_gc`.
+        let gc_addr = table.gc_state_addr(self.runtime_addr, head_addr);
+        let mut global_table = table.clone();
+        global_table.gc_stats_addr = self.gc_stats_region_addr(gc_addr)?;
+        global_table.read_gc_stats(&self.handle, iid)
+    }
+
+    /// Per-interpreter walk, shared by 3.9+ inline and all ring builds: follow the
+    /// interpreter chain from `head_addr`, resolving and reading each interpreter's stats
+    /// region (the shape difference is absorbed by [`gc_stats_region_addr`](Self::gc_stats_region_addr)).
+    /// Stops after the first interpreter unless `all_interpreters`. Always advances the walk
+    /// even for an interpreter with no readable stats, so a NULL region never hangs it (C1).
+    fn gc_stats_per_interpreter(
+        &self,
+        head_addr: u64,
+        all_interpreters: bool,
+    ) -> Result<Vec<GcStat>> {
+        let table = self.resolved.table();
         let next_off = table.interp_next();
         let id_off = table.interp_id();
-
-        // Global-GC path (3.8): the GC state lives in `_PyRuntime` itself, not per
-        // interpreter. Resolve the stats region once from the runtime and read it a
-        // single time — reading it inside the interpreter walk would emit the same
-        // global generations once per interpreter under `--all`.
-        if table.interp_gc.is_none()
-            && table.gc_stats_kind == GcStatsKind::InlineArray
-            && let Some(runtime_gc) = table.runtime_gc
-        {
-            let iid = if head_addr != 0 { self.read_i64(head_addr + id_off)? } else { 0 };
-            let gc_addr = self.runtime_addr + runtime_gc; // global `_gc_runtime_state`
-            let mut global_table = table.clone();
-            global_table.gc_stats_addr = self.gc_stats_region_addr(gc_addr)?;
-            return global_table.read_gc_stats(&self.handle, iid);
-        }
-
-        let gc_off = table.interp_gc.unwrap_or(0);
 
         let mut stats = Vec::new();
         let mut current = head_addr;
         let mut first = true;
         while current != 0 {
             let iid = self.read_i64(current + id_off)?;
-            let gc_addr = current + gc_off; // this interpreter's `_gc_runtime_state`
+            let gc_addr = table.gc_state_addr(self.runtime_addr, current); // this interpreter's `_gc_runtime_state`
 
-            // Resolve this interpreter's stats address by its region shape (single
-            // source of truth — the diagram collector resolves through the same path).
-            let stats_addr = self.gc_stats_region_addr(gc_addr)?;
-
-            if let Some(addr) = stats_addr {
+            // Resolve this interpreter's stats address by its region shape (single source of
+            // truth — the diagram collector resolves through the same path).
+            if let Some(addr) = self.gc_stats_region_addr(gc_addr)? {
                 let mut interp_table = table.clone();
                 interp_table.gc_stats_addr = Some(addr);
                 stats.extend(interp_table.read_gc_stats(&self.handle, iid)?);
             }
 
-            // Always advance — the walk must make progress even for an interpreter
-            // with no readable stats (this is what previously hung on NULL pointers).
+            // Always advance — the walk must make progress even for an interpreter with no
+            // readable stats (this is what previously hung on NULL pointers).
             current = self.read_u64(current + next_off)?;
             if first && !all_interpreters {
                 break;

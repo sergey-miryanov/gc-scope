@@ -101,6 +101,28 @@ impl OffsetTable {
         self.runtime_gc.expect("runtime_gc is only available on Python 3.8")
     }
 
+    /// True for the 3.8 global-GC layout: the GC state lives in `_PyRuntime` (`runtime_gc`),
+    /// not per interpreter. Every 3.9+ build is per-interpreter (`interp_gc`). The single
+    /// predicate for "is this 3.8?" — both `PySession::gc_stats` and the diagram collector
+    /// branch on it, so dropping 3.8 is a matter of deleting this plus the `runtime_gc`
+    /// field (the compiler then flags every dependent site).
+    pub fn has_global_gc(&self) -> bool {
+        self.interp_gc.is_none() && self.runtime_gc.is_some()
+    }
+
+    /// Absolute address of the `_gc_runtime_state` for the interpreter at `interp_addr`.
+    /// 3.8's global GC lives at `runtime_addr + runtime_gc` (the interpreter is irrelevant);
+    /// 3.9+ is per-interpreter at `interp_addr + interp_gc`. Pure address arithmetic — the
+    /// single definition both `PySession::gc_stats` and the diagram collector use, composed
+    /// with [`gc_stats_region`](Self::gc_stats_region) to reach the actual stats region.
+    pub fn gc_state_addr(&self, runtime_addr: u64, interp_addr: u64) -> u64 {
+        if self.has_global_gc() {
+            runtime_addr + self.runtime_gc.unwrap_or(0)
+        } else {
+            interp_addr + self.interp_gc.unwrap_or(0)
+        }
+    }
+
     /// Locate one interpreter's GC generation-stats region from its `_gc_runtime_state`
     /// address (`gc_addr`) and the ring `generation_stats` pointer field offset
     /// (`gen_stats_ptr_off`; 0 / ignored for inline builds). Pure — no process access —
@@ -507,6 +529,40 @@ mod tests {
         let stats = table.decode_gc_stats(&buf, 0);
         assert_eq!(stats.len(), 3);
         assert!(stats.iter().all(|s| s.slot == 0));
+    }
+
+    // ── GC topology (pure, no process) ──────────────────────────
+
+    /// 3.8 is the one build with global GC (`interp_gc` None + `runtime_gc` Some); every
+    /// 3.9+/3.13+ build is per-interpreter. `has_global_gc` is the single predicate both
+    /// the monitor and the collector branch on, and the one place to delete when 3.8 goes.
+    #[test]
+    fn has_global_gc_is_true_only_for_the_3_8_shape() {
+        // 3.12 legacy: per-interpreter (`interp_gc` Some, `runtime_gc` None).
+        let per_interp = pre_3_13::table_for_version(3, 12).unwrap();
+        assert!(!per_interp.has_global_gc());
+
+        // Synthesize the 3.8 shape from it: global GC lives in `_PyRuntime`.
+        let mut global = per_interp.clone();
+        global.interp_gc = None;
+        global.runtime_gc = Some(0x158);
+        assert!(global.has_global_gc());
+    }
+
+    /// `gc_state_addr` locates `_gc_runtime_state`: `interp_addr + interp_gc` per interpreter
+    /// (3.9+), or `runtime_addr + runtime_gc` for 3.8's global GC (interpreter ignored).
+    #[test]
+    fn gc_state_addr_picks_global_vs_per_interpreter() {
+        let per_interp = pre_3_13::table_for_version(3, 12).unwrap();
+        let interp_gc = per_interp.interp_gc.unwrap();
+        // Per-interpreter: interp addr + interp_gc; the runtime addr is irrelevant.
+        assert_eq!(per_interp.gc_state_addr(0xdead_0000, 0x1000), 0x1000 + interp_gc);
+
+        let mut global = per_interp.clone();
+        global.interp_gc = None;
+        global.runtime_gc = Some(0x158);
+        // Global: runtime addr + runtime_gc; the interpreter addr is ignored.
+        assert_eq!(global.gc_state_addr(0x2_0000, 0x9999), 0x2_0000 + 0x158);
     }
 
     // ── stats-region location (pure, no process) ────────────────
