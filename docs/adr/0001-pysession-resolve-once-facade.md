@@ -39,7 +39,7 @@ single "resolve this process" facade:
 
 A session holds fields with different lifetimes, so caching is split in two:
 
-- **Instance state** (`handle`, `runtime_addr`, per-`(gen,slot)` freshness) is
+- **Instance state** (`handle`, `runtime_addr`, per-`(gen,entry)` freshness) is
   per-PID and evicted through a **single** site, `mark_died`.
 - **Layout** (`Resolved`) is a pure function of the binary, cached separately keyed
   by **`(interpreter-path, mtime)`**, and **survives death** — so a relaunch or a
@@ -52,7 +52,7 @@ A session holds fields with different lifetimes, so caching is split in two:
 
 - One resolve per process; the per-frame goblin-parse storm is gone.
 - `collect_data` stayed a **free function taking `&PySession`** (not a method) to
-  avoid a `remote_debugging`→`diagram` layering inversion.
+  avoid a `remote_debugging`→`tui` layering inversion.
 - **Later changes** that built on this:
   - The separate `Tier` enum this introduced was **removed**; the `Resolved`
     variants plus `PySession::supports_gc_stats()` now carry the capability

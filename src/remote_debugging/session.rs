@@ -8,7 +8,7 @@
 //!
 //! See `docs/adr/0001-pysession-resolve-once-facade.md`. `attach` + reads, the
 //! `(exe_path, mtime)`-keyed layout cache and `revalidate`, plus
-//! `gc_stats`/`collect`, are consumed by gc-stats, monitor, the diagram stack,
+//! `gc_stats`/`collect`, are consumed by gc-stats, monitor, the TUI,
 //! and list-pids.
 
 use std::collections::HashMap;
@@ -119,7 +119,7 @@ where
     }
 }
 
-/// Whether a stats kind yields any decodable slots. `None` is the one non-reading kind:
+/// Whether a stats kind yields any decodable entries. `None` is the one non-reading kind:
 /// [`PySession::supports_gc_stats`] (the capability the TUI picker and `list-pids` "S" column
 /// report) reports it as unsupported, and [`PySession::gc_stats`] fast-returns an empty vec for
 /// it. Both key off this single predicate.
@@ -147,7 +147,7 @@ pub enum LayoutSource {
 /// same-minor fallback). `Legacy` (3.8–3.12) has no self-describing struct, only a
 /// hardcoded table: it supports interpreter navigation and — for 3.9–3.12 — GC
 /// generation stats (see [`PySession::supports_gc_stats`]), but not the
-/// `_Py_DebugOffsets` struct panels of the diagram.
+/// `_Py_DebugOffsets` struct panels of the TUI.
 #[derive(Debug)]
 pub enum Resolved {
     Full { offsets: VersionedOffsets, table: OffsetTable },
@@ -321,7 +321,7 @@ impl PySession {
     }
 
     /// A cheap clone of the shared layout, for consumers that want to hold it
-    /// alongside a snapshot (e.g. the diagram's `CollectedData`).
+    /// alongside a snapshot (e.g. the TUI's `CollectedData`).
     pub fn resolved_arc(&self) -> Arc<Resolved> {
         Arc::clone(&self.resolved)
     }
@@ -366,7 +366,7 @@ impl PySession {
     /// `_gc_runtime_state` address (`gc_addr`).
     ///
     /// The single reader-layer entry point for stats-region resolution: both this
-    /// session's own [`gc_stats`](Self::gc_stats) (the monitor path) and the diagram
+    /// session's own [`gc_stats`](Self::gc_stats) (the monitor path) and the TUI
     /// collector call it, so the fail-open "which address, deref the ring, handle NULL"
     /// logic lives in one place and any fix reaches both. The geometry decision is the pure
     /// [`OffsetTable::gc_stats_region`]; the one ring-pointer read a `Deref` needs happens
@@ -451,10 +451,10 @@ impl PySession {
     /// The process publishes the true byte size of its ring region in
     /// `gc.generation_stats_size`; `attach` has already selected the best-matching layout,
     /// so for any recognized build the reconstructed size equals what the process reports
-    /// and this stays silent. A mismatch means the per-slot stride or the field offsets are
+    /// and this stays silent. A mismatch means the per-entry stride or the field offsets are
     /// wrong — every number we could decode would be garbage — so bail with a regenerate
     /// hint (C12) rather than decode nonsense. (This is how a 3.15.0b4 target silently
-    /// decoded through the 3.15.0a8 layout, 96-byte slots vs 64, while every CI leg stayed
+    /// decoded through the 3.15.0a8 layout, 96-byte entries vs 64, while every CI leg stayed
     /// green.)
     fn verify_ring_stats_size(&self) -> Result<()> {
         let table = self.resolved.table();

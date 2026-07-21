@@ -12,10 +12,10 @@ use ratatui::Terminal;
 
 use crate::remote_debugging::gc_stats::GcStat;
 use crate::snapshot::collect::{
-    avg_collection_time_per_gen, collections_rate_from_slots, CollectRequest, CollectedData,
+    avg_collection_time_per_gen, collections_rate_from_entries, CollectRequest, CollectedData, GcEntry,
 };
 use crate::snapshot::poller::SnapshotPoller;
-use super::render::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
+use super::tree::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
 use crate::remote_debugging::offsets::VersionedOffsets;
 
 // ── Layout constants ──────────────────────────────────────────────
@@ -24,6 +24,13 @@ const PL: usize = 65;
 const PR: usize = 90;
 const INNER_W: usize = PL - 4;      // 61
 const INNER_TW: usize = INNER_W - 2; // 59
+
+// The GC-stats buffer view splits the same 160-col frame differently from the full view: a
+// 16-byte hexdump row is exactly 78 cols wide, so the right column is pinned to that and the
+// left gets the rest (`| L | R |` = 1+77+3+78+1 = 160). The left is wider than the full view's
+// `PL` so a `+inc` build's long field names (`ts_handle_weakref_callbacks_start`, …) fit.
+const GC_PR: usize = 78;
+const GC_PL: usize = OUTER_W + 2 - GC_PR - 5; // 77 (frame 160 minus the `| … | … |` framing)
 
 
 /// Restores the terminal (raw mode, alternate screen, cursor) on drop, so it is cleaned
@@ -62,11 +69,11 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         }
     };
 
-    let mut poller = SnapshotPoller::attach_with(initial_pid, CollectRequest::diagram())?;
+    let mut poller = SnapshotPoller::attach_with(initial_pid, CollectRequest::tui())?;
     let mut start = Instant::now();
     let mut frame: u64 = 0;
 
-    // View state (scroll, slot selection, panel toggles, rate, glitch-enable) — every
+    // View state (scroll, entry selection, panel toggles, rate, glitch-enable) — every
     // mutation goes through `TuiState::handle_key`, so the key bindings are unit-testable.
     let mut state = TuiState::new(rate_ms, glitch_enabled);
 
@@ -79,6 +86,12 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         .unwrap_or(12345);
     let mut glitch = GlitchState::new(Instant::now());
 
+    // `s` requests a frame dump, but the current `data` isn't polled until below, so the
+    // key sets a flag the loop acts on once the frame exists. `dump_note` carries the
+    // result into the header title (writing to stderr would corrupt the alt-screen).
+    let mut pending_dump = false;
+    let mut dump_note: Option<String> = None;
+
     let result = loop {
         if event::poll(Duration::from_millis(state.rate_ms))?
             && let Event::Key(key) = event::read()?
@@ -86,6 +99,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         {
             match state.handle_key(key.code) {
                 KeyOutcome::Quit => break Ok(()),
+                KeyOutcome::DumpSnapshot => pending_dump = true,
                 KeyOutcome::PickPid => {
                     if let Ok((processes, pid_info_map)) = crate::list_pids::list_python_processes()
                         && let Ok(Some(new_pid)) = super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map)
@@ -117,9 +131,21 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
             }
         };
 
-        // Clamp selected_slot to valid range based on new data
-        let slot_count = data.interpreter.gc.generation_stats.slots.len();
-        state.clamp_slot(slot_count);
+        // Clamp selected_entry to valid range based on new data
+        let entry_count = data.interpreter.gc.generation_stats.entries.len();
+        state.clamp_entry(entry_count);
+
+        // Act on a pending `s` dump now that this frame's `data` exists. Overwrites
+        // `<pid>.txt` in the working directory with the current view.
+        if pending_dump {
+            pending_dump = false;
+            let path = format!("{}.txt", poller.pid());
+            let frame = render_snapshot(&data, state.selected_entry, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex, state.gc_only);
+            dump_note = Some(match std::fs::write(&path, frame) {
+                Ok(()) => format!(" — Saved {path}"),
+                Err(e) => format!(" — Save failed: {e}"),
+            });
+        }
 
         let elapsed = start.elapsed();
         frame += 1;
@@ -139,12 +165,16 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         glitch.update_jitter(now, &mut rng_state);
 
         let stats = &data.interpreter.gc.generation_stats;
-        let slots = &stats.slots;
+        let entries = &stats.entries;
         let (rate_per_gen, avg_coll_time_per_gen) = (
-            collections_rate_from_slots(slots, stats.has_timestamps),
-            avg_collection_time_per_gen(slots, stats.has_duration),
+            collections_rate_from_entries(entries, stats.has_timestamps),
+            avg_collection_time_per_gen(entries, stats.has_duration),
         );
-        let (styled_lines, _slot_line) = build_lines(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_slot, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex);
+        let styled_lines = if state.gc_only {
+            build_gc_only_lines(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_entry)
+        } else {
+            build_lines(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_entry, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex).0
+        };
 
         // Pre-compute glitch draw conditions for this frame.
         let should_glitch = glitch.should_glitch(state.glitch_enabled);
@@ -163,8 +193,9 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         // each frame so a mid-loop pick-pid retarget is reflected in the title.
         let pid = poller.pid();
         let rate_ms = state.rate_ms;
-        let selected_slot = state.selected_slot;
+        let selected_entry = state.selected_entry;
         let glitch_enabled = state.glitch_enabled;
+        let dump_note_str = dump_note.as_deref().unwrap_or("");
         let mut scroll = state.scroll;
         terminal.draw(|f| {
             let area = f.size();
@@ -181,18 +212,20 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
             }
 
             let title = format!(
-                " gcscope tui — PID {} — Frame {} @ {:.1}s — Rate {}ms{} ",
+                " gcscope tui — PID {} — Frame {} @ {:.1}s — Rate {}ms — Poll {}{}{} ",
                 pid,
                 frame,
                 elapsed.as_secs_f64(),
                 rate_ms,
-                duration_secs.map_or(String::new(), |d| format!(" — Dur {d}s"))
+                fmt_duration_ns(data.collect_duration),
+                duration_secs.map_or(String::new(), |d| format!(" — Dur {d}s")),
+                dump_note_str
             );
             let content = Paragraph::new(Text::from(styled_lines))
                 .block(Block::bordered().border_type(BorderType::Plain).title(title))
                 .scroll((scroll, 0));
 
-            let status = status_bar(scroll, max_scroll, selected_slot, slot_count, rate_ms, glitch_badge_active, cl_active, glitch_enabled, data.collect_duration);
+            let status = status_bar(scroll, max_scroll, selected_entry, entry_count, glitch_badge_active, cl_active, glitch_enabled);
             f.render_widget(content, chunks[0]);
             f.render_widget(status, chunks[1]);
             if should_buildup {
@@ -217,31 +250,36 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TuiState {
     scroll: u16,
-    selected_slot: usize,
+    selected_entry: usize,
     debug_offsets_show_tree: bool,
     debug_offsets_show_hex: bool,
     show_runtime_hex: bool,
+    /// `true` = the GC-stats-only buffer view; `false` = the full layout. Toggled by `g`.
+    gc_only: bool,
     rate_ms: u64,
     glitch_enabled: bool,
 }
 
-/// What a key press asks the render loop to do. `PickPid` and `Quit` are the two outcomes
-/// that need terminal/session I/O, which the loop owns — the reducer stays pure.
+/// What a key press asks the render loop to do. `PickPid`, `Quit`, and `DumpSnapshot` are
+/// the outcomes that need terminal/session/file I/O, which the loop owns — the reducer
+/// stays pure.
 #[derive(Debug, PartialEq, Eq)]
 enum KeyOutcome {
     Continue,
     Quit,
     PickPid,
+    DumpSnapshot,
 }
 
 impl TuiState {
     fn new(rate_ms: u64, glitch_enabled: bool) -> Self {
         TuiState {
             scroll: 0,
-            selected_slot: 0,
+            selected_entry: 0,
             debug_offsets_show_tree: true,
             debug_offsets_show_hex: true,
             show_runtime_hex: false,
+            gc_only: false,
             rate_ms,
             glitch_enabled,
         }
@@ -251,17 +289,18 @@ impl TuiState {
     /// reset, which deliberately left `rate_ms` and `glitch_enabled` alone.
     fn reset_view(&mut self) {
         self.scroll = 0;
-        self.selected_slot = 0;
+        self.selected_entry = 0;
         self.debug_offsets_show_tree = true;
         self.debug_offsets_show_hex = true;
         self.show_runtime_hex = false;
+        self.gc_only = false;
     }
 
-    /// Pulls `selected_slot` back into `[0, slot_count)` when a new snapshot has fewer slots.
-    fn clamp_slot(&mut self, slot_count: usize) {
-        let max_slot = slot_count.saturating_sub(1);
-        if self.selected_slot > max_slot {
-            self.selected_slot = max_slot;
+    /// Pulls `selected_entry` back into `[0, entry_count)` when a new snapshot has fewer entries.
+    fn clamp_entry(&mut self, entry_count: usize) {
+        let max_entry = entry_count.saturating_sub(1);
+        if self.selected_entry > max_entry {
+            self.selected_entry = max_entry;
         }
     }
 
@@ -271,8 +310,8 @@ impl TuiState {
     fn handle_key(&mut self, code: KeyCode) -> KeyOutcome {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return KeyOutcome::Quit,
-            KeyCode::Up | KeyCode::Char('k') => self.selected_slot = self.selected_slot.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.selected_slot = self.selected_slot.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => self.selected_entry = self.selected_entry.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.selected_entry = self.selected_entry.saturating_add(1),
             KeyCode::Char('t') => self.debug_offsets_show_tree = !self.debug_offsets_show_tree,
             KeyCode::Char('h') => self.debug_offsets_show_hex = !self.debug_offsets_show_hex,
             KeyCode::Char('o') => {
@@ -287,7 +326,9 @@ impl TuiState {
             KeyCode::Char('d') => self.show_runtime_hex = !self.show_runtime_hex,
             KeyCode::Char('r') => self.rate_ms = self.rate_ms.saturating_sub(10).max(10),
             KeyCode::Char('R') => self.rate_ms = self.rate_ms.saturating_add(10),
-            KeyCode::Char('g') => self.glitch_enabled = !self.glitch_enabled,
+            KeyCode::Char('g') => self.gc_only = !self.gc_only,
+            KeyCode::Char('G') => self.glitch_enabled = !self.glitch_enabled,
+            KeyCode::Char('s') => return KeyOutcome::DumpSnapshot,
             KeyCode::Char('p') => return KeyOutcome::PickPid,
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
@@ -402,13 +443,10 @@ impl GlitchState {
     }
 }
 
-// Nine heterogeneous scalars, all read off the render loop's local state at the single
-// call site below. A struct would relocate the same nine fields and add a per-frame
-// construction site; the only safety it would add — guarding the three adjacent bools
-// against transposition — is moot for a status bar, where a swap is cosmetic and visible
-// on screen at once. Allowed rather than worked around.
-#[allow(clippy::too_many_arguments)]
-fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, rate_ms: u64, glitch_active: bool, cl_active: bool, glitch_enabled: bool, collect_dur: Duration) -> Paragraph<'static> {
+// Seven heterogeneous scalars, all read off the render loop's local state at the single
+// call site below. Poll rate and poll time live in the header title instead, so they don't
+// appear here twice.
+fn status_bar(scroll: u16, max_scroll: u16, entry: usize, entry_count: usize, glitch_active: bool, cl_active: bool, glitch_enabled: bool) -> Paragraph<'static> {
     let style = Style::new().bg(Color::Blue).fg(Color::White);
     // u32 math on purpose: `scroll` is a u16 and `scroll * 100` overflows it once the
     // scrollback passes 655 rows — a debug-build panic in a view that can easily be
@@ -417,16 +455,15 @@ fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, rate
         Some(pct) => format!(" {pct:>3}%"),
         None => " 100%".to_string(),
     };
-    let slot_text = if slot_count > 0 {
-        format!(" slot {}/{} ", slot + 1, slot_count)
+    let entry_text = if entry_count > 0 {
+        format!(" entry {}/{} ", entry + 1, entry_count)
     } else {
-        " no slots ".to_string()
+        " no entries ".to_string()
     };
-    let rate_text = format!(" {}ms ", rate_ms);
     let badge = if cl_active {
         Span::styled(" [CL] ", style.bg(Color::Red).fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD))
     } else if glitch_active {
-        Span::styled(" [G] ", style.bg(Color::Red).fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD))
+        Span::styled(" [FX] ", style.bg(Color::Red).fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD))
     } else {
         Span::raw("")
     };
@@ -434,22 +471,22 @@ fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, rate
     let glitch_style = if glitch_enabled { style } else { style.bg(Color::DarkGray) };
     let text = Line::from(vec![
         Span::styled(" [q] quit ", style.bg(Color::DarkGray)),
+        Span::styled(" [s] save ", style),
         Span::styled(" [p] pick pid ", style),
+        Span::styled(" [g] gc-view ", style),
         Span::styled(" [t] tree [h] hex [o] collapse [d] Dbg/Rt", style),
         Span::styled(" [r/R] rate", style),
-        Span::styled(format!(" [g] {}", glitch_label), glitch_style),
-        Span::styled(format!(" {} ", fmt_duration_ns(collect_dur)), style.bg(Color::DarkGray)),
-        Span::styled(rate_text, style.bg(Color::DarkGray)),
+        Span::styled(format!(" [G] glitch:{}", glitch_label), glitch_style),
         badge,
         Span::styled(" [\u{2191}\u{2193}/jk] ", style),
-        Span::styled(slot_text, style.bg(Color::DarkGray)),
+        Span::styled(entry_text, style.bg(Color::DarkGray)),
         Span::styled(format!(" [PgUp/PgDn] scroll{} ", scroll_pct), style),
     ]);
     Paragraph::new(text)
 }
 
 // ── Main line builder ─────────────────────────────────────────────
-fn build_lines(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_coll_time_per_gen: [Option<f64>; 3], selected_slot: usize, debug_offsets_show_tree: bool, debug_offsets_show_hex: bool, show_runtime_hex: bool) -> (Vec<Line<'static>>, usize) {
+fn build_lines(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_coll_time_per_gen: [Option<f64>; 3], selected_entry: usize, debug_offsets_show_tree: bool, debug_offsets_show_hex: bool, show_runtime_hex: bool) -> (Vec<Line<'static>>, usize) {
     let mut lines = Vec::new();
     // Sections 1–2 render the `_Py_DebugOffsets` struct — 3.13+ only. Pre-3.13 skips
     // section 1 entirely and shows a focused interpreter header (section 2), then the
@@ -468,10 +505,10 @@ fn build_lines(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_coll_ti
     let sep1 = if s1_len > 0 { lines.push(Line::from("")); 1 } else { 0 };
     lines.extend(s2);
     lines.push(Line::from(""));
-    lines.extend(section_gc_stats(data, rate_per_gen, avg_coll_time_per_gen, selected_slot));
-    // Slot row in section_gc_stats starts at index 3 (top/buffer/top) + 7 header lines in the interleave
-    let slot_line_idx = s1_len + sep1 + s2_len + 1 + 3 + 7 + selected_slot;
-    (lines, slot_line_idx)
+    lines.extend(section_gc_stats(data, rate_per_gen, avg_coll_time_per_gen, selected_entry));
+    // Entry row in section_gc_stats starts at index 3 (top/buffer/top) + 7 header lines in the interleave
+    let entry_line_idx = s1_len + sep1 + s2_len + 1 + 3 + 7 + selected_entry;
+    (lines, entry_line_idx)
 }
 
 // ── Box helpers ───────────────────────────────────────────────────
@@ -479,8 +516,12 @@ fn top() -> String {
     format!("+{}+", "-".repeat(OUTER_W))
 }
 
+// `| ` + content + ` |` must total `top()`'s width (OUTER_W + 2), so the padded content
+// area is OUTER_W - 2 — not OUTER_W, which overpads full-width rows by 2 and pushes them
+// past the box border (harmless clipping in a live terminal, visible misalignment in a
+// `tui --output` file dump).
 fn l(content: &str) -> String {
-    format!("| {:<w$} |", content, w = OUTER_W)
+    format!("| {:<w$} |", content, w = OUTER_W - 2)
 }
 
 fn plain_line(left: &str, right: &str) -> Line<'static> {
@@ -513,6 +554,26 @@ fn span_line(left_spans: Vec<Span<'static>>, right_spans: Vec<Span<'static>>) ->
     spans.extend(right_spans);
     if rw < PR {
         spans.push(Span::raw(" ".repeat(PR - rw)));
+    }
+    spans.push(Span::raw("|"));
+    Line::from(spans)
+}
+
+/// Two-column body row for the GC-stats buffer view: `|<left> | <right>|`, padding each
+/// column to `GC_PL`/`GC_PR` so the frame borders line up. Like [`span_line`] but with the
+/// buffer view's wider-left split instead of the full view's `PL`/`PR`.
+fn gc_two_col(left: Vec<Span<'static>>, right: Vec<Span<'static>>) -> Line<'static> {
+    let mut spans = vec![Span::raw("|")];
+    let lw: usize = left.iter().map(|s| s.content.len()).sum();
+    spans.extend(left);
+    if lw < GC_PL {
+        spans.push(Span::raw(" ".repeat(GC_PL - lw)));
+    }
+    spans.push(Span::raw(" | "));
+    let rw: usize = right.iter().map(|s| s.content.len()).sum();
+    spans.extend(right);
+    if rw < GC_PR {
+        spans.push(Span::raw(" ".repeat(GC_PR - rw)));
     }
     spans.push(Span::raw("|"));
     Line::from(spans)
@@ -654,12 +715,12 @@ fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets, show_tree
     let gs = gen_stats_layout(gen_stats_size);
 
     // Drive the GC-state subtree from actual, version-correct layout: the `gc`
-    // sub-struct fields and the resolved per-slot field layout (which reflects the
+    // sub-struct fields and the resolved per-entry field layout (which reflects the
     // clean-vs-`+inc` selection).
     let gc_fields = off.gc_debug_fields();
     let offset_table = off.to_offset_table(data.pid, data.runtime_addr);
-    let slot_fields = offset_table.gc_layout.map(|l| l.fields);
-    let tree = debug_offsets_tree(&gc_fields, slot_fields);
+    let entry_fields = offset_table.gc_layout.map(|l| l.fields);
+    let tree = debug_offsets_tree(&gc_fields, entry_fields);
     let prefixes = tree_prefixes(&tree);
 
     let debug_highlights = if !show_runtime_hex {
@@ -717,11 +778,11 @@ fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets, show_tree
         let (item_size, young_bytes, _old_bytes, i0, i1, i2, _o0) = gs;
         match label {
             "item_size" => format!("{}", item_size),
-            "young_slots (11)" => format!("11 x {} = {} bytes", item_size, young_bytes),
+            "young_entries (11)" => format!("11 x {} = {} bytes", item_size, young_bytes),
             "index0" => format!("+{}", i0),
-            "old0_slots (3)" => format!("3 x {} bytes", item_size),
+            "old0_entries (3)" => format!("3 x {} bytes", item_size),
             "index1" => format!("+{}", i1),
-            "old1_slots (3)" => format!("3 x {} bytes", item_size),
+            "old1_entries (3)" => format!("3 x {} bytes", item_size),
             "index2" => format!("+{}", i2),
             _ => String::new(),
         }
@@ -733,13 +794,6 @@ fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets, show_tree
         format!("{}{}{}", before, " ".repeat(pad), value_str)
     };
 
-    use std::collections::HashMap;
-    let tree_row_colors: HashMap<&str, Color> = [
-        ("cookie[8]", Color::Green),
-        ("interpreters_head", Color::Cyan),
-        ("next", Color::Yellow),
-        ("gc", Color::Magenta),
-    ].into_iter().collect();
     let mut tree_highlight_rows: Vec<(usize, Color)> = Vec::new();
 
     let mut left_owned: Vec<String> = Vec::new();
@@ -748,26 +802,25 @@ fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets, show_tree
         for (i, entry) in tree.iter().enumerate() {
             let pfx = &prefixes[i];
             let line = match entry.kind {
-                super::render::TreeEntryKind::RawValue { offset } => {
+                super::tree::TreeEntryKind::RawValue { offset } => {
                     let val = read_u64(offset);
                     let f = fmt_val(val, entry.label);
                     format_tree_line(pfx, &format!("0x{:04x}  ", offset), entry.label, &f)
                 }
-                super::render::TreeEntryKind::Group => {
+                super::tree::TreeEntryKind::Group => {
                     format_tree_line(pfx, "", entry.label, "")
                 }
-                super::render::TreeEntryKind::Derived => {
+                super::tree::TreeEntryKind::Derived => {
                     let val_str = derived_val(entry.label);
                     format_tree_line(pfx, "", entry.label, &val_str)
                 }
-                super::render::TreeEntryKind::Layout { field_type: _, field_offset } => {
+                super::tree::TreeEntryKind::Layout { field_type: _, field_offset } => {
                     let val_str = format!("+{}", field_offset);
                     format_tree_line(pfx, "", entry.label, &val_str)
                 }
             };
             left_owned.push(line);
-            let label: &str = entry.label;
-            if let Some(&color) = tree_row_colors.get(label) {
+            if let Some(color) = debug_tree_row_color(entry.label, entry.kind) {
                 tree_highlight_rows.push((left_owned.len() - 1, color));
             }
         }
@@ -1020,13 +1073,13 @@ fn section_interpreter(data: &CollectedData, off: &VersionedOffsets) -> Vec<Line
 }
 
 // ── Section 3: GC Generation Stats ────────────────────────────────
-fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_coll_time_per_gen: [Option<f64>; 3], selected_slot: usize) -> Vec<Line<'static>> {
+fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_coll_time_per_gen: [Option<f64>; 3], selected_entry: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let gc = &data.interpreter.gc.generation_stats;
 
     lines.push(Line::from(Span::raw(top())));
 
-    if gc.stats_addr == 0 || gc.slots.is_empty() {
+    if gc.stats_addr == 0 || gc.entries.is_empty() {
         lines.push(Line::from(Span::raw(l("GC Generation Stats: not available"))));
         lines.push(Line::from(Span::raw(top())));
         return lines;
@@ -1038,111 +1091,76 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
     )))));
     lines.push(Line::from(Span::raw(top())));
 
-    // Version-correct geometry/layout for this build (IO-free): drives the per-slot size,
-    // the per-generation slot counts, and the slot-items field list below. Sourced from
+    // Version-correct geometry/layout for this build (IO-free): drives the per-entry size,
+    // the per-generation entry counts, and the entry-items field list below. Sourced from
     // the flat table the session already built, so it works for every tier (incl. Legacy).
     let offset_table = data.resolved.table().clone();
     let item_size = if gc.item_size > 0 { gc.item_size } else { gc.raw_stats_bytes.len().min(64) };
-    // Per-generation slot counts come from the collected snapshot (version/layout-derived,
+    // Per-generation entry counts come from the collected snapshot (version/layout-derived,
     // FT-correct) rather than a GIL-assuming literal or a per-frame tally.
-    let slots_per_gen = gc.slots_per_gen;
-    // Version-correct per-slot field layout (name → offset): drives both the hex-dump
-    // highlights and the slot-items table. Using it (not the fixed ring layout) keeps the
-    // 3.13/3.14 inline slots — collections@0/collected@8 — highlighted at the right bytes.
-    let slot_fields: &[(&str, usize)] = offset_table.gc_layout.map(|l| l.fields).unwrap_or(&[]);
+    let entries_per_gen = gc.entries_per_gen;
+    // Version-correct per-entry field layout (name → offset): drives both the hex-dump
+    // highlights and the entry-items table. Using it (not the fixed ring layout) keeps the
+    // 3.13/3.14 inline entries — collections@0/collected@8 — highlighted at the right bytes.
+    let entry_fields: &[(&str, usize)] = offset_table.gc_layout.map(|l| l.fields).unwrap_or(&[]);
 
     // ── Left panel ──
     let mut left: Vec<String> = Vec::new();
-    let gen_names = [
-        (format!("Gen 0 (Young) - {} slots", slots_per_gen[0]), rate_per_gen[0], avg_coll_time_per_gen[0]),
-        (format!("Gen 1 (Middle) - {} slots", slots_per_gen[1]), rate_per_gen[1], avg_coll_time_per_gen[1]),
-        (format!("Gen 2 (Oldest) - {} slots", slots_per_gen[2]), rate_per_gen[2], avg_coll_time_per_gen[2]),
-    ];
-    for (name, rate, avg_coll) in &gen_names {
-        let rate_str = match rate { Some(r) => fmt_rate(*r), None => "n/a".to_string() };
-        let coll_str = match avg_coll { Some(d) => fmt_duration(*d), None => "n/a".to_string() };
-        left.push(format!("{:<pl$}", format!("{}  (rate = {}, avg coll = {})", name, rate_str, coll_str), pl = PL));
+    for line in gen_summary_lines(entries_per_gen, rate_per_gen, avg_coll_time_per_gen) {
+        left.push(format!("{:<pl$}", line, pl = PL));
     }
     left.push(format!(
         "{:<pl$}",
-        format!("slot size: {} bytes  |  total buffer: {} bytes", item_size, gc.stats_size),
+        format!("entry size: {} bytes  |  total buffer: {} bytes", item_size, gc.stats_size),
         pl = PL
     ));
     left.push(format!("{:<pl$}", "", pl = PL));
-    let hdr = format!(
-        "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11}",
-        "gen", "slot", "collections", "collected", "heap", "duration(s)"
-    );
+    let hdr = entry_table_header();
     let hdr_len = hdr.len();
     left.push(format!("{:<pl$}", hdr, pl = PL));
     left.push(format!("  {}", "-".repeat(hdr_len - 2)));
 
-    for slot in &gc.slots {
-        let gen_label = format!("{}", slot.generation);
-        let heap = fmt_bytes(slot.heap_size as u64);
-        left.push(format!(
-            "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11.3}",
-            gen_label, slot.slot, slot.collections, slot.collected, heap, slot.duration
-        ));
+    for entry in &gc.entries {
+        left.push(entry_table_row(entry));
     }
 
     // ── Right panel ──
-    let slot = &gc.slots[selected_slot];
-    // Clamp the start too: if the raw stats buffer wasn't collected (empty) while `slots`
-    // was, `byte_offset` can exceed the buffer, which would make `start > end` and panic.
-    // Clamping yields an empty slice instead — the hex panel simply renders nothing.
-    let slot_raw_start = slot.byte_offset.min(gc.raw_stats_bytes.len());
-    let slot_raw_end = (slot_raw_start + item_size).min(gc.raw_stats_bytes.len());
-    let slot_bytes = &gc.raw_stats_bytes[slot_raw_start..slot_raw_end];
-    let display_bytes = slot_bytes.len();
-    // Decode this slot's fields through the shared `GcStat` primitive — the same by-name/offset
+    let entry = &gc.entries[selected_entry];
+    let entry_bytes = selected_entry_bytes(&gc.raw_stats_bytes, entry.byte_offset, item_size);
+    let display_bytes = entry_bytes.len();
+    // Decode this entry's fields through the shared `GcStat` primitive — the same by-name/offset
     // path the Chrome exporter uses — instead of re-reading the raw bytes inline here.
-    let slot_view = offset_table
+    let entry_view = offset_table
         .gc_layout
-        .map(|l| GcStat::from_slot(slot_bytes, l, slot.generation, slot.slot, 0));
+        .map(|l| GcStat::from_entry(entry_bytes, l, entry.generation, entry.index, 0));
 
     let mut right_items: Vec<Vec<Span<'static>>> = Vec::new();
     // Header
     right_items.push(vec![Span::raw(format!(
         "{:<pr$}",
-        format!("Slot #{} (gen {}, slot {}) of stats buffer:", selected_slot + 1, slot.generation, slot.slot),
+        format!("Entry #{} (gen {}, entry {}) of stats buffer:", selected_entry + 1, entry.generation, entry.index),
         pr = PR
     ))]);
 
-    // Hex dump of selected slot bytes, highlighting each present, colored field at its real
-    // per-version offset (from `slot_fields`). Deriving from the actual layout keeps the
-    // 3.13/3.14 inline slots (collections@0, collected@8) from being painted at the ring
-    // offsets (16/24). Fields without a color entry (uncollectable, candidates, the `+inc`
-    // extras) are left unhighlighted, as before.
-    let slot_label_colors: std::collections::HashMap<&str, Color> = [
-        ("ts_start", Color::Blue),
-        ("ts_stop", Color::Blue),
-        ("collections", Color::Green),
-        ("collected", Color::Magenta),
-        ("duration", Color::Yellow),
-        ("heap_size", Color::Cyan),
-    ].into_iter().collect();
-    let adjusted_highlights: Vec<(usize, u8, Color)> = slot_view.iter()
-        .flat_map(|v| v.iter_fields())
-        .filter_map(|(name, off, _)| {
-            slot_label_colors.get(name).map(|&c| (off + slot.byte_offset, 8u8, c))
-        })
-        .collect();
-    let hex_rows = hex_dump_rows(slot_bytes, display_bytes, &adjusted_highlights, slot.byte_offset);
+    // Hex dump of selected entry bytes, highlighting each present, colored field at its real
+    // per-version offset. Deriving from the actual layout keeps the 3.13/3.14 inline entries
+    // (collections@0, collected@8) from being painted at the ring offsets (16/24).
+    let adjusted_highlights = field_highlights(&entry_view, entry.byte_offset);
+    let hex_rows = hex_dump_rows(entry_bytes, display_bytes, &adjusted_highlights, entry.byte_offset);
     for hr in &hex_rows {
         right_items.push(padding_hex_right(hr.clone()));
     }
 
-    // Slot field table (inner box)
+    // Entry field table (inner box)
     let dashes = PR - 12;
     let tw = dashes - 2;
 
     right_items.push(vec![Span::raw(format!("  +{}+", "-".repeat(dashes)))]);
     right_items.push(vec![Span::raw(format!(
         "  | {:<tw$} |",
-        format!("GC Generation Stats Slot #{} (gen {}, slot {}) @ {:#x}",
-            selected_slot + 1, slot.generation, slot.slot,
-            gc.stats_addr + slot.byte_offset as u64),
+        format!("GC Generation Stats Entry #{} (gen {}, entry {}) @ {:#x}",
+            selected_entry + 1, entry.generation, entry.index,
+            gc.stats_addr + entry.byte_offset as u64),
         tw = tw
     ))]);
     right_items.push(vec![Span::raw(format!("  +{}+", "-".repeat(dashes)))]);
@@ -1150,22 +1168,12 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
     // Width the name column to the widest field this build actually has, so the `@ +offset`
     // and value columns stay aligned even for the long `+inc` names (e.g.
     // `ts_handle_weakref_callbacks_start`). Floored at 15 so short-field builds are unchanged.
-    let name_w = slot_fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(15);
+    let name_w = entry_fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(15);
 
-    for (name, offset, valbits) in slot_view.iter().flat_map(|v| v.iter_fields()) {
-        let val_fmt = if name == "duration" {
-            format!("{:.6}", f64::from_bits(valbits))
-        } else if name.starts_with("ts_") {
-            fmt_thousands(valbits)
-        } else if valbits > 0xFFFF_FFFF {
-            format!("{:#x}", valbits)
-        } else {
-            format!("{}", valbits)
-        };
-
+    for (name, offset, valbits) in entry_view.iter().flat_map(|v| v.iter_fields()) {
+        let val_fmt = format_field_value(name, valbits);
         let content = format!("  {:<name_w$} @ +{:<4}  {}", name, offset, val_fmt, name_w = name_w);
-        let name_str: &str = name;
-        let color = slot_label_colors.get(name_str).copied();
+        let color = entry_field_color(name);
 
         if let Some(c) = color {
             let prefix_span = Span::raw("  | ".to_string());
@@ -1185,7 +1193,7 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
     right_items.push(vec![Span::raw(format!("  +{}+", "-".repeat(dashes)))]);
 
     // ── Combine ──
-    let selected_left_idx = 7 + selected_slot; // left items 0-6 are headers
+    let selected_left_idx = 7 + selected_entry; // left items 0-6 are headers
     let max_rows = left.len().max(right_items.len());
     for i in 0..max_rows {
         let lv = left.get(i).map(|s| s.as_str()).unwrap_or("");
@@ -1203,6 +1211,258 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
         } else {
             lines.push(full_line(lv, right));
         }
+    }
+
+    lines.push(Line::from(Span::raw(top())));
+    lines
+}
+
+/// The color a GC-stat field is painted in, in both the hexdump highlights and the field
+/// table. `None` = left unhighlighted (uncollectable, candidates, the `+inc` extras). Shared
+/// by the full view (`section_gc_stats`) and the buffer view (`build_gc_only_lines`) so the
+/// two never drift.
+fn entry_field_color(name: &str) -> Option<Color> {
+    match name {
+        "ts_start" | "ts_stop" => Some(Color::Blue),
+        "collections" => Some(Color::Green),
+        "collected" => Some(Color::Magenta),
+        "duration" => Some(Color::Yellow),
+        "heap_size" => Some(Color::Cyan),
+        _ => None,
+    }
+}
+
+/// Highlight color for one `_Py_DebugOffsets` tree row, or `None` to leave it unshaded. The
+/// named runtime fields match their hexdump-region colors (see the `hex_highlights` mapping);
+/// every first-entry field item (`Layout` kind — the per-entry `gc_generation_stats` fields on
+/// ring builds) shares one color so the entry's layout reads as a single group. That group is
+/// tree-only: those items have no hexdump region of their own.
+fn debug_tree_row_color(label: &str, kind: super::tree::TreeEntryKind) -> Option<Color> {
+    use super::tree::TreeEntryKind;
+    match label {
+        "cookie[8]" => Some(Color::Green),
+        "interpreters_head" => Some(Color::Cyan),
+        "next" => Some(Color::Yellow),
+        "gc" => Some(Color::Magenta),
+        _ => matches!(kind, TreeEntryKind::Layout { .. }).then_some(Color::Blue),
+    }
+}
+
+// ── Shared GC-stats rendering helpers ─────────────────────────────
+// The full view (`section_gc_stats`) and the buffer view (`build_gc_only_lines`) lay their
+// panels out differently but decode and format the same bytes; these keep that shared logic in
+// one place so the two can't drift.
+
+/// The per-generation summary lines — entry count, collections rate, avg collection duration —
+/// with `n/a` where the layout lacks the field. Unpadded; each view pads/wraps to its own width.
+fn gen_summary_lines(
+    entries_per_gen: [u64; 3],
+    rate_per_gen: [Option<f64>; 3],
+    avg_coll_time_per_gen: [Option<f64>; 3],
+) -> [String; 3] {
+    const LABELS: [&str; 3] = ["Gen 0 (Young)", "Gen 1 (Middle)", "Gen 2 (Oldest)"];
+    std::array::from_fn(|g| {
+        let rate = match rate_per_gen[g] { Some(r) => fmt_rate(r), None => "n/a".to_string() };
+        let coll = match avg_coll_time_per_gen[g] { Some(d) => fmt_duration(d), None => "n/a".to_string() };
+        format!("{} - {} entries  (rate = {}, avg coll = {})", LABELS[g], entries_per_gen[g], rate, coll)
+    })
+}
+
+/// The entry-table column header shared by both views' left tables.
+fn entry_table_header() -> String {
+    format!(
+        "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11}",
+        "gen", "idx", "collections", "collected", "heap", "duration(s)"
+    )
+}
+
+/// One row of the entry table — same columns as [`entry_table_header`].
+fn entry_table_row(entry: &GcEntry) -> String {
+    format!(
+        "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11.3}",
+        entry.generation, entry.index, entry.collections, entry.collected,
+        fmt_bytes(entry.heap_size as u64), entry.duration
+    )
+}
+
+/// One entry's window into the raw stats buffer, clamped so a short/absent buffer yields an
+/// empty slice instead of an out-of-range panic (`byte_offset + item_size` can exceed the
+/// collected bytes when a request skipped the raw payload).
+fn selected_entry_bytes(raw: &[u8], byte_offset: usize, item_size: usize) -> &[u8] {
+    let start = byte_offset.min(raw.len());
+    let end = (start + item_size).min(raw.len());
+    &raw[start..end]
+}
+
+/// Format one decoded field value for display: `duration` as seconds, `ts_*` grouped by
+/// thousands, values above `u32::MAX` as hex, everything else decimal.
+fn format_field_value(name: &str, valbits: u64) -> String {
+    if name == "duration" {
+        format!("{:.6}", f64::from_bits(valbits))
+    } else if name.starts_with("ts_") {
+        fmt_thousands(valbits)
+    } else if valbits > 0xFFFF_FFFF {
+        format!("{:#x}", valbits)
+    } else {
+        format!("{}", valbits)
+    }
+}
+
+/// Hex-dump highlights for a decoded entry's colored fields, each 8 bytes at its real
+/// per-version offset (shifted by the entry's `byte_offset` into the buffer). Fields without a
+/// color (uncollectable, candidates, the `+inc` extras) are left unhighlighted.
+fn field_highlights(entry_view: &Option<GcStat>, byte_offset: usize) -> Vec<(usize, u8, Color)> {
+    entry_view
+        .iter()
+        .flat_map(|v| v.iter_fields())
+        .filter_map(|(name, off, _)| entry_field_color(name).map(|c| (off + byte_offset, 8u8, c)))
+        .collect()
+}
+
+/// The byte offset of each generation's ring index in the raw buffer. CPython stores an `i8`
+/// (plus 7 bytes of padding) right *after* each generation's entries — per
+/// `compute_ring_base_offsets`, generation `g`'s entries start at `bases[g]`, so its index sits
+/// at `bases[g] + entries[g] * item_size`. The index value is the active entry number for that
+/// generation's ring. Empty for inline/legacy builds (one entry per generation, no index).
+fn ring_index_offsets(
+    table: &crate::remote_debugging::offsets::offset_table::OffsetTable,
+    item_size: usize,
+) -> Vec<usize> {
+    use crate::remote_debugging::offsets::offset_table::GcStatsKind;
+    if table.gc_stats_kind != GcStatsKind::RingBuffer || item_size == 0 {
+        return Vec::new();
+    }
+    let (Some(bases), Some(entries)) = (table.gc_gen_base_offsets, table.gc_entries_per_gen) else {
+        return Vec::new();
+    };
+    (0..3)
+        .map(|g| bases[g] as usize + entries[g] as usize * item_size)
+        .collect()
+}
+
+/// The GC-stats-only "buffer view" (`g` toggles it). Left column: the entry table (top,
+/// arrow-selectable) over the selected entry's decoded field→value list (bottom). Right
+/// column: a hexdump of the *whole* stats buffer — the selected entry's byte range shaded
+/// `DarkGray` with its decoded fields colored in place, and (on ring builds) each generation's
+/// `i8` ring index shaded `Red` as a fixed visual anchor, so the reader can watch the active
+/// entry number change in place. Reuses the two-column box, the hex renderer, and
+/// `entry_field_color` from the full view; the one difference from `section_gc_stats` is that
+/// the hexdump spans the entire buffer, not one entry.
+fn build_gc_only_lines(
+    data: &CollectedData,
+    rate_per_gen: [Option<f64>; 3],
+    avg_coll_time_per_gen: [Option<f64>; 3],
+    selected_entry: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let gc = &data.interpreter.gc.generation_stats;
+
+    lines.push(Line::from(Span::raw(top())));
+    lines.push(Line::from(Span::raw(l("GC Stats Buffer View  ([g] back to full layout)"))));
+    lines.push(Line::from(Span::raw(top())));
+
+    if gc.stats_addr == 0 || gc.entries.is_empty() {
+        lines.push(Line::from(Span::raw(l("GC Generation Stats: not available"))));
+        lines.push(Line::from(Span::raw(top())));
+        return lines;
+    }
+
+    let offset_table = data.resolved.table().clone();
+    let item_size = if gc.item_size > 0 { gc.item_size } else { gc.raw_stats_bytes.len().min(64) };
+    let entry_fields: &[(&str, usize)] = offset_table.gc_layout.map(|l| l.fields).unwrap_or(&[]);
+    let selected = selected_entry.min(gc.entries.len() - 1);
+    let sel = &gc.entries[selected];
+
+    // Byte offsets of each generation's ring index (ring builds only), shaded in the hexdump
+    // below as an anchor for reading the active entry number.
+    let index_offsets = ring_index_offsets(&offset_table, item_size);
+
+    // ── Left column ──
+    let mut left: Vec<Vec<Span<'static>>> = Vec::new();
+    left.push(vec![Span::raw(format!(
+        "Buffer @ {:#x}  (size: {} bytes, entry: {} bytes)",
+        gc.stats_addr, gc.stats_size, item_size
+    ))]);
+    // Per-generation summary — entry count, collections rate, and avg collection duration.
+    for line in gen_summary_lines(gc.entries_per_gen, rate_per_gen, avg_coll_time_per_gen) {
+        left.push(vec![Span::raw(line)]);
+    }
+    if !index_offsets.is_empty() {
+        left.push(vec![
+            Span::raw("legend: ".to_string()),
+            Span::styled(" ring ", Style::new().bg(Color::Red).fg(Color::Black)),
+            Span::raw(" = per-generation ring index (i8, points at the active entry)".to_string()),
+        ]);
+    }
+    left.push(vec![Span::raw(String::new())]);
+
+    // Entry table (top) — one row per entry, the selected row shaded.
+    let hdr = entry_table_header();
+    let hdr_len = hdr.len();
+    left.push(vec![Span::raw(hdr)]);
+    left.push(vec![Span::raw(format!("  {}", "-".repeat(hdr_len - 2)))]);
+    for (i, entry) in gc.entries.iter().enumerate() {
+        let content = entry_table_row(entry);
+        if i == selected {
+            left.push(vec![Span::styled(
+                format!("{:<pl$}", content, pl = GC_PL),
+                Style::new().bg(Color::DarkGray).fg(Color::White),
+            )]);
+        } else {
+            left.push(vec![Span::raw(content)]);
+        }
+    }
+
+    // Entry table (bottom) — the selected entry decoded field→value, each colored field shaded
+    // to match the hexdump.
+    let entry_bytes = selected_entry_bytes(&gc.raw_stats_bytes, sel.byte_offset, item_size);
+    let entry_view = offset_table
+        .gc_layout
+        .map(|l| GcStat::from_entry(entry_bytes, l, sel.generation, sel.index, 0));
+
+    left.push(vec![Span::raw(String::new())]);
+    left.push(vec![Span::raw(format!(
+        "Entry #{} (gen {}, entry {}) @ {:#x}",
+        selected + 1, sel.generation, sel.index, gc.stats_addr + sel.byte_offset as u64
+    ))]);
+    let name_w = entry_fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(12);
+    for (name, offset, valbits) in entry_view.iter().flat_map(|v| v.iter_fields()) {
+        let val_fmt = format_field_value(name, valbits);
+        let content = format!("  {:<name_w$} @ +{:<4}  {}", name, offset, val_fmt, name_w = name_w);
+        match entry_field_color(name) {
+            Some(c) => left.push(vec![Span::styled(
+                format!("{:<pl$}", content, pl = GC_PL),
+                Style::new().bg(c).fg(Color::Black),
+            )]),
+            None => left.push(vec![Span::raw(content)]),
+        }
+    }
+
+    // ── Right column: whole-buffer hexdump ──
+    // `hex_dump_rows` takes the FIRST matching highlight, so order is priority: the selected
+    // entry's colored fields, then its DarkGray whole-entry shade, then each generation's ring
+    // index in Red. The index gaps never overlap a entry, so their order relative to the entry
+    // shades doesn't matter. `item_size` is small (24 inline, the ring-struct size otherwise)
+    // but capped to the `u8` highlight length.
+    let mut highlights = field_highlights(&entry_view, sel.byte_offset);
+    highlights.push((sel.byte_offset, item_size.min(255) as u8, Color::DarkGray));
+    // The index is an `i8` followed by 7 bytes of padding; shade the whole 8-byte field so it
+    // reads as one anchor block between generations.
+    for &off in &index_offsets {
+        if off + 8 <= gc.raw_stats_bytes.len() {
+            highlights.push((off, 8, Color::Red));
+        }
+    }
+
+    // A 16-byte hexdump row is exactly `GC_PR` wide; `gc_two_col` pads the short final row.
+    let right = hex_dump_rows(&gc.raw_stats_bytes, gc.raw_stats_bytes.len(), &highlights, 0);
+
+    // ── Combine ──
+    let max_rows = left.len().max(right.len());
+    for i in 0..max_rows {
+        let lv = left.get(i).cloned().unwrap_or_default();
+        let rv = right.get(i).cloned().unwrap_or_default();
+        lines.push(gc_two_col(lv, rv));
     }
 
     lines.push(Line::from(Span::raw(top())));
@@ -1273,25 +1533,39 @@ fn fmt_rate(rate: f64) -> String {
 /// integration test can exercise the **Full-tier** section builders
 /// (`section_debug_offsets` / `section_interpreter`) that only run against a real 3.13+
 /// `_Py_DebugOffsets` struct and so can't be reached from the synthetic-Legacy unit tests.
-/// Mirrors what `run_tui` feeds into the content `Paragraph`. Test-only seam, like
-/// `MonitorContext::insert_session_for_test`.
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub fn render_frame_for_test(
+/// Renders a single static TUI frame as plain text (no styling, no glitch overlay) — the
+/// non-interactive counterpart to `run_tui`, used by `tui --output` to dump a frame to a
+/// file. Unlike the interactive draw loop the styled `Line`s are flattened to their text,
+/// and the PID/version header the loop puts in the `Paragraph` title bar (absent from
+/// `build_lines`) is prepended here, since a file has no title bar. Always compiled so both
+/// `run_tui_snapshot` and the integration tests can reach it through the public API.
+pub fn render_snapshot(
     data: &CollectedData,
-    selected_slot: usize,
+    selected_entry: usize,
     show_tree: bool,
     show_hex: bool,
     show_runtime_hex: bool,
-) -> Vec<String> {
+    gc_only: bool,
+) -> String {
     let stats = &data.interpreter.gc.generation_stats;
-    let rate = collections_rate_from_slots(&stats.slots, stats.has_timestamps);
-    let avg = avg_collection_time_per_gen(&stats.slots, stats.has_duration);
-    let (lines, _) = build_lines(data, rate, avg, selected_slot, show_tree, show_hex, show_runtime_hex);
-    lines
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect()
+    let rate = collections_rate_from_entries(&stats.entries, stats.has_timestamps);
+    let avg = avg_collection_time_per_gen(&stats.entries, stats.has_duration);
+    let lines = if gc_only {
+        build_gc_only_lines(data, rate, avg, selected_entry)
+    } else {
+        build_lines(data, rate, avg, selected_entry, show_tree, show_hex, show_runtime_hex).0
+    };
+    let mut out = format!(
+        "gcscope tui — PID {} — Python 0x{:08x}\n",
+        data.pid, data.runtime_version
+    );
+    for line in &lines {
+        for span in &line.spans {
+            out.push_str(span.content.as_ref());
+        }
+        out.push('\n');
+    }
+    out
 }
 
 // ── Glitch effects ─────────────────────────────────────────────────
@@ -1463,7 +1737,7 @@ mod tests {
     use ratatui::widgets::Widget;
 
     use crate::snapshot::collect::{
-        GcSlot, GcStatsSnapshot, GcSubState, InterpreterSnapshot,
+        GcEntry, GcStatsSnapshot, GcSubState, InterpreterSnapshot,
     };
     use crate::remote_debugging::offsets::pre_3_13;
     use crate::remote_debugging::session::Resolved;
@@ -1614,12 +1888,12 @@ mod tests {
     // The pre-3.13 (`Legacy`) tier is the only one constructible without a live process
     // (flat `OffsetTable`, no bindgen struct). Same trick as `ascii::tests::legacy_data`.
 
-    fn legacy_data(with_slots: bool) -> CollectedData {
+    fn legacy_data(with_entries: bool) -> CollectedData {
         let table = pre_3_13::table_for_version(3, 12).unwrap();
-        let slots = if with_slots {
-            vec![GcSlot {
+        let entries = if with_entries {
+            vec![GcEntry {
                 generation: 0,
-                slot: 0,
+                index: 0,
                 byte_offset: 0,
                 start_ts: 0,
                 stop_ts: 0,
@@ -1645,14 +1919,92 @@ mod tests {
                 gc: GcSubState {
                     raw_bytes: vec![0u8; 64],
                     generation_stats: GcStatsSnapshot {
-                        stats_addr: if with_slots { 0x7000 } else { 0 },
+                        stats_addr: if with_entries { 0x7000 } else { 0 },
                         stats_size: 72,
                         item_size: 24,
-                        slots_per_gen: [1, 1, 1],
+                        entries_per_gen: [1, 1, 1],
                         has_timestamps: false,
                         has_duration: false,
                         raw_stats_bytes: vec![0u8; 72],
-                        slots,
+                        entries,
+                    },
+                },
+                gc_offset: 0x80,
+                gc_size: 64,
+                id: 0,
+                next_addr: 0,
+            },
+            collect_duration: Duration::from_millis(1),
+        }
+    }
+
+    /// A synthetic ring snapshot (3.15-style geometry) built from the public `OffsetTable`
+    /// fields. The buffer view reads only the table + stats (never the `Resolved` tier), so
+    /// `Resolved::Legacy` is just the cheapest table wrapper that still drives the ring path.
+    /// The buffer is all zero except each generation's index byte, set to `0x5A` so the Red
+    /// index highlight can be found positionally in the hexdump.
+    fn ring_data() -> CollectedData {
+        use crate::remote_debugging::offsets::offset_table::{
+            compute_ring_base_offsets, GcItemLayout, GcStatsKind,
+        };
+        static RING_LAYOUT: GcItemLayout = GcItemLayout {
+            item_size: 24,
+            fields: &[("ts_start", 0), ("collections", 8), ("collected", 16)],
+        };
+        let item = 24usize;
+        let entries_per_gen = [11u64, 3, 3];
+        let bases = compute_ring_base_offsets(item as u64, &entries_per_gen);
+        let region = bases[2] as usize + entries_per_gen[2] as usize * item + 8;
+
+        let mut raw = vec![0u8; region];
+        for g in 0..3 {
+            let idx_off = bases[g] as usize + entries_per_gen[g] as usize * item;
+            raw[idx_off] = 0x5A;
+        }
+
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        table.gc_stats_kind = GcStatsKind::RingBuffer;
+        table.gc_item_size = Some(item as u64);
+        table.gc_entries_per_gen = Some(entries_per_gen);
+        table.gc_gen_base_offsets = Some(bases);
+        table.gc_layout = Some(&RING_LAYOUT);
+
+        let entries = (0..3)
+            .map(|g| GcEntry {
+                generation: g as u32,
+                index: 0,
+                byte_offset: bases[g as usize] as usize,
+                start_ts: 0,
+                stop_ts: 0,
+                collections: 0,
+                collected: 0,
+                uncollectable: 0,
+                candidates: 0,
+                duration: 0.0,
+                heap_size: 0,
+            })
+            .collect();
+
+        CollectedData {
+            pid: 4321,
+            runtime_addr: 0x5000,
+            runtime_version: 0x030f0000,
+            runtime_raw_bytes: Vec::new(),
+            debug_offsets_size: 0,
+            resolved: Arc::new(Resolved::Legacy { table }),
+            interpreter: InterpreterSnapshot {
+                addr: 0x6000,
+                gc: GcSubState {
+                    raw_bytes: vec![0u8; 64],
+                    generation_stats: GcStatsSnapshot {
+                        stats_addr: 0x7000,
+                        stats_size: region as u64,
+                        item_size: item,
+                        entries_per_gen,
+                        has_timestamps: true,
+                        has_duration: false,
+                        raw_stats_bytes: raw,
+                        entries,
                     },
                 },
                 gc_offset: 0x80,
@@ -1687,44 +2039,199 @@ mod tests {
         let data = legacy_data(true);
         let out = join_lines(&section_gc_stats(&data, [None; 3], [None; 3], 0));
         assert!(out.contains("GC Generation Stats Buffer @ 0x7000"), "{out}");
-        assert!(out.contains("Gen 0 (Young) - 1 slots"), "{out}");
-        assert!(out.contains("slot size: 24 bytes"), "{out}");
+        assert!(out.contains("Gen 0 (Young) - 1 entries"), "{out}");
+        assert!(out.contains("entry size: 24 bytes"), "{out}");
         // None rate/avg must degrade to "n/a", not "0" or a panic.
         assert!(out.contains("n/a"), "{out}");
-        // The one slot's decoded counters appear in the left table.
-        assert!(out.contains("GC Generation Stats Slot #1"), "right-panel slot box: {out}");
+        // The one entry's decoded counters appear in the left table.
+        assert!(out.contains("GC Generation Stats Entry #1"), "right-panel entry box: {out}");
     }
 
     #[test]
-    fn section_gc_stats_reports_absent_stats_when_there_are_no_slots() {
+    fn section_gc_stats_reports_absent_stats_when_there_are_no_entries() {
         let data = legacy_data(false);
         let out = join_lines(&section_gc_stats(&data, [None; 3], [None; 3], 0));
         assert!(out.contains("GC Generation Stats: not available"), "{out}");
     }
 
-    /// If the raw stats buffer is empty (e.g. a request skipped it) but decoded `slots`
-    /// remain, the right-panel byte slice must not panic even when the selected slot's
+    /// If the raw stats buffer is empty (e.g. a request skipped it) but decoded `entries`
+    /// remain, the right-panel byte slice must not panic even when the selected entry's
     /// `byte_offset` points past the (empty) buffer — the start clamp keeps `start <= end`.
     #[test]
-    fn section_gc_stats_does_not_panic_when_raw_is_empty_but_a_slot_is_selected() {
+    fn section_gc_stats_does_not_panic_when_raw_is_empty_but_a_entry_is_selected() {
         let mut data = legacy_data(true);
         let stats = &mut data.interpreter.gc.generation_stats;
         stats.raw_stats_bytes = Vec::new();
-        stats.slots[0].byte_offset = 48; // a gen-1/2-style offset, past the empty buffer
+        stats.entries[0].byte_offset = 48; // a gen-1/2-style offset, past the empty buffer
         // Must render (empty hex panel) rather than slice-index panic.
         let out = join_lines(&section_gc_stats(&data, [None; 3], [None; 3], 0));
-        assert!(out.contains("GC Generation Stats Slot #1"), "{out}");
+        assert!(out.contains("GC Generation Stats Entry #1"), "{out}");
+    }
+
+    #[test]
+    fn build_gc_only_lines_shows_the_entry_table_field_list_and_whole_buffer_hexdump() {
+        let data = legacy_data(true);
+        let lines = build_gc_only_lines(&data, [None; 3], [None; 3], 0);
+        let out = join_lines(&lines);
+        assert!(out.contains("GC Stats Buffer View"), "mode header: {out}");
+        assert!(out.contains("Buffer @ 0x7000"), "buffer address line: {out}");
+        // Left: the entry table row and the selected entry's decoded field list.
+        assert!(out.contains("collections"), "field table: {out}");
+        assert!(out.contains("Entry #1 (gen 0, entry 0)"), "selected-entry header: {out}");
+        // Right: a whole-buffer hexdump — the 72-byte buffer spans past the first entry, so an
+        // offset row beyond the first 16 bytes proves it dumps the whole buffer, not one entry.
+        assert!(out.contains("00000010"), "hexdump must cover the whole buffer: {out}");
+        // No line overflows the fixed frame width.
+        let border = format!("+{}+", "-".repeat(OUTER_W));
+        assert!(out.lines().any(|l| l == border), "a full-width border must appear");
+        assert!(
+            out.lines().all(|l| l.chars().count() <= OUTER_W + 2),
+            "a line exceeded the frame width: {out}"
+        );
+    }
+
+    #[test]
+    fn build_gc_only_lines_reports_absent_stats_and_never_panics_on_an_empty_buffer() {
+        // No entries → the not-available short-circuit.
+        let out = join_lines(&build_gc_only_lines(&legacy_data(false), [None; 3], [None; 3], 0));
+        assert!(out.contains("GC Generation Stats: not available"), "{out}");
+        // Entries but an empty raw buffer with a past-the-end offset must clamp, not panic.
+        let mut data = legacy_data(true);
+        let stats = &mut data.interpreter.gc.generation_stats;
+        stats.raw_stats_bytes = Vec::new();
+        stats.entries[0].byte_offset = 48;
+        let out = join_lines(&build_gc_only_lines(&data, [None; 3], [None; 3], 0));
+        assert!(out.contains("Entry #1 (gen 0, entry 0)"), "{out}");
+    }
+
+    #[test]
+    fn ring_index_offsets_point_just_past_each_generations_entries() {
+        use crate::remote_debugging::offsets::offset_table::{compute_ring_base_offsets, GcStatsKind};
+
+        // A GIL ring: entries [11, 3, 3], 24-byte items. Build the geometry from the public
+        // fields (set_ring is private to the offsets module).
+        let item = 24usize;
+        let entries = [11u64, 3, 3];
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        table.gc_stats_kind = GcStatsKind::RingBuffer;
+        table.gc_item_size = Some(item as u64);
+        table.gc_entries_per_gen = Some(entries);
+        table.gc_gen_base_offsets = Some(compute_ring_base_offsets(item as u64, &entries));
+        let bases = table.gc_gen_base_offsets.unwrap();
+
+        // Each index sits immediately after its generation's entries, i.e. 8 bytes before the
+        // next generation's base (and, for the last, at the buffer's trailing cursor).
+        let offs = ring_index_offsets(&table, item);
+        assert_eq!(
+            offs,
+            vec![
+                bases[0] as usize + 11 * item,
+                bases[1] as usize + 3 * item,
+                bases[2] as usize + 3 * item,
+            ]
+        );
+        assert_eq!(offs[0], bases[1] as usize - 8, "gen-0 index is the 8-byte gap before gen 1");
+        assert_eq!(offs[1], bases[2] as usize - 8, "gen-1 index is the 8-byte gap before gen 2");
+
+        // Inline/Legacy is not a ring → no index gaps at all.
+        let legacy = legacy_data(true);
+        assert!(ring_index_offsets(legacy.resolved.table(), 24).is_empty());
+    }
+
+    /// Every span across the frame with a `Red` background whose trimmed text equals `hex`.
+    fn red_bytes(lines: &[Line], hex: &str) -> usize {
+        lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .filter(|s| s.style.bg == Some(Color::Red) && s.content.trim() == hex)
+            .count()
+    }
+
+    #[test]
+    fn build_gc_only_lines_on_a_ring_highlights_every_index_byte_and_shows_the_legend() {
+        let lines = build_gc_only_lines(&ring_data(), [Some(15.0), None, None], [None; 3], 0);
+
+        // The per-generation summary header renders (entry counts + rate/avg, "n/a" where absent).
+        let text = join_lines(&lines);
+        assert!(text.contains("Gen 0 (Young) - 11 entries  (rate = 15.0/s, avg coll = n/a)"), "summary: {text}");
+        assert!(text.contains("Gen 2 (Oldest) - 3 entries"), "gen-2 summary: {text}");
+
+        // The legend appears (ring builds only) with a Red swatch.
+        assert!(text.contains("per-generation ring index"), "legend text missing");
+        assert!(
+            lines.iter().flat_map(|l| &l.spans)
+                .any(|s| s.style.bg == Some(Color::Red) && s.content.trim() == "ring"),
+            "legend must carry a Red swatch"
+        );
+
+        // The one index byte of each generation (0x5A) is Red in the hexdump — exactly three,
+        // one per generation, and the only 0x5A bytes in the otherwise-zero buffer.
+        assert_eq!(red_bytes(&lines, "5a"), 3, "all three ring index bytes must be highlighted");
+
+        // Selected-entry decoration still works alongside the index anchors: its `collections`
+        // field keeps Green and its whole-entry range keeps the DarkGray shade.
+        let spans = || lines.iter().flat_map(|l| &l.spans);
+        assert!(spans().any(|s| s.style.bg == Some(Color::Green)), "field colours must survive");
+        assert!(spans().any(|s| s.style.bg == Some(Color::DarkGray)), "selected-entry shade must survive");
+    }
+
+    #[test]
+    fn build_gc_only_lines_on_an_inline_build_has_no_index_highlight_or_legend() {
+        let lines = build_gc_only_lines(&legacy_data(true), [None; 3], [None; 3], 0);
+        assert!(!join_lines(&lines).contains("ring index"), "inline/legacy must show no legend");
+        assert!(
+            !lines.iter().flat_map(|l| &l.spans).any(|s| s.style.bg == Some(Color::Red)),
+            "inline/legacy has no ring index to highlight"
+        );
+    }
+
+    #[test]
+    fn debug_tree_row_color_shades_named_fields_and_every_first_entry_item() {
+        use crate::tui::tree::TreeEntryKind;
+        // Named runtime fields keep their hexdump-region colors.
+        assert_eq!(debug_tree_row_color("cookie[8]", TreeEntryKind::RawValue { offset: 0 }), Some(Color::Green));
+        assert_eq!(debug_tree_row_color("gc", TreeEntryKind::RawValue { offset: 88 }), Some(Color::Magenta));
+        // Every first-entry field item (Layout) shares one color, whatever its field name.
+        let layout = |off| TreeEntryKind::Layout { field_type: "", field_offset: off };
+        assert_eq!(debug_tree_row_color("ts_start", layout(0)), Some(Color::Blue));
+        assert_eq!(debug_tree_row_color("increment_size", layout(32)), Some(Color::Blue));
+        // Groups, derived rows, and unnamed raw values stay unshaded.
+        assert_eq!(debug_tree_row_color("young_entries (11)", TreeEntryKind::Derived), None);
+        assert_eq!(debug_tree_row_color("version", TreeEntryKind::RawValue { offset: 8 }), None);
     }
 
     #[test]
     fn build_lines_on_a_legacy_snapshot_skips_the_debug_offsets_section() {
         let data = legacy_data(true);
-        let (lines, _slot_idx) = build_lines(&data, [None; 3], [None; 3], 0, true, true, false);
+        let (lines, _entry_idx) = build_lines(&data, [None; 3], [None; 3], 0, true, true, false);
         let out = join_lines(&lines);
         // Pre-3.13 → no _Py_DebugOffsets section, straight to the legacy header + GC table.
         assert!(!out.contains("_Py_DebugOffsets (embedded"), "legacy must skip section 1: {out}");
         assert!(out.contains("pre-3.13: no _Py_DebugOffsets"), "{out}");
-        assert!(out.contains("Gen 0 (Young) - 1 slots"), "{out}");
+        assert!(out.contains("Gen 0 (Young) - 1 entries"), "{out}");
+    }
+
+    /// `render_snapshot` (the `tui --output` path) prepends the PID/version header the
+    /// interactive title bar normally supplies — absent from `build_lines` — then flattens
+    /// the styled frame to plain text. The body's box borders stay at the fixed frame width;
+    /// only the prepended header is shorter.
+    #[test]
+    fn render_snapshot_prepends_header_and_flattens_the_frame() {
+        let out = render_snapshot(&legacy_data(true), 0, true, true, false, false);
+        assert!(
+            out.lines().next().unwrap().contains("PID 4321")
+                && out.lines().next().unwrap().contains("0x030c0000"),
+            "first line must be the PID/version header: {out}"
+        );
+        // The flattened body still carries the GC section (proves build_lines ran + joined).
+        assert!(out.contains("Gen 0 (Young) - 1 entries"), "{out}");
+        // A full-width border appears and no line overflows the frame (header aside).
+        let border = format!("+{}+", "-".repeat(OUTER_W));
+        assert!(out.lines().any(|line| line == border), "a full-width border must appear");
+        assert!(
+            out.lines().all(|line| line.chars().count() <= OUTER_W + 2),
+            "a line exceeded the frame width"
+        );
     }
 
     // ── status_bar ────────────────────────────────────────────────
@@ -1734,36 +2241,38 @@ mod tests {
     fn render_status(
         scroll: u16,
         max_scroll: u16,
-        slot: usize,
-        slot_count: usize,
+        entry: usize,
+        entry_count: usize,
         glitch_active: bool,
         cl_active: bool,
         glitch_enabled: bool,
     ) -> String {
         let mut buf = Buffer::empty(Rect::new(0, 0, 220, 1));
-        status_bar(scroll, max_scroll, slot, slot_count, 100, glitch_active, cl_active, glitch_enabled, Duration::from_millis(1))
+        status_bar(scroll, max_scroll, entry, entry_count, glitch_active, cl_active, glitch_enabled)
             .render(buf.area, &mut buf);
         buf.content.iter().map(|c| c.symbol()).collect()
     }
 
     #[test]
-    fn status_bar_shows_slot_position_and_the_100_percent_sentinel_when_unscrollable() {
+    fn status_bar_shows_entry_position_and_the_100_percent_sentinel_when_unscrollable() {
         let out = render_status(0, 0, 0, 1, false, false, true);
         assert!(out.contains("[q] quit"), "{out}");
         assert!(out.contains("[p] pick pid"), "{out}");
-        assert!(out.contains("slot 1/1"), "{out}");
+        assert!(out.contains("entry 1/1"), "{out}");
         // max_scroll == 0 → checked_div is None → the "100%" branch.
         assert!(out.contains("100%"), "{out}");
-        assert!(out.contains("[g] on"), "glitch-enabled label: {out}");
+        assert!(out.contains("[g] gc-view"), "gc-view mode hint: {out}");
+        assert!(out.contains("glitch:on"), "glitch-enabled label: {out}");
     }
 
     #[test]
-    fn status_bar_reflects_no_slots_disabled_glitch_and_the_badges() {
-        assert!(render_status(0, 0, 0, 0, false, false, true).contains("no slots"));
-        assert!(render_status(0, 0, 0, 1, false, false, false).contains("[g] off"));
+    fn status_bar_reflects_no_entries_disabled_glitch_and_the_badges() {
+        assert!(render_status(0, 0, 0, 0, false, false, true).contains("no entries"));
+        assert!(render_status(0, 0, 0, 1, false, false, false).contains("glitch:off"));
         // Connection-lost outranks the ordinary glitch badge.
         assert!(render_status(0, 0, 0, 1, true, true, true).contains("[CL]"));
-        assert!(render_status(0, 0, 0, 1, true, false, true).contains("[G]"));
+        // The firing-glitch badge is `[FX]`, distinct from the `[G]` (mode) / `[G] glitch` keys.
+        assert!(render_status(0, 0, 0, 1, true, false, true).contains("[FX]"));
     }
 
     // ── Glitch effects (buffer-mutating) ──────────────────────────
@@ -1821,18 +2330,18 @@ mod tests {
     // input→state assertion with no terminal.
 
     #[test]
-    fn handle_key_moves_the_slot_selection_with_saturation() {
+    fn handle_key_moves_the_entry_selection_with_saturation() {
         let mut s = TuiState::new(100, false);
         assert_eq!(s.handle_key(KeyCode::Down), KeyOutcome::Continue);
-        assert_eq!(s.selected_slot, 1);
+        assert_eq!(s.selected_entry, 1);
         s.handle_key(KeyCode::Char('j'));
-        assert_eq!(s.selected_slot, 2);
+        assert_eq!(s.selected_entry, 2);
         s.handle_key(KeyCode::Up);
-        assert_eq!(s.selected_slot, 1);
+        assert_eq!(s.selected_entry, 1);
         // Saturates at 0 rather than underflowing.
         s.handle_key(KeyCode::Char('k'));
         s.handle_key(KeyCode::Char('k'));
-        assert_eq!(s.selected_slot, 0);
+        assert_eq!(s.selected_entry, 0);
     }
 
     #[test]
@@ -1845,6 +2354,15 @@ mod tests {
         assert!(!s.debug_offsets_show_hex);
         s.handle_key(KeyCode::Char('d'));
         assert!(s.show_runtime_hex);
+    }
+
+    #[test]
+    fn handle_key_s_requests_a_snapshot_dump_without_mutating_view_state() {
+        let mut s = TuiState::new(100, false);
+        let before = s.clone();
+        assert_eq!(s.handle_key(KeyCode::Char('s')), KeyOutcome::DumpSnapshot);
+        // The dump is pure I/O the loop performs; the key must not change the view.
+        assert_eq!(s, before);
     }
 
     #[test]
@@ -1890,8 +2408,20 @@ mod tests {
         assert_eq!(s.scroll, u16::MAX);
         s.handle_key(KeyCode::Home);
         assert_eq!(s.scroll, 0);
-        s.handle_key(KeyCode::Char('g'));
+        // Shift-`G` toggles the glitch effect (lower-case `g` is the view toggle below).
+        s.handle_key(KeyCode::Char('G'));
         assert!(!s.glitch_enabled);
+    }
+
+    #[test]
+    fn handle_key_g_toggles_the_gc_only_view_leaving_glitch_alone() {
+        let mut s = TuiState::new(100, true);
+        assert!(!s.gc_only, "full layout by default");
+        s.handle_key(KeyCode::Char('g'));
+        assert!(s.gc_only, "`g` switches to the GC-stats buffer view");
+        assert!(s.glitch_enabled, "`g` must not touch the glitch effect");
+        s.handle_key(KeyCode::Char('g'));
+        assert!(!s.gc_only, "`g` toggles back to the full layout");
     }
 
     #[test]
@@ -1909,12 +2439,12 @@ mod tests {
     fn reset_view_clears_the_view_but_keeps_rate_and_glitch() {
         let mut s = TuiState::new(250, true);
         s.scroll = 40;
-        s.selected_slot = 3;
+        s.selected_entry = 3;
         s.debug_offsets_show_tree = false;
         s.debug_offsets_show_hex = false;
         s.show_runtime_hex = true;
         s.reset_view();
-        assert_eq!((s.scroll, s.selected_slot), (0, 0));
+        assert_eq!((s.scroll, s.selected_entry), (0, 0));
         assert!(s.debug_offsets_show_tree && s.debug_offsets_show_hex && !s.show_runtime_hex);
         // rate_ms and glitch_enabled survive a re-pick, as the original loop did.
         assert_eq!(s.rate_ms, 250);
@@ -1922,16 +2452,16 @@ mod tests {
     }
 
     #[test]
-    fn clamp_slot_pulls_the_selection_into_range() {
+    fn clamp_entry_pulls_the_selection_into_range() {
         let mut s = TuiState::new(100, false);
-        s.selected_slot = 5;
-        s.clamp_slot(3);
-        assert_eq!(s.selected_slot, 2, "clamped to the last valid slot");
-        s.clamp_slot(0);
-        assert_eq!(s.selected_slot, 0, "no slots → index 0");
-        s.selected_slot = 1;
-        s.clamp_slot(4);
-        assert_eq!(s.selected_slot, 1, "an in-range selection is left alone");
+        s.selected_entry = 5;
+        s.clamp_entry(3);
+        assert_eq!(s.selected_entry, 2, "clamped to the last valid entry");
+        s.clamp_entry(0);
+        assert_eq!(s.selected_entry, 0, "no entries → index 0");
+        s.selected_entry = 1;
+        s.clamp_entry(4);
+        assert_eq!(s.selected_entry, 1, "an in-range selection is left alone");
     }
 
     // ── Tier B: glitch timer (GlitchState) ────────────────────────

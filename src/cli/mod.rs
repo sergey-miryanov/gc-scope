@@ -76,7 +76,7 @@ pub enum Command {
         #[arg(short = 'C', long)]
         no_cmdline: bool,
     },
-    /// Live TUI diagram of Python runtime memory layout
+    /// Full-screen TUI of Python runtime memory layout (or `--output` to dump a frame)
     Tui {
         /// PID (0 = show interactive process list)
         #[arg(allow_hyphen_values = true, default_value = "0")]
@@ -90,16 +90,9 @@ pub enum Command {
         /// Enable visual glitch effects
         #[arg(short, long)]
         glitch: bool,
-    },
-    /// Generate ASCII diagram of Python runtime memory layout (stdout)
-    Ascii {
-        #[arg(allow_hyphen_values = true)]
-        pid: i32,
-        /// Watch mode: continuously poll and redraw
-        #[arg(short, long)]
-        watch: bool,
-        /// Polling interval in milliseconds (default: 1000, requires --watch)
-        #[arg(short, long, default_value = "1000", requires = "watch")]
-        rate: u64,
+        /// Write a single static frame (plain text) to this file and exit, instead of
+        /// launching the interactive terminal UI. Requires an explicit PID.
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<String>,
     },
 }

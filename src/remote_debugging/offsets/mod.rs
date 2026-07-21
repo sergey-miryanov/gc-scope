@@ -51,7 +51,7 @@ const LAYOUTS: &[(u64, fn(u32, u64) -> Result<VersionedOffsets>)] = &[
 /// A candidate GC-stats layout for a version hex that has more than one compiled
 /// `gc_generation_stats` shape — e.g. a clean release and a GC-instrumented `+inc`
 /// build sharing a `PY_VERSION_HEX` and an identical `_Py_DebugOffsets` (so one nav
-/// variant serves both), differing only in the per-slot stats struct. The correct one
+/// variant serves both), differing only in the per-entry stats struct. The correct one
 /// is chosen at read-time by `select_gc_shape`.
 struct GcCandidate {
     kind: offset_table::GcStatsKind,
@@ -231,9 +231,9 @@ pub enum VersionedOffsets {
 /// Shape of a version's GC generation-stats region, as data.
 pub struct GcStatsShape {
     pub kind: offset_table::GcStatsKind,
-    /// Per-slot size in bytes; 0 when `kind` is `None`.
+    /// Per-entry size in bytes; 0 when `kind` is `None`.
     pub item_size: u64,
-    /// Per-slot field layout; `None` when unavailable (no readable stats).
+    /// Per-entry field layout; `None` when unavailable (no readable stats).
     pub layout: Option<&'static GcItemLayout>,
 }
 
@@ -254,7 +254,7 @@ pub trait DebugOffsetsView {
     fn gc_generation_stats(&self) -> u64;
     /// `gc.generation_stats_size` value offset (ring-buffer versions), else 0.
     fn gc_generation_stats_size(&self) -> u64;
-    /// The GC generation-stats region shape (kind + per-slot size + field layout).
+    /// The GC generation-stats region shape (kind + per-entry size + field layout).
     fn gc_stats_shape(&self) -> GcStatsShape;
     /// For `InlineArray` versions: byte offset of `generation_stats[]` within
     /// `_gc_runtime_state`. Version-specific and computed by `gen-offsets.py`
@@ -386,7 +386,7 @@ impl VersionedOffsets {
     }
 
     /// The `gc` sub-struct fields as `(name, absolute byte offset within
-    /// `_Py_DebugOffsets`)`, version-correct. Used to drive the diagram's GC-state
+    /// `_Py_DebugOffsets`)`, version-correct. Used to drive the TUI's GC-state
     /// subtree from actual layout instead of hardcoded offsets.
     ///
     /// The `gc` sub-struct is append-only across CPython versions (`size`@0,
@@ -483,7 +483,7 @@ impl VersionedOffsets {
 }
 
 /// Configure an `OffsetTable` for an inline-array GC stats layout (3.13.x, 3.14.4):
-/// one slot per generation, laid out contiguously at a fixed offset from the gc state.
+/// one entry per generation, laid out contiguously at a fixed offset from the gc state.
 fn set_inline(
     table: &mut offset_table::OffsetTable,
     item_size: u64,
@@ -493,20 +493,20 @@ fn set_inline(
     table.gc_stats_kind = offset_table::GcStatsKind::InlineArray;
     table.gc_layout = Some(layout);
     table.gc_item_size = Some(item_size);
-    table.gc_slots_per_gen = Some([1, 1, 1]);
+    table.gc_entries_per_gen = Some([1, 1, 1]);
     table.gc_gen_base_offsets = Some([0, item_size, 2 * item_size]);
     table.gc_stats_inline_off = inline_off;
     table.gc_stats_addr_is_per_interp = true;
 }
 
 /// Expected total `generation_stats_size` (ring byte-count) for a ring layout with the
-/// given per-slot `item_size` and free-threaded flag. Mirrors the geometry in `set_ring`
+/// given per-entry `item_size` and free-threaded flag. Mirrors the geometry in `set_ring`
 /// and the size guard in `gc_stats.rs`.
 fn expected_ring_size(item_size: u64, free_threaded: u64) -> u64 {
     let (young, old) = if free_threaded != 0 { (1u64, 1u64) } else { (11, 3) };
-    let slots = [young, old, old];
-    let bases = offset_table::compute_ring_base_offsets(item_size, &slots);
-    bases[2] + slots[2] * item_size + 8
+    let entries = [young, old, old];
+    let bases = offset_table::compute_ring_base_offsets(item_size, &entries);
+    bases[2] + entries[2] * item_size + 8
 }
 
 /// Pick the GC-stats shape for `hex` when more than one layout is compiled for it (a
@@ -531,7 +531,7 @@ fn select_gc_shape(hex: u64, reported: u64, free_threaded: u64, default: GcStats
 }
 
 /// Configure an `OffsetTable` for a ring-buffer GC stats layout (3.15.0a8+): per-generation
-/// rings whose slot counts depend on whether this is a free-threaded build.
+/// rings whose entry counts depend on whether this is a free-threaded build.
 fn set_ring(
     table: &mut offset_table::OffsetTable,
     item_size: u64,
@@ -539,12 +539,12 @@ fn set_ring(
     free_threaded: u64,
 ) {
     let (young, old) = if free_threaded != 0 { (1u64, 1u64) } else { (11, 3) };
-    let slots = [young, old, old];
-    let bases = offset_table::compute_ring_base_offsets(item_size, &slots);
+    let entries = [young, old, old];
+    let bases = offset_table::compute_ring_base_offsets(item_size, &entries);
     table.gc_stats_kind = offset_table::GcStatsKind::RingBuffer;
     table.gc_layout = Some(layout);
     table.gc_item_size = Some(item_size);
-    table.gc_slots_per_gen = Some(slots);
+    table.gc_entries_per_gen = Some(entries);
     table.gc_gen_base_offsets = Some(bases);
     table.gc_stats_addr_is_per_interp = true;
 }
@@ -573,15 +573,15 @@ impl VersionedOffsets {
             gc_layout: None,
             gc_stats_addr: None,
             gc_item_size: None,
-            gc_slots_per_gen: None,
+            gc_entries_per_gen: None,
             gc_gen_base_offsets: None,
             gc_stats_inline_off: 0,
             gc_stats_addr_is_per_interp: false,
         };
 
         // GC generation-stats geometry comes from each struct's `DebugOffsetsView`
-        // impl (generated per version) — kind, per-slot size, and field layout are
-        // data, keyed by version rather than struct byte-size. Only the ring slot
+        // impl (generated per version) — kind, per-entry size, and field layout are
+        // data, keyed by version rather than struct byte-size. Only the ring entry
         // counts (free-threaded vs GIL) are resolved here. A new version that forgets
         // its impl / `for_each_variant!` arm fails to COMPILE — it cannot panic here.
         // The nav variant's own shape is the default; when this hex has multiple
@@ -936,10 +936,10 @@ mod gc_shape_tests {
                 for ft in [0u64, 1] {
                     let mut table = pre_3_13::table_for_version(3, 12).unwrap();
                     set_ring(&mut table, c.item_size, c.layout, ft);
-                    let slots = table.gc_slots_per_gen.unwrap();
+                    let entries = table.gc_entries_per_gen.unwrap();
                     let bases = table.gc_gen_base_offsets.unwrap();
                     assert_eq!(
-                        bases[2] + slots[2] * c.item_size + 8,
+                        bases[2] + entries[2] * c.item_size + 8,
                         expected_ring_size(c.item_size, ft),
                         "ring geometry drifted (item_size={}, free_threaded={ft})",
                         c.item_size

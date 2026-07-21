@@ -10,11 +10,11 @@ The `GcStat` view (0007) and the package reorg (0008) raised the natural questio
 help or hurt performance, and should a benchmark lock that in?
 
 - **The refactor is roughly perf-neutral.** A smaller struct and lazy by-name decode help the
-  monitor's per-tick path; a per-slot `Vec` allocation and a by-name linear field scan offset
+  monitor's per-tick path; a per-entry `Vec` allocation and a by-name linear field scan offset
   them; none of it is on a hot path. There is no perf *win* to claim and nothing regressed —
   so the refactors are not sold as performance work.
 - **The only plausible scaling axis is the monitor/`run` loop** against a process tree with
-  tens of children (multiprocessing pools, workers) — not decode of a single slot, and not the
+  tens of children (multiprocessing pools, workers) — not decode of a single entry, and not the
   TUI. So if anything were benchmarked, that loop is the right scope.
 
 But a wall-clock benchmark of that loop is the wrong instrument:
@@ -33,7 +33,7 @@ But a wall-clock benchmark of that loop is the wrong instrument:
    The refactors are not presented as optimizations.
 2. **When regression protection is genuinely needed, guard *shape*, not wall-clock.** Express
    the loop's cost as **complexity invariants**: count attaches / memory-reads / allocations as
-   a function of (N PIDs × slots) and assert them — linear in PIDs, **one attach per PID reused
+   a function of (N PIDs × entries) and assert them — linear in PIDs, **one attach per PID reused
    across ticks** (no per-tick re-attach), no quadratic tree-diff or dedup. These invariants are
    stable across machines; a wall-clock number is not.
 3. **Threshold for adding any benchmark** — all three must hold: (1) a real scaling axis exists,

@@ -1,9 +1,9 @@
 use crate::remote_debugging::offsets::offset_table::GcItemLayout;
 
-/// One decoded GC generation-stats slot, as a lean **view** over the slot's raw bytes plus
+/// One decoded GC generation-stats entry, as a lean **view** over the entry's raw bytes plus
 /// the version's field layout — not a fixed struct enumerating every possible field.
 ///
-/// The set of fields a slot carries is a property of the build (a regular build has only the
+/// The set of fields a entry carries is a property of the build (a regular build has only the
 /// core counters; `+inc` and other custom builds add per-phase timestamps and sizes), so it
 /// lives in the `GcItemLayout` (name → offset), not in named struct fields. Consumers read
 /// fields by name through [`get`](Self::get)/[`iter_fields`](Self::iter_fields) (or the typed
@@ -11,47 +11,47 @@ use crate::remote_debugging::offsets::offset_table::GcItemLayout;
 /// Chrome exporter and the TUI right-side detail panel both use.
 pub struct GcStat {
     pub generation: u32,
-    pub slot: usize,
+    pub index: usize,
     pub interpreter_id: i64,
-    /// This slot's raw item bytes (`layout.item_size` long).
+    /// This entry's raw item bytes (`layout.item_size` long).
     bytes: Vec<u8>,
-    /// The version's per-slot field layout, mapping each field name to its byte offset.
+    /// The version's per-entry field layout, mapping each field name to its byte offset.
     layout: &'static GcItemLayout,
 }
 
 impl GcStat {
-    /// Wrap an owned slot-bytes buffer. Used by the decoder, which slices the region into
-    /// per-slot windows.
+    /// Wrap an owned entry-bytes buffer. Used by the decoder, which slices the region into
+    /// per-entry windows.
     pub fn new(
         generation: u32,
-        slot: usize,
+        index: usize,
         interpreter_id: i64,
         bytes: Vec<u8>,
         layout: &'static GcItemLayout,
     ) -> Self {
-        Self { generation, slot, interpreter_id, bytes, layout }
+        Self { generation, index, interpreter_id, bytes, layout }
     }
 
-    /// Wrap a borrowed slot-byte window (copies it). For consumers that already hold the raw
-    /// region — e.g. the diagram building a view over one selected slot.
-    pub fn from_slot(
+    /// Wrap a borrowed entry-byte window (copies it). For consumers that already hold the raw
+    /// region — e.g. the TUI building a view over one selected entry.
+    pub fn from_entry(
         bytes: &[u8],
         layout: &'static GcItemLayout,
         generation: u32,
-        slot: usize,
+        index: usize,
         interpreter_id: i64,
     ) -> Self {
-        Self::new(generation, slot, interpreter_id, bytes.to_vec(), layout)
+        Self::new(generation, index, interpreter_id, bytes.to_vec(), layout)
     }
 
-    /// The 8 little-endian bytes at `off` as a `u64`, or `None` if the slot is too short (a
+    /// The 8 little-endian bytes at `off` as a `u64`, or `None` if the entry is too short (a
     /// plausible teardown race — never panics, unlike a raw slice+`unwrap`).
     fn raw_at(&self, off: usize) -> Option<u64> {
         self.bytes.get(off..off + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
     }
 
     /// The `i64` value of `name`, or `None` if this build's layout lacks the field (or the
-    /// slot is short). `None` — not `Some(0)` — is what marks a field genuinely absent.
+    /// entry is short). `None` — not `Some(0)` — is what marks a field genuinely absent.
     pub fn get(&self, name: &str) -> Option<i64> {
         self.raw_at(self.layout.field_offset(name)?).map(|v| v as i64)
     }
@@ -66,8 +66,8 @@ impl GcStat {
         self.layout.has_field(name)
     }
 
-    /// Every field the layout defines, in layout order, as `(name, offset-within-slot, raw u64
-    /// bits)`. The offset feeds the diagram's hex-highlight; the caller formats the bits by
+    /// Every field the layout defines, in layout order, as `(name, offset-within-entry, raw u64
+    /// bits)`. The offset feeds the TUI's hex-highlight; the caller formats the bits by
     /// name (`duration` via `f64::from_bits`, `ts_*` as timestamps, large values as hex).
     pub fn iter_fields(&self) -> impl Iterator<Item = (&'static str, usize, u64)> + '_ {
         self.layout
@@ -95,7 +95,7 @@ impl GcStat {
     /// asserts a decoded duration, so this stays `i64`-only for simplicity.
     pub fn from_fields(
         generation: u32,
-        slot: usize,
+        index: usize,
         interpreter_id: i64,
         layout: &'static GcItemLayout,
         fields: &[(&str, i64)],
@@ -106,12 +106,12 @@ impl GcStat {
                 bytes[off..off + 8].copy_from_slice(&val.to_le_bytes());
             }
         }
-        Self::new(generation, slot, interpreter_id, bytes, layout)
+        Self::new(generation, index, interpreter_id, bytes, layout)
     }
 }
 
-/// Whether any slot comes from an extended (`+inc`) build. `increment_size` (and the rest of
-/// the `+inc` set) is present in the layout only on such builds, so its presence in ANY slot
+/// Whether any entry comes from an extended (`+inc`) build. `increment_size` (and the rest of
+/// the `+inc` set) is present in the layout only on such builds, so its presence in ANY entry
 /// selects `print_stats`' wider column set. Pulled out of `print_stats` so the column-selection
 /// decision is unit-testable without capturing stdout.
 fn has_extended(stats: &[GcStat]) -> bool {
@@ -124,7 +124,7 @@ fn format_header(has_extended: bool) -> String {
     if has_extended {
         format!(
             "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
-            "generation", "Slot", "IntID",
+            "generation", "Entry", "IntID",
             "Collections", "Collected", "Uncollect.", "Candidates",
             "HeapSize", "Duration",
             "IncrSize", "AliveSize", "Finalized", "ClearWKRef",
@@ -133,7 +133,7 @@ fn format_header(has_extended: bool) -> String {
     } else {
         format!(
             "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10}",
-            "generation", "Slot", "IntID",
+            "generation", "Entry", "IntID",
             "Collections", "Collected", "Uncollect.", "Candidates",
             "HeapSize", "Duration"
         )
@@ -141,14 +141,14 @@ fn format_header(has_extended: bool) -> String {
 }
 
 /// Format one stats row. On the extended path the six `+inc` columns are appended, each read
-/// with a zero fallback so a slot missing one (an absent field or a torn read) prints `0`
+/// with a zero fallback so a entry missing one (an absent field or a torn read) prints `0`
 /// rather than dropping a column and misaligning the whole table. Pure — returns the line — so
 /// the extended column layout and its fallbacks are unit-testable without capturing stdout.
 fn format_row(s: &GcStat, has_extended: bool) -> String {
     if has_extended {
         format!(
             "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10.6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
-            s.generation, s.slot, s.interpreter_id,
+            s.generation, s.index, s.interpreter_id,
             s.collections(), s.collected(), s.uncollectable(),
             s.candidates(), s.heap_size(), s.duration(),
             s.get("increment_size").unwrap_or(0),
@@ -161,7 +161,7 @@ fn format_row(s: &GcStat, has_extended: bool) -> String {
     } else {
         format!(
             "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10.6}",
-            s.generation, s.slot, s.interpreter_id,
+            s.generation, s.index, s.interpreter_id,
             s.collections(), s.collected(), s.uncollectable(),
             s.candidates(), s.heap_size(), s.duration(),
         )
@@ -191,11 +191,11 @@ mod tests {
     use crate::remote_debugging::offsets::offset_table::seq_layout;
     use std::sync::LazyLock;
 
-    /// A standard build's slot layout — core counters only, no `+inc` extras.
+    /// A standard build's entry layout — core counters only, no `+inc` extras.
     static REGULAR: LazyLock<&'static GcItemLayout> =
         LazyLock::new(|| seq_layout(&["ts_start", "collections", "collected"]));
 
-    /// An extended (`+inc`) build's slot layout — the core counters plus the `increment_size`
+    /// An extended (`+inc`) build's entry layout — the core counters plus the `increment_size`
     /// set that `print_stats` widens its columns for. Exactly the field names `print_stats`
     /// reads on the extended path.
     static EXTENDED: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
@@ -215,12 +215,12 @@ mod tests {
         ])
     });
 
-    /// A view over a standard-set slot must report the extended fields as genuinely absent:
+    /// A view over a standard-set entry must report the extended fields as genuinely absent:
     /// `get` returns `None` (never `Some(0)` or a read past the field list), `has` is false,
     /// and `iter_fields` yields exactly the layout's own fields — the view can't fabricate a
     /// field the build doesn't have.
     #[test]
-    fn reading_extra_fields_from_a_standard_slot_returns_none() {
+    fn reading_extra_fields_from_a_standard_entry_returns_none() {
         let s = GcStat::from_fields(0, 0, 1, *REGULAR, &[("ts_start", 100), ("collections", 5)]);
 
         // Present fields decode normally.
@@ -240,26 +240,26 @@ mod tests {
     }
 
     /// `print_stats` selects its wide `+inc` column set from `has_extended`, which fires when
-    /// ANY slot carries `increment_size`. A slice mixing a core-only slot with one extended
-    /// slot still counts as extended; an all-core (or empty) slice does not.
+    /// ANY entry carries `increment_size`. A slice mixing a core-only entry with one extended
+    /// entry still counts as extended; an all-core (or empty) slice does not.
     #[test]
-    fn has_extended_is_true_when_any_slot_carries_increment_size() {
+    fn has_extended_is_true_when_any_entry_carries_increment_size() {
         let core = GcStat::from_fields(0, 0, 1, *REGULAR, &[("collections", 1)]);
         let ext = GcStat::from_fields(0, 0, 1, *EXTENDED, &[("increment_size", 1)]);
 
         assert!(!has_extended(&[]), "empty slice is not extended");
         assert!(!has_extended(std::slice::from_ref(&core)), "core-only is not extended");
-        assert!(has_extended(std::slice::from_ref(&ext)), "an extended slot is extended");
-        // A mixed slice is extended as soon as one slot has the field.
+        assert!(has_extended(std::slice::from_ref(&ext)), "an extended entry is extended");
+        // A mixed slice is extended as soon as one entry has the field.
         let core2 = GcStat::from_fields(0, 0, 1, *REGULAR, &[("collections", 2)]);
         let ext2 = GcStat::from_fields(0, 0, 1, *EXTENDED, &[("increment_size", 2)]);
         assert!(has_extended(&[core, ext, core2, ext2]));
     }
 
-    /// `iter_fields` is the diagram's hex-highlight feed, so it yields the full `(name,
+    /// `iter_fields` is the TUI's hex-highlight feed, so it yields the full `(name,
     /// offset, raw u64 bits)` tuple — not just the name the other tests check. The offset is
-    /// the field's byte position within the slot, and the bits are the exact little-endian
-    /// contents: raw, NOT sign-interpreted the way `get` reads them (a `-1` slot reads back as
+    /// the field's byte position within the entry, and the bits are the exact little-endian
+    /// contents: raw, NOT sign-interpreted the way `get` reads them (a `-1` entry reads back as
     /// `u64::MAX` here but `Some(-1)` through `get`).
     #[test]
     fn iter_fields_yields_name_offset_and_raw_bits() {
@@ -286,18 +286,18 @@ mod tests {
         assert_eq!(s.get("collections"), Some(-1));
     }
 
-    /// A slot shorter than the layout (a teardown-race truncation) makes `iter_fields` skip
+    /// A entry shorter than the layout (a teardown-race truncation) makes `iter_fields` skip
     /// the fields that would read past the end: `raw_at` returns `None` and the `filter_map`
     /// drops them, rather than panicking on an out-of-range slice.
     #[test]
-    fn iter_fields_skips_fields_past_a_truncated_slot() {
+    fn iter_fields_skips_fields_past_a_truncated_entry() {
         // REGULAR wants 24 bytes (fields at 0, 8, 16); give it only 16 so `collected`
         // (offset 16, needs bytes 16..24) can't be read.
         let s = GcStat::new(0, 0, 1, vec![0u8; 16], *REGULAR);
 
         let names: Vec<&str> = s.iter_fields().map(|(n, _, _)| n).collect();
         assert_eq!(names, ["ts_start", "collections"]);
-        // The dropped field reads back `None` through `get` too — a short slot never panics.
+        // The dropped field reads back `None` through `get` too — a short entry never panics.
         assert_eq!(s.get("collected"), None);
     }
 
@@ -325,11 +325,11 @@ mod tests {
     }
 
     /// The extended print path reads each `+inc` field by name via `get`. A view over an
-    /// extended slot must decode every one of them (not fall back to zero the way a core-only
+    /// extended entry must decode every one of them (not fall back to zero the way a core-only
     /// layout does), while the always-present core stays readable and `iter_fields` yields the
     /// full extended set in layout order.
     #[test]
-    fn an_extended_slot_decodes_its_plus_inc_fields() {
+    fn an_extended_entry_decodes_its_plus_inc_fields() {
         let s = GcStat::from_fields(
             0,
             0,
@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(s.get("deleted_garbage_count"), Some(5));
         assert_eq!(s.get("ts_mark_alive_start"), Some(999));
 
-        // The core accessors still work on the same slot.
+        // The core accessors still work on the same entry.
         assert_eq!(s.collections(), 7);
 
         // `iter_fields` yields the full extended layout, in order.
@@ -381,7 +381,7 @@ mod tests {
     }
 
     /// The extended row (the `+inc` print path) must place all 15 columns —
-    /// generation/slot/intid, the six core counters, then the six `+inc` fields — in order.
+    /// generation/entry/intid, the six core counters, then the six `+inc` fields — in order.
     /// A wrong order or a dropped `.unwrap_or` would silently print a value under the wrong
     /// header; splitting the row on whitespace pins the exact column contents.
     #[test]
@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(
             cols,
             [
-                "0", "1", "2", // generation, slot, interpreter_id
+                "0", "1", "2", // generation, entry, interpreter_id
                 "7", "8", "9", "10", "11", // collections..heap_size
                 "0.000000", // duration (from_fields can't set an f64; stays 0.0)
                 "100", "200", "3", "4", "5", "999", // the six +inc columns, in order
@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(cols.len(), format_header(true).split_whitespace().count());
     }
 
-    /// On the extended path a slot whose layout is missing an `+inc` field (a torn read, or a
+    /// On the extended path a entry whose layout is missing an `+inc` field (a torn read, or a
     /// partially-extended build) must still print that column as `0` via `.unwrap_or(0)` — the
     /// column stays present so the table never misaligns.
     #[test]

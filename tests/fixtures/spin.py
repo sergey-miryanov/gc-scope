@@ -47,7 +47,7 @@ def main():
     # reader sees a strict collections[0] > [1] > [2] pyramid no matter how
     # quickly it attaches. That asymmetry is load-bearing: it is what lets a
     # checker tell the three generations apart, and so catch a decode whose base
-    # offsets alias one generation onto another's slot (right shape, wrong data).
+    # offsets alias one generation onto another's entry (right shape, wrong data).
     # An equal rotation would make those two cases indistinguishable.
     for generation, rounds in ((0, GEN_SEED_ROUNDS), (1, 5), (2, 1)):
         for _ in range(rounds):

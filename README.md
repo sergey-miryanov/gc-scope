@@ -71,7 +71,7 @@ All pre-3.13 versions (3.8–3.12) use hardcoded tables in `pre_3_13.rs`.
 ### Builds that share a version hex (multi-candidate GC layout)
 
 A clean release and a GC-instrumented `+inc` build can share a `PY_VERSION_HEX` and an
-identical `_Py_DebugOffsets`, differing only in the per-slot `gc_generation_stats` struct.
+identical `_Py_DebugOffsets`, differing only in the per-entry `gc_generation_stats` struct.
 For those, `GC_CANDIDATES` (in `offsets/mod.rs`) registers each candidate GC layout for the
 hex, and `select_gc_shape` picks the right one at read-time by the process-published
 `generation_stats_size` (total ring bytes). Candidates for one hex must have distinct ring

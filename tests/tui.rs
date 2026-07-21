@@ -1,5 +1,5 @@
-//! Live coverage for the diagram collect→render pipeline. The pure pieces
-//! (`parse_gc_slots`, the rate/avg summaries, the tree model, the Legacy ASCII
+//! Live coverage for the TUI collect→render pipeline. The pure pieces
+//! (`parse_gc_entries`, the rate/avg summaries, the tree model, the Legacy snapshot
 //! render) are unit-tested in-crate; this exercises `collect_data` against a real
 //! interpreter and renders the **3.13+ (Full) tier** the synthetic Legacy unit test
 //! can't reach.
@@ -11,22 +11,20 @@ mod common;
 
 use common::{pid_alive, python_version, test_python, SpawnedPython};
 
-use gcscope::snapshot::collect::{
-    self, avg_collection_time_per_gen, collections_rate_from_slots, CollectRequest,
-};
-use gcscope::diagram::ascii;
+use gcscope::snapshot::collect::{self, CollectRequest};
+use gcscope::tui::render_snapshot;
 use gcscope::snapshot::poller::SnapshotPoller;
 use gcscope::remote_debugging::session::PySession;
 
 /// `collect_data` gathers a coherent snapshot from a live interpreter, and
-/// `render_ascii` turns it into a diagram without panicking. On 3.13+ the snapshot
-/// carries the `_Py_DebugOffsets` struct, so the Full-tier render path runs and the
-/// header names it (vs. the pre-3.13 "no _Py_DebugOffsets" note).
+/// `render_snapshot` turns it into a static TUI frame (the `tui --output` path) without
+/// panicking. On 3.13+ the snapshot carries the `_Py_DebugOffsets` struct, so the Full-tier
+/// render path runs and names it (vs. the pre-3.13 "no _Py_DebugOffsets" note).
 #[test]
 #[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
-fn collect_and_render_ascii_on_a_live_interpreter() {
+fn collect_and_render_snapshot_on_a_live_interpreter() {
     let Some(python) = test_python() else {
-        eprintln!("SKIP collect_and_render_ascii_on_a_live_interpreter: no Python found");
+        eprintln!("SKIP collect_and_render_snapshot_on_a_live_interpreter: no Python found");
         return;
     };
     let proc = SpawnedPython::spawn(&python).expect("spin.py should reach READY");
@@ -40,10 +38,7 @@ fn collect_and_render_ascii_on_a_live_interpreter() {
     assert_ne!(data.runtime_addr, 0, "_PyRuntime address must be non-zero");
     assert_ne!(data.interpreter.addr, 0, "interpreter head address must be non-zero");
 
-    let stats = &data.interpreter.gc.generation_stats;
-    let rate = collections_rate_from_slots(&stats.slots, stats.has_timestamps);
-    let avg = avg_collection_time_per_gen(&stats.slots, stats.has_duration);
-    let out = ascii::render_ascii(&data, rate, avg);
+    let out = render_snapshot(&data, 0, true, true, false, false);
 
     assert!(out.contains(&format!("PID {pid}")), "header must name the PID:\n{out}");
     // The frame stays within its fixed width even on the wider Full-tier panels.
@@ -61,7 +56,7 @@ fn collect_and_render_ascii_on_a_live_interpreter() {
     }
 }
 
-/// `SnapshotPoller` is the single-PID producer both the TUI and `ascii --watch` sit on. It
+/// `SnapshotPoller` is the single-PID producer the TUI and its `--output` snapshot sit on. It
 /// polls a healthy interpreter, and once that interpreter exits its next `poll` runs the
 /// revalidate ladder's `Dead` arm and surfaces a contextualized error — the resilience the
 /// snapshot loops inherit from the monitor. Exercised here without a terminal, which the
@@ -130,7 +125,7 @@ fn collect_request_skips_only_the_unrequested_layers() {
         "gc sub-struct layer must be skipped"
     );
     assert!(
-        !lean.interpreter.gc.generation_stats.slots.is_empty(),
+        !lean.interpreter.gc.generation_stats.entries.is_empty(),
         "the requested gc-stats layer must still be decoded"
     );
 
@@ -141,20 +136,17 @@ fn collect_request_skips_only_the_unrequested_layers() {
         !full.interpreter.gc.raw_bytes.is_empty(),
         "all must fill the gc sub-struct layer"
     );
-    assert!(!full.interpreter.gc.generation_stats.slots.is_empty());
+    assert!(!full.interpreter.gc.generation_stats.entries.is_empty());
 }
 
 /// The TUI body's **Full-tier** section builders (`section_debug_offsets`,
 /// `section_interpreter`) only run against a real 3.13+ `_Py_DebugOffsets` struct, so the
-/// synthetic-Legacy unit tests in `tui_v2.rs` can't reach them. This drives them over a
-/// live snapshot through the `test-hooks` seam and checks the frame is coherent across the
-/// tree/hex toggles. Gated on `test-hooks`, matching the CI integration-coverage leg.
-#[cfg(feature = "test-hooks")]
+/// synthetic-Legacy unit tests in `frame.rs` can't reach them. This drives them over a
+/// live snapshot through `render_snapshot` and checks the frame is coherent across the
+/// tree/hex toggles.
 #[test]
 #[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
 fn tui_frame_renders_the_full_tier_sections_on_a_live_interpreter() {
-    use gcscope::diagram::tui_v2::render_frame_for_test;
-
     let Some(python) = test_python() else {
         eprintln!("SKIP tui_frame_renders_the_full_tier_sections_on_a_live_interpreter: no Python found");
         return;
@@ -169,9 +161,8 @@ fn tui_frame_renders_the_full_tier_sections_on_a_live_interpreter() {
     // Exercise the toggle combinations the loop can drive: full tree+hex, both collapsed,
     // and the runtime-hex view. None may panic and all must produce a non-empty frame.
     for (tree, hex, rt_hex) in [(true, true, false), (false, false, false), (true, true, true)] {
-        let lines = render_frame_for_test(&data, 0, tree, hex, rt_hex);
-        assert!(!lines.is_empty(), "frame must have content for ({tree},{hex},{rt_hex})");
-        let out = lines.join("\n");
+        let out = render_snapshot(&data, 0, tree, hex, rt_hex, false);
+        assert!(!out.is_empty(), "frame must have content for ({tree},{hex},{rt_hex})");
         assert!(out.contains("GC Generation Stats"), "GC section must render:\n{out}");
         if is_3_13_plus {
             assert!(
@@ -180,4 +171,8 @@ fn tui_frame_renders_the_full_tier_sections_on_a_live_interpreter() {
             );
         }
     }
+
+    // The GC-stats-only buffer view (`g`) renders on the same live snapshot for every tier.
+    let gc_view = render_snapshot(&data, 0, true, true, false, true);
+    assert!(gc_view.contains("GC Stats Buffer View"), "buffer view must render:\n{gc_view}");
 }

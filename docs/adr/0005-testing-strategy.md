@@ -32,12 +32,12 @@ A layered gate, each layer matched to what it can actually prove:
    (pure, takes `&[u8]`) and `monitor::select_fresh`. Runs in <1s with no Python; catches
    logic regressions, never offset errors.
 2. **Live-smoke matrix — the correctness gate.** For each `(OS, version)` it spawns a real
-   interpreter, attaches, decodes, and asserts **shape**: the expected `(kind, slots)`
+   interpreter, attaches, decodes, and asserts **shape**: the expected `(kind, entries)`
    derived from the target's own `sys.version_info` + GIL flag, the exact
-   `(generation, slot)` index set, and a strict `collections` pyramid across generations.
+   `(generation, entry)` index set, and a strict `collections` pyramid across generations.
    The shared fixture (`tests/fixtures/spin.py`) seeds collections **20/5/1** so the
    generations are tellable apart — an even rotation would make a correct decode and one
-   that aliases two generations onto the same slots indistinguishable. Shape, not
+   that aliases two generations onto the same entries indistinguishable. Shape, not
    "non-empty", is the whole point. `setup-python` supplies 3.8–3.15 + 3.15t; source-built
    legs supply the rest (see [ADR 0006](0006-layout-registration-integrity.md)).
 3. **Lifecycle tests** (`tests/lifecycle.rs`, `#[ignore]`d, run in a permissioned CI leg)
