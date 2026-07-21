@@ -160,3 +160,35 @@ where
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_wait_policy_continues_only_while_ok() {
+        let mut p = NoWaitPolicy;
+        assert!(p.wait(PollStatus::Ok));
+        assert!(!p.wait(PollStatus::InvalidProcess));
+    }
+
+    #[test]
+    fn startup_timeout_retries_invalid_until_the_first_ok() {
+        // A generous window: before any successful read, an invalid process is retried
+        // rather than dropped (it may just not be ready yet).
+        let mut p = StartupTimeoutPolicy::new(Duration::from_secs(3600));
+        assert!(p.wait(PollStatus::InvalidProcess), "retry while inside the startup window");
+        // The first Ok marks the process alive and keeps polling.
+        assert!(p.wait(PollStatus::Ok));
+        // After a success, an invalid process gives up at once — no more grace period.
+        assert!(!p.wait(PollStatus::InvalidProcess), "post-startup failure stops immediately");
+    }
+
+    #[test]
+    fn startup_timeout_gives_up_once_the_window_has_elapsed() {
+        // A zero-length window: `elapsed() < ZERO` is never true, so a process that has
+        // never been seen alive is abandoned on the very first invalid poll.
+        let mut p = StartupTimeoutPolicy::new(Duration::ZERO);
+        assert!(!p.wait(PollStatus::InvalidProcess));
+    }
+}

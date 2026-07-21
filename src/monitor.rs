@@ -85,6 +85,10 @@ impl<'a> MonitorContext<'a> {
                         // A different program holds this PID now: drop the stale
                         // session AND its freshness marks so the next tick
                         // re-attaches from scratch and dedups against a clean slate.
+                        // NOTE: this is the one poll branch with no automated test — it
+                        // needs a *different* program to reuse the exact same PID between
+                        // ticks, which can't be reproduced deterministically. The Fresh,
+                        // Dead, and give-up paths are covered in tests/monitor.rs.
                         self.sessions.remove(&pid);
                         self.seen.remove(&pid);
                         return self.on_invalid(pid);
