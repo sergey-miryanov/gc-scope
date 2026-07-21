@@ -467,8 +467,6 @@ impl PySession {
         } else {
             0
         };
-        // Global GC: the interpreter address is irrelevant, so `head_addr` is only a
-        // placeholder here — `gc_state_addr` resolves to `runtime_addr + runtime_gc`.
         let gc_addr = table.gc_state_addr(self.runtime_addr, head_addr);
         let mut global_table = table.clone();
         global_table.gc_stats_addr = self.gc_stats_region_addr(gc_addr)?;
@@ -494,10 +492,7 @@ impl PySession {
         let mut first = true;
         while current != 0 {
             let iid = self.read_i64(current + id_off)?;
-            let gc_addr = table.gc_state_addr(self.runtime_addr, current); // this interpreter's `_gc_runtime_state`
-
-            // Resolve this interpreter's stats address by its region shape (single source of
-            // truth — the diagram collector resolves through the same path).
+            let gc_addr = table.gc_state_addr(self.runtime_addr, current);
             if let Some(addr) = self.gc_stats_region_addr(gc_addr)? {
                 let mut interp_table = table.clone();
                 interp_table.gc_stats_addr = Some(addr);

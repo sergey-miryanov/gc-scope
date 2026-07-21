@@ -128,9 +128,6 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
         .context("Failed to read interpreters_head pointer")?;
 
     let gc_offset = offset_table.interp_gc.unwrap_or(0);
-    // Absolute address of `_gc_runtime_state` (global in `_PyRuntime` for 3.8, per-interpreter
-    // otherwise) — resolved by the shared reader-layer helper so the monitor and the diagram
-    // agree. Without it, 3.8 would read stats at `interpreter + 0x80` (garbage).
     let gc_addr = offset_table.gc_state_addr(runtime_addr, head_addr);
     // Exact `gc` sub-struct span on 3.13+; on Legacy synthesize the inline stats region
     // (only used for the section-2 hexdump, which Legacy skips).
@@ -146,16 +143,13 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
         .read(head_addr, 256)
         .context("Failed to read interpreter state start")?;
 
-    // Read GC sub-struct at its actual location (`gc_addr`, which handles 3.8's global GC)
     let gc_raw = session
         .read(gc_addr, gc_size as usize)
         .context("Failed to read GC state")?;
 
-    // Address resolution (inline offset vs. ring-pointer deref, incl. NULL handling) is the
-    // reader layer's job — the single path the monitor also uses — so a fix there reaches
-    // both. The diagram only decides how many bytes to pull for its raw hexdump: the exact
-    // inline span, or the process-reported ring region size (which includes the trailing
-    // per-generation cursors the decoder skips).
+    // How many raw bytes to pull for the hexdump differs by kind: the exact inline span, or
+    // the process-reported ring size (which includes the trailing per-generation cursors the
+    // decoder skips).
     let item_size = offset_table.gc_item_size.unwrap_or(0) as usize;
     let slots_per_gen = offset_table.gc_slots_per_gen.unwrap_or([0, 0, 0]);
     let stats_addr = session.gc_stats_region_addr(gc_addr)?.unwrap_or(0);
