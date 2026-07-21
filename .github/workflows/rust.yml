@@ -33,33 +33,15 @@ jobs:
         run: cargo test --verbose
 
       # Separate instrumented run so a coverage-tool failure isn't mistaken for a test
-      # failure and the gate keeps running an uninstrumented binary. RUSTFLAGS is step-scoped.
+      # failure and the gate keeps running an uninstrumented binary. Non-blocking.
       - name: Coverage (unit tests)
         continue-on-error: true
-        shell: bash
-        env:
-          RUSTFLAGS: -Cinstrument-coverage
-          LLVM_PROFILE_FILE: ${{ github.workspace }}/target/profraw/gcscope-%p-%m.profraw
-        run: |
-          cargo test --quiet
-          grcov target/profraw \
-            --binary-path target/debug \
-            -s . -t lcov --branch --ignore-not-existing \
-            --ignore '../*' --ignore '/*' --ignore 'C:/Users/*' \
-            -o lcov.info
-          echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
-
-      - name: Upload coverage to Codecov
-        continue-on-error: true
-        uses: codecov/codecov-action@v5
+        uses: ./.github/actions/coverage-report
         with:
-          files: lcov.info
+          test-cmd: cargo test --quiet
           flags: unit,${{ matrix.os }}
           name: unit-${{ matrix.os }}
-          # Explicit path; searching the tree would also pick up stale local reports.
-          disable_search: true
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
 
       # Non-blocking until the existing warning/format baseline is cleaned up.
       - name: Clippy (non-blocking)
@@ -266,29 +248,12 @@ jobs:
       # Non-blocking so a coverage-tool failure can't fail the gate above.
       - name: Coverage (integration tests)
         continue-on-error: true
-        shell: bash
-        env:
-          RUSTFLAGS: -Cinstrument-coverage
-          LLVM_PROFILE_FILE: ${{ github.workspace }}/target/profraw/gcscope-%p-%m.profraw
-        run: |
-          cargo test --features test-hooks --tests -- --ignored
-          grcov target/profraw \
-            --binary-path target/debug \
-            -s . -t lcov --branch --ignore-not-existing \
-            --ignore '../*' --ignore '/*' --ignore 'C:/Users/*' \
-            -o lcov.info
-          echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
-
-      - name: Upload coverage to Codecov
-        continue-on-error: true
-        uses: codecov/codecov-action@v5
+        uses: ./.github/actions/coverage-report
         with:
-          files: lcov.info
+          test-cmd: cargo test --features test-hooks --tests -- --ignored
           flags: integration,ubuntu-latest
           name: integration-ubuntu-latest
-          disable_search: true
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
 
   # grcov (not cargo-llvm-cov): `-s .` emits repo-relative paths so Windows uploads merge
   # with Linux/macOS instead of double-counting under absolute paths.
@@ -356,25 +321,12 @@ jobs:
         continue-on-error: true
         run: sudo chown -R "$(whoami)" target/profraw || true
 
-      - name: Generate lcov
+      # Profraw was already emitted by the smoke run above (job-level RUSTFLAGS), so
+      # no test-cmd here — just grcov + upload.
+      - name: Generate and upload coverage
         continue-on-error: true
-        shell: bash
-        run: |
-          # --ignore drops registry sources so only this crate's files reach the report.
-          grcov target/profraw \
-            --binary-path target/debug \
-            -s . -t lcov --branch --ignore-not-existing \
-            --ignore '../*' --ignore '/*' --ignore 'C:/Users/*' \
-            -o lcov.info
-          echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
-
-      - name: Upload coverage to Codecov
-        continue-on-error: true
-        uses: codecov/codecov-action@v5
+        uses: ./.github/actions/coverage-report
         with:
-          files: lcov.info
           flags: smoke,${{ matrix.os }}
           name: smoke-${{ matrix.os }}-py${{ matrix.python }}
-          disable_search: true
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
