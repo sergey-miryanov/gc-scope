@@ -79,6 +79,12 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         .unwrap_or(12345);
     let mut glitch = GlitchState::new(Instant::now());
 
+    // `s` requests a frame dump, but the current `data` isn't polled until below, so the
+    // key sets a flag the loop acts on once the frame exists. `dump_note` carries the
+    // result into the header title (writing to stderr would corrupt the alt-screen).
+    let mut pending_dump = false;
+    let mut dump_note: Option<String> = None;
+
     let result = loop {
         if event::poll(Duration::from_millis(state.rate_ms))?
             && let Event::Key(key) = event::read()?
@@ -86,6 +92,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         {
             match state.handle_key(key.code) {
                 KeyOutcome::Quit => break Ok(()),
+                KeyOutcome::DumpSnapshot => pending_dump = true,
                 KeyOutcome::PickPid => {
                     if let Ok((processes, pid_info_map)) = crate::list_pids::list_python_processes()
                         && let Ok(Some(new_pid)) = super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map)
@@ -120,6 +127,18 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         // Clamp selected_slot to valid range based on new data
         let slot_count = data.interpreter.gc.generation_stats.slots.len();
         state.clamp_slot(slot_count);
+
+        // Act on a pending `s` dump now that this frame's `data` exists. Overwrites
+        // `<pid>.txt` in the working directory with the current view.
+        if pending_dump {
+            pending_dump = false;
+            let path = format!("{}.txt", poller.pid());
+            let frame = render_snapshot(&data, state.selected_slot, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex);
+            dump_note = Some(match std::fs::write(&path, frame) {
+                Ok(()) => format!(" — Saved {path}"),
+                Err(e) => format!(" — Save failed: {e}"),
+            });
+        }
 
         let elapsed = start.elapsed();
         frame += 1;
@@ -165,6 +184,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         let rate_ms = state.rate_ms;
         let selected_slot = state.selected_slot;
         let glitch_enabled = state.glitch_enabled;
+        let dump_note_str = dump_note.as_deref().unwrap_or("");
         let mut scroll = state.scroll;
         terminal.draw(|f| {
             let area = f.size();
@@ -181,13 +201,14 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
             }
 
             let title = format!(
-                " gcscope tui — PID {} — Frame {} @ {:.1}s — Rate {}ms — Poll {}{} ",
+                " gcscope tui — PID {} — Frame {} @ {:.1}s — Rate {}ms — Poll {}{}{} ",
                 pid,
                 frame,
                 elapsed.as_secs_f64(),
                 rate_ms,
                 fmt_duration_ns(data.collect_duration),
-                duration_secs.map_or(String::new(), |d| format!(" — Dur {d}s"))
+                duration_secs.map_or(String::new(), |d| format!(" — Dur {d}s")),
+                dump_note_str
             );
             let content = Paragraph::new(Text::from(styled_lines))
                 .block(Block::bordered().border_type(BorderType::Plain).title(title))
@@ -226,13 +247,15 @@ struct TuiState {
     glitch_enabled: bool,
 }
 
-/// What a key press asks the render loop to do. `PickPid` and `Quit` are the two outcomes
-/// that need terminal/session I/O, which the loop owns — the reducer stays pure.
+/// What a key press asks the render loop to do. `PickPid`, `Quit`, and `DumpSnapshot` are
+/// the outcomes that need terminal/session/file I/O, which the loop owns — the reducer
+/// stays pure.
 #[derive(Debug, PartialEq, Eq)]
 enum KeyOutcome {
     Continue,
     Quit,
     PickPid,
+    DumpSnapshot,
 }
 
 impl TuiState {
@@ -289,6 +312,7 @@ impl TuiState {
             KeyCode::Char('r') => self.rate_ms = self.rate_ms.saturating_sub(10).max(10),
             KeyCode::Char('R') => self.rate_ms = self.rate_ms.saturating_add(10),
             KeyCode::Char('g') => self.glitch_enabled = !self.glitch_enabled,
+            KeyCode::Char('s') => return KeyOutcome::DumpSnapshot,
             KeyCode::Char('p') => return KeyOutcome::PickPid,
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
@@ -431,6 +455,7 @@ fn status_bar(scroll: u16, max_scroll: u16, slot: usize, slot_count: usize, glit
     let glitch_style = if glitch_enabled { style } else { style.bg(Color::DarkGray) };
     let text = Line::from(vec![
         Span::styled(" [q] quit ", style.bg(Color::DarkGray)),
+        Span::styled(" [s] save ", style),
         Span::styled(" [p] pick pid ", style),
         Span::styled(" [t] tree [h] hex [o] collapse [d] Dbg/Rt", style),
         Span::styled(" [r/R] rate", style),
@@ -1876,6 +1901,15 @@ mod tests {
         assert!(!s.debug_offsets_show_hex);
         s.handle_key(KeyCode::Char('d'));
         assert!(s.show_runtime_hex);
+    }
+
+    #[test]
+    fn handle_key_s_requests_a_snapshot_dump_without_mutating_view_state() {
+        let mut s = TuiState::new(100, false);
+        let before = s.clone();
+        assert_eq!(s.handle_key(KeyCode::Char('s')), KeyOutcome::DumpSnapshot);
+        // The dump is pure I/O the loop performs; the key must not change the view.
+        assert_eq!(s, before);
     }
 
     #[test]
