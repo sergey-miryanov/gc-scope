@@ -12,7 +12,7 @@ use ratatui::Terminal;
 
 use crate::remote_debugging::gc_stats::GcStat;
 use crate::snapshot::collect::{
-    avg_collection_time_per_gen, collections_rate_from_slots, CollectRequest, CollectedData,
+    avg_collection_time_per_gen, collections_rate_from_slots, CollectRequest, CollectedData, GcSlot,
 };
 use crate::snapshot::poller::SnapshotPoller;
 use super::tree::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
@@ -171,7 +171,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
             avg_collection_time_per_gen(slots, stats.has_duration),
         );
         let styled_lines = if state.gc_only {
-            build_gc_only_lines(&data, state.selected_slot)
+            build_gc_only_lines(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_slot)
         } else {
             build_lines(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_slot, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex).0
         };
@@ -1114,15 +1114,8 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
 
     // ── Left panel ──
     let mut left: Vec<String> = Vec::new();
-    let gen_names = [
-        (format!("Gen 0 (Young) - {} slots", slots_per_gen[0]), rate_per_gen[0], avg_coll_time_per_gen[0]),
-        (format!("Gen 1 (Middle) - {} slots", slots_per_gen[1]), rate_per_gen[1], avg_coll_time_per_gen[1]),
-        (format!("Gen 2 (Oldest) - {} slots", slots_per_gen[2]), rate_per_gen[2], avg_coll_time_per_gen[2]),
-    ];
-    for (name, rate, avg_coll) in &gen_names {
-        let rate_str = match rate { Some(r) => fmt_rate(*r), None => "n/a".to_string() };
-        let coll_str = match avg_coll { Some(d) => fmt_duration(*d), None => "n/a".to_string() };
-        left.push(format!("{:<pl$}", format!("{}  (rate = {}, avg coll = {})", name, rate_str, coll_str), pl = PL));
+    for line in gen_summary_lines(slots_per_gen, rate_per_gen, avg_coll_time_per_gen) {
+        left.push(format!("{:<pl$}", line, pl = PL));
     }
     left.push(format!(
         "{:<pl$}",
@@ -1130,31 +1123,18 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
         pl = PL
     ));
     left.push(format!("{:<pl$}", "", pl = PL));
-    let hdr = format!(
-        "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11}",
-        "gen", "slot", "collections", "collected", "heap", "duration(s)"
-    );
+    let hdr = slot_table_header();
     let hdr_len = hdr.len();
     left.push(format!("{:<pl$}", hdr, pl = PL));
     left.push(format!("  {}", "-".repeat(hdr_len - 2)));
 
     for slot in &gc.slots {
-        let gen_label = format!("{}", slot.generation);
-        let heap = fmt_bytes(slot.heap_size as u64);
-        left.push(format!(
-            "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11.3}",
-            gen_label, slot.slot, slot.collections, slot.collected, heap, slot.duration
-        ));
+        left.push(slot_table_row(slot));
     }
 
     // ── Right panel ──
     let slot = &gc.slots[selected_slot];
-    // Clamp the start too: if the raw stats buffer wasn't collected (empty) while `slots`
-    // was, `byte_offset` can exceed the buffer, which would make `start > end` and panic.
-    // Clamping yields an empty slice instead — the hex panel simply renders nothing.
-    let slot_raw_start = slot.byte_offset.min(gc.raw_stats_bytes.len());
-    let slot_raw_end = (slot_raw_start + item_size).min(gc.raw_stats_bytes.len());
-    let slot_bytes = &gc.raw_stats_bytes[slot_raw_start..slot_raw_end];
+    let slot_bytes = selected_slot_bytes(&gc.raw_stats_bytes, slot.byte_offset, item_size);
     let display_bytes = slot_bytes.len();
     // Decode this slot's fields through the shared `GcStat` primitive — the same by-name/offset
     // path the Chrome exporter uses — instead of re-reading the raw bytes inline here.
@@ -1171,16 +1151,9 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
     ))]);
 
     // Hex dump of selected slot bytes, highlighting each present, colored field at its real
-    // per-version offset (from `slot_fields`). Deriving from the actual layout keeps the
-    // 3.13/3.14 inline slots (collections@0, collected@8) from being painted at the ring
-    // offsets (16/24). Fields without a color entry (uncollectable, candidates, the `+inc`
-    // extras) are left unhighlighted, as before.
-    let adjusted_highlights: Vec<(usize, u8, Color)> = slot_view.iter()
-        .flat_map(|v| v.iter_fields())
-        .filter_map(|(name, off, _)| {
-            slot_field_color(name).map(|c| (off + slot.byte_offset, 8u8, c))
-        })
-        .collect();
+    // per-version offset. Deriving from the actual layout keeps the 3.13/3.14 inline slots
+    // (collections@0, collected@8) from being painted at the ring offsets (16/24).
+    let adjusted_highlights = field_highlights(&slot_view, slot.byte_offset);
     let hex_rows = hex_dump_rows(slot_bytes, display_bytes, &adjusted_highlights, slot.byte_offset);
     for hr in &hex_rows {
         right_items.push(padding_hex_right(hr.clone()));
@@ -1206,16 +1179,7 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
     let name_w = slot_fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(15);
 
     for (name, offset, valbits) in slot_view.iter().flat_map(|v| v.iter_fields()) {
-        let val_fmt = if name == "duration" {
-            format!("{:.6}", f64::from_bits(valbits))
-        } else if name.starts_with("ts_") {
-            fmt_thousands(valbits)
-        } else if valbits > 0xFFFF_FFFF {
-            format!("{:#x}", valbits)
-        } else {
-            format!("{}", valbits)
-        };
-
+        let val_fmt = format_field_value(name, valbits);
         let content = format!("  {:<name_w$} @ +{:<4}  {}", name, offset, val_fmt, name_w = name_w);
         let color = slot_field_color(name);
 
@@ -1276,6 +1240,77 @@ fn slot_field_color(name: &str) -> Option<Color> {
     }
 }
 
+// ── Shared GC-stats rendering helpers ─────────────────────────────
+// The full view (`section_gc_stats`) and the buffer view (`build_gc_only_lines`) lay their
+// panels out differently but decode and format the same bytes; these keep that shared logic in
+// one place so the two can't drift.
+
+/// The per-generation summary lines — slot count, collections rate, avg collection duration —
+/// with `n/a` where the layout lacks the field. Unpadded; each view pads/wraps to its own width.
+fn gen_summary_lines(
+    slots_per_gen: [u64; 3],
+    rate_per_gen: [Option<f64>; 3],
+    avg_coll_time_per_gen: [Option<f64>; 3],
+) -> [String; 3] {
+    const LABELS: [&str; 3] = ["Gen 0 (Young)", "Gen 1 (Middle)", "Gen 2 (Oldest)"];
+    std::array::from_fn(|g| {
+        let rate = match rate_per_gen[g] { Some(r) => fmt_rate(r), None => "n/a".to_string() };
+        let coll = match avg_coll_time_per_gen[g] { Some(d) => fmt_duration(d), None => "n/a".to_string() };
+        format!("{} - {} slots  (rate = {}, avg coll = {})", LABELS[g], slots_per_gen[g], rate, coll)
+    })
+}
+
+/// The slot-table column header shared by both views' left tables.
+fn slot_table_header() -> String {
+    format!(
+        "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11}",
+        "gen", "slot", "collections", "collected", "heap", "duration(s)"
+    )
+}
+
+/// One row of the slot table — same columns as [`slot_table_header`].
+fn slot_table_row(slot: &GcSlot) -> String {
+    format!(
+        "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11.3}",
+        slot.generation, slot.slot, slot.collections, slot.collected,
+        fmt_bytes(slot.heap_size as u64), slot.duration
+    )
+}
+
+/// One slot's window into the raw stats buffer, clamped so a short/absent buffer yields an
+/// empty slice instead of an out-of-range panic (`byte_offset + item_size` can exceed the
+/// collected bytes when a request skipped the raw payload).
+fn selected_slot_bytes(raw: &[u8], byte_offset: usize, item_size: usize) -> &[u8] {
+    let start = byte_offset.min(raw.len());
+    let end = (start + item_size).min(raw.len());
+    &raw[start..end]
+}
+
+/// Format one decoded field value for display: `duration` as seconds, `ts_*` grouped by
+/// thousands, values above `u32::MAX` as hex, everything else decimal.
+fn format_field_value(name: &str, valbits: u64) -> String {
+    if name == "duration" {
+        format!("{:.6}", f64::from_bits(valbits))
+    } else if name.starts_with("ts_") {
+        fmt_thousands(valbits)
+    } else if valbits > 0xFFFF_FFFF {
+        format!("{:#x}", valbits)
+    } else {
+        format!("{}", valbits)
+    }
+}
+
+/// Hex-dump highlights for a decoded slot's colored fields, each 8 bytes at its real
+/// per-version offset (shifted by the slot's `byte_offset` into the buffer). Fields without a
+/// color (uncollectable, candidates, the `+inc` extras) are left unhighlighted.
+fn field_highlights(slot_view: &Option<GcStat>, byte_offset: usize) -> Vec<(usize, u8, Color)> {
+    slot_view
+        .iter()
+        .flat_map(|v| v.iter_fields())
+        .filter_map(|(name, off, _)| slot_field_color(name).map(|c| (off + byte_offset, 8u8, c)))
+        .collect()
+}
+
 /// The byte offset of each generation's ring index in the raw buffer. CPython stores an `i8`
 /// (plus 7 bytes of padding) right *after* each generation's slots — per
 /// `compute_ring_base_offsets`, generation `g`'s slots start at `bases[g]`, so its index sits
@@ -1305,7 +1340,12 @@ fn ring_index_offsets(
 /// slot number change in place. Reuses the two-column box, the hex renderer, and
 /// `slot_field_color` from the full view; the one difference from `section_gc_stats` is that
 /// the hexdump spans the entire buffer, not one slot.
-fn build_gc_only_lines(data: &CollectedData, selected_slot: usize) -> Vec<Line<'static>> {
+fn build_gc_only_lines(
+    data: &CollectedData,
+    rate_per_gen: [Option<f64>; 3],
+    avg_coll_time_per_gen: [Option<f64>; 3],
+    selected_slot: usize,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let gc = &data.interpreter.gc.generation_stats;
 
@@ -1335,6 +1375,10 @@ fn build_gc_only_lines(data: &CollectedData, selected_slot: usize) -> Vec<Line<'
         "Buffer @ {:#x}  (size: {} bytes, slot: {} bytes)",
         gc.stats_addr, gc.stats_size, item_size
     ))]);
+    // Per-generation summary — slot count, collections rate, and avg collection duration.
+    for line in gen_summary_lines(gc.slots_per_gen, rate_per_gen, avg_coll_time_per_gen) {
+        left.push(vec![Span::raw(line)]);
+    }
     if !index_offsets.is_empty() {
         left.push(vec![
             Span::raw("legend: ".to_string()),
@@ -1344,21 +1388,13 @@ fn build_gc_only_lines(data: &CollectedData, selected_slot: usize) -> Vec<Line<'
     }
     left.push(vec![Span::raw(String::new())]);
 
-    // Slot table (top) — one row per slot, the selected row shaded. Same columns/format as the
-    // full view's left table so the two read identically.
-    let hdr = format!(
-        "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11}",
-        "gen", "slot", "collections", "collected", "heap", "duration(s)"
-    );
+    // Slot table (top) — one row per slot, the selected row shaded.
+    let hdr = slot_table_header();
     let hdr_len = hdr.len();
     left.push(vec![Span::raw(hdr)]);
     left.push(vec![Span::raw(format!("  {}", "-".repeat(hdr_len - 2)))]);
     for (i, slot) in gc.slots.iter().enumerate() {
-        let heap = fmt_bytes(slot.heap_size as u64);
-        let content = format!(
-            "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11.3}",
-            slot.generation, slot.slot, slot.collections, slot.collected, heap, slot.duration
-        );
+        let content = slot_table_row(slot);
         if i == selected {
             left.push(vec![Span::styled(
                 format!("{:<pl$}", content, pl = GC_PL),
@@ -1370,11 +1406,8 @@ fn build_gc_only_lines(data: &CollectedData, selected_slot: usize) -> Vec<Line<'
     }
 
     // Slot table (bottom) — the selected slot decoded field→value, each colored field shaded
-    // to match the hexdump. Clamp the slice: an uncollected raw buffer leaves `slots` populated
-    // but `raw_stats_bytes` empty, so `byte_offset + item_size` can exceed it.
-    let slot_raw_start = sel.byte_offset.min(gc.raw_stats_bytes.len());
-    let slot_raw_end = (slot_raw_start + item_size).min(gc.raw_stats_bytes.len());
-    let slot_bytes = &gc.raw_stats_bytes[slot_raw_start..slot_raw_end];
+    // to match the hexdump.
+    let slot_bytes = selected_slot_bytes(&gc.raw_stats_bytes, sel.byte_offset, item_size);
     let slot_view = offset_table
         .gc_layout
         .map(|l| GcStat::from_slot(slot_bytes, l, sel.generation, sel.slot, 0));
@@ -1386,15 +1419,7 @@ fn build_gc_only_lines(data: &CollectedData, selected_slot: usize) -> Vec<Line<'
     ))]);
     let name_w = slot_fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(12);
     for (name, offset, valbits) in slot_view.iter().flat_map(|v| v.iter_fields()) {
-        let val_fmt = if name == "duration" {
-            format!("{:.6}", f64::from_bits(valbits))
-        } else if name.starts_with("ts_") {
-            fmt_thousands(valbits)
-        } else if valbits > 0xFFFF_FFFF {
-            format!("{:#x}", valbits)
-        } else {
-            format!("{}", valbits)
-        };
+        let val_fmt = format_field_value(name, valbits);
         let content = format!("  {:<name_w$} @ +{:<4}  {}", name, offset, val_fmt, name_w = name_w);
         match slot_field_color(name) {
             Some(c) => left.push(vec![Span::styled(
@@ -1411,11 +1436,7 @@ fn build_gc_only_lines(data: &CollectedData, selected_slot: usize) -> Vec<Line<'
     // index in Red. The index gaps never overlap a slot, so their order relative to the slot
     // shades doesn't matter. `item_size` is small (24 inline, the ring-struct size otherwise)
     // but capped to the `u8` highlight length.
-    let mut highlights: Vec<(usize, u8, Color)> = slot_view
-        .iter()
-        .flat_map(|v| v.iter_fields())
-        .filter_map(|(name, off, _)| slot_field_color(name).map(|c| (off + sel.byte_offset, 8u8, c)))
-        .collect();
+    let mut highlights = field_highlights(&slot_view, sel.byte_offset);
     highlights.push((sel.byte_offset, item_size.min(255) as u8, Color::DarkGray));
     // The index is an `i8` followed by 7 bytes of padding; shade the whole 8-byte field so it
     // reads as one anchor block between generations.
@@ -1522,7 +1543,7 @@ pub fn render_snapshot(
     let rate = collections_rate_from_slots(&stats.slots, stats.has_timestamps);
     let avg = avg_collection_time_per_gen(&stats.slots, stats.has_duration);
     let lines = if gc_only {
-        build_gc_only_lines(data, selected_slot)
+        build_gc_only_lines(data, rate, avg, selected_slot)
     } else {
         build_lines(data, rate, avg, selected_slot, show_tree, show_hex, show_runtime_hex).0
     };
@@ -2042,7 +2063,7 @@ mod tests {
     #[test]
     fn build_gc_only_lines_shows_the_slot_table_field_list_and_whole_buffer_hexdump() {
         let data = legacy_data(true);
-        let lines = build_gc_only_lines(&data, 0);
+        let lines = build_gc_only_lines(&data, [None; 3], [None; 3], 0);
         let out = join_lines(&lines);
         assert!(out.contains("GC Stats Buffer View"), "mode header: {out}");
         assert!(out.contains("Buffer @ 0x7000"), "buffer address line: {out}");
@@ -2064,14 +2085,14 @@ mod tests {
     #[test]
     fn build_gc_only_lines_reports_absent_stats_and_never_panics_on_an_empty_buffer() {
         // No slots → the not-available short-circuit.
-        let out = join_lines(&build_gc_only_lines(&legacy_data(false), 0));
+        let out = join_lines(&build_gc_only_lines(&legacy_data(false), [None; 3], [None; 3], 0));
         assert!(out.contains("GC Generation Stats: not available"), "{out}");
         // Slots but an empty raw buffer with a past-the-end offset must clamp, not panic.
         let mut data = legacy_data(true);
         let stats = &mut data.interpreter.gc.generation_stats;
         stats.raw_stats_bytes = Vec::new();
         stats.slots[0].byte_offset = 48;
-        let out = join_lines(&build_gc_only_lines(&data, 0));
+        let out = join_lines(&build_gc_only_lines(&data, [None; 3], [None; 3], 0));
         assert!(out.contains("Slot #1 (gen 0, slot 0)"), "{out}");
     }
 
@@ -2120,10 +2141,15 @@ mod tests {
 
     #[test]
     fn build_gc_only_lines_on_a_ring_highlights_every_index_byte_and_shows_the_legend() {
-        let lines = build_gc_only_lines(&ring_data(), 0);
+        let lines = build_gc_only_lines(&ring_data(), [Some(15.0), None, None], [None; 3], 0);
+
+        // The per-generation summary header renders (slot counts + rate/avg, "n/a" where absent).
+        let text = join_lines(&lines);
+        assert!(text.contains("Gen 0 (Young) - 11 slots  (rate = 15.0/s, avg coll = n/a)"), "summary: {text}");
+        assert!(text.contains("Gen 2 (Oldest) - 3 slots"), "gen-2 summary: {text}");
 
         // The legend appears (ring builds only) with a Red swatch.
-        assert!(join_lines(&lines).contains("per-generation ring index"), "legend text missing");
+        assert!(text.contains("per-generation ring index"), "legend text missing");
         assert!(
             lines.iter().flat_map(|l| &l.spans)
                 .any(|s| s.style.bg == Some(Color::Red) && s.content.trim() == "idx"),
@@ -2143,7 +2169,7 @@ mod tests {
 
     #[test]
     fn build_gc_only_lines_on_an_inline_build_has_no_index_highlight_or_legend() {
-        let lines = build_gc_only_lines(&legacy_data(true), 0);
+        let lines = build_gc_only_lines(&legacy_data(true), [None; 3], [None; 3], 0);
         assert!(!join_lines(&lines).contains("ring index"), "inline/legacy must show no legend");
         assert!(
             !lines.iter().flat_map(|l| &l.spans).any(|s| s.style.bg == Some(Color::Red)),
