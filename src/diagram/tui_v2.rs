@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Terminal;
 
 use crate::remote_debugging::collect::{avg_collection_time_per_gen, collections_rate_from_slots, CollectedData};
-use super::poller::SnapshotPoller;
+use crate::remote_debugging::poller::SnapshotPoller;
 use super::render::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
 use crate::remote_debugging::offsets::VersionedOffsets;
 

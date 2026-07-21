@@ -7,7 +7,7 @@ use crate::remote_debugging::session::{PySession, Revalidated};
 
 /// Per-process polling context.
 ///
-/// The multi-PID sibling of [`crate::diagram::poller::SnapshotPoller`]: where that owns one
+/// The multi-PID sibling of [`crate::remote_debugging::poller::SnapshotPoller`]: where that owns one
 /// session and *returns* a full snapshot, this owns a `HashMap<u32, PySession>` and *emits*
 /// deduped event deltas into an `EventsExporter`. Both share the same `Fresh/Changed/Dead`
 /// revalidate ladder (see [`poll`](Self::poll)).

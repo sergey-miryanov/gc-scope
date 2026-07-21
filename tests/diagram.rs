@@ -15,7 +15,7 @@ use gcscope::remote_debugging::collect::{
     self, avg_collection_time_per_gen, collections_rate_from_slots,
 };
 use gcscope::diagram::ascii;
-use gcscope::diagram::poller::SnapshotPoller;
+use gcscope::remote_debugging::poller::SnapshotPoller;
 use gcscope::remote_debugging::session::PySession;
 
 /// `collect_data` gathers a coherent snapshot from a live interpreter, and

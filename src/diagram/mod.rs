@@ -1,13 +1,12 @@
 pub mod ascii;
 pub mod pid_dialog;
-pub mod poller;
 pub mod render;
 pub mod tui_v2;
 
 use anyhow::Result;
 
 use crate::remote_debugging::collect::{avg_collection_time_per_gen, collections_rate_from_slots};
-use poller::SnapshotPoller;
+use crate::remote_debugging::poller::SnapshotPoller;
 
 fn fmt_duration_ns(d: std::time::Duration) -> String {
     let ns = d.as_nanos() as f64;
