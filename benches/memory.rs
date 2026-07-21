@@ -21,12 +21,23 @@ fn classify_inputs() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
+/// `classify` is only a handful of byte reads and a match, so a single call is
+/// far shorter than the fixed per-measurement overhead of the harness. That
+/// makes a one-call benchmark dominated by noise and prone to large *relative*
+/// swings (e.g. when the CI runner CPU changes). Repeating the call inside the
+/// measured closure makes the real work dominate, so the measurement is stable.
+const CLASSIFY_ITERS: usize = 1024;
+
 fn bench_classify(c: &mut Criterion) {
     let inputs = classify_inputs();
     let mut group = c.benchmark_group("classify");
     for (name, bytes) in &inputs {
         group.bench_function(*name, |b| {
-            b.iter(|| classify(black_box(bytes.as_slice())));
+            b.iter(|| {
+                for _ in 0..CLASSIFY_ITERS {
+                    black_box(classify(black_box(bytes.as_slice())));
+                }
+            });
         });
     }
     group.finish();
