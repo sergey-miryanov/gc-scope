@@ -18,6 +18,11 @@ ignore:
   # Interactive ratatui screens; nothing headless reaches them.
   - "src/diagram/tui_v2.rs"
   - "src/diagram/pid_dialog.rs"
+  # Integration-test harnesses. Coverage of test scaffolding is not a useful signal —
+  # e.g. the `SKIP … no interpreter found` guards in the live suites never run on CI, so
+  # they'd read as permanently-uncovered patch lines. The product code these tests exercise
+  # is still credited against its own `src/…` files.
+  - "tests/"
 
 flag_management:
   default_rules:
