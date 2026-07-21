@@ -9,12 +9,13 @@
 
 mod common;
 
-use common::{python_version, test_python, SpawnedPython};
+use common::{pid_alive, python_version, test_python, SpawnedPython};
 
 use gcscope::diagram::collect::{
     self, avg_collection_time_per_gen, collections_rate_from_slots,
 };
 use gcscope::diagram::ascii;
+use gcscope::diagram::poller::SnapshotPoller;
 use gcscope::remote_debugging::session::PySession;
 
 /// `collect_data` gathers a coherent snapshot from a live interpreter, and
@@ -57,6 +58,46 @@ fn collect_and_render_ascii_on_a_live_interpreter() {
             "the 3.13+ header must name _Py_DebugOffsets:\n{out}"
         );
     }
+}
+
+/// `SnapshotPoller` is the single-PID producer both the TUI and `ascii --watch` sit on. It
+/// polls a healthy interpreter, and once that interpreter exits its next `poll` runs the
+/// revalidate ladder's `Dead` arm and surfaces a contextualized error — the resilience the
+/// snapshot loops inherit from the monitor. Exercised here without a terminal, which the
+/// interactive TUI loop can't offer.
+#[test]
+#[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
+fn poller_errors_after_the_target_process_exits() {
+    use std::time::Duration;
+
+    let Some(python) = test_python() else {
+        eprintln!("SKIP poller_errors_after_the_target_process_exits: no Python found");
+        return;
+    };
+    let mut proc = SpawnedPython::spawn(&python).expect("spin.py should reach READY");
+    let pid = proc.pid();
+
+    let mut poller = SnapshotPoller::attach(pid).expect("attach to the live interpreter");
+    poller.poll().expect("a healthy interpreter must poll Ok");
+
+    // Kill the interpreter and wait until the OS has really reaped it, so the next poll
+    // genuinely fails against a gone process rather than racing a live one.
+    proc.kill();
+    for _ in 0..100 {
+        if !pid_alive(pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!pid_alive(pid), "the interpreter must be gone before the next poll");
+
+    let err = poller
+        .poll()
+        .expect_err("a poll against an exited process must surface an error");
+    assert!(
+        err.to_string().contains("gone"),
+        "the Dead-arm error must name the gone process: {err}"
+    );
 }
 
 /// The TUI body's **Full-tier** section builders (`section_debug_offsets`,

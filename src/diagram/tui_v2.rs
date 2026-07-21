@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Terminal;
 
 use super::collect::{avg_collection_time_per_gen, collections_rate_from_slots, CollectedData};
+use super::poller::SnapshotPoller;
 use super::render::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
 use crate::remote_debugging::offsets::VersionedOffsets;
 
@@ -47,7 +48,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
     terminal.hide_cursor()?;
 
     // PID selection dialog if no PID given
-    let mut pid = match pid {
+    let initial_pid = match pid {
         Some(p) => p,
         None => {
             let (processes, pid_info_map) = crate::list_pids::list_python_processes()?;
@@ -58,7 +59,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         }
     };
 
-    let mut session = crate::remote_debugging::session::PySession::attach(pid)?;
+    let mut poller = SnapshotPoller::attach(initial_pid)?;
     let mut start = Instant::now();
     let mut frame: u64 = 0;
 
@@ -85,11 +86,11 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
                 KeyOutcome::PickPid => {
                     if let Ok((processes, pid_info_map)) = crate::list_pids::list_python_processes()
                         && let Ok(Some(new_pid)) = super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map)
-                        && let Ok(new_session) = crate::remote_debugging::session::PySession::attach(new_pid)
+                        && poller.retarget(new_pid).is_ok()
                     {
-                        // Commit the switch only once it fully resolves.
-                        session = new_session;
-                        pid = new_pid;
+                        // `retarget` swaps the session in only on a successful attach, so a
+                        // failed re-pick leaves the old session live; commit the view reset
+                        // only once it fully resolves.
                         start = Instant::now();
                         frame = 0;
                         state.reset_view();
@@ -99,7 +100,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
             }
         }
 
-        let data = match crate::diagram::collect::collect_data(&session) {
+        let data = match poller.poll() {
             Ok(d) => d,
             Err(e) => {
                 terminal.draw(|f| {
@@ -155,7 +156,9 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         let (cl_active, cl_jx, cl_jy) = (glitch.cl_active, glitch.cl_jx, glitch.cl_jy);
 
         // Copy the view scalars the render closure reads; `scroll` is taken mutably so the
-        // closure can clamp it, then written back below.
+        // closure can clamp it, then written back below. `pid` is re-read from the poller
+        // each frame so a mid-loop pick-pid retarget is reflected in the title.
+        let pid = poller.pid();
         let rate_ms = state.rate_ms;
         let selected_slot = state.selected_slot;
         let glitch_enabled = state.glitch_enabled;

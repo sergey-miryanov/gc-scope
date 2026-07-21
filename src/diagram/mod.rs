@@ -1,13 +1,14 @@
 pub mod ascii;
 pub mod collect;
 pub mod pid_dialog;
+pub mod poller;
 pub mod render;
 pub mod tui_v2;
 
 use anyhow::Result;
 
 use collect::{avg_collection_time_per_gen, collections_rate_from_slots};
-use crate::remote_debugging::session::PySession;
+use poller::SnapshotPoller;
 
 fn fmt_duration_ns(d: std::time::Duration) -> String {
     let ns = d.as_nanos() as f64;
@@ -21,8 +22,8 @@ fn fmt_duration_ns(d: std::time::Duration) -> String {
 }
 
 pub fn run_ascii(pid: u32) -> Result<()> {
-    let session = PySession::attach(pid)?;
-    let data = collect::collect_data(&session)?;
+    let mut poller = SnapshotPoller::attach(pid)?;
+    let data = poller.poll()?;
     let stats = &data.interpreter.gc.generation_stats;
     let slots = &stats.slots;
     let (rate_per_gen, avg_coll_time_per_gen) = (
@@ -45,7 +46,7 @@ pub fn run_ascii_watch(pid: u32, rate_ms: u64) -> Result<()> {
         r.store(false, Ordering::SeqCst);
     })?;
 
-    let session = PySession::attach(pid)?;
+    let mut poller = SnapshotPoller::attach(pid)?;
     let mut out = std::io::stdout().lock();
     let start = Instant::now();
 
@@ -56,7 +57,7 @@ pub fn run_ascii_watch(pid: u32, rate_ms: u64) -> Result<()> {
     let mut frame: u64 = 0;
     let result = loop {
         let elapsed = start.elapsed();
-        let data = match collect::collect_data(&session) {
+        let data = match poller.poll() {
             Ok(d) => d,
             Err(e) => break Err(e),
         };
