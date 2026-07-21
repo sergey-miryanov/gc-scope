@@ -18,12 +18,15 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
         with:
+          toolchain: stable
           components: clippy, rustfmt, llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@grcov
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: grcov  # pinned SHA: the ref no longer selects the tool
 
       - name: Build
         run: cargo build --verbose
@@ -33,33 +36,15 @@ jobs:
         run: cargo test --verbose
 
       # Separate instrumented run so a coverage-tool failure isn't mistaken for a test
-      # failure and the gate keeps running an uninstrumented binary. RUSTFLAGS is step-scoped.
+      # failure and the gate keeps running an uninstrumented binary. Non-blocking.
       - name: Coverage (unit tests)
         continue-on-error: true
-        shell: bash
-        env:
-          RUSTFLAGS: -Cinstrument-coverage
-          LLVM_PROFILE_FILE: ${{ github.workspace }}/target/profraw/gcscope-%p-%m.profraw
-        run: |
-          cargo test --quiet
-          grcov target/profraw \
-            --binary-path target/debug \
-            -s . -t lcov --branch --ignore-not-existing \
-            --ignore '../*' --ignore '/*' --ignore 'C:/Users/*' \
-            -o lcov.info
-          echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
-
-      - name: Upload coverage to Codecov
-        continue-on-error: true
-        uses: codecov/codecov-action@v5
+        uses: ./.github/actions/coverage-report
         with:
-          files: lcov.info
+          test-cmd: cargo test --quiet
           flags: unit,${{ matrix.os }}
           name: unit-${{ matrix.os }}
-          # Explicit path; searching the tree would also pick up stale local reports.
-          disable_search: true
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
 
       # Non-blocking until the existing warning/format baseline is cleaned up.
       - name: Clippy (non-blocking)
@@ -94,10 +79,12 @@ jobs:
           - { python: '3.11', macos_needs_root: 'yes' }
           - { python: '3.12', macos_needs_root: 'yes' }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: ${{ matrix.python }}
           # Required for the beta-only 3.15.
@@ -177,9 +164,11 @@ jobs:
             provenance_file: 'src/remote_debugging/offsets/v_3_16_0a0.rs'
             expect_extended: 'no'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # Resolve to an exact commit (empty ref → read the pin from provenance_file). The
       # cache key is that commit, so a moving branch re-keys and a pinned SHA stays a hit.
@@ -200,7 +189,7 @@ jobs:
 
       - name: Cache built interpreter
         id: cache-py
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: ~/cpython-build
           key: cpython-${{ matrix.label }}-${{ steps.rev.outputs.sha }}
@@ -242,14 +231,17 @@ jobs:
     name: integration tests (attach)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
         with:
+          toolchain: stable
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@grcov
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: grcov  # pinned SHA: the ref no longer selects the tool
       # Guarantees an interpreter, so the tests run rather than skip (a false green).
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: '3.13'
 
@@ -266,29 +258,12 @@ jobs:
       # Non-blocking so a coverage-tool failure can't fail the gate above.
       - name: Coverage (integration tests)
         continue-on-error: true
-        shell: bash
-        env:
-          RUSTFLAGS: -Cinstrument-coverage
-          LLVM_PROFILE_FILE: ${{ github.workspace }}/target/profraw/gcscope-%p-%m.profraw
-        run: |
-          cargo test --features test-hooks --tests -- --ignored
-          grcov target/profraw \
-            --binary-path target/debug \
-            -s . -t lcov --branch --ignore-not-existing \
-            --ignore '../*' --ignore '/*' --ignore 'C:/Users/*' \
-            -o lcov.info
-          echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
-
-      - name: Upload coverage to Codecov
-        continue-on-error: true
-        uses: codecov/codecov-action@v5
+        uses: ./.github/actions/coverage-report
         with:
-          files: lcov.info
+          test-cmd: cargo test --features test-hooks --tests -- --ignored
           flags: integration,ubuntu-latest
           name: integration-ubuntu-latest
-          disable_search: true
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
 
   # grcov (not cargo-llvm-cov): `-s .` emits repo-relative paths so Windows uploads merge
   # with Linux/macOS instead of double-counting under absolute paths.
@@ -314,12 +289,15 @@ jobs:
           - { python: '3.8',  macos_needs_root: 'yes' }
           - { python: '3.12', macos_needs_root: 'yes' }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
         with:
+          toolchain: stable
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@grcov
-      - uses: actions/setup-python@v5
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: grcov  # pinned SHA: the ref no longer selects the tool
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: ${{ matrix.python }}
           allow-prereleases: true
@@ -356,25 +334,12 @@ jobs:
         continue-on-error: true
         run: sudo chown -R "$(whoami)" target/profraw || true
 
-      - name: Generate lcov
+      # Profraw was already emitted by the smoke run above (job-level RUSTFLAGS), so
+      # no test-cmd here — just grcov + upload.
+      - name: Generate and upload coverage
         continue-on-error: true
-        shell: bash
-        run: |
-          # --ignore drops registry sources so only this crate's files reach the report.
-          grcov target/profraw \
-            --binary-path target/debug \
-            -s . -t lcov --branch --ignore-not-existing \
-            --ignore '../*' --ignore '/*' --ignore 'C:/Users/*' \
-            -o lcov.info
-          echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
-
-      - name: Upload coverage to Codecov
-        continue-on-error: true
-        uses: codecov/codecov-action@v5
+        uses: ./.github/actions/coverage-report
         with:
-          files: lcov.info
           flags: smoke,${{ matrix.os }}
           name: smoke-${{ matrix.os }}-py${{ matrix.python }}
-          disable_search: true
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
