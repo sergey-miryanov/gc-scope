@@ -7,11 +7,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::cli_monitor_options::MonitorOptions;
-use crate::exporters::chrome::ChromeTraceExporter;
-use crate::exporters::EventsExporter;
-use crate::monitor::MonitorContext;
-use crate::monitor_loop;
+use crate::cli::monitor_options::MonitorOptions;
+use crate::monitor::exporters::chrome::ChromeTraceExporter;
+use crate::monitor::exporters::EventsExporter;
+use crate::monitor::{run_loop, MonitorContext, StartupTimeoutPolicy};
 
 // ---------------------------------------------------------------------------
 // ProcessRunner — abstracts attach-vs-spawn
@@ -136,12 +135,12 @@ fn run_monitoring_loop(
     ctrlc::set_handler(move || r.store(false, Ordering::SeqCst))?;
 
     let mut ctx = MonitorContext::new(&mut exporter);
-    monitor_loop::run_loop(
+    run_loop(
         &mut ctx,
         pid,
         opts.rate,
         &running,
-        || monitor_loop::StartupTimeoutPolicy::new(Duration::from_secs(2)),
+        || StartupTimeoutPolicy::new(Duration::from_secs(2)),
     )?;
 
     ctx.close()?;

@@ -11,11 +11,11 @@ mod common;
 
 use common::{pid_alive, python_version, test_python, SpawnedPython};
 
-use gcscope::remote_debugging::collect::{
+use gcscope::snapshot::collect::{
     self, avg_collection_time_per_gen, collections_rate_from_slots, CollectRequest,
 };
 use gcscope::diagram::ascii;
-use gcscope::remote_debugging::poller::SnapshotPoller;
+use gcscope::snapshot::poller::SnapshotPoller;
 use gcscope::remote_debugging::session::PySession;
 
 /// `collect_data` gathers a coherent snapshot from a live interpreter, and

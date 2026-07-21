@@ -5,10 +5,10 @@ pub mod tui_v2;
 
 use anyhow::Result;
 
-use crate::remote_debugging::collect::{
+use crate::snapshot::collect::{
     avg_collection_time_per_gen, collections_rate_from_slots, CollectRequest,
 };
-use crate::remote_debugging::poller::SnapshotPoller;
+use crate::snapshot::poller::SnapshotPoller;
 
 fn fmt_duration_ns(d: std::time::Duration) -> String {
     let ns = d.as_nanos() as f64;

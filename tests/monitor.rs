@@ -23,9 +23,8 @@ use std::time::Duration;
 
 use common::{pid_alive, test_python, SpawnedPython};
 
-use gcscope::exporters::{EventsExporter, ProcessLifecycle};
-use gcscope::monitor::MonitorContext;
-use gcscope::monitor_loop::{run_loop, PollStatus, StartupTimeoutPolicy};
+use gcscope::monitor::exporters::{EventsExporter, ProcessLifecycle};
+use gcscope::monitor::{run_loop, MonitorContext, PollStatus, StartupTimeoutPolicy};
 use gcscope::remote_debugging::gc_stats::GcStat;
 use gcscope::remote_debugging::session::PySession;
 

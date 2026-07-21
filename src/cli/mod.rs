@@ -1,6 +1,9 @@
 use clap::{Parser, Subcommand};
 
-use crate::cli_monitor_options::MonitorOptions;
+pub mod monitor;
+pub mod monitor_options;
+
+use crate::cli::monitor_options::MonitorOptions;
 
 #[derive(Parser)]
 #[command(name = "gcscope", about = "Process memory analysis tool")]

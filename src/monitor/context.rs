@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::exporters::{EventsExporter, ProcessLifecycle};
-use crate::monitor_loop::PollStatus;
+use crate::monitor::exporters::{EventsExporter, ProcessLifecycle};
+use crate::monitor::run_loop::PollStatus;
 use crate::remote_debugging::gc_stats::GcStat;
 use crate::remote_debugging::session::{PySession, Revalidated};
 
 /// Per-process polling context.
 ///
-/// The multi-PID sibling of [`crate::remote_debugging::poller::SnapshotPoller`]: where that owns one
+/// The multi-PID sibling of [`crate::snapshot::poller::SnapshotPoller`]: where that owns one
 /// session and *returns* a full snapshot, this owns a `HashMap<u32, PySession>` and *emits*
 /// deduped event deltas into an `EventsExporter`. Both share the same `Fresh/Changed/Dead`
 /// revalidate ladder (see [`poll`](Self::poll)).
@@ -15,7 +15,7 @@ use crate::remote_debugging::session::{PySession, Revalidated};
 /// Owns the exporter and, per PID, an attached [`PySession`] (resolved once and
 /// reused every tick) plus lifecycle/last-timestamp state. All per-PID state is
 /// evicted together in [`MonitorContext::mark_died`] — the single death path
-/// `monitor_loop::run_loop` funnels every give-up through (C7).
+/// `run_loop::run_loop` funnels every give-up through (C7).
 pub struct MonitorContext<'a> {
     exporter: &'a mut dyn EventsExporter,
     /// Resolved session per PID. Attached lazily on first `poll`; a failed attach
