@@ -238,8 +238,8 @@ jobs:
   # #[ignore]d because they attach to a live interpreter; this leg grants attach
   # permission and runs them all. --features test-hooks is required by tests/monitor.rs
   # and a no-op elsewhere. Linux/py3.13. Blocking gate.
-  lifecycle-tests:
-    name: lifecycle tests (attach)
+  integration-tests:
+    name: integration tests (attach)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

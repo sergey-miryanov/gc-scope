@@ -58,3 +58,40 @@ fn collect_and_render_ascii_on_a_live_interpreter() {
         );
     }
 }
+
+/// The TUI body's **Full-tier** section builders (`section_debug_offsets`,
+/// `section_interpreter`) only run against a real 3.13+ `_Py_DebugOffsets` struct, so the
+/// synthetic-Legacy unit tests in `tui_v2.rs` can't reach them. This drives them over a
+/// live snapshot through the `test-hooks` seam and checks the frame is coherent across the
+/// tree/hex toggles. Gated on `test-hooks`, matching the CI integration-coverage leg.
+#[cfg(feature = "test-hooks")]
+#[test]
+#[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
+fn tui_frame_renders_the_full_tier_sections_on_a_live_interpreter() {
+    use gcscope::diagram::tui_v2::render_frame_for_test;
+
+    let Some(python) = test_python() else {
+        eprintln!("SKIP tui_frame_renders_the_full_tier_sections_on_a_live_interpreter: no Python found");
+        return;
+    };
+    let is_3_13_plus = python_version(&python).is_some_and(|v| v >= (3, 13));
+    let proc = SpawnedPython::spawn(&python).expect("spin.py should reach READY");
+
+    let session = PySession::attach(proc.pid()).expect("attach to the live interpreter");
+    let data = collect::collect_data(&session).expect("collect a snapshot from a live interpreter");
+
+    // Exercise the toggle combinations the loop can drive: full tree+hex, both collapsed,
+    // and the runtime-hex view. None may panic and all must produce a non-empty frame.
+    for (tree, hex, rt_hex) in [(true, true, false), (false, false, false), (true, true, true)] {
+        let lines = render_frame_for_test(&data, 0, tree, hex, rt_hex);
+        assert!(!lines.is_empty(), "frame must have content for ({tree},{hex},{rt_hex})");
+        let out = lines.join("\n");
+        assert!(out.contains("GC Generation Stats"), "GC section must render:\n{out}");
+        if is_3_13_plus {
+            assert!(
+                out.contains("_Py_DebugOffsets"),
+                "3.13+ frame must render the _Py_DebugOffsets section for ({tree},{hex},{rt_hex}):\n{out}"
+            );
+        }
+    }
+}
