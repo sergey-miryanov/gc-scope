@@ -5,7 +5,9 @@ pub mod tui_v2;
 
 use anyhow::Result;
 
-use crate::remote_debugging::collect::{avg_collection_time_per_gen, collections_rate_from_slots};
+use crate::remote_debugging::collect::{
+    avg_collection_time_per_gen, collections_rate_from_slots, CollectRequest,
+};
 use crate::remote_debugging::poller::SnapshotPoller;
 
 fn fmt_duration_ns(d: std::time::Duration) -> String {
@@ -20,7 +22,7 @@ fn fmt_duration_ns(d: std::time::Duration) -> String {
 }
 
 pub fn run_ascii(pid: u32) -> Result<()> {
-    let mut poller = SnapshotPoller::attach(pid)?;
+    let mut poller = SnapshotPoller::attach_with(pid, CollectRequest::diagram())?;
     let data = poller.poll()?;
     let stats = &data.interpreter.gc.generation_stats;
     let slots = &stats.slots;
@@ -44,7 +46,7 @@ pub fn run_ascii_watch(pid: u32, rate_ms: u64) -> Result<()> {
         r.store(false, Ordering::SeqCst);
     })?;
 
-    let mut poller = SnapshotPoller::attach(pid)?;
+    let mut poller = SnapshotPoller::attach_with(pid, CollectRequest::diagram())?;
     let mut out = std::io::stdout().lock();
     let start = Instant::now();
 

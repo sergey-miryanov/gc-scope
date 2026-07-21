@@ -10,7 +10,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Terminal;
 
-use crate::remote_debugging::collect::{avg_collection_time_per_gen, collections_rate_from_slots, CollectedData};
+use crate::remote_debugging::collect::{
+    avg_collection_time_per_gen, collections_rate_from_slots, CollectRequest, CollectedData,
+};
 use crate::remote_debugging::poller::SnapshotPoller;
 use super::render::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
 use crate::remote_debugging::offsets::VersionedOffsets;
@@ -59,7 +61,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         }
     };
 
-    let mut poller = SnapshotPoller::attach(initial_pid)?;
+    let mut poller = SnapshotPoller::attach_with(initial_pid, CollectRequest::diagram())?;
     let mut start = Instant::now();
     let mut frame: u64 = 0;
 
@@ -1085,7 +1087,10 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
 
     // ── Right panel ──
     let slot = &gc.slots[selected_slot];
-    let slot_raw_start = slot.byte_offset;
+    // Clamp the start too: if the raw stats buffer wasn't collected (empty) while `slots`
+    // was, `byte_offset` can exceed the buffer, which would make `start > end` and panic.
+    // Clamping yields an empty slice instead — the hex panel simply renders nothing.
+    let slot_raw_start = slot.byte_offset.min(gc.raw_stats_bytes.len());
     let slot_raw_end = (slot_raw_start + item_size).min(gc.raw_stats_bytes.len());
     let slot_bytes = &gc.raw_stats_bytes[slot_raw_start..slot_raw_end];
     let display_bytes = slot_bytes.len();
@@ -1637,7 +1642,6 @@ mod tests {
             resolved: Arc::new(Resolved::Legacy { table }),
             interpreter: InterpreterSnapshot {
                 addr: 0x6000,
-                raw_bytes: vec![0u8; 256],
                 gc: GcSubState {
                     raw_bytes: vec![0u8; 64],
                     generation_stats: GcStatsSnapshot {
@@ -1696,6 +1700,20 @@ mod tests {
         let data = legacy_data(false);
         let out = join_lines(&section_gc_stats(&data, [None; 3], [None; 3], 0));
         assert!(out.contains("GC Generation Stats: not available"), "{out}");
+    }
+
+    /// If the raw stats buffer is empty (e.g. a request skipped it) but decoded `slots`
+    /// remain, the right-panel byte slice must not panic even when the selected slot's
+    /// `byte_offset` points past the (empty) buffer — the start clamp keeps `start <= end`.
+    #[test]
+    fn section_gc_stats_does_not_panic_when_raw_is_empty_but_a_slot_is_selected() {
+        let mut data = legacy_data(true);
+        let stats = &mut data.interpreter.gc.generation_stats;
+        stats.raw_stats_bytes = Vec::new();
+        stats.slots[0].byte_offset = 48; // a gen-1/2-style offset, past the empty buffer
+        // Must render (empty hex panel) rather than slice-index panic.
+        let out = join_lines(&section_gc_stats(&data, [None; 3], [None; 3], 0));
+        assert!(out.contains("GC Generation Stats Slot #1"), "{out}");
     }
 
     #[test]

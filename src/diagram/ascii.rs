@@ -510,7 +510,6 @@ mod tests {
             resolved: Arc::new(Resolved::Legacy { table }),
             interpreter: InterpreterSnapshot {
                 addr: 0x6000,
-                raw_bytes: vec![0u8; 256],
                 gc: GcSubState {
                     raw_bytes: vec![0u8; 64],
                     generation_stats: GcStatsSnapshot {

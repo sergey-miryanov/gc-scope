@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::remote_debugging::collect::{collect_data, CollectedData};
+use crate::remote_debugging::collect::{collect_data, CollectRequest, CollectedData};
 use crate::remote_debugging::session::{PySession, Revalidated};
 
 /// Single-PID snapshot producer: owns the attached [`PySession`], hands out a full
@@ -16,13 +16,21 @@ use crate::remote_debugging::session::{PySession, Revalidated};
 /// extension, not a rewrite.
 pub struct SnapshotPoller {
     session: PySession,
+    request: CollectRequest,
 }
 
 impl SnapshotPoller {
-    /// Attach to `pid`, resolving its `_PyRuntime` and offsets once.
+    /// Attach to `pid`, resolving its `_PyRuntime` and offsets once. Collects every layer;
+    /// use [`attach_with`](Self::attach_with) to narrow to the layers a consumer renders.
     pub fn attach(pid: u32) -> Result<Self> {
+        Self::attach_with(pid, CollectRequest::all())
+    }
+
+    /// Attach to `pid`, collecting only the layers named in `request` on each [`poll`](Self::poll).
+    pub fn attach_with(pid: u32, request: CollectRequest) -> Result<Self> {
         Ok(Self {
             session: PySession::attach(pid)?,
+            request,
         })
     }
 
@@ -47,10 +55,10 @@ impl SnapshotPoller {
     /// - [`Revalidated::Changed`] — a different program now holds this PID; propagate.
     /// - [`Revalidated::Dead`] — the process is gone; propagate.
     pub fn poll(&mut self) -> Result<CollectedData> {
-        match collect_data(&self.session) {
+        match collect_data(&self.session, &self.request) {
             Ok(data) => Ok(data),
             Err(e) => match self.session.revalidate() {
-                Revalidated::Fresh => collect_data(&self.session),
+                Revalidated::Fresh => collect_data(&self.session, &self.request),
                 Revalidated::Changed => {
                     Err(e.context("target PID is now held by a different program"))
                 }
@@ -65,6 +73,6 @@ impl SnapshotPoller {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn from_session(session: PySession) -> Self {
-        Self { session }
+        Self { session, request: CollectRequest::all() }
     }
 }
