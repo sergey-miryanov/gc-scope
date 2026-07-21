@@ -1909,6 +1909,84 @@ mod tests {
         }
     }
 
+    /// A synthetic ring snapshot (3.15-style geometry) built from the public `OffsetTable`
+    /// fields. The buffer view reads only the table + stats (never the `Resolved` tier), so
+    /// `Resolved::Legacy` is just the cheapest table wrapper that still drives the ring path.
+    /// The buffer is all zero except each generation's index byte, set to `0x5A` so the Red
+    /// index highlight can be found positionally in the hexdump.
+    fn ring_data() -> CollectedData {
+        use crate::remote_debugging::offsets::offset_table::{
+            compute_ring_base_offsets, GcItemLayout, GcStatsKind,
+        };
+        static RING_LAYOUT: GcItemLayout = GcItemLayout {
+            item_size: 24,
+            fields: &[("ts_start", 0), ("collections", 8), ("collected", 16)],
+        };
+        let item = 24usize;
+        let slots_per_gen = [11u64, 3, 3];
+        let bases = compute_ring_base_offsets(item as u64, &slots_per_gen);
+        let region = bases[2] as usize + slots_per_gen[2] as usize * item + 8;
+
+        let mut raw = vec![0u8; region];
+        for g in 0..3 {
+            let idx_off = bases[g] as usize + slots_per_gen[g] as usize * item;
+            raw[idx_off] = 0x5A;
+        }
+
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        table.gc_stats_kind = GcStatsKind::RingBuffer;
+        table.gc_item_size = Some(item as u64);
+        table.gc_slots_per_gen = Some(slots_per_gen);
+        table.gc_gen_base_offsets = Some(bases);
+        table.gc_layout = Some(&RING_LAYOUT);
+
+        let slots = (0..3)
+            .map(|g| GcSlot {
+                generation: g as u32,
+                slot: 0,
+                byte_offset: bases[g as usize] as usize,
+                start_ts: 0,
+                stop_ts: 0,
+                collections: 0,
+                collected: 0,
+                uncollectable: 0,
+                candidates: 0,
+                duration: 0.0,
+                heap_size: 0,
+            })
+            .collect();
+
+        CollectedData {
+            pid: 4321,
+            runtime_addr: 0x5000,
+            runtime_version: 0x030f0000,
+            runtime_raw_bytes: Vec::new(),
+            debug_offsets_size: 0,
+            resolved: Arc::new(Resolved::Legacy { table }),
+            interpreter: InterpreterSnapshot {
+                addr: 0x6000,
+                gc: GcSubState {
+                    raw_bytes: vec![0u8; 64],
+                    generation_stats: GcStatsSnapshot {
+                        stats_addr: 0x7000,
+                        stats_size: region as u64,
+                        item_size: item,
+                        slots_per_gen,
+                        has_timestamps: true,
+                        has_duration: false,
+                        raw_stats_bytes: raw,
+                        slots,
+                    },
+                },
+                gc_offset: 0x80,
+                gc_size: 64,
+                id: 0,
+                next_addr: 0,
+            },
+            collect_duration: Duration::from_millis(1),
+        }
+    }
+
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
@@ -2029,6 +2107,48 @@ mod tests {
         // Inline/Legacy is not a ring → no index gaps at all.
         let legacy = legacy_data(true);
         assert!(ring_index_offsets(legacy.resolved.table(), 24).is_empty());
+    }
+
+    /// Every span across the frame with a `Red` background whose trimmed text equals `hex`.
+    fn red_bytes(lines: &[Line], hex: &str) -> usize {
+        lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .filter(|s| s.style.bg == Some(Color::Red) && s.content.trim() == hex)
+            .count()
+    }
+
+    #[test]
+    fn build_gc_only_lines_on_a_ring_highlights_every_index_byte_and_shows_the_legend() {
+        let lines = build_gc_only_lines(&ring_data(), 0);
+
+        // The legend appears (ring builds only) with a Red swatch.
+        assert!(join_lines(&lines).contains("per-generation ring index"), "legend text missing");
+        assert!(
+            lines.iter().flat_map(|l| &l.spans)
+                .any(|s| s.style.bg == Some(Color::Red) && s.content.trim() == "idx"),
+            "legend must carry a Red swatch"
+        );
+
+        // The one index byte of each generation (0x5A) is Red in the hexdump — exactly three,
+        // one per generation, and the only 0x5A bytes in the otherwise-zero buffer.
+        assert_eq!(red_bytes(&lines, "5a"), 3, "all three ring index bytes must be highlighted");
+
+        // Selected-slot decoration still works alongside the index anchors: its `collections`
+        // field keeps Green and its whole-slot range keeps the DarkGray shade.
+        let spans = || lines.iter().flat_map(|l| &l.spans);
+        assert!(spans().any(|s| s.style.bg == Some(Color::Green)), "field colours must survive");
+        assert!(spans().any(|s| s.style.bg == Some(Color::DarkGray)), "selected-slot shade must survive");
+    }
+
+    #[test]
+    fn build_gc_only_lines_on_an_inline_build_has_no_index_highlight_or_legend() {
+        let lines = build_gc_only_lines(&legacy_data(true), 0);
+        assert!(!join_lines(&lines).contains("ring index"), "inline/legacy must show no legend");
+        assert!(
+            !lines.iter().flat_map(|l| &l.spans).any(|s| s.style.bg == Some(Color::Red)),
+            "inline/legacy has no ring index to highlight"
+        );
     }
 
     #[test]
