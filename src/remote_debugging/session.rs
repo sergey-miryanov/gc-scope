@@ -98,6 +98,35 @@ fn classify_cmdline(old: Option<&str>, new: Option<&str>) -> CmdlineCheck {
     }
 }
 
+/// Resolve a [`GcStatsRegion`] to a concrete stats-region address, performing the single
+/// ring-pointer read a `Deref` needs through `read_ptr`. Split out of
+/// [`PySession::gc_stats_region_addr`] so its fail-open branching is unit-testable without a
+/// live target: `Absent` → `None` (no read at all — a read would fail *open* on a bogus
+/// address); `Direct(a)` → `Some(a)` (already an address, no read); `Deref(p)` → read `p` and
+/// treat NULL as the normal "stats not yet allocated / teardown" state (`None`, not an error).
+/// A genuine read failure propagates, since a non-`Absent` region asserted stats should be there.
+fn resolve_stats_region<F>(region: GcStatsRegion, read_ptr: F) -> Result<Option<u64>>
+where
+    F: FnOnce(u64) -> Result<u64>,
+{
+    match region {
+        GcStatsRegion::Absent => Ok(None),
+        GcStatsRegion::Direct(addr) => Ok(Some(addr)),
+        GcStatsRegion::Deref(ptr_addr) => {
+            let ptr = read_ptr(ptr_addr).context("Failed to read gc.generation_stats pointer")?;
+            Ok((ptr != 0).then_some(ptr))
+        }
+    }
+}
+
+/// Whether a stats kind yields any decodable slots. `None` is the one non-reading kind:
+/// [`PySession::supports_gc_stats`] (the capability the TUI picker and `list-pids` "S" column
+/// report) reports it as unsupported, and [`PySession::gc_stats`] fast-returns an empty vec for
+/// it. Both key off this single predicate.
+fn kind_reads_stats(kind: GcStatsKind) -> bool {
+    kind != GcStatsKind::None
+}
+
 /// Where an [`PySession`]'s layout came from on `attach`. Exposed so a caller — or a
 /// lifecycle test — can tell whether the binary was re-parsed or the process-wide cache
 /// was reused (ADR 0001's E1/E2 fast path). Purely informational: both tiers behave
@@ -315,7 +344,7 @@ impl PySession {
     /// stats layout (`GcStatsKind::None`). This is the capability the TUI picker and
     /// `list-pids` "S" column report.
     pub fn supports_gc_stats(&self) -> bool {
-        self.resolved.table().gc_stats_kind != GcStatsKind::None
+        kind_reads_stats(self.resolved.table().gc_stats_kind)
     }
 
     /// Read `size` bytes at `addr` through the held handle (no per-call open).
@@ -349,16 +378,8 @@ impl PySession {
             .offsets()
             .map(|vo| vo.gc_generation_stats())
             .unwrap_or(0);
-        match self.resolved.table().gc_stats_region(gc_addr, gen_stats_off) {
-            GcStatsRegion::Absent => Ok(None),
-            GcStatsRegion::Direct(addr) => Ok(Some(addr)),
-            GcStatsRegion::Deref(ptr_addr) => {
-                let ptr = self
-                    .read_u64(ptr_addr)
-                    .context("Failed to read gc.generation_stats pointer")?;
-                Ok((ptr != 0).then_some(ptr))
-            }
-        }
+        let region = self.resolved.table().gc_stats_region(gc_addr, gen_stats_off);
+        resolve_stats_region(region, |ptr_addr| self.read_u64(ptr_addr))
     }
 
     /// Test hook: force the next `n` `gc_stats` calls on this session to fail with
@@ -667,5 +688,74 @@ mod tests {
             classify_cmdline(None, Some("python spin.py")),
             CmdlineCheck::Inconclusive
         );
+    }
+
+    // ── stats-region resolution (pure; the one ring read is injected) ──
+
+    /// `Absent` is the "this build exposes no stats" outcome (a `None`-kind build, or a ring
+    /// whose pointer field is unresolved). It must resolve to `None` WITHOUT any pointer read
+    /// — a read here would fail *open* on a bogus address and hand back garbage. The reader
+    /// closure panics to prove it is never called.
+    #[test]
+    fn absent_region_resolves_to_none_without_reading() {
+        let got = resolve_stats_region(GcStatsRegion::Absent, |_| {
+            panic!("Absent must not trigger a pointer read")
+        })
+        .unwrap();
+        assert_eq!(got, None);
+    }
+
+    /// `Direct` (inline builds) is already the stats address — hand it back verbatim, again
+    /// with no read.
+    #[test]
+    fn direct_region_returns_the_address_verbatim() {
+        let got = resolve_stats_region(GcStatsRegion::Direct(0xdead_beef), |_| {
+            panic!("Direct must not trigger a pointer read")
+        })
+        .unwrap();
+        assert_eq!(got, Some(0xdead_beef));
+    }
+
+    /// `Deref` (ring builds) reads the pointer at the *pointer-field* address it is handed; a
+    /// non-NULL value is the stats region, a NULL value is the normal "not allocated yet /
+    /// teardown" state and resolves to `None` — skipped, never an error.
+    #[test]
+    fn deref_region_reads_the_pointer_and_maps_null_to_none() {
+        // Non-NULL → Some(pointer). The closure also confirms it is handed the pointer-FIELD
+        // address (0x1000), not the region address it returns.
+        let got = resolve_stats_region(GcStatsRegion::Deref(0x1000), |addr| {
+            assert_eq!(addr, 0x1000);
+            Ok(0x4000)
+        })
+        .unwrap();
+        assert_eq!(got, Some(0x4000));
+
+        // NULL → None, not an error.
+        let got = resolve_stats_region(GcStatsRegion::Deref(0x1000), |_| Ok(0)).unwrap();
+        assert_eq!(got, None);
+    }
+
+    /// A failed pointer read on a `Deref` is a real error (a non-`Absent` region asserted the
+    /// stats should be there) and propagates *with context* — it is NOT swallowed to `None`.
+    #[test]
+    fn deref_region_propagates_a_read_error() {
+        let err = resolve_stats_region(GcStatsRegion::Deref(0x1000), |_| {
+            Err(anyhow!("simulated read failure"))
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("gc.generation_stats pointer"),
+            "the read error must carry its context: {err}"
+        );
+    }
+
+    /// `None` is the single stats kind that reads nothing — it is what `supports_gc_stats`
+    /// reports as unsupported and what `gc_stats` fast-returns an empty vec for. Every other
+    /// kind reads.
+    #[test]
+    fn only_the_none_kind_reads_no_stats() {
+        assert!(!kind_reads_stats(GcStatsKind::None));
+        assert!(kind_reads_stats(GcStatsKind::InlineArray));
+        assert!(kind_reads_stats(GcStatsKind::RingBuffer));
     }
 }

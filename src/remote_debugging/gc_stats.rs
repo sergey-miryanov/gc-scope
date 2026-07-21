@@ -110,15 +110,21 @@ impl GcStat {
     }
 }
 
+/// Whether any slot comes from an extended (`+inc`) build. `increment_size` (and the rest of
+/// the `+inc` set) is present in the layout only on such builds, so its presence in ANY slot
+/// selects `print_stats`' wider column set. Pulled out of `print_stats` so the column-selection
+/// decision is unit-testable without capturing stdout.
+fn has_extended(stats: &[GcStat]) -> bool {
+    stats.iter().any(|s| s.has("increment_size"))
+}
+
 pub fn print_stats(stats: &[GcStat]) {
     if stats.is_empty() {
         println!("No GC stats found.");
         return;
     }
 
-    // Extended builds carry `increment_size` (and the rest of the `+inc` set); its presence in
-    // the layout selects the wider column set.
-    let has_extended = stats.iter().any(|s| s.has("increment_size"));
+    let has_extended = has_extended(stats);
 
     let header = if has_extended {
         format!(
@@ -176,6 +182,26 @@ mod tests {
     static REGULAR: LazyLock<&'static GcItemLayout> =
         LazyLock::new(|| seq_layout(&["ts_start", "collections", "collected"]));
 
+    /// An extended (`+inc`) build's slot layout — the core counters plus the `increment_size`
+    /// set that `print_stats` widens its columns for. Exactly the field names `print_stats`
+    /// reads on the extended path.
+    static EXTENDED: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
+        seq_layout(&[
+            "ts_start",
+            "collections",
+            "collected",
+            "uncollectable",
+            "candidates",
+            "heap_size",
+            "increment_size",
+            "alive_size",
+            "finalized_garbage_count",
+            "clear_weakrefs_count",
+            "deleted_garbage_count",
+            "ts_mark_alive_start",
+        ])
+    });
+
     /// A view over a standard-set slot must report the extended fields as genuinely absent:
     /// `get` returns `None` (never `Some(0)` or a read past the field list), `has` is false,
     /// and `iter_fields` yields exactly the layout's own fields — the view can't fabricate a
@@ -198,5 +224,78 @@ mod tests {
         // `iter_fields` walks the layout, so it yields only the fields the build defines.
         let names: Vec<&str> = s.iter_fields().map(|(n, _, _)| n).collect();
         assert_eq!(names, ["ts_start", "collections", "collected"]);
+    }
+
+    /// `print_stats` selects its wide `+inc` column set from `has_extended`, which fires when
+    /// ANY slot carries `increment_size`. A slice mixing a core-only slot with one extended
+    /// slot still counts as extended; an all-core (or empty) slice does not.
+    #[test]
+    fn has_extended_is_true_when_any_slot_carries_increment_size() {
+        let core = GcStat::from_fields(0, 0, 1, *REGULAR, &[("collections", 1)]);
+        let ext = GcStat::from_fields(0, 0, 1, *EXTENDED, &[("increment_size", 1)]);
+
+        assert!(!has_extended(&[]), "empty slice is not extended");
+        assert!(!has_extended(std::slice::from_ref(&core)), "core-only is not extended");
+        assert!(has_extended(std::slice::from_ref(&ext)), "an extended slot is extended");
+        // A mixed slice is extended as soon as one slot has the field.
+        let core2 = GcStat::from_fields(0, 0, 1, *REGULAR, &[("collections", 2)]);
+        let ext2 = GcStat::from_fields(0, 0, 1, *EXTENDED, &[("increment_size", 2)]);
+        assert!(has_extended(&[core, ext, core2, ext2]));
+    }
+
+    /// The extended print path reads each `+inc` field by name via `get`. A view over an
+    /// extended slot must decode every one of them (not fall back to zero the way a core-only
+    /// layout does), while the always-present core stays readable and `iter_fields` yields the
+    /// full extended set in layout order.
+    #[test]
+    fn an_extended_slot_decodes_its_plus_inc_fields() {
+        let s = GcStat::from_fields(
+            0,
+            0,
+            2,
+            *EXTENDED,
+            &[
+                ("collections", 7),
+                ("increment_size", 100),
+                ("alive_size", 200),
+                ("finalized_garbage_count", 3),
+                ("clear_weakrefs_count", 4),
+                ("deleted_garbage_count", 5),
+                ("ts_mark_alive_start", 999),
+            ],
+        );
+
+        // The build is recognized as extended, and each `+inc` field `print_stats` prints
+        // decodes to its set value — Some(v), never None or a zero fallback.
+        assert!(s.has("increment_size"));
+        assert_eq!(s.get("increment_size"), Some(100));
+        assert_eq!(s.get("alive_size"), Some(200));
+        assert_eq!(s.get("finalized_garbage_count"), Some(3));
+        assert_eq!(s.get("clear_weakrefs_count"), Some(4));
+        assert_eq!(s.get("deleted_garbage_count"), Some(5));
+        assert_eq!(s.get("ts_mark_alive_start"), Some(999));
+
+        // The core accessors still work on the same slot.
+        assert_eq!(s.collections(), 7);
+
+        // `iter_fields` yields the full extended layout, in order.
+        let names: Vec<&str> = s.iter_fields().map(|(n, _, _)| n).collect();
+        assert_eq!(
+            names,
+            [
+                "ts_start",
+                "collections",
+                "collected",
+                "uncollectable",
+                "candidates",
+                "heap_size",
+                "increment_size",
+                "alive_size",
+                "finalized_garbage_count",
+                "clear_weakrefs_count",
+                "deleted_garbage_count",
+                "ts_mark_alive_start",
+            ]
+        );
     }
 }
