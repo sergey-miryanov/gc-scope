@@ -22,6 +22,24 @@ pub enum GcStatsKind {
     RingBuffer,
 }
 
+/// Where an interpreter's GC generation-stats live, as a pure function of the layout —
+/// no process access, so the fail-open offset arithmetic is unit-testable without a
+/// target. Produced by [`OffsetTable::gc_stats_region`]; the caller
+/// ([`crate::remote_debugging::session::PySession::gc_stats_region_addr`]) turns it into a
+/// concrete address, performing the one read a `Deref` needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcStatsRegion {
+    /// This build exposes no readable stats (no stats kind, or a ring whose pointer
+    /// field wasn't resolved).
+    Absent,
+    /// Stats sit at this absolute address (inline: `gc_addr + gc_stats_inline_off`).
+    Direct(u64),
+    /// Stats hang off a pointer stored at this address (ring:
+    /// `gc_addr + gen_stats_ptr_off`); the caller reads it and treats NULL as "no stats
+    /// yet" (not-yet-allocated / teardown).
+    Deref(u64),
+}
+
 #[derive(Debug, Clone)]
 pub struct OffsetTable {
     pub version_hex: u64,
@@ -81,6 +99,51 @@ impl OffsetTable {
     /// Panics if `runtime_gc` is `None` (i.e. on Python 3.9+).
     pub fn runtime_gc_unwrap(&self) -> u64 {
         self.runtime_gc.expect("runtime_gc is only available on Python 3.8")
+    }
+
+    /// Locate one interpreter's GC generation-stats region from its `_gc_runtime_state`
+    /// address (`gc_addr`) and the ring `generation_stats` pointer field offset
+    /// (`gen_stats_ptr_off`; 0 / ignored for inline builds). Pure — no process access —
+    /// so this fail-open offset arithmetic is unit-testable without a target.
+    ///
+    /// - `InlineArray` → [`GcStatsRegion::Direct`] at `gc_addr + gc_stats_inline_off`.
+    /// - `RingBuffer` → [`GcStatsRegion::Deref`] at `gc_addr + gen_stats_ptr_off` (the
+    ///   caller reads that pointer); [`GcStatsRegion::Absent`] if the field is unresolved.
+    /// - `None` → [`GcStatsRegion::Absent`].
+    ///
+    /// This is the single source of truth for stats-region location: the monitor
+    /// ([`crate::remote_debugging::session::PySession::gc_stats`]) and the diagram
+    /// collector both resolve through here (via
+    /// [`crate::remote_debugging::session::PySession::gc_stats_region_addr`]), so a fix to
+    /// this logic reaches both.
+    pub fn gc_stats_region(&self, gc_addr: u64, gen_stats_ptr_off: u64) -> GcStatsRegion {
+        match self.gc_stats_kind {
+            GcStatsKind::None => GcStatsRegion::Absent,
+            GcStatsKind::InlineArray => GcStatsRegion::Direct(gc_addr + self.gc_stats_inline_off),
+            GcStatsKind::RingBuffer => {
+                if gen_stats_ptr_off == 0 {
+                    GcStatsRegion::Absent
+                } else {
+                    GcStatsRegion::Deref(gc_addr + gen_stats_ptr_off)
+                }
+            }
+        }
+    }
+
+    /// Byte offset of generation `gen`'s slot `slot` within the stats region
+    /// (`gc_gen_base_offsets[gen] + slot * gc_item_size`) — the same arithmetic
+    /// [`decode_gc_stats`](Self::decode_gc_stats) walks, exposed so the diagram can map a
+    /// decoded slot back to its raw-region location for its hexdump highlight. `None` when
+    /// this build has no slot geometry, or `gen`/`slot` is out of range.
+    pub fn slot_byte_offset(&self, generation: u32, slot: usize) -> Option<usize> {
+        let item = self.gc_item_size? as usize;
+        let bases = self.gc_gen_base_offsets?;
+        let slots = self.gc_slots_per_gen?;
+        let g = generation as usize;
+        if g >= 3 || slot >= slots[g] as usize {
+            return None;
+        }
+        Some(bases[g] as usize + slot * item)
     }
 
     /// Read GC generation stats for one interpreter through an already-open handle.
@@ -169,8 +232,9 @@ impl OffsetTable {
 
     /// Byte length of one interpreter's stats region — the last generation's base
     /// plus its slots. `None` when this build exposes no decodable stats (those are
-    /// shape facts, not failures; see [`Self::read_gc_stats`]).
-    fn stats_buffer_len(&self) -> Option<usize> {
+    /// shape facts, not failures; see [`Self::read_gc_stats`]). The single definition of
+    /// this formula, shared by `read_gc_stats`/`decode_gc_stats` and the diagram collector.
+    pub fn stats_buffer_len(&self) -> Option<usize> {
         let item_size = self.gc_item_size? as usize;
         if item_size == 0 {
             return None;
@@ -443,6 +507,81 @@ mod tests {
         let stats = table.decode_gc_stats(&buf, 0);
         assert_eq!(stats.len(), 3);
         assert!(stats.iter().all(|s| s.slot == 0));
+    }
+
+    // ── stats-region location (pure, no process) ────────────────
+
+    /// Inline builds put the stats at a fixed offset from the gc state — a `Direct`
+    /// address, no pointer to chase. The offset is the version's `gc_stats_inline_off`;
+    /// the ring pointer-field argument is irrelevant and must be ignored.
+    #[test]
+    fn gc_stats_region_inline_is_direct_at_the_fixed_offset() {
+        let table = pre_3_13::table_for_version(3, 12).unwrap();
+        assert_eq!(table.gc_stats_inline_off, 0x80);
+        assert_eq!(
+            table.gc_stats_region(0x1_0000, 0x999),
+            GcStatsRegion::Direct(0x1_0000 + 0x80)
+        );
+    }
+
+    /// Ring builds hand back the *address of the pointer* to dereference
+    /// (`gc_addr + generation_stats field offset`), leaving the read to the caller.
+    #[test]
+    fn gc_stats_region_ring_defers_the_pointer_read() {
+        let table = ring_table(0);
+        assert_eq!(
+            table.gc_stats_region(0x2_0000, 0x40),
+            GcStatsRegion::Deref(0x2_0000 + 0x40)
+        );
+    }
+
+    /// A ring build whose `generation_stats` field offset wasn't resolved (0) has no way
+    /// to reach the stats — `Absent`, never a bogus read at `gc_addr + 0`.
+    #[test]
+    fn gc_stats_region_ring_without_a_pointer_field_is_absent() {
+        let table = ring_table(0);
+        assert_eq!(table.gc_stats_region(0x2_0000, 0), GcStatsRegion::Absent);
+    }
+
+    /// A build with no stats kind is `Absent` whatever addresses are passed.
+    #[test]
+    fn gc_stats_region_none_is_absent() {
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        table.gc_stats_kind = GcStatsKind::None;
+        assert_eq!(table.gc_stats_region(0x1000, 0x40), GcStatsRegion::Absent);
+    }
+
+    // ── slot_byte_offset ────────────────────────────────────────
+
+    /// `slot_byte_offset` is exactly the arithmetic `decode_gc_stats` walks, so the
+    /// diagram can map a decoded slot back to its bytes. Ring bases include the pad.
+    #[test]
+    fn slot_byte_offset_matches_the_decode_walk() {
+        let table = ring_table(0);
+        let bases = table.gc_gen_base_offsets.unwrap();
+        let item = table.gc_item_size.unwrap() as usize;
+        assert_eq!(table.slot_byte_offset(0, 0), Some(bases[0] as usize));
+        assert_eq!(table.slot_byte_offset(0, 5), Some(bases[0] as usize + 5 * item));
+        assert_eq!(table.slot_byte_offset(1, 0), Some(bases[1] as usize));
+        assert_eq!(table.slot_byte_offset(2, 2), Some(bases[2] as usize + 2 * item));
+    }
+
+    /// Out-of-range generation or slot yields `None`, not an offset that spills into the
+    /// next generation's region.
+    #[test]
+    fn slot_byte_offset_rejects_out_of_range() {
+        let table = ring_table(0); // slots [11, 3, 3]
+        assert_eq!(table.slot_byte_offset(0, 11), None, "gen0 has slots 0..=10");
+        assert_eq!(table.slot_byte_offset(1, 3), None, "gen1 has 3 slots");
+        assert_eq!(table.slot_byte_offset(3, 0), None, "no generation 3");
+    }
+
+    /// A build without slot geometry has no offsets to give.
+    #[test]
+    fn slot_byte_offset_is_none_without_geometry() {
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        table.gc_item_size = None;
+        assert_eq!(table.slot_byte_offset(0, 0), None);
     }
 
     // ── shape guards ────────────────────────────────────────────

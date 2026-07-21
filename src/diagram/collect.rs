@@ -130,7 +130,7 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
     // (only used for the section-2 hexdump, which Legacy skips).
     let gc_size = match off_opt {
         Some(off) => off.gc_size(),
-        None => offset_table.gc_stats_inline_off + gc_stats_total_bytes(&offset_table) as u64,
+        None => offset_table.gc_stats_inline_off + offset_table.stats_buffer_len().unwrap_or(0) as u64,
     };
     let next_addr = session.read_u64(head_addr + offset_table.interp_next())?;
     let id = session.read_i64(head_addr + offset_table.interp_id())?;
@@ -145,29 +145,19 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
         .read(gc_addr, gc_size as usize)
         .context("Failed to read GC state")?;
 
-    // Resolve the GC generation-stats region by its version-specific shape — same logic as
-    // `gc_stats.rs::read_gc_stats`. `InlineArray` (pre-3.13, 3.13/3.14) stores the stats
-    // inline in `_gc_runtime_state` at a fixed offset; `RingBuffer` (3.15+, always a 3.13+
-    // tier) reaches a ring buffer through the `gc.generation_stats` pointer.
+    // Address resolution (inline offset vs. ring-pointer deref, incl. NULL handling) is the
+    // reader layer's job — the single path the monitor also uses — so a fix there reaches
+    // both. The diagram only decides how many bytes to pull for its raw hexdump: the exact
+    // inline span, or the process-reported ring region size (which includes the trailing
+    // per-generation cursors the decoder skips).
     let item_size = offset_table.gc_item_size.unwrap_or(0) as usize;
     let slots_per_gen = offset_table.gc_slots_per_gen.unwrap_or([0, 0, 0]);
-    let (stats_addr, stats_total) = match offset_table.gc_stats_kind {
-        offsets::offset_table::GcStatsKind::None => (0u64, 0usize),
-        offsets::offset_table::GcStatsKind::InlineArray => {
-            let addr = gc_addr + offset_table.gc_stats_inline_off;
-            (addr, gc_stats_total_bytes(&offset_table))
-        }
+    let stats_addr = session.gc_stats_region_addr(gc_addr)?.unwrap_or(0);
+    let stats_total = match offset_table.gc_stats_kind {
+        offsets::offset_table::GcStatsKind::None => 0usize,
+        offsets::offset_table::GcStatsKind::InlineArray => offset_table.stats_buffer_len().unwrap_or(0),
         offsets::offset_table::GcStatsKind::RingBuffer => {
-            let gen_stats_field_off = off_opt.map(|o| o.gc_generation_stats()).unwrap_or(0);
-            let ptr = if gen_stats_field_off == 0 {
-                0
-            } else {
-                session
-                    .read_u64(gc_addr + gen_stats_field_off)
-                    .context("Failed to read generation_stats pointer")?
-            };
-            let size = off_opt.map(|o| o.gc_generation_stats_size()).unwrap_or(0) as usize;
-            (ptr, size)
+            off_opt.map(|o| o.gc_generation_stats_size()).unwrap_or(0) as usize
         }
     };
 
@@ -251,90 +241,39 @@ impl CollectedData {
 }
 
 // ── GC slot parsing ────────────────────────────────────────────
-/// Total bytes of the (inline) generation-stats region: `bases[last] + slots[last] *
-/// item_size`. Used only for the `InlineArray` kind (ring buffers use the process-reported
-/// `generation_stats_size` directly).
-fn gc_stats_total_bytes(table: &offsets::offset_table::OffsetTable) -> usize {
-    match (table.gc_item_size, table.gc_gen_base_offsets, table.gc_slots_per_gen) {
-        (Some(item), Some(bases), Some(slots)) => (bases[2] + slots[2] * item) as usize,
-        _ => 0,
-    }
-}
-
-/// Parse GC slots from the raw region using the version's geometry (per-gen slot counts,
-/// gen base offsets, per-slot item size) and per-slot field layout — the same source
-/// `offset_table::read_gc_stats` uses. This handles both inline (3.13/3.14: 1 slot/gen,
-/// 3 fields) and ring-buffer (3.15+: 11/3/3 slots, many fields) layouts uniformly.
+/// Build the diagram's per-slot view from the raw generation-stats region.
+///
+/// Decoding runs through the reader layer's single decoder
+/// ([`OffsetTable::decode_gc_stats`]) — the exact path the monitor uses — then projects
+/// each [`GcStat`](crate::remote_debugging::gc_stats::GcStat) onto the display-oriented
+/// [`GcSlot`], recovering the raw-region `byte_offset` (for the hexdump highlight) from the
+/// table geometry. The one diagram-only policy lives here: torn ring slots
+/// (`stop_ts < start_ts`, a half-written concurrent update) are dropped, whereas the
+/// monitor keeps every slot and dedups downstream. Inline layouts (3.13/3.14) carry no
+/// timestamps, so `has_ts` is false and every slot is kept.
 fn parse_gc_slots(raw: &[u8], table: &offsets::offset_table::OffsetTable) -> Vec<GcSlot> {
-    let (Some(item_size), Some(slots_per_gen), Some(bases), Some(layout)) = (
-        table.gc_item_size.map(|v| v as usize),
-        table.gc_slots_per_gen,
-        table.gc_gen_base_offsets,
-        table.gc_layout,
-    ) else {
-        return Vec::new();
-    };
-    if raw.is_empty() || item_size == 0 {
-        return Vec::new();
-    }
+    let has_ts = table
+        .gc_layout
+        .is_some_and(|l| l.has_field("ts_start") && l.has_field("ts_stop"));
 
-    let mut slots = Vec::new();
-    for gen_idx in 0..3u32 {
-        let n = slots_per_gen[gen_idx as usize] as usize;
-        let base = bases[gen_idx as usize] as usize;
-        for slot in 0..n {
-            let offset = base + slot * item_size;
-            if offset + item_size > raw.len() { break; }
-            if let Some(s) = parse_slot(&raw[offset..offset + item_size], gen_idx, slot, offset, layout) {
-                slots.push(s);
-            }
-        }
-    }
-    slots
-}
-
-fn parse_slot(
-    bytes: &[u8],
-    generation: u32,
-    slot: usize,
-    byte_offset: usize,
-    layout: &offsets::offset_table::GcItemLayout,
-) -> Option<GcSlot> {
-    let rdi = |name: &str| -> i64 {
-        layout.field_offset(name)
-            .filter(|&o| o + 8 <= bytes.len())
-            .map(|o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap()))
-            .unwrap_or(0)
-    };
-    let rdf = |name: &str| -> f64 {
-        layout.field_offset(name)
-            .filter(|&o| o + 8 <= bytes.len())
-            .map(|o| f64::from_le_bytes(bytes[o..o + 8].try_into().unwrap()))
-            .unwrap_or(0.0)
-    };
-
-    let start_ts = rdi("ts_start");
-    let stop_ts = rdi("ts_stop");
-    // Ring-buffer slots carry timestamps: skip torn entries (a concurrent write left
-    // stop_ts stale and below start_ts). Inline layouts (3.13/3.14) have no timestamps —
-    // both read as 0, so the check is a no-op and every slot is kept.
-    if layout.has_field("ts_start") && layout.has_field("ts_stop") && stop_ts < start_ts {
-        return None;
-    }
-
-    Some(GcSlot {
-        generation,
-        slot,
-        byte_offset,
-        start_ts,
-        stop_ts,
-        collections: rdi("collections"),
-        collected: rdi("collected"),
-        uncollectable: rdi("uncollectable"),
-        candidates: rdi("candidates"),
-        duration: rdf("duration"),
-        heap_size: rdi("heap_size"),
-    })
+    table
+        .decode_gc_stats(raw, 0)
+        .into_iter()
+        .filter(|s| !(has_ts && s.ts_stop < s.ts_start))
+        .map(|s| GcSlot {
+            generation: s.generation,
+            slot: s.slot,
+            byte_offset: table.slot_byte_offset(s.generation, s.slot).unwrap_or(0),
+            start_ts: s.ts_start,
+            stop_ts: s.ts_stop,
+            collections: s.collections,
+            collected: s.collected,
+            uncollectable: s.uncollectable,
+            candidates: s.candidates,
+            duration: s.duration,
+            heap_size: s.heap_size,
+        })
+        .collect()
 }
 
 /// Compute average collection pause time per generation from a single snapshot.
@@ -499,17 +438,26 @@ mod tests {
     /// A layout carrying timestamps, so the torn-entry guard is live. Built by hand
     /// (not `set_ring`, which is private to the offsets module) — three 1-slot gens
     /// with the standard 8-byte inter-generation pad.
+    /// Carries `collected`/`uncollectable` because the shared decoder
+    /// (`decode_gc_stats`) treats those as required core fields — every real GC layout
+    /// has them; a synthetic one that omits them isn't representative.
     static TS_LAYOUT: GcItemLayout = GcItemLayout {
-        item_size: 24,
-        fields: &[("ts_start", 0), ("ts_stop", 8), ("collections", 16)],
+        item_size: 40,
+        fields: &[
+            ("ts_start", 0),
+            ("ts_stop", 8),
+            ("collections", 16),
+            ("collected", 24),
+            ("uncollectable", 32),
+        ],
     };
 
     fn ts_ring_table() -> offsets::offset_table::OffsetTable {
         let mut t = pre_3_13::table_for_version(3, 12).unwrap();
         t.gc_layout = Some(&TS_LAYOUT);
-        t.gc_item_size = Some(24);
+        t.gc_item_size = Some(40);
         t.gc_slots_per_gen = Some([1, 1, 1]);
-        t.gc_gen_base_offsets = Some([0, 32, 64]); // 24-byte slot + 8-byte pad per gen
+        t.gc_gen_base_offsets = Some([0, 48, 96]); // 40-byte slot + 8-byte cursor per gen
         t
     }
 
@@ -520,7 +468,7 @@ mod tests {
     fn parse_drops_torn_ring_slots_but_keeps_intact_ones() {
         let table = ts_ring_table();
         let bases = table.gc_gen_base_offsets.unwrap();
-        let mut raw = vec![0u8; bases[2] as usize + 24];
+        let mut raw = vec![0u8; bases[2] as usize + 40];
 
         // gen0: torn — stop_ts (50) < start_ts (100).
         put_i64(&mut raw, bases[0] as usize, 100);
@@ -568,5 +516,50 @@ mod tests {
         assert_ne!(slots[0].collections, 0);
         assert_eq!(slots[0].heap_size, 0);
         assert_eq!(slots[0].duration, 0.0);
+    }
+
+    /// One source of truth: the diagram and the monitor decode the same bytes into the
+    /// same numbers because they share one decoder (`OffsetTable::decode_gc_stats`). The
+    /// only sanctioned divergence is the diagram's torn-slot drop; everything else agrees
+    /// field-for-field, and the diagram's `byte_offset` matches the table geometry the
+    /// decoder walked.
+    #[test]
+    fn diagram_and_monitor_decode_agree_except_for_torn_slots() {
+        let table = ts_ring_table();
+        let bases = table.gc_gen_base_offsets.unwrap();
+        let item = table.gc_item_size.unwrap() as usize;
+        let mut raw = vec![0u8; bases[2] as usize + item];
+
+        // One intact slot per generation (stop_ts >= start_ts), distinct collections.
+        for (g, &base) in bases.iter().enumerate() {
+            put_i64(&mut raw, base as usize, 100 + g as i64); // ts_start
+            put_i64(&mut raw, base as usize + 8, 200 + g as i64); // ts_stop
+            put_i64(&mut raw, base as usize + 16, 10 + g as i64); // collections
+        }
+
+        let monitor = table.decode_gc_stats(&raw, 0); // Vec<GcStat>
+        let diagram = parse_gc_slots(&raw, &table); // Vec<GcSlot>
+
+        // No torn slots → identical population, field-for-field.
+        assert_eq!(monitor.len(), diagram.len());
+        for (m, d) in monitor.iter().zip(&diagram) {
+            assert_eq!((m.generation, m.slot), (d.generation, d.slot));
+            assert_eq!(m.ts_start, d.start_ts);
+            assert_eq!(m.ts_stop, d.stop_ts);
+            assert_eq!(m.collections, d.collections);
+            assert_eq!(m.collected, d.collected);
+            assert_eq!(m.uncollectable, d.uncollectable);
+            // The diagram recovers the exact raw-region offset the decoder walked.
+            assert_eq!(d.byte_offset, table.slot_byte_offset(d.generation, d.slot).unwrap());
+        }
+
+        // Tear gen0's slot (stop_ts < start_ts). The monitor keeps every slot (it dedups
+        // downstream); the diagram drops the torn one so it never renders garbage.
+        put_i64(&mut raw, bases[0] as usize + 8, 0);
+        let monitor_torn = table.decode_gc_stats(&raw, 0);
+        let diagram_torn = parse_gc_slots(&raw, &table);
+        assert_eq!(monitor_torn.len(), monitor.len(), "monitor keeps torn slots");
+        assert_eq!(diagram_torn.len(), diagram.len() - 1, "diagram drops the torn slot");
+        assert!(diagram_torn.iter().all(|s| s.generation != 0));
     }
 }

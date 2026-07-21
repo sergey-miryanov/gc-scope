@@ -18,14 +18,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use read_process_memory::ProcessHandle;
 
 use crate::memory::{process, reader};
 use crate::remote_debugging::gc_stats::GcStat;
 use crate::remote_debugging::offsets::{
     self,
-    offset_table::{GcStatsKind, OffsetTable},
+    offset_table::{GcStatsKind, GcStatsRegion, OffsetTable},
     VersionedOffsets,
 };
 use crate::remote_debugging::version::{self, PythonVersion};
@@ -332,6 +332,34 @@ impl PySession {
         Ok(self.read_u64(addr)? as i64)
     }
 
+    /// Resolve one interpreter's GC generation-stats region address from its
+    /// `_gc_runtime_state` address (`gc_addr`).
+    ///
+    /// The single reader-layer entry point for stats-region resolution: both this
+    /// session's own [`gc_stats`](Self::gc_stats) (the monitor path) and the diagram
+    /// collector call it, so the fail-open "which address, deref the ring, handle NULL"
+    /// logic lives in one place and any fix reaches both. The geometry decision is the pure
+    /// [`OffsetTable::gc_stats_region`]; the one ring-pointer read a `Deref` needs happens
+    /// here through the held handle. A NULL ring pointer (stats not yet allocated /
+    /// teardown) reads back as `Ok(None)`.
+    pub fn gc_stats_region_addr(&self, gc_addr: u64) -> Result<Option<u64>> {
+        let gen_stats_off = self
+            .resolved
+            .offsets()
+            .map(|vo| vo.gc_generation_stats())
+            .unwrap_or(0);
+        match self.resolved.table().gc_stats_region(gc_addr, gen_stats_off) {
+            GcStatsRegion::Absent => Ok(None),
+            GcStatsRegion::Direct(addr) => Ok(Some(addr)),
+            GcStatsRegion::Deref(ptr_addr) => {
+                let ptr = self
+                    .read_u64(ptr_addr)
+                    .context("Failed to read gc.generation_stats pointer")?;
+                Ok((ptr != 0).then_some(ptr))
+            }
+        }
+    }
+
     /// Read GC generation stats for the first (or, with `all_interpreters`, every)
     /// interpreter. Walks the interpreter chain and resolves each interpreter's
     /// stats region by its shape (`InlineArray` at a fixed offset, `RingBuffer`
@@ -414,9 +442,9 @@ impl PySession {
             && let Some(runtime_gc) = table.runtime_gc
         {
             let iid = if head_addr != 0 { self.read_i64(head_addr + id_off)? } else { 0 };
+            let gc_addr = self.runtime_addr + runtime_gc; // global `_gc_runtime_state`
             let mut global_table = table.clone();
-            global_table.gc_stats_addr =
-                Some(self.runtime_addr + runtime_gc + table.gc_stats_inline_off);
+            global_table.gc_stats_addr = self.gc_stats_region_addr(gc_addr)?;
             return global_table.read_gc_stats(&self.handle, iid);
         }
 
@@ -429,24 +457,9 @@ impl PySession {
             let iid = self.read_i64(current + id_off)?;
             let gc_addr = current + gc_off; // this interpreter's `_gc_runtime_state`
 
-            // Resolve this interpreter's stats address by its region shape.
-            let stats_addr = match table.gc_stats_kind {
-                GcStatsKind::None => None,
-                GcStatsKind::InlineArray => Some(gc_addr + table.gc_stats_inline_off),
-                GcStatsKind::RingBuffer => {
-                    let gen_stats_off = self
-                        .resolved
-                        .offsets()
-                        .map(|vo| vo.gc_generation_stats())
-                        .unwrap_or(0);
-                    if gen_stats_off == 0 {
-                        None
-                    } else {
-                        let ptr = self.read_u64(gc_addr + gen_stats_off)?;
-                        (ptr != 0).then_some(ptr)
-                    }
-                }
-            };
+            // Resolve this interpreter's stats address by its region shape (single
+            // source of truth — the diagram collector resolves through the same path).
+            let stats_addr = self.gc_stats_region_addr(gc_addr)?;
 
             if let Some(addr) = stats_addr {
                 let mut interp_table = table.clone();
