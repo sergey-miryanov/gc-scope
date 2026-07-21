@@ -37,7 +37,7 @@ impl Drop for TerminalGuard {
 }
 
 // ── Entry point ───────────────────────────────────────────────────
-pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, mut glitch_enabled: bool) -> Result<()> {
+pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitch_enabled: bool) -> Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
     stdout().execute(EnterAlternateScreen)?;
@@ -61,95 +61,41 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
     let mut session = crate::remote_debugging::session::PySession::attach(pid)?;
     let mut start = Instant::now();
     let mut frame: u64 = 0;
-    let mut scroll: u16 = 0;
-    let mut selected_slot: usize = 0;
-    let mut debug_offsets_show_tree: bool = true;
-    let mut debug_offsets_show_hex: bool = true;
-    let mut show_runtime_hex: bool = false;
 
-    // Glitch state
+    // View state (scroll, slot selection, panel toggles, rate, glitch-enable) — every
+    // mutation goes through `TuiState::handle_key`, so the key bindings are unit-testable.
+    let mut state = TuiState::new(rate_ms, glitch_enabled);
+
+    // Glitch / connection-lost timer state, advanced once per frame by `GlitchState::tick`.
+    // `rng_state` stays beside it (not inside) so the render closure can borrow it while the
+    // timer struct is left untouched.
     let mut rng_state: u32 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u32)
         .unwrap_or(12345);
-    let mut glitch_active = false;
-    let mut next_glitch_at = Instant::now();
-    let mut glitch_end = Instant::now();
-
-    // Connection-lost sequence state
-    let mut cl_active = false;
-    let mut cl_phase: u8 = 0;        // 0=inactive, 1=build-up, 2=message
-    let mut cl_phase_start = Instant::now();
-    let mut cl_end = Instant::now();
-    let mut next_cl_show = Instant::now() + Duration::from_secs(30);
-    let mut cl_jx: i32 = 0;
-    let mut cl_jy: i32 = 0;
-    let mut cl_last_jitter = Instant::now();
+    let mut glitch = GlitchState::new(Instant::now());
 
     let result = loop {
-        if event::poll(Duration::from_millis(rate_ms))?
+        if event::poll(Duration::from_millis(state.rate_ms))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    selected_slot = selected_slot.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    selected_slot = selected_slot.saturating_add(1);
-                }
-                KeyCode::Char('t') => {
-                    debug_offsets_show_tree = !debug_offsets_show_tree;
-                }
-                KeyCode::Char('h') => {
-                    debug_offsets_show_hex = !debug_offsets_show_hex;
-                }
-                KeyCode::Char('o') => {
-                    if debug_offsets_show_tree || debug_offsets_show_hex {
-                        debug_offsets_show_tree = false;
-                        debug_offsets_show_hex = false;
-                    } else {
-                        debug_offsets_show_tree = true;
-                        debug_offsets_show_hex = true;
-                    }
-                }
-                KeyCode::Char('d') => {
-                    show_runtime_hex = !show_runtime_hex;
-                }
-                KeyCode::Char('r') => {
-                    rate_ms = rate_ms.saturating_sub(10).max(10);
-                }
-                KeyCode::Char('R') => {
-                    rate_ms = rate_ms.saturating_add(10);
-                }
-                KeyCode::Char('g') => {
-                    glitch_enabled = !glitch_enabled;
-                }
-                KeyCode::Char('p') => {
+            match state.handle_key(key.code) {
+                KeyOutcome::Quit => break Ok(()),
+                KeyOutcome::PickPid => {
                     if let Ok((processes, pid_info_map)) = crate::list_pids::list_python_processes()
                         && let Ok(Some(new_pid)) = super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map)
+                        && let Ok(new_session) = crate::remote_debugging::session::PySession::attach(new_pid)
                     {
-                        // Re-attach to the newly picked PID; only commit
-                        // the switch if it resolves.
-                        if let Ok(new_session) = crate::remote_debugging::session::PySession::attach(new_pid) {
-                            session = new_session;
-                            pid = new_pid;
-                            start = Instant::now();
-                            scroll = 0;
-                            selected_slot = 0;
-                            frame = 0;
-                            debug_offsets_show_tree = true;
-                            debug_offsets_show_hex = true;
-                            show_runtime_hex = false;
-                        }
+                        // Commit the switch only once it fully resolves.
+                        session = new_session;
+                        pid = new_pid;
+                        start = Instant::now();
+                        frame = 0;
+                        state.reset_view();
                     }
                 }
-                KeyCode::PageUp => scroll = scroll.saturating_sub(10),
-                KeyCode::PageDown => scroll = scroll.saturating_add(10),
-                KeyCode::Home => scroll = 0,
-                KeyCode::End => scroll = u16::MAX,
-                _ => {}
+                KeyOutcome::Continue => {}
             }
         }
 
@@ -169,10 +115,7 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
 
         // Clamp selected_slot to valid range based on new data
         let slot_count = data.interpreter.gc.generation_stats.slots.len();
-        let max_slot = slot_count.saturating_sub(1);
-        if selected_slot > max_slot {
-            selected_slot = max_slot;
-        }
+        state.clamp_slot(slot_count);
 
         let elapsed = start.elapsed();
         frame += 1;
@@ -184,46 +127,12 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
             break Ok(());
         }
 
-        // Glitch + connection-lost timer logic (wall-clock based)
-        if glitch_enabled {
-            let now = Instant::now();
-            if cl_active {
-                if cl_phase == 1 {
-                    // Build-up phase lasts 1 second
-                    if now >= cl_phase_start + Duration::from_secs(1) {
-                        cl_phase = 2;
-                        cl_phase_start = now;
-                        let msg_dur = rand_range(&mut rng_state, 4000, 8000);
-                        cl_end = now + Duration::from_millis(msg_dur as u64);
-                    }
-                } else if cl_phase == 2
-                    && now >= cl_end
-                {
-                    cl_active = false;
-                    cl_phase = 0;
-                    // Double next normal glitch cooldown
-                    let delay = rand_range(&mut rng_state, 1000, 8000) * 2;
-                    next_glitch_at = now + Duration::from_millis(delay as u64);
-                    // Schedule next sequence in ~30 s
-                    let interval = rand_range(&mut rng_state, 25000, 35000);
-                    next_cl_show = now + Duration::from_millis(interval as u64);
-                }
-            } else if now >= next_cl_show {
-                cl_active = true;
-                cl_phase = 1;
-                cl_phase_start = now;
-            } else if glitch_active {
-                if now >= glitch_end {
-                    glitch_active = false;
-                    let delay = rand_range(&mut rng_state, 1000, 8000);
-                    next_glitch_at = now + Duration::from_millis(delay as u64);
-                }
-            } else if now >= next_glitch_at {
-                glitch_active = true;
-                let dur = rand_range(&mut rng_state, 200, 600);
-                glitch_end = now + Duration::from_millis(dur as u64);
-            }
-        }
+        // Advance the glitch / connection-lost state machine. `now` is captured once and
+        // passed in (rather than read inside) so the transitions are deterministically
+        // testable; see `GlitchState::tick`.
+        let now = Instant::now();
+        glitch.tick(now, state.glitch_enabled, &mut rng_state);
+        glitch.update_jitter(now, &mut rng_state);
 
         let stats = &data.interpreter.gc.generation_stats;
         let slots = &stats.slots;
@@ -231,29 +140,26 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
             collections_rate_from_slots(slots, stats.has_timestamps),
             avg_collection_time_per_gen(slots, stats.has_duration),
         );
-        let (styled_lines, _slot_line) = build_lines(&data, rate_per_gen, avg_coll_time_per_gen, selected_slot, debug_offsets_show_tree, debug_offsets_show_hex, show_runtime_hex);
+        let (styled_lines, _slot_line) = build_lines(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_slot, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex);
 
-        // Pre-compute glitch draw conditions
-        let should_glitch = glitch_enabled && !cl_active && glitch_active;
-        let should_buildup = glitch_enabled && cl_active && cl_phase == 1;
-        let should_msg = glitch_enabled && cl_active && cl_phase == 2;
+        // Pre-compute glitch draw conditions for this frame.
+        let should_glitch = glitch.should_glitch(state.glitch_enabled);
+        let should_buildup = glitch.should_buildup(state.glitch_enabled);
+        let should_msg = glitch.should_msg(state.glitch_enabled);
         let buildup_progress = if should_buildup {
-            cl_phase_start.elapsed().as_secs_f64().min(1.0)
+            glitch.cl_phase_start.elapsed().as_secs_f64().min(1.0)
         } else {
             0.0
         };
-        let glitch_badge_active = glitch_active || cl_active;
+        let glitch_badge_active = glitch.badge_active();
+        let (cl_active, cl_jx, cl_jy) = (glitch.cl_active, glitch.cl_jx, glitch.cl_jy);
 
-        // Update CL jitter at most every 200ms
-        if cl_active && cl_phase == 2 {
-            let now = Instant::now();
-            if now >= cl_last_jitter + Duration::from_millis(200) {
-                cl_jx = ((rand_range(&mut rng_state, 0, 2) as i32) - 1).clamp(-1, 1);
-                cl_jy = ((rand_range(&mut rng_state, 0, 2) as i32) - 1).clamp(-1, 1);
-                cl_last_jitter = now;
-            }
-        }
-
+        // Copy the view scalars the render closure reads; `scroll` is taken mutably so the
+        // closure can clamp it, then written back below.
+        let rate_ms = state.rate_ms;
+        let selected_slot = state.selected_slot;
+        let glitch_enabled = state.glitch_enabled;
+        let mut scroll = state.scroll;
         terminal.draw(|f| {
             let area = f.size();
             let chunks = ratatui::layout::Layout::vertical([
@@ -294,10 +200,200 @@ pub fn run_tui(pid: Option<u32>, mut rate_ms: u64, duration_secs: Option<u64>, m
                 apply_glitch(f.buffer_mut(), &mut rng_state);
             }
         })?;
+        state.scroll = scroll;
     };
 
     // Terminal teardown is handled by `_guard` on drop, covering every exit path.
     result
+}
+
+// ── View state (key reducer) ──────────────────────────────────────
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiState {
+    scroll: u16,
+    selected_slot: usize,
+    debug_offsets_show_tree: bool,
+    debug_offsets_show_hex: bool,
+    show_runtime_hex: bool,
+    rate_ms: u64,
+    glitch_enabled: bool,
+}
+
+/// What a key press asks the render loop to do. `PickPid` and `Quit` are the two outcomes
+/// that need terminal/session I/O, which the loop owns — the reducer stays pure.
+#[derive(Debug, PartialEq, Eq)]
+enum KeyOutcome {
+    Continue,
+    Quit,
+    PickPid,
+}
+
+impl TuiState {
+    fn new(rate_ms: u64, glitch_enabled: bool) -> Self {
+        TuiState {
+            scroll: 0,
+            selected_slot: 0,
+            debug_offsets_show_tree: true,
+            debug_offsets_show_hex: true,
+            show_runtime_hex: false,
+            rate_ms,
+            glitch_enabled,
+        }
+    }
+
+    /// Resets the per-view state after a successful PID re-pick. Mirrors the original inline
+    /// reset, which deliberately left `rate_ms` and `glitch_enabled` alone.
+    fn reset_view(&mut self) {
+        self.scroll = 0;
+        self.selected_slot = 0;
+        self.debug_offsets_show_tree = true;
+        self.debug_offsets_show_hex = true;
+        self.show_runtime_hex = false;
+    }
+
+    /// Pulls `selected_slot` back into `[0, slot_count)` when a new snapshot has fewer slots.
+    fn clamp_slot(&mut self, slot_count: usize) {
+        let max_slot = slot_count.saturating_sub(1);
+        if self.selected_slot > max_slot {
+            self.selected_slot = max_slot;
+        }
+    }
+
+    /// Applies one key press to the view state, returning whether the loop should continue,
+    /// quit, or open the PID picker. Pure aside from `&mut self`, so every binding is
+    /// directly unit-testable without a terminal.
+    fn handle_key(&mut self, code: KeyCode) -> KeyOutcome {
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => return KeyOutcome::Quit,
+            KeyCode::Up | KeyCode::Char('k') => self.selected_slot = self.selected_slot.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.selected_slot = self.selected_slot.saturating_add(1),
+            KeyCode::Char('t') => self.debug_offsets_show_tree = !self.debug_offsets_show_tree,
+            KeyCode::Char('h') => self.debug_offsets_show_hex = !self.debug_offsets_show_hex,
+            KeyCode::Char('o') => {
+                if self.debug_offsets_show_tree || self.debug_offsets_show_hex {
+                    self.debug_offsets_show_tree = false;
+                    self.debug_offsets_show_hex = false;
+                } else {
+                    self.debug_offsets_show_tree = true;
+                    self.debug_offsets_show_hex = true;
+                }
+            }
+            KeyCode::Char('d') => self.show_runtime_hex = !self.show_runtime_hex,
+            KeyCode::Char('r') => self.rate_ms = self.rate_ms.saturating_sub(10).max(10),
+            KeyCode::Char('R') => self.rate_ms = self.rate_ms.saturating_add(10),
+            KeyCode::Char('g') => self.glitch_enabled = !self.glitch_enabled,
+            KeyCode::Char('p') => return KeyOutcome::PickPid,
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
+            KeyCode::Home => self.scroll = 0,
+            KeyCode::End => self.scroll = u16::MAX,
+            _ => {}
+        }
+        KeyOutcome::Continue
+    }
+}
+
+// ── Glitch / connection-lost timer ────────────────────────────────
+/// The glitch and "connection lost" visual-effect state machine, split out of the render
+/// loop so its transitions can be tested against an injected clock. `tick`/`update_jitter`
+/// take `now` as a parameter instead of calling `Instant::now()` internally.
+struct GlitchState {
+    glitch_active: bool,
+    next_glitch_at: Instant,
+    glitch_end: Instant,
+    cl_active: bool,
+    cl_phase: u8, // 0=inactive, 1=build-up, 2=message
+    cl_phase_start: Instant,
+    cl_end: Instant,
+    next_cl_show: Instant,
+    cl_jx: i32,
+    cl_jy: i32,
+    cl_last_jitter: Instant,
+}
+
+impl GlitchState {
+    fn new(now: Instant) -> Self {
+        GlitchState {
+            glitch_active: false,
+            next_glitch_at: now,
+            glitch_end: now,
+            cl_active: false,
+            cl_phase: 0,
+            cl_phase_start: now,
+            cl_end: now,
+            next_cl_show: now + Duration::from_secs(30),
+            cl_jx: 0,
+            cl_jy: 0,
+            cl_last_jitter: now,
+        }
+    }
+
+    /// Advances the glitch + connection-lost timers by one frame. No-op while `glitch_enabled`
+    /// is false, matching the original inline guard.
+    fn tick(&mut self, now: Instant, glitch_enabled: bool, rng: &mut u32) {
+        if !glitch_enabled {
+            return;
+        }
+        if self.cl_active {
+            if self.cl_phase == 1 {
+                // Build-up phase lasts 1 second, then the message shows.
+                if now >= self.cl_phase_start + Duration::from_secs(1) {
+                    self.cl_phase = 2;
+                    self.cl_phase_start = now;
+                    let msg_dur = rand_range(rng, 4000, 8000);
+                    self.cl_end = now + Duration::from_millis(msg_dur as u64);
+                }
+            } else if self.cl_phase == 2 && now >= self.cl_end {
+                self.cl_active = false;
+                self.cl_phase = 0;
+                // Double the next normal glitch cooldown, and reschedule the next sequence.
+                let delay = rand_range(rng, 1000, 8000) * 2;
+                self.next_glitch_at = now + Duration::from_millis(delay as u64);
+                let interval = rand_range(rng, 25000, 35000);
+                self.next_cl_show = now + Duration::from_millis(interval as u64);
+            }
+        } else if now >= self.next_cl_show {
+            self.cl_active = true;
+            self.cl_phase = 1;
+            self.cl_phase_start = now;
+        } else if self.glitch_active {
+            if now >= self.glitch_end {
+                self.glitch_active = false;
+                let delay = rand_range(rng, 1000, 8000);
+                self.next_glitch_at = now + Duration::from_millis(delay as u64);
+            }
+        } else if now >= self.next_glitch_at {
+            self.glitch_active = true;
+            let dur = rand_range(rng, 200, 600);
+            self.glitch_end = now + Duration::from_millis(dur as u64);
+        }
+    }
+
+    /// Updates the connection-lost box jitter, throttled to ~5 Hz and only during the
+    /// message phase.
+    fn update_jitter(&mut self, now: Instant, rng: &mut u32) {
+        if self.cl_active
+            && self.cl_phase == 2
+            && now >= self.cl_last_jitter + Duration::from_millis(200)
+        {
+            self.cl_jx = ((rand_range(rng, 0, 2) as i32) - 1).clamp(-1, 1);
+            self.cl_jy = ((rand_range(rng, 0, 2) as i32) - 1).clamp(-1, 1);
+            self.cl_last_jitter = now;
+        }
+    }
+
+    fn should_glitch(&self, enabled: bool) -> bool {
+        enabled && !self.cl_active && self.glitch_active
+    }
+    fn should_buildup(&self, enabled: bool) -> bool {
+        enabled && self.cl_active && self.cl_phase == 1
+    }
+    fn should_msg(&self, enabled: bool) -> bool {
+        enabled && self.cl_active && self.cl_phase == 2
+    }
+    fn badge_active(&self) -> bool {
+        self.glitch_active || self.cl_active
+    }
 }
 
 // Nine heterogeneous scalars, all read off the render loop's local state at the single
@@ -1697,5 +1793,196 @@ mod tests {
         // Jitter offsets and a clamped-tiny buffer must not write out of bounds.
         draw_connection_lost_box(&mut buf, 1, -1);
         draw_connection_lost_box(&mut Buffer::empty(Rect::new(0, 0, 10, 3)), 0, 0);
+    }
+
+    // ── Tier A: key reducer (TuiState) ────────────────────────────
+    // The interactive event loop's decision logic, extracted so each binding is a plain
+    // input→state assertion with no terminal.
+
+    #[test]
+    fn handle_key_moves_the_slot_selection_with_saturation() {
+        let mut s = TuiState::new(100, false);
+        assert_eq!(s.handle_key(KeyCode::Down), KeyOutcome::Continue);
+        assert_eq!(s.selected_slot, 1);
+        s.handle_key(KeyCode::Char('j'));
+        assert_eq!(s.selected_slot, 2);
+        s.handle_key(KeyCode::Up);
+        assert_eq!(s.selected_slot, 1);
+        // Saturates at 0 rather than underflowing.
+        s.handle_key(KeyCode::Char('k'));
+        s.handle_key(KeyCode::Char('k'));
+        assert_eq!(s.selected_slot, 0);
+    }
+
+    #[test]
+    fn handle_key_toggles_the_debug_offsets_panels() {
+        let mut s = TuiState::new(100, false);
+        assert!(s.debug_offsets_show_tree && s.debug_offsets_show_hex, "both shown by default");
+        s.handle_key(KeyCode::Char('t'));
+        assert!(!s.debug_offsets_show_tree);
+        s.handle_key(KeyCode::Char('h'));
+        assert!(!s.debug_offsets_show_hex);
+        s.handle_key(KeyCode::Char('d'));
+        assert!(s.show_runtime_hex);
+    }
+
+    #[test]
+    fn handle_key_o_collapses_when_anything_shown_and_expands_when_all_hidden() {
+        let mut s = TuiState::new(100, false);
+        // Both shown → collapse to both hidden.
+        s.handle_key(KeyCode::Char('o'));
+        assert!(!s.debug_offsets_show_tree && !s.debug_offsets_show_hex);
+        // Both hidden → expand to both shown.
+        s.handle_key(KeyCode::Char('o'));
+        assert!(s.debug_offsets_show_tree && s.debug_offsets_show_hex);
+        // Mixed (only tree shown) still counts as "shown" → collapse both.
+        s.debug_offsets_show_hex = false;
+        s.handle_key(KeyCode::Char('o'));
+        assert!(!s.debug_offsets_show_tree && !s.debug_offsets_show_hex);
+    }
+
+    #[test]
+    fn handle_key_rate_steps_by_ten_and_floors_at_ten() {
+        let mut s = TuiState::new(100, false);
+        s.handle_key(KeyCode::Char('r'));
+        assert_eq!(s.rate_ms, 90);
+        s.handle_key(KeyCode::Char('R'));
+        assert_eq!(s.rate_ms, 100);
+        // Down never drops below 10, even stepping from just above it.
+        s.rate_ms = 15;
+        s.handle_key(KeyCode::Char('r'));
+        assert_eq!(s.rate_ms, 10);
+        s.handle_key(KeyCode::Char('r'));
+        assert_eq!(s.rate_ms, 10);
+    }
+
+    #[test]
+    fn handle_key_scrolls_and_toggles_glitch() {
+        let mut s = TuiState::new(100, true);
+        s.handle_key(KeyCode::PageDown);
+        assert_eq!(s.scroll, 10);
+        s.handle_key(KeyCode::PageDown);
+        assert_eq!(s.scroll, 20);
+        s.handle_key(KeyCode::PageUp);
+        assert_eq!(s.scroll, 10);
+        s.handle_key(KeyCode::End);
+        assert_eq!(s.scroll, u16::MAX);
+        s.handle_key(KeyCode::Home);
+        assert_eq!(s.scroll, 0);
+        s.handle_key(KeyCode::Char('g'));
+        assert!(!s.glitch_enabled);
+    }
+
+    #[test]
+    fn handle_key_signals_quit_pickpid_and_ignores_unbound_keys() {
+        let mut s = TuiState::new(100, false);
+        assert_eq!(s.handle_key(KeyCode::Char('q')), KeyOutcome::Quit);
+        assert_eq!(s.handle_key(KeyCode::Esc), KeyOutcome::Quit);
+        assert_eq!(s.handle_key(KeyCode::Char('p')), KeyOutcome::PickPid);
+        let before = s.clone();
+        assert_eq!(s.handle_key(KeyCode::Char('z')), KeyOutcome::Continue);
+        assert_eq!(s, before, "an unbound key must not mutate state");
+    }
+
+    #[test]
+    fn reset_view_clears_the_view_but_keeps_rate_and_glitch() {
+        let mut s = TuiState::new(250, true);
+        s.scroll = 40;
+        s.selected_slot = 3;
+        s.debug_offsets_show_tree = false;
+        s.debug_offsets_show_hex = false;
+        s.show_runtime_hex = true;
+        s.reset_view();
+        assert_eq!((s.scroll, s.selected_slot), (0, 0));
+        assert!(s.debug_offsets_show_tree && s.debug_offsets_show_hex && !s.show_runtime_hex);
+        // rate_ms and glitch_enabled survive a re-pick, as the original loop did.
+        assert_eq!(s.rate_ms, 250);
+        assert!(s.glitch_enabled);
+    }
+
+    #[test]
+    fn clamp_slot_pulls_the_selection_into_range() {
+        let mut s = TuiState::new(100, false);
+        s.selected_slot = 5;
+        s.clamp_slot(3);
+        assert_eq!(s.selected_slot, 2, "clamped to the last valid slot");
+        s.clamp_slot(0);
+        assert_eq!(s.selected_slot, 0, "no slots → index 0");
+        s.selected_slot = 1;
+        s.clamp_slot(4);
+        assert_eq!(s.selected_slot, 1, "an in-range selection is left alone");
+    }
+
+    // ── Tier B: glitch timer (GlitchState) ────────────────────────
+    // `now` is injected, so every transition is deterministic without reading the clock.
+
+    #[test]
+    fn glitch_tick_is_a_noop_while_disabled() {
+        let t0 = Instant::now();
+        let mut g = GlitchState::new(t0);
+        let mut rng = 1u32;
+        // next_glitch_at == t0, so an *enabled* tick would fire; a disabled one must not.
+        g.tick(t0 + Duration::from_millis(1), false, &mut rng);
+        assert!(!g.glitch_active && !g.badge_active());
+    }
+
+    #[test]
+    fn glitch_tick_activates_then_clears_an_ordinary_glitch() {
+        let t0 = Instant::now();
+        let mut g = GlitchState::new(t0);
+        let mut rng = 12345u32;
+
+        // First enabled tick past next_glitch_at turns the glitch on.
+        g.tick(t0 + Duration::from_millis(1), true, &mut rng);
+        assert!(g.glitch_active && g.should_glitch(true) && g.badge_active());
+
+        // Ticking past glitch_end clears it and schedules the next one in the future.
+        let end = g.glitch_end;
+        g.tick(end + Duration::from_millis(1), true, &mut rng);
+        assert!(!g.glitch_active);
+        assert!(g.next_glitch_at > end);
+    }
+
+    #[test]
+    fn glitch_tick_runs_the_connection_lost_sequence_through_its_phases() {
+        let t0 = Instant::now();
+        let mut g = GlitchState::new(t0);
+        let mut rng = 999u32;
+
+        // next_cl_show is ~30s out; crossing it enters the build-up phase.
+        let enter = t0 + Duration::from_secs(31);
+        g.tick(enter, true, &mut rng);
+        assert!(g.cl_active && g.cl_phase == 1);
+        assert!(g.should_buildup(true) && !g.should_glitch(true), "CL outranks the plain glitch");
+
+        // Build-up lasts 1s → message phase.
+        g.tick(enter + Duration::from_millis(1001), true, &mut rng);
+        assert_eq!(g.cl_phase, 2);
+        assert!(g.should_msg(true));
+
+        // Past cl_end the sequence resets and reschedules both timers into the future.
+        let end = g.cl_end;
+        g.tick(end + Duration::from_millis(1), true, &mut rng);
+        assert!(!g.cl_active && g.cl_phase == 0);
+        assert!(g.next_cl_show > end && g.next_glitch_at > end);
+    }
+
+    #[test]
+    fn update_jitter_moves_within_one_cell_and_throttles() {
+        let t0 = Instant::now();
+        let mut g = GlitchState::new(t0);
+        let mut rng = 7u32;
+        // Force the message phase, where jitter is live.
+        g.cl_active = true;
+        g.cl_phase = 2;
+
+        let j = t0 + Duration::from_secs(1);
+        g.update_jitter(j, &mut rng);
+        assert!((-1..=1).contains(&g.cl_jx) && (-1..=1).contains(&g.cl_jy));
+        assert_eq!(g.cl_last_jitter, j);
+
+        // A second update inside the 200ms window is throttled out.
+        g.update_jitter(j + Duration::from_millis(100), &mut rng);
+        assert_eq!(g.cl_last_jitter, j, "jitter must not update faster than ~5 Hz");
     }
 }
