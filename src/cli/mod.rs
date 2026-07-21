@@ -90,16 +90,9 @@ pub enum Command {
         /// Enable visual glitch effects
         #[arg(short, long)]
         glitch: bool,
-    },
-    /// Generate ASCII diagram of Python runtime memory layout (stdout)
-    Ascii {
-        #[arg(allow_hyphen_values = true)]
-        pid: i32,
-        /// Watch mode: continuously poll and redraw
-        #[arg(short, long)]
-        watch: bool,
-        /// Polling interval in milliseconds (default: 1000, requires --watch)
-        #[arg(short, long, default_value = "1000", requires = "watch")]
-        rate: u64,
+        /// Write a single static frame (plain text) to this file and exit, instead of
+        /// launching the interactive terminal UI. Requires an explicit PID.
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<String>,
     },
 }

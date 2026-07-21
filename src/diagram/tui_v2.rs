@@ -479,8 +479,12 @@ fn top() -> String {
     format!("+{}+", "-".repeat(OUTER_W))
 }
 
+// `| ` + content + ` |` must total `top()`'s width (OUTER_W + 2), so the padded content
+// area is OUTER_W - 2 — not OUTER_W, which overpads full-width rows by 2 and pushes them
+// past the box border (harmless clipping in a live terminal, visible misalignment in a
+// `tui --output` file dump).
 fn l(content: &str) -> String {
-    format!("| {:<w$} |", content, w = OUTER_W)
+    format!("| {:<w$} |", content, w = OUTER_W - 2)
 }
 
 fn plain_line(left: &str, right: &str) -> Line<'static> {
@@ -1273,25 +1277,34 @@ fn fmt_rate(rate: f64) -> String {
 /// integration test can exercise the **Full-tier** section builders
 /// (`section_debug_offsets` / `section_interpreter`) that only run against a real 3.13+
 /// `_Py_DebugOffsets` struct and so can't be reached from the synthetic-Legacy unit tests.
-/// Mirrors what `run_tui` feeds into the content `Paragraph`. Test-only seam, like
-/// `MonitorContext::insert_session_for_test`.
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub fn render_frame_for_test(
+/// Renders a single static TUI frame as plain text (no styling, no glitch overlay) — the
+/// non-interactive counterpart to `run_tui`, used by `tui --output` to dump a frame to a
+/// file. Unlike the interactive draw loop the styled `Line`s are flattened to their text,
+/// and the PID/version header the loop puts in the `Paragraph` title bar (absent from
+/// `build_lines`) is prepended here, since a file has no title bar. Always compiled so both
+/// `run_tui_snapshot` and the integration tests can reach it through the public API.
+pub fn render_snapshot(
     data: &CollectedData,
     selected_slot: usize,
     show_tree: bool,
     show_hex: bool,
     show_runtime_hex: bool,
-) -> Vec<String> {
+) -> String {
     let stats = &data.interpreter.gc.generation_stats;
     let rate = collections_rate_from_slots(&stats.slots, stats.has_timestamps);
     let avg = avg_collection_time_per_gen(&stats.slots, stats.has_duration);
     let (lines, _) = build_lines(data, rate, avg, selected_slot, show_tree, show_hex, show_runtime_hex);
-    lines
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect()
+    let mut out = format!(
+        "gcscope tui — PID {} — Python 0x{:08x}\n",
+        data.pid, data.runtime_version
+    );
+    for line in &lines {
+        for span in &line.spans {
+            out.push_str(span.content.as_ref());
+        }
+        out.push('\n');
+    }
+    out
 }
 
 // ── Glitch effects ─────────────────────────────────────────────────
@@ -1725,6 +1738,29 @@ mod tests {
         assert!(!out.contains("_Py_DebugOffsets (embedded"), "legacy must skip section 1: {out}");
         assert!(out.contains("pre-3.13: no _Py_DebugOffsets"), "{out}");
         assert!(out.contains("Gen 0 (Young) - 1 slots"), "{out}");
+    }
+
+    /// `render_snapshot` (the `tui --output` path) prepends the PID/version header the
+    /// interactive title bar normally supplies — absent from `build_lines` — then flattens
+    /// the styled frame to plain text. The body's box borders stay at the fixed frame width;
+    /// only the prepended header is shorter.
+    #[test]
+    fn render_snapshot_prepends_header_and_flattens_the_frame() {
+        let out = render_snapshot(&legacy_data(true), 0, true, true, false);
+        assert!(
+            out.lines().next().unwrap().contains("PID 4321")
+                && out.lines().next().unwrap().contains("0x030c0000"),
+            "first line must be the PID/version header: {out}"
+        );
+        // The flattened body still carries the GC section (proves build_lines ran + joined).
+        assert!(out.contains("Gen 0 (Young) - 1 slots"), "{out}");
+        // A full-width border appears and no line overflows the frame (header aside).
+        let border = format!("+{}+", "-".repeat(OUTER_W));
+        assert!(out.lines().any(|line| line == border), "a full-width border must appear");
+        assert!(
+            out.lines().all(|line| line.chars().count() <= OUTER_W + 2),
+            "a line exceeded the frame width"
+        );
     }
 
     // ── status_bar ────────────────────────────────────────────────
