@@ -119,7 +119,7 @@ where
     }
 }
 
-/// Whether a stats kind yields any decodable slots. `None` is the one non-reading kind:
+/// Whether a stats kind yields any decodable entries. `None` is the one non-reading kind:
 /// [`PySession::supports_gc_stats`] (the capability the TUI picker and `list-pids` "S" column
 /// report) reports it as unsupported, and [`PySession::gc_stats`] fast-returns an empty vec for
 /// it. Both key off this single predicate.
@@ -451,10 +451,10 @@ impl PySession {
     /// The process publishes the true byte size of its ring region in
     /// `gc.generation_stats_size`; `attach` has already selected the best-matching layout,
     /// so for any recognized build the reconstructed size equals what the process reports
-    /// and this stays silent. A mismatch means the per-slot stride or the field offsets are
+    /// and this stays silent. A mismatch means the per-entry stride or the field offsets are
     /// wrong — every number we could decode would be garbage — so bail with a regenerate
     /// hint (C12) rather than decode nonsense. (This is how a 3.15.0b4 target silently
-    /// decoded through the 3.15.0a8 layout, 96-byte slots vs 64, while every CI leg stayed
+    /// decoded through the 3.15.0a8 layout, 96-byte entries vs 64, while every CI leg stayed
     /// green.)
     fn verify_ring_stats_size(&self) -> Result<()> {
         let table = self.resolved.table();

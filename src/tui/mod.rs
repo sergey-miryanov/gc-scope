@@ -15,7 +15,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
 
 /// Attaches, polls a single snapshot, and writes one static TUI frame (plain text) to
 /// `path` — the non-interactive counterpart to `run_tui`, used by `tui --output`. The
-/// frame renders with the default view (slot 0, tree + hex shown, DebugOffsets hex).
+/// frame renders with the default view (entry 0, tree + hex shown, DebugOffsets hex).
 pub fn run_tui_snapshot(pid: u32, path: &str) -> Result<()> {
     let mut poller = SnapshotPoller::attach_with(pid, CollectRequest::tui())?;
     let data = poller.poll()?;

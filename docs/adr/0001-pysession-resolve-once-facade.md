@@ -39,7 +39,7 @@ single "resolve this process" facade:
 
 A session holds fields with different lifetimes, so caching is split in two:
 
-- **Instance state** (`handle`, `runtime_addr`, per-`(gen,slot)` freshness) is
+- **Instance state** (`handle`, `runtime_addr`, per-`(gen,entry)` freshness) is
   per-PID and evicted through a **single** site, `mark_died`.
 - **Layout** (`Resolved`) is a pure function of the binary, cached separately keyed
   by **`(interpreter-path, mtime)`**, and **survives death** — so a relaunch or a

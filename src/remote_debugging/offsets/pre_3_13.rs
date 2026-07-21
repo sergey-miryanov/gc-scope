@@ -4,8 +4,8 @@ use crate::remote_debugging::offsets::offset_table::{GcItemLayout, GcStatsKind, 
 pub const GC_STATS_INLINE_OFF: u64 = 0x80;
 /// Size of a single `gc_generation_stats` struct (3 × Py_ssize_t = 24 bytes).
 pub const GC_ITEM_SIZE: u64 = 24;
-/// Slot count for inline array: one per generation, no ring buffer.
-pub const GC_SLOTS: [u64; 3] = [1, 1, 1];
+/// Entry count for inline array: one per generation, no ring buffer.
+pub const GC_ENTRIES: [u64; 3] = [1, 1, 1];
 /// Base offsets for each generation in the inline array.
 pub const GC_BASES: [u64; 3] = [0, 24, 48];
 /// Offset of `collecting` within `_gc_runtime_state`.
@@ -60,7 +60,7 @@ fn table(version_hex: u64, runtime_ih: u64, interp_next: u64, interp_id: u64,
         gc_layout: Some(&LEGACY_GC_LAYOUT),
         gc_stats_addr: None,  // filled per-interpreter by the stats loop (gc_state + GC_STATS_INLINE_OFF)
         gc_item_size: Some(GC_ITEM_SIZE),
-        gc_slots_per_gen: Some(GC_SLOTS),
+        gc_entries_per_gen: Some(GC_ENTRIES),
         gc_gen_base_offsets: Some(GC_BASES),
         gc_stats_inline_off: GC_STATS_INLINE_OFF,
         gc_stats_addr_is_per_interp: true,
@@ -202,7 +202,7 @@ mod tests {
             let at = format!("{major}.{minor}");
             assert_eq!(t.gc_stats_kind, GcStatsKind::InlineArray, "{at}");
             assert_eq!(t.gc_item_size, Some(24), "{at}");
-            assert_eq!(t.gc_slots_per_gen, Some([1, 1, 1]), "{at}");
+            assert_eq!(t.gc_entries_per_gen, Some([1, 1, 1]), "{at}");
             assert_eq!(t.gc_gen_base_offsets, Some([0, 24, 48]), "{at}");
             assert_eq!(t.gc_stats_inline_off, 0x80, "{at}");
             assert!(t.gc_layout.is_some(), "{at}");

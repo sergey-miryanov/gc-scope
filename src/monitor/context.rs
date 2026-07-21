@@ -21,12 +21,12 @@ pub struct MonitorContext<'a> {
     /// Resolved session per PID. Attached lazily on first `poll`; a failed attach
     /// is NOT cached (so a not-yet-ready process is retried per the `WaitPolicy`).
     sessions: HashMap<u32, PySession>,
-    /// Per-PID, per-(generation, slot) timestamp high-water mark for event dedup
-    /// (C4). `read_gc_stats` yields slots in generation-major order, not timestamp
-    /// order, so a single per-PID mark would drop a fresh event in one slot after
+    /// Per-PID, per-(generation, entry) timestamp high-water mark for event dedup
+    /// (C4). `read_gc_stats` yields entries in generation-major order, not timestamp
+    /// order, so a single per-PID mark would drop a fresh event in one entry after
     /// a higher timestamp was seen in another (across generations, or across a ring
-    /// wrap within a generation). Tracking freshness per slot fixes that; each ring
-    /// slot's `ts_start` only ever increases as it is overwritten.
+    /// wrap within a generation). Tracking freshness per entry fixes that; each ring
+    /// entry's `ts_start` only ever increases as it is overwritten.
     seen: HashMap<u32, HashMap<(u32, usize), i64>>,
     alive_pids: HashSet<u32>,
 }
@@ -148,11 +148,11 @@ impl<'a> MonitorContext<'a> {
     }
 }
 
-/// Select the stats fresher than the last seen ts for their OWN `(generation, slot)`,
+/// Select the stats fresher than the last seen ts for their OWN `(generation, entry)`,
 /// returned in timestamp order so the trace stays ordered regardless of the
-/// generation-major order the slots arrive in (C4). Advances `seen` to the new marks.
+/// generation-major order the entries arrive in (C4). Advances `seen` to the new marks.
 ///
-/// `ts_start == 0` means an untouched slot (never collected) and is never selected —
+/// `ts_start == 0` means an untouched entry (never collected) and is never selected —
 /// the initial mark is 0 and selection is strictly greater-than.
 fn select_fresh<'s>(
     stats: &'s [GcStat],
@@ -160,7 +160,7 @@ fn select_fresh<'s>(
 ) -> Vec<&'s GcStat> {
     let mut fresh: Vec<&GcStat> = Vec::new();
     for stat in stats {
-        let mark = seen.entry((stat.generation, stat.slot)).or_insert(0);
+        let mark = seen.entry((stat.generation, stat.index)).or_insert(0);
         if stat.ts_start() > *mark {
             *mark = stat.ts_start();
             fresh.push(stat);
@@ -176,64 +176,64 @@ mod tests {
     use crate::remote_debugging::offsets::offset_table::{seq_layout, GcItemLayout};
     use std::sync::LazyLock;
 
-    /// Minimal slot layout for the dedup tests — they only ever set/read `ts_start`
-    /// (`generation`/`slot` are identity fields on the view, not layout fields).
+    /// Minimal entry layout for the dedup tests — they only ever set/read `ts_start`
+    /// (`generation`/`entry` are identity fields on the view, not layout fields).
     static TEST_LAYOUT: LazyLock<&'static GcItemLayout> = LazyLock::new(|| seq_layout(&["ts_start"]));
 
-    fn stat(generation: u32, slot: usize, ts_start: i64) -> GcStat {
-        GcStat::from_fields(generation, slot, 0, *TEST_LAYOUT, &[("ts_start", ts_start)])
+    fn stat(generation: u32, index: usize, ts_start: i64) -> GcStat {
+        GcStat::from_fields(generation, index, 0, *TEST_LAYOUT, &[("ts_start", ts_start)])
     }
 
     fn fresh_ts(stats: &[GcStat], seen: &mut HashMap<(u32, usize), i64>) -> Vec<i64> {
         select_fresh(stats, seen).into_iter().map(|s| s.ts_start()).collect()
     }
 
-    /// Slots that have never been collected read back as zero. The initial mark is
+    /// Entries that have never been collected read back as zero. The initial mark is
     /// also zero and selection is strictly greater-than, so they must never be
     /// emitted — otherwise every attach floods the trace with phantom events at t=0.
     #[test]
-    fn untouched_slots_are_never_emitted() {
+    fn untouched_entries_are_never_emitted() {
         let mut seen = HashMap::new();
         let stats = vec![stat(0, 0, 0), stat(1, 0, 0), stat(2, 0, 0)];
         assert!(fresh_ts(&stats, &mut seen).is_empty());
-        // Still nothing on a second poll of the same untouched slots.
+        // Still nothing on a second poll of the same untouched entries.
         assert!(fresh_ts(&stats, &mut seen).is_empty());
     }
 
     #[test]
-    fn a_slot_is_emitted_once_per_new_timestamp() {
+    fn a_entry_is_emitted_once_per_new_timestamp() {
         let mut seen = HashMap::new();
         assert_eq!(fresh_ts(&[stat(0, 0, 100)], &mut seen), vec![100]);
         // Same reading on the next tick: already seen.
         assert!(fresh_ts(&[stat(0, 0, 100)], &mut seen).is_empty());
-        // The slot was overwritten by a newer collection.
+        // The entry was overwritten by a newer collection.
         assert_eq!(fresh_ts(&[stat(0, 0, 150)], &mut seen), vec![150]);
     }
 
-    /// The C4 regression. `read_gc_stats` yields slots generation-major, not in
+    /// The C4 regression. `read_gc_stats` yields entries generation-major, not in
     /// timestamp order, so a single per-PID high-water mark lets a high-timestamped
     /// generation-2 event swallow a genuinely new — but older — generation-0 event.
-    /// The mark is per `(generation, slot)` precisely to stop that.
+    /// The mark is per `(generation, entry)` precisely to stop that.
     #[test]
     fn a_high_timestamp_in_one_generation_does_not_mask_another() {
         let mut seen = HashMap::new();
         // Tick 1: only generation 2 has run, and it ran late.
         assert_eq!(fresh_ts(&[stat(2, 0, 900)], &mut seen), vec![900]);
         // Tick 2: generation 0 collected at t=100 — older than the gen-2 mark, but
-        // new for its own slot. A per-PID mark would drop it.
+        // new for its own entry. A per-PID mark would drop it.
         assert_eq!(fresh_ts(&[stat(0, 0, 100), stat(2, 0, 900)], &mut seen), vec![100]);
     }
 
-    /// Same hazard inside one generation: the ring's slots are overwritten in turn,
-    /// so slot 7 can hold an older timestamp than slot 3 and still be unreported.
+    /// Same hazard inside one generation: the ring's entries are overwritten in turn,
+    /// so entry 7 can hold an older timestamp than entry 3 and still be unreported.
     #[test]
-    fn slots_within_a_generation_are_tracked_independently() {
+    fn entries_within_a_generation_are_tracked_independently() {
         let mut seen = HashMap::new();
         assert_eq!(fresh_ts(&[stat(0, 3, 500)], &mut seen), vec![500]);
         assert_eq!(fresh_ts(&[stat(0, 3, 500), stat(0, 7, 200)], &mut seen), vec![200]);
     }
 
-    /// Slots arrive generation-major but the trace must be ordered by time, or
+    /// Entries arrive generation-major but the trace must be ordered by time, or
     /// Perfetto renders the begin/end pairs out of sequence.
     #[test]
     fn output_is_sorted_by_timestamp_regardless_of_input_order() {
@@ -248,11 +248,11 @@ mod tests {
     }
 
     #[test]
-    fn marks_advance_only_for_the_slots_that_were_selected() {
+    fn marks_advance_only_for_the_entries_that_were_selected() {
         let mut seen = HashMap::new();
         let _ = fresh_ts(&[stat(0, 0, 100), stat(1, 0, 0)], &mut seen);
         assert_eq!(seen.get(&(0, 0)), Some(&100));
-        // The zero-timestamp slot was still recorded (at 0) but never emitted, so a
+        // The zero-timestamp entry was still recorded (at 0) but never emitted, so a
         // later real collection in it is not suppressed.
         assert_eq!(seen.get(&(1, 0)), Some(&0));
         assert_eq!(fresh_ts(&[stat(1, 0, 50)], &mut seen), vec![50]);

@@ -67,7 +67,7 @@ def target_version(python):
 
 
 def is_free_threaded(python):
-    """True for a free-threaded (no-GIL) build, which halves the GC ring slots."""
+    """True for a free-threaded (no-GIL) build, which halves the GC ring entries."""
     rc, out = run([python, "-c",
                    "import sysconfig;"
                    "print(sysconfig.get_config_var('Py_GIL_DISABLED') or 0)"])
@@ -75,10 +75,10 @@ def is_free_threaded(python):
 
 
 def expected_shape(version, free_threaded):
-    """(kind, slots-per-generation) gcscope should decode for this interpreter.
+    """(kind, entries-per-generation) gcscope should decode for this interpreter.
 
-    Mirrors `GcStatsKind` selection in `offsets/mod.rs`: one inline slot per
-    generation through 3.14, ring buffers from 3.15. Ring slot counts differ
+    Mirrors `GcStatsKind` selection in `offsets/mod.rs`: one inline entry per
+    generation through 3.14, ring buffers from 3.15. Ring entry counts differ
     between GIL (11/3/3) and free-threaded (1/1/1) builds.
     """
     if version is None:
@@ -102,7 +102,7 @@ def parse_stats_table(out):
         try:
             row = {
                 "generation": int(parts[0]),
-                "slot": int(parts[1]),
+                "entry": int(parts[1]),
                 "interpreter_id": int(parts[2]),
                 "collections": int(parts[3]),
                 "collected": int(parts[4]),
@@ -123,26 +123,26 @@ def parse_stats_table(out):
 SANE_COUNTER_MAX = 10 ** 12
 
 
-def check_stats(rows, kind, slots, fail):
+def check_stats(rows, kind, entries, fail):
     """Assert the decoded table has the right shape and plausible values.
 
     Shape is the point: without it, a mis-keyed decode that emits the right
     number of garbage rows passes as readily as a correct one.
     """
-    want = sum(slots)
+    want = sum(entries)
     if len(rows) != want:
-        return fail("expected %d %s rows (slots %s), decoded %d"
-                    % (want, kind, slots, len(rows)))
+        return fail("expected %d %s rows (entries %s), decoded %d"
+                    % (want, kind, entries, len(rows)))
 
-    # Every (generation, slot) pair exactly once — catches a base offset that
-    # aliases two generations onto the same slot range.
-    got = sorted((r["generation"], r["slot"]) for r in rows)
-    expect = sorted((g, s) for g in range(3) for s in range(slots[g]))
+    # Every (generation, entry) pair exactly once — catches a base offset that
+    # aliases two generations onto the same entry range.
+    got = sorted((r["generation"], r["entry"]) for r in rows)
+    expect = sorted((g, s) for g in range(3) for s in range(entries[g]))
     if got != expect:
-        return fail("wrong (generation, slot) set for %s: %s" % (kind, got))
+        return fail("wrong (generation, entry) set for %s: %s" % (kind, got))
 
     for r in rows:
-        where = "gen %d slot %d" % (r["generation"], r["slot"])
+        where = "gen %d entry %d" % (r["generation"], r["entry"])
         for name in ("collections", "collected", "uncollectable",
                      "candidates", "heap_size"):
             v = r[name]
@@ -177,7 +177,7 @@ def check_stats(rows, kind, slots, fail):
     # never collected more often than a younger one.
     if not (peak[0] > peak[1] > peak[2]):
         return fail("generation collections %s are not a strict pyramid; "
-                    "generations may be aliased onto the same slots" % peak)
+                    "generations may be aliased onto the same entries" % peak)
     return 0
 
 
@@ -309,15 +309,15 @@ def main():
 
         # Shape, not just presence: a mis-keyed decode emits a full table of
         # garbage and would otherwise pass every leg of the matrix.
-        kind, slots = expected_shape(version, free_threaded)
+        kind, entries = expected_shape(version, free_threaded)
         if kind is None:
             print("WARN: could not determine the target version; "
                   "skipping the shape check")
         else:
-            print("expecting %s, slots %s%s"
-                  % (kind, slots, " (free-threaded)" if free_threaded else ""))
+            print("expecting %s, entries %s%s"
+                  % (kind, entries, " (free-threaded)" if free_threaded else ""))
             rows = parse_stats_table(out)
-            if check_stats(rows, kind, slots, fail):
+            if check_stats(rows, kind, entries, fail):
                 return 1
 
         # For a same-hex collision build (gc-gen-3.15+inc shares 0x030f00b1 with clean
@@ -331,7 +331,7 @@ def main():
                         "candidate was not selected -- decoded through the base layout")
 
         print("PASS(%s): attached + detected + decoded %s stats, shape %s"
-              % (label, kind or "?", slots or "?"))
+              % (label, kind or "?", entries or "?"))
         return 0
     finally:
         if proc.poll() is None:

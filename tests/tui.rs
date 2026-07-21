@@ -1,5 +1,5 @@
 //! Live coverage for the TUI collect→render pipeline. The pure pieces
-//! (`parse_gc_slots`, the rate/avg summaries, the tree model, the Legacy snapshot
+//! (`parse_gc_entries`, the rate/avg summaries, the tree model, the Legacy snapshot
 //! render) are unit-tested in-crate; this exercises `collect_data` against a real
 //! interpreter and renders the **3.13+ (Full) tier** the synthetic Legacy unit test
 //! can't reach.
@@ -125,7 +125,7 @@ fn collect_request_skips_only_the_unrequested_layers() {
         "gc sub-struct layer must be skipped"
     );
     assert!(
-        !lean.interpreter.gc.generation_stats.slots.is_empty(),
+        !lean.interpreter.gc.generation_stats.entries.is_empty(),
         "the requested gc-stats layer must still be decoded"
     );
 
@@ -136,7 +136,7 @@ fn collect_request_skips_only_the_unrequested_layers() {
         !full.interpreter.gc.raw_bytes.is_empty(),
         "all must fill the gc sub-struct layer"
     );
-    assert!(!full.interpreter.gc.generation_stats.slots.is_empty());
+    assert!(!full.interpreter.gc.generation_stats.entries.is_empty());
 }
 
 /// The TUI body's **Full-tier** section builders (`section_debug_offsets`,

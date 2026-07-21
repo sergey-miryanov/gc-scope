@@ -7,7 +7,7 @@
 
 The GC-stats memory layout changes across versions: 3.13/3.14 store
 `generation_stats` **inline** in `_gc_runtime_state`; 3.15+ use a **ring buffer**
-reached through a pointer; free-threaded vs. GIL builds differ in slot counts.
+reached through a pointer; free-threaded vs. GIL builds differ in entry counts.
 Hardcoding field positions per version in call sites does not scale.
 
 The key insight for pre-3.13: the `gc_generation_stats` item — `collections@0`,
@@ -20,7 +20,7 @@ path 3.13/3.14 already use.
 
 Decode is keyed by a **`GcStatsKind` { None, InlineArray, RingBuffer }** on the flat
 `OffsetTable`, with a `GcItemLayout` mapping field names → byte offsets within one
-slot. Both the stats loop (`PySession::gc_stats`) and the TUI collector (`snapshot::collect`)
+entry. Both the stats loop (`PySession::gc_stats`) and the TUI collector (`snapshot::collect`)
 branch on the **kind**, never on the version.
 
 - **Pre-3.13 (3.8–3.12)** decode through `InlineArray` with a hand-written

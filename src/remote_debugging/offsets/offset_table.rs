@@ -13,9 +13,9 @@ use crate::remote_debugging::gc_stats::GcStat;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcStatsKind {
     /// No readable generation stats — e.g. Python 3.8 (GC state is global, not yet
-    /// decoded) or a build whose per-slot GC layout wasn't generated.
+    /// decoded) or a build whose per-entry GC layout wasn't generated.
     None,
-    /// One slot per generation, contiguous at a fixed offset from the gc state.
+    /// One entry per generation, contiguous at a fixed offset from the gc state.
     /// The same inline layout spans pre-3.13 (3.9–3.12) and 3.13.x / 3.14.4.
     InlineArray,
     /// Ring buffer reached via the `gc.generation_stats` pointer (3.15.0a8+).
@@ -62,11 +62,11 @@ pub struct OffsetTable {
     // GC generation stats metadata (None = not available for this version)
     /// Shape of the generation-stats region for this version.
     pub gc_stats_kind: GcStatsKind,
-    /// Per-slot field layout, keyed by version (not by item size).
+    /// Per-entry field layout, keyed by version (not by item size).
     pub gc_layout: Option<&'static GcItemLayout>,
     pub gc_stats_addr: Option<u64>,
     pub gc_item_size: Option<u64>,
-    pub gc_slots_per_gen: Option<[u64; 3]>,
+    pub gc_entries_per_gen: Option<[u64; 3]>,
     pub gc_gen_base_offsets: Option<[u64; 3]>,
     /// For `InlineArray` kind: byte offset of `generation_stats[]` within each
     /// interpreter's `_gc_runtime_state`. Version-specific (3.13 = 0x80, 3.14 = 0x78)
@@ -152,26 +152,26 @@ impl OffsetTable {
         }
     }
 
-    /// Byte offset of generation `gen`'s slot `slot` within the stats region
-    /// (`gc_gen_base_offsets[gen] + slot * gc_item_size`) — the same arithmetic
+    /// Byte offset of generation `gen`'s entry `entry` within the stats region
+    /// (`gc_gen_base_offsets[gen] + entry * gc_item_size`) — the same arithmetic
     /// [`decode_gc_stats`](Self::decode_gc_stats) walks, exposed so the TUI can map a
-    /// decoded slot back to its raw-region location for its hexdump highlight. `None` when
-    /// this build has no slot geometry, or `gen`/`slot` is out of range.
-    pub fn slot_byte_offset(&self, generation: u32, slot: usize) -> Option<usize> {
+    /// decoded entry back to its raw-region location for its hexdump highlight. `None` when
+    /// this build has no entry geometry, or `gen`/`entry` is out of range.
+    pub fn entry_byte_offset(&self, generation: u32, index: usize) -> Option<usize> {
         let item = self.gc_item_size? as usize;
         let bases = self.gc_gen_base_offsets?;
-        let slots = self.gc_slots_per_gen?;
+        let entries = self.gc_entries_per_gen?;
         let g = generation as usize;
-        if g >= 3 || slot >= slots[g] as usize {
+        if g >= 3 || index >= entries[g] as usize {
             return None;
         }
-        Some(bases[g] as usize + slot * item)
+        Some(bases[g] as usize + index * item)
     }
 
     /// Read GC generation stats for one interpreter through an already-open handle.
     ///
     /// Returns `Ok(vec![])` for the legitimate "this build exposes no decodable
-    /// stats" cases (no stats address, zero item size, no slot/base/layout info) —
+    /// stats" cases (no stats address, zero item size, no entry/base/layout info) —
     /// those are shape facts, not failures. A failed *read* of the stats buffer is
     /// a real error and propagates as `Err` (C6): the caller has already decided,
     /// via a non-NULL `gc_stats_addr`, that stats should be there.
@@ -197,13 +197,13 @@ impl OffsetTable {
     pub fn describe_gc_geometry(&self) -> String {
         let mut s = String::new();
         s.push_str(&format!("  kind             : {:?}\n", self.gc_stats_kind));
-        match (self.gc_item_size, self.gc_slots_per_gen, self.gc_gen_base_offsets) {
-            (Some(item), Some(slots), Some(bases)) => {
-                s.push_str(&format!("  slot size        : {item} bytes\n"));
-                s.push_str(&format!("  slots/generation : {slots:?}\n"));
+        match (self.gc_item_size, self.gc_entries_per_gen, self.gc_gen_base_offsets) {
+            (Some(item), Some(entries), Some(bases)) => {
+                s.push_str(&format!("  entry size        : {item} bytes\n"));
+                s.push_str(&format!("  entries/generation : {entries:?}\n"));
                 s.push_str(&format!("  generation bases : {bases:?}\n"));
                 s.push_str(&format!(
-                    "  bytes read       : {} (bases[2] + slots[2]*size)\n",
+                    "  bytes read       : {} (bases[2] + entries[2]*size)\n",
                     self.stats_buffer_len().unwrap_or(0)
                 ));
                 if self.gc_stats_kind == GcStatsKind::RingBuffer {
@@ -216,7 +216,7 @@ impl OffsetTable {
                     ));
                 }
             }
-            _ => s.push_str("  (no slot geometry — this build decodes no GC stats)\n"),
+            _ => s.push_str("  (no entry geometry — this build decodes no GC stats)\n"),
         }
         if self.gc_stats_inline_off != 0 {
             s.push_str(&format!(
@@ -226,13 +226,13 @@ impl OffsetTable {
         }
         match self.gc_layout {
             Some(l) => {
-                s.push_str(&format!("  per-slot fields  : {} in {} bytes\n",
+                s.push_str(&format!("  per-entry fields  : {} in {} bytes\n",
                                     l.fields.len(), l.item_size));
                 for (name, off) in l.fields {
                     s.push_str(&format!("      {off:>4}  {name}\n"));
                 }
             }
-            None => s.push_str("  per-slot fields  : (none registered)\n"),
+            None => s.push_str("  per-entry fields  : (none registered)\n"),
         }
         s
     }
@@ -246,14 +246,14 @@ impl OffsetTable {
         if self.gc_stats_kind != GcStatsKind::RingBuffer {
             return 0;
         }
-        match (self.gc_item_size, self.gc_slots_per_gen, self.gc_gen_base_offsets) {
-            (Some(item), Some(slots), Some(bases)) => bases[2] + slots[2] * item + 8,
+        match (self.gc_item_size, self.gc_entries_per_gen, self.gc_gen_base_offsets) {
+            (Some(item), Some(entries), Some(bases)) => bases[2] + entries[2] * item + 8,
             _ => 0,
         }
     }
 
     /// Byte length of one interpreter's stats region — the last generation's base
-    /// plus its slots. `None` when this build exposes no decodable stats (those are
+    /// plus its entries. `None` when this build exposes no decodable stats (those are
     /// shape facts, not failures; see [`Self::read_gc_stats`]). The single definition of
     /// this formula, shared by `read_gc_stats`/`decode_gc_stats` and the TUI collector.
     pub fn stats_buffer_len(&self) -> Option<usize> {
@@ -261,14 +261,14 @@ impl OffsetTable {
         if item_size == 0 {
             return None;
         }
-        let slots = self.gc_slots_per_gen?;
+        let entries = self.gc_entries_per_gen?;
         let bases = self.gc_gen_base_offsets?;
         self.gc_layout?;
-        Some((bases[2] as usize) + (slots[2] as usize) * item_size)
+        Some((bases[2] as usize) + (entries[2] as usize) * item_size)
     }
 
     /// Decode an already-read stats buffer. Pure — no process access — so the
-    /// per-version slot geometry and field offsets are testable without a target.
+    /// per-version entry geometry and field offsets are testable without a target.
     ///
     /// Returns an empty vec for the same "no decodable stats" shapes as
     /// [`Self::read_gc_stats`], and for a `raw` shorter than the shape requires
@@ -282,28 +282,28 @@ impl OffsetTable {
             return vec![];
         }
         let item_size = self.gc_item_size.unwrap_or(0) as usize;
-        let slots = self.gc_slots_per_gen.unwrap_or([0; 3]);
+        let entries = self.gc_entries_per_gen.unwrap_or([0; 3]);
         let bases = self.gc_gen_base_offsets.unwrap_or([0; 3]);
         let layout = match self.gc_layout {
             Some(l) => l,
             None => return vec![],
         };
 
-        // Slice the region into per-slot byte windows; each `GcStat` is a view over its window
+        // Slice the region into per-entry byte windows; each `GcStat` is a view over its window
         // plus `layout`, decoding fields lazily by name. No fixed field list to enumerate, so a
         // build with fields beyond the common set is carried without any struct change.
         let mut stats = Vec::new();
         for gidx in 0..3u32 {
             let base = bases[gidx as usize] as usize;
-            let n = slots[gidx as usize] as usize;
-            for slot in 0..n {
-                let off = base + slot * item_size;
+            let n = entries[gidx as usize] as usize;
+            for entry in 0..n {
+                let off = base + entry * item_size;
                 if off + item_size > raw.len() {
                     break; // short region (teardown race) — stop walking this generation
                 }
                 stats.push(GcStat::new(
                     gidx,
-                    slot,
+                    entry,
                     iid,
                     raw[off..off + item_size].to_vec(),
                     layout,
@@ -353,12 +353,12 @@ pub fn seq_layout(names: &[&'static str]) -> &'static GcItemLayout {
 }
 
 /// Compute gen_base_offsets for a ring-buffer GC stats layout.
-/// `item_size` is bytes per slot, `slots` is `[young, old0, old1]`.
-pub fn compute_ring_base_offsets(item_size: u64, slots: &[u64; 3]) -> [u64; 3] {
+/// `item_size` is bytes per entry, `entries` is `[young, old0, old1]`.
+pub fn compute_ring_base_offsets(item_size: u64, entries: &[u64; 3]) -> [u64; 3] {
     [
         0,
-        slots[0] * item_size + 8,
-        slots[0] * item_size + 8 + slots[1] * item_size + 8,
+        entries[0] * item_size + 8,
+        entries[0] * item_size + 8 + entries[1] * item_size + 8,
     ]
 }
 
@@ -367,7 +367,7 @@ mod tests {
     use super::*;
     use crate::remote_debugging::offsets::{pre_3_13, set_ring};
 
-    /// A synthetic ring-slot layout with an extended field, so the tests exercise
+    /// A synthetic ring-entry layout with an extended field, so the tests exercise
     /// both the required fields and the `Option` ones without pinning any real
     /// build's struct (those are covered by the registry tests in `offsets/mod.rs`).
     static RING_LAYOUT: GcItemLayout = GcItemLayout {
@@ -388,15 +388,15 @@ mod tests {
     // ── geometry ────────────────────────────────────────────────
 
     /// Generations are separated by an 8-byte gap (the ring's own write cursor), so
-    /// a base is NOT simply `slots_so_far * item_size`. Dropping the pad shifts every
-    /// generation after the first onto the wrong slot.
+    /// a base is NOT simply `entries_so_far * item_size`. Dropping the pad shifts every
+    /// generation after the first onto the wrong entry.
     #[test]
     fn ring_base_offsets_include_the_inter_generation_pad() {
         let bases = compute_ring_base_offsets(40, &[11, 3, 3]);
         assert_eq!(bases, [0, 11 * 40 + 8, 11 * 40 + 8 + 3 * 40 + 8]);
         assert!(bases[0] < bases[1] && bases[1] < bases[2]);
 
-        // Free-threaded builds carry one slot per generation, same pad.
+        // Free-threaded builds carry one entry per generation, same pad.
         let ft = compute_ring_base_offsets(40, &[1, 1, 1]);
         assert_eq!(ft, [0, 48, 96]);
     }
@@ -411,11 +411,11 @@ mod tests {
 
     // ── inline decode (3.8-3.12 and 3.13/3.14) ──────────────────
 
-    /// Three 24-byte slots back to back. Each generation must read from its own
-    /// slot: an off-by-one base or stride silently reports generation N's counters
+    /// Three 24-byte entries back to back. Each generation must read from its own
+    /// entry: an off-by-one base or stride silently reports generation N's counters
     /// under generation N-1.
     #[test]
-    fn inline_decode_maps_each_generation_to_its_own_slot() {
+    fn inline_decode_maps_each_generation_to_its_own_entry() {
         let mut table = pre_3_13::table_for_version(3, 12).unwrap();
         table.gc_stats_addr = Some(0x1000); // any non-None value; decode never reads it
 
@@ -428,10 +428,10 @@ mod tests {
         }
 
         let stats = table.decode_gc_stats(&buf, 7);
-        assert_eq!(stats.len(), 3, "one slot per generation");
+        assert_eq!(stats.len(), 3, "one entry per generation");
         for (g, s) in stats.iter().enumerate() {
             assert_eq!(s.generation, g as u32);
-            assert_eq!(s.slot, 0);
+            assert_eq!(s.index, 0);
             assert_eq!(s.interpreter_id, 7);
             assert_eq!(s.collections(), 100 * g as i64 + 1);
             assert_eq!(s.collected(), 100 * g as i64 + 2);
@@ -471,22 +471,22 @@ mod tests {
         table
     }
 
-    /// GIL builds keep 11 young slots and 3 per old generation; the decode must
-    /// produce every one, indexed by its own generation and slot.
+    /// GIL builds keep 11 young entries and 3 per old generation; the decode must
+    /// produce every one, indexed by its own generation and entry.
     #[test]
-    fn ring_decode_walks_every_slot_of_every_generation() {
+    fn ring_decode_walks_every_entry_of_every_generation() {
         let table = ring_table(0);
-        let slots = table.gc_slots_per_gen.unwrap();
+        let entries = table.gc_entries_per_gen.unwrap();
         let bases = table.gc_gen_base_offsets.unwrap();
-        assert_eq!(slots, [11, 3, 3], "GIL ring geometry");
+        assert_eq!(entries, [11, 3, 3], "GIL ring geometry");
 
         let item = RING_LAYOUT.item_size;
-        let mut buf = vec![0u8; bases[2] as usize + slots[2] as usize * item];
+        let mut buf = vec![0u8; bases[2] as usize + entries[2] as usize * item];
         for g in 0..3usize {
-            for slot in 0..slots[g] as usize {
-                let off = bases[g] as usize + slot * item;
-                put_i64(&mut buf, off, 1000 * (g as i64 + 1) + slot as i64); // ts_start
-                put_i64(&mut buf, off + 32, 10 * g as i64 + slot as i64); // increment_size
+            for entry in 0..entries[g] as usize {
+                let off = bases[g] as usize + entry * item;
+                put_i64(&mut buf, off, 1000 * (g as i64 + 1) + entry as i64); // ts_start
+                put_i64(&mut buf, off + 32, 10 * g as i64 + entry as i64); // increment_size
             }
         }
 
@@ -495,29 +495,29 @@ mod tests {
         for s in &stats {
             assert_eq!(
                 s.ts_start(),
-                1000 * (s.generation as i64 + 1) + s.slot as i64,
-                "generation {} slot {} read from the wrong offset",
-                s.generation, s.slot
+                1000 * (s.generation as i64 + 1) + s.index as i64,
+                "generation {} entry {} read from the wrong offset",
+                s.generation, s.index
             );
-            assert_eq!(s.get("increment_size"), Some(10 * s.generation as i64 + s.slot as i64));
+            assert_eq!(s.get("increment_size"), Some(10 * s.generation as i64 + s.index as i64));
         }
 
-        // Generation 1 starts one 8-byte pad past the end of generation 0's slots;
+        // Generation 1 starts one 8-byte pad past the end of generation 0's entries;
         // reading it at `11 * item` instead would land inside the pad and return 0.
-        let gen1_first = stats.iter().find(|s| s.generation == 1 && s.slot == 0).unwrap();
+        let gen1_first = stats.iter().find(|s| s.generation == 1 && s.index == 0).unwrap();
         assert_eq!(gen1_first.ts_start(), 2000);
     }
 
     #[test]
-    fn free_threaded_ring_has_one_slot_per_generation() {
+    fn free_threaded_ring_has_one_entry_per_generation() {
         let table = ring_table(1);
-        assert_eq!(table.gc_slots_per_gen.unwrap(), [1, 1, 1]);
+        assert_eq!(table.gc_entries_per_gen.unwrap(), [1, 1, 1]);
 
         let bases = table.gc_gen_base_offsets.unwrap();
         let buf = vec![0u8; bases[2] as usize + RING_LAYOUT.item_size];
         let stats = table.decode_gc_stats(&buf, 0);
         assert_eq!(stats.len(), 3);
-        assert!(stats.iter().all(|s| s.slot == 0));
+        assert!(stats.iter().all(|s| s.index == 0));
     }
 
     // ── GC topology (pure, no process) ──────────────────────────
@@ -596,37 +596,37 @@ mod tests {
         assert_eq!(table.gc_stats_region(0x1000, 0x40), GcStatsRegion::Absent);
     }
 
-    // ── slot_byte_offset ────────────────────────────────────────
+    // ── entry_byte_offset ────────────────────────────────────────
 
-    /// `slot_byte_offset` is exactly the arithmetic `decode_gc_stats` walks, so the
-    /// diagram can map a decoded slot back to its bytes. Ring bases include the pad.
+    /// `entry_byte_offset` is exactly the arithmetic `decode_gc_stats` walks, so the
+    /// diagram can map a decoded entry back to its bytes. Ring bases include the pad.
     #[test]
-    fn slot_byte_offset_matches_the_decode_walk() {
+    fn entry_byte_offset_matches_the_decode_walk() {
         let table = ring_table(0);
         let bases = table.gc_gen_base_offsets.unwrap();
         let item = table.gc_item_size.unwrap() as usize;
-        assert_eq!(table.slot_byte_offset(0, 0), Some(bases[0] as usize));
-        assert_eq!(table.slot_byte_offset(0, 5), Some(bases[0] as usize + 5 * item));
-        assert_eq!(table.slot_byte_offset(1, 0), Some(bases[1] as usize));
-        assert_eq!(table.slot_byte_offset(2, 2), Some(bases[2] as usize + 2 * item));
+        assert_eq!(table.entry_byte_offset(0, 0), Some(bases[0] as usize));
+        assert_eq!(table.entry_byte_offset(0, 5), Some(bases[0] as usize + 5 * item));
+        assert_eq!(table.entry_byte_offset(1, 0), Some(bases[1] as usize));
+        assert_eq!(table.entry_byte_offset(2, 2), Some(bases[2] as usize + 2 * item));
     }
 
-    /// Out-of-range generation or slot yields `None`, not an offset that spills into the
+    /// Out-of-range generation or entry yields `None`, not an offset that spills into the
     /// next generation's region.
     #[test]
-    fn slot_byte_offset_rejects_out_of_range() {
-        let table = ring_table(0); // slots [11, 3, 3]
-        assert_eq!(table.slot_byte_offset(0, 11), None, "gen0 has slots 0..=10");
-        assert_eq!(table.slot_byte_offset(1, 3), None, "gen1 has 3 slots");
-        assert_eq!(table.slot_byte_offset(3, 0), None, "no generation 3");
+    fn entry_byte_offset_rejects_out_of_range() {
+        let table = ring_table(0); // entries [11, 3, 3]
+        assert_eq!(table.entry_byte_offset(0, 11), None, "gen0 has entries 0..=10");
+        assert_eq!(table.entry_byte_offset(1, 3), None, "gen1 has 3 entries");
+        assert_eq!(table.entry_byte_offset(3, 0), None, "no generation 3");
     }
 
-    /// A build without slot geometry has no offsets to give.
+    /// A build without entry geometry has no offsets to give.
     #[test]
-    fn slot_byte_offset_is_none_without_geometry() {
+    fn entry_byte_offset_is_none_without_geometry() {
         let mut table = pre_3_13::table_for_version(3, 12).unwrap();
         table.gc_item_size = None;
-        assert_eq!(table.slot_byte_offset(0, 0), None);
+        assert_eq!(table.entry_byte_offset(0, 0), None);
     }
 
     // ── shape guards ────────────────────────────────────────────
@@ -661,9 +661,9 @@ mod tests {
         zero_item_size.gc_item_size = Some(0);
         assert!(zero_item_size.decode_gc_stats(&buf, 0).is_empty());
 
-        let mut no_slots = base.clone();
-        no_slots.gc_slots_per_gen = None;
-        assert!(no_slots.decode_gc_stats(&buf, 0).is_empty());
+        let mut no_entries = base.clone();
+        no_entries.gc_entries_per_gen = None;
+        assert!(no_entries.decode_gc_stats(&buf, 0).is_empty());
 
         let mut no_bases = base.clone();
         no_bases.gc_gen_base_offsets = None;
@@ -675,17 +675,17 @@ mod tests {
     /// `gc_stats_region_size` is what the process publishes in
     /// `gc.generation_stats_size` and what the `gc_stats` guard compares against, so
     /// its formula must match the ring geometry exactly: the last generation's base
-    /// plus its slots, PLUS the trailing 8-byte cursor the decoder never reads. A
+    /// plus its entries, PLUS the trailing 8-byte cursor the decoder never reads. A
     /// drift here would either spuriously reject a valid build or wave a mis-decode
     /// through. It is exactly `stats_buffer_len() + 8` for a ring.
     #[test]
     fn ring_region_size_is_the_decoded_length_plus_the_trailing_cursor() {
         let table = ring_table(0);
         let bases = table.gc_gen_base_offsets.unwrap();
-        let slots = table.gc_slots_per_gen.unwrap();
+        let entries = table.gc_entries_per_gen.unwrap();
         let item = RING_LAYOUT.item_size as u64;
 
-        let expected = bases[2] + slots[2] * item + 8;
+        let expected = bases[2] + entries[2] * item + 8;
         assert_eq!(table.gc_stats_region_size(), expected);
         // ...and that trailing +8 is the whole difference from what the decoder reads.
         assert_eq!(
@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(table.gc_stats_region_size(), 0);
     }
 
-    /// A ring build missing its slot geometry can't state a region size; 0, not a panic.
+    /// A ring build missing its entry geometry can't state a region size; 0, not a panic.
     #[test]
     fn ring_region_size_without_geometry_is_zero() {
         let mut table = ring_table(0);
@@ -713,16 +713,16 @@ mod tests {
 
     // ── geometry description (diagnostic dump) ──────────────────
 
-    /// The ring dump surfaces the numbers a mis-decode investigation needs: the slot
+    /// The ring dump surfaces the numbers a mis-decode investigation needs: the entry
     /// size, the decoded length, and the published region size — the last drawn from
     /// the same `gc_stats_region_size` the guard uses, so the dump can't disagree with
     /// the check.
     #[test]
-    fn describe_ring_geometry_reports_slot_size_and_region_size() {
+    fn describe_ring_geometry_reports_entry_size_and_region_size() {
         let table = ring_table(0);
         let out = table.describe_gc_geometry();
         assert!(out.contains("RingBuffer"), "{out}");
-        assert!(out.contains("slot size        : 40 bytes"), "{out}");
+        assert!(out.contains("entry size        : 40 bytes"), "{out}");
         assert!(
             out.contains(&format!("region size      : {}", table.gc_stats_region_size())),
             "{out}"
@@ -731,28 +731,28 @@ mod tests {
             out.contains(&format!("bytes read       : {}", table.stats_buffer_len().unwrap())),
             "{out}"
         );
-        // Registered per-slot fields are listed for offset diagnosis.
+        // Registered per-entry fields are listed for offset diagnosis.
         assert!(out.contains("ts_start"), "{out}");
         assert!(out.contains("increment_size"), "{out}");
     }
 
-    /// The inline dump shows the slot geometry but NO "region size" line — that line
+    /// The inline dump shows the entry geometry but NO "region size" line — that line
     /// is ring-only, since inline builds publish no region size to compare against.
     #[test]
     fn describe_inline_geometry_omits_the_region_size_line() {
         let table = pre_3_13::table_for_version(3, 12).unwrap();
         let out = table.describe_gc_geometry();
-        assert!(out.contains("slot size"), "{out}");
+        assert!(out.contains("entry size"), "{out}");
         assert!(!out.contains("region size"), "{out}");
     }
 
-    /// A build with no slot geometry says so explicitly rather than printing a
+    /// A build with no entry geometry says so explicitly rather than printing a
     /// half-filled dump — the "decodes no GC stats" shape must be legible.
     #[test]
     fn describe_geometry_without_a_shape_says_so() {
         let mut table = pre_3_13::table_for_version(3, 12).unwrap();
         table.gc_item_size = None;
         let out = table.describe_gc_geometry();
-        assert!(out.contains("no slot geometry"), "{out}");
+        assert!(out.contains("no entry geometry"), "{out}");
     }
 }

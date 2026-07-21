@@ -24,8 +24,8 @@ in reading benefits both. The module tree, however, was flat under `src/` and hi
 
 Two distinct data shapes exist over the same bytes, and conflating them was the trap:
 
-- The **snapshot** consumer wants a fully-owned `CollectedData` (the `GcSlot` projection,
-  torn ring slots dropped, renderer-shaped) — one picture per call.
+- The **snapshot** consumer wants a fully-owned `CollectedData` (the `GcEntry` projection,
+  torn ring entries dropped, renderer-shaped) — one picture per call.
 - The **monitor** consumer wants `Vec<GcStat>` deltas (deduped by `ts_start`, per-interpreter,
   streamed) — and never consumes `CollectedData`.
 

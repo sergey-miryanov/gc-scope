@@ -29,15 +29,15 @@ pub struct TreeEntry {
 ///   _Py_DebugOffsets)`, from `VersionedOffsets::gc_debug_fields()`. On 3.13/3.14 this is
 ///   just `size`/`collecting`; on ring-buffer builds it also has
 ///   `frame`/`generation_stats_size`/`generation_stats`.
-/// - `slot_fields` are the per-slot `gc_generation_stats` fields as `(name, offset within
-///   one slot)`, from the resolved `GcItemLayout` (so a `+inc` build shows its extended
+/// - `entry_fields` are the per-entry `gc_generation_stats` fields as `(name, offset within
+///   one entry)`, from the resolved `GcItemLayout` (so a `+inc` build shows its extended
 ///   fields). `None` when this build exposes no readable stats layout.
 ///
-/// The derived `generation_stats` layout subtree (item_size, young/old slot groups) is
+/// The derived `generation_stats` layout subtree (item_size, young/old entry groups) is
 /// emitted only when a `generation_stats` field is present (ring-buffer builds).
 pub fn debug_offsets_tree(
     gc_fields: &[(&'static str, u64)],
-    slot_fields: Option<&[(&'static str, usize)]>,
+    entry_fields: Option<&[(&'static str, usize)]>,
 ) -> Vec<TreeEntry> {
     // The fixed prefix of the tree: offsets 0..88 are identical in every
     // `_Py_DebugOffsets` layout, so they are literals rather than table lookups.
@@ -70,18 +70,18 @@ pub fn debug_offsets_tree(
     }
 
     // Ring-buffer builds publish a `generation_stats` pointer; only then does the
-    // derived per-generation slot layout apply. Inline (3.13/3.14) and stat-less builds
+    // derived per-generation entry layout apply. Inline (3.13/3.14) and stat-less builds
     // have no such subtree.
     if gc_fields.iter().any(|&(name, _)| name == "generation_stats") {
         // depth 4 derived entries under generation_stats
         e.push(TreeEntry { depth: 4, label: "item_size",          kind: TreeEntryKind::Derived });
-        e.push(TreeEntry { depth: 4, label: "young_slots (11)",   kind: TreeEntryKind::Derived });
+        e.push(TreeEntry { depth: 4, label: "young_entries (11)",   kind: TreeEntryKind::Derived });
 
-        // depth 5 slot group under young_slots
-        e.push(TreeEntry { depth: 5, label: "slot",               kind: TreeEntryKind::Group });
+        // depth 5 entry group under young_entries
+        e.push(TreeEntry { depth: 5, label: "entry",               kind: TreeEntryKind::Group });
 
-        // depth 6 actual slot fields
-        if let Some(fields) = slot_fields {
+        // depth 6 actual entry fields
+        if let Some(fields) = entry_fields {
             for &(name, off) in fields {
                 e.push(TreeEntry { depth: 6, label: name, kind: TreeEntryKind::Layout { field_type: "", field_offset: off as u32 } });
             }
@@ -89,9 +89,9 @@ pub fn debug_offsets_tree(
 
         // depth 4 more derived entries
         e.push(TreeEntry { depth: 4, label: "index0",             kind: TreeEntryKind::Derived });
-        e.push(TreeEntry { depth: 4, label: "old0_slots (3)",     kind: TreeEntryKind::Derived });
+        e.push(TreeEntry { depth: 4, label: "old0_entries (3)",     kind: TreeEntryKind::Derived });
         e.push(TreeEntry { depth: 4, label: "index1",             kind: TreeEntryKind::Derived });
-        e.push(TreeEntry { depth: 4, label: "old1_slots (3)",     kind: TreeEntryKind::Derived });
+        e.push(TreeEntry { depth: 4, label: "old1_entries (3)",     kind: TreeEntryKind::Derived });
         e.push(TreeEntry { depth: 4, label: "index2",             kind: TreeEntryKind::Derived });
     }
 
@@ -155,18 +155,18 @@ mod tests {
         assert!(tree.iter().any(|e| e.label == "gc" && e.depth == 2));
         assert!(tree.iter().any(|e| e.label == "size" && e.depth == 3));
         assert!(tree.iter().any(|e| e.label == "collecting" && e.depth == 3));
-        assert!(!tree.iter().any(|e| e.label == "young_slots (11)"));
+        assert!(!tree.iter().any(|e| e.label == "young_entries (11)"));
     }
 
     /// A `generation_stats` field (ring builds) grows the derived per-generation
-    /// slot subtree, and the resolved slot fields nest under it at depth 6.
+    /// entry subtree, and the resolved entry fields nest under it at depth 6.
     #[test]
     fn tree_adds_the_ring_subtree_when_generation_stats_is_present() {
         let gc_fields = [("size", 96u64), ("collecting", 104), ("generation_stats", 112)];
-        let slot_fields = [("ts_start", 0usize), ("collections", 8)];
-        let tree = debug_offsets_tree(&gc_fields, Some(&slot_fields));
-        assert!(tree.iter().any(|e| e.label == "young_slots (11)" && e.depth == 4));
-        assert!(tree.iter().any(|e| e.label == "old0_slots (3)"));
+        let entry_fields = [("ts_start", 0usize), ("collections", 8)];
+        let tree = debug_offsets_tree(&gc_fields, Some(&entry_fields));
+        assert!(tree.iter().any(|e| e.label == "young_entries (11)" && e.depth == 4));
+        assert!(tree.iter().any(|e| e.label == "old0_entries (3)"));
         assert!(tree.iter().any(|e| e.label == "ts_start" && e.depth == 6));
         assert!(tree.iter().any(|e| e.label == "collections" && e.depth == 6));
     }
@@ -186,11 +186,11 @@ mod tests {
         }
     }
 
-    /// The derived slot geometry is `(region_size - 24) / 17` for the item size, with
-    /// 11 young + 3 + 3 old slots and 8-byte index gaps. Below the 24-byte header there
+    /// The derived entry geometry is `(region_size - 24) / 17` for the item size, with
+    /// 11 young + 3 + 3 old entries and 8-byte index gaps. Below the 24-byte header there
     /// is no geometry (item size 0).
     #[test]
-    fn gen_stats_layout_derives_slot_geometry_from_the_region_size() {
+    fn gen_stats_layout_derives_entry_geometry_from_the_region_size() {
         // item_size 40 → 24 + 17*40 = 704.
         assert_eq!(gen_stats_layout(704), (40, 440, 120, 440, 568, 696, 448));
         assert_eq!(gen_stats_layout(0).0, 0);

@@ -2,9 +2,9 @@
 //!
 //! [`collect_data`] walks an attached [`PySession`] once and returns a fully-owned
 //! [`CollectedData`] — the interpreter/GC layout, raw struct bytes, and decoded generation
-//! slots — for a consumer to render. It lives in the reader layer (not `tui/`) so it is
+//! entries — for a consumer to render. It lives in the reader layer (not `tui/`) so it is
 //! a single source of truth: it resolves the stats region through
-//! [`PySession::gc_stats_region_addr`] and decodes slots through
+//! [`PySession::gc_stats_region_addr`] and decodes entries through
 //! [`crate::remote_debugging::offsets::offset_table::OffsetTable::decode_gc_stats`], the same
 //! paths the monitor uses, and the `tui` renderer merely consumes its output.
 
@@ -28,8 +28,8 @@ pub struct CollectRequest {
     pub debug_offsets: bool,
     /// The `gc` sub-struct raw bytes (for the GC-state hexdump).
     pub gc_state: bool,
-    /// The GC generation stats — decoded `slots` AND `raw_stats_bytes` together. These two
-    /// always travel as a unit: a renderer that has `slots` but no raw buffer would index a
+    /// The GC generation stats — decoded `entries` AND `raw_stats_bytes` together. These two
+    /// always travel as a unit: a renderer that has `entries` but no raw buffer would index a
     /// buffer it doesn't have, so the layer is atomic by construction.
     pub gc_stats: bool,
 }
@@ -54,9 +54,9 @@ impl CollectRequest {
 }
 
 #[derive(Debug)]
-pub struct GcSlot {
+pub struct GcEntry {
     pub generation: u32,
-    pub slot: usize,
+    pub index: usize,
     pub byte_offset: usize,
     pub start_ts: i64,
     pub stop_ts: i64,
@@ -72,23 +72,23 @@ pub struct GcSlot {
 pub struct GcStatsSnapshot {
     pub stats_addr: u64,
     pub stats_size: u64,
-    /// Authoritative per-slot size from the version's `gc_layout` (not re-derived from a
+    /// Authoritative per-entry size from the version's `gc_layout` (not re-derived from a
     /// magic `stats_size` formula) — 24 for inline 3.13/3.14, the ring struct size for 3.15+.
     pub item_size: usize,
-    /// Per-generation slot counts from the version's layout (`offset_table.gc_slots_per_gen`):
+    /// Per-generation entry counts from the version's layout (`offset_table.gc_entries_per_gen`):
     /// `[1, 1, 1]` for inline 3.13/3.14 and free-threaded rings, `[11, 3, 3]` for GIL rings.
     /// Captured here so renderers read it rather than assuming a GIL layout.
-    pub slots_per_gen: [u64; 3],
-    /// Whether the version's slot layout carries GC-pause timing (`ts_start`/`ts_stop`).
+    pub entries_per_gen: [u64; 3],
+    /// Whether the version's entry layout carries GC-pause timing (`ts_start`/`ts_stop`).
     /// Gates the collections-rate summary: false (e.g. inline 3.13/3.14) -> rate renders
     /// "n/a" instead of a fake 0.
     pub has_timestamps: bool,
-    /// Whether the slot layout carries the `duration` field. Gates the avg-collection-time
+    /// Whether the entry layout carries the `duration` field. Gates the avg-collection-time
     /// summary: false -> "n/a" (unrecoverable without the field — an external sampler can't
     /// observe an internal GC pause).
     pub has_duration: bool,
     pub raw_stats_bytes: Vec<u8>,
-    pub slots: Vec<GcSlot>,
+    pub entries: Vec<GcEntry>,
 }
 
 #[derive(Debug)]
@@ -235,8 +235,8 @@ fn read_gc_state(session: &PySession, gc_addr: u64, gc_size: u64) -> Result<Vec<
 
 /// L4: the GC generation stats chunk. The geometry/field-presence scalars and the region
 /// address are always resolved (renderers use them for labels and the "not available" gate);
-/// the heavy `raw_stats_bytes` + decoded `slots` are read only when `collect` is set. Those
-/// two always travel together, so a caller never sees decoded slots without their raw bytes.
+/// the heavy `raw_stats_bytes` + decoded `entries` are read only when `collect` is set. Those
+/// two always travel together, so a caller never sees decoded entries without their raw bytes.
 fn collect_gc_stats(
     session: &PySession,
     table: &offsets::offset_table::OffsetTable,
@@ -245,7 +245,7 @@ fn collect_gc_stats(
     collect: bool,
 ) -> Result<GcStatsSnapshot> {
     let item_size = table.gc_item_size.unwrap_or(0) as usize;
-    let slots_per_gen = table.gc_slots_per_gen.unwrap_or([0, 0, 0]);
+    let entries_per_gen = table.gc_entries_per_gen.unwrap_or([0, 0, 0]);
     let stats_addr = session.gc_stats_region_addr(gc_addr)?.unwrap_or(0);
     // How many raw bytes the buffer spans differs by kind: the exact inline span, or the
     // process-reported ring size (which includes the trailing per-generation cursors the
@@ -258,17 +258,17 @@ fn collect_gc_stats(
         }
     };
 
-    let (raw_stats_bytes, slots) = if collect && stats_addr != 0 && stats_total > 0 {
+    let (raw_stats_bytes, entries) = if collect && stats_addr != 0 && stats_total > 0 {
         let raw = session
             .read(stats_addr, stats_total)
             .context("Failed to read GC stats buffer")?;
-        let parsed = parse_gc_slots(&raw, table);
+        let parsed = parse_gc_entries(&raw, table);
         (raw, parsed)
     } else {
         (Vec::new(), Vec::new())
     };
 
-    // Field presence is a property of the version's slot layout (a GcSlot's absent fields
+    // Field presence is a property of the version's entry layout (a GcEntry's absent fields
     // are indistinguishable zeros), so capture it once here alongside the geometry.
     let (has_timestamps, has_duration) = match table.gc_layout {
         Some(l) => (l.has_field("ts_start") && l.has_field("ts_stop"), l.has_field("duration")),
@@ -279,11 +279,11 @@ fn collect_gc_stats(
         stats_addr,
         stats_size: stats_total as u64,
         item_size,
-        slots_per_gen,
+        entries_per_gen,
         has_timestamps,
         has_duration,
         raw_stats_bytes,
-        slots,
+        entries,
     })
 }
 
@@ -313,18 +313,18 @@ impl CollectedData {
     }
 }
 
-// ── GC slot parsing ────────────────────────────────────────────
-/// Build the TUI's per-slot view from the raw generation-stats region.
+// ── GC entry parsing ────────────────────────────────────────────
+/// Build the TUI's per-entry view from the raw generation-stats region.
 ///
 /// Decoding runs through the reader layer's single decoder
 /// ([`OffsetTable::decode_gc_stats`]) — the exact path the monitor uses — then projects
 /// each [`GcStat`](crate::remote_debugging::gc_stats::GcStat) onto the display-oriented
-/// [`GcSlot`], recovering the raw-region `byte_offset` (for the hexdump highlight) from the
-/// table geometry. The one TUI-only policy lives here: torn ring slots
+/// [`GcEntry`], recovering the raw-region `byte_offset` (for the hexdump highlight) from the
+/// table geometry. The one TUI-only policy lives here: torn ring entries
 /// (`stop_ts < start_ts`, a half-written concurrent update) are dropped, whereas the
-/// monitor keeps every slot and dedups downstream. Inline layouts (3.13/3.14) carry no
-/// timestamps, so `has_ts` is false and every slot is kept.
-fn parse_gc_slots(raw: &[u8], table: &offsets::offset_table::OffsetTable) -> Vec<GcSlot> {
+/// monitor keeps every entry and dedups downstream. Inline layouts (3.13/3.14) carry no
+/// timestamps, so `has_ts` is false and every entry is kept.
+fn parse_gc_entries(raw: &[u8], table: &offsets::offset_table::OffsetTable) -> Vec<GcEntry> {
     let has_ts = table
         .gc_layout
         .is_some_and(|l| l.has_field("ts_start") && l.has_field("ts_stop"));
@@ -333,10 +333,10 @@ fn parse_gc_slots(raw: &[u8], table: &offsets::offset_table::OffsetTable) -> Vec
         .decode_gc_stats(raw, 0)
         .into_iter()
         .filter(|s| !(has_ts && s.ts_stop() < s.ts_start()))
-        .map(|s| GcSlot {
+        .map(|s| GcEntry {
             generation: s.generation,
-            slot: s.slot,
-            byte_offset: table.slot_byte_offset(s.generation, s.slot).unwrap_or(0),
+            index: s.index,
+            byte_offset: table.entry_byte_offset(s.generation, s.index).unwrap_or(0),
             start_ts: s.ts_start(),
             stop_ts: s.ts_stop(),
             collections: s.collections(),
@@ -351,28 +351,28 @@ fn parse_gc_slots(raw: &[u8], table: &offsets::offset_table::OffsetTable) -> Vec
 
 /// Compute average collection pause time per generation from a single snapshot.
 /// Uses the full ring range: `(max.duration - min.duration) / (max.collections - min.collections)`.
-/// Returns `[None; 3]` when the slot layout has no `duration` field (e.g. inline 3.13/3.14):
+/// Returns `[None; 3]` when the entry layout has no `duration` field (e.g. inline 3.13/3.14):
 /// the pause time is unrecoverable externally, so the summary renders "n/a" rather than a
-/// fake 0. Gens with <2 slots stay `Some(0.0)` (formatted like before).
-pub fn avg_collection_time_per_gen(slots: &[GcSlot], has_duration: bool) -> [Option<f64>; 3] {
+/// fake 0. Gens with <2 entries stay `Some(0.0)` (formatted like before).
+pub fn avg_collection_time_per_gen(entries: &[GcEntry], has_duration: bool) -> [Option<f64>; 3] {
     if !has_duration {
         return [None, None, None];
     }
-    let mut gen_slots: [Vec<&GcSlot>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for slot in slots {
-        let g = slot.generation as usize;
+    let mut gen_entries: [Vec<&GcEntry>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for entry in entries {
+        let g = entry.generation as usize;
         if g < 3 {
-            gen_slots[g].push(slot);
+            gen_entries[g].push(entry);
         }
     }
 
     let mut avgs = [Some(0.0f64); 3];
-    for (g, gslots) in gen_slots.iter().enumerate() {
-        if gslots.len() < 2 {
+    for (g, gentries) in gen_entries.iter().enumerate() {
+        if gentries.len() < 2 {
             continue;
         }
-        let min_coll = gslots.iter().min_by_key(|s| s.collections).unwrap();
-        let max_coll = gslots.iter().max_by_key(|s| s.collections).unwrap();
+        let min_coll = gentries.iter().min_by_key(|s| s.collections).unwrap();
+        let max_coll = gentries.iter().max_by_key(|s| s.collections).unwrap();
 
         let coll_delta = max_coll.collections - min_coll.collections;
         let dur_delta = max_coll.duration - min_coll.duration;
@@ -386,30 +386,30 @@ pub fn avg_collection_time_per_gen(slots: &[GcSlot], has_duration: bool) -> [Opt
 
 /// Compute collections rate per second for each generation from a single snapshot.
 /// Uses the full ring range: `(max.collections - min.collections) / ((max.stop_ts - min.start_ts) / 1e9)`.
-/// Returns `[None; 3]` when the slot layout has no `ts_start`/`ts_stop` fields (e.g. inline
+/// Returns `[None; 3]` when the entry layout has no `ts_start`/`ts_stop` fields (e.g. inline
 /// 3.13/3.14): there is no time base in a single snapshot, so the summary renders "n/a"
-/// rather than a fake 0. Gens with <2 slots stay `Some(0.0)` (formatted like before).
-pub fn collections_rate_from_slots(slots: &[GcSlot], has_timestamps: bool) -> [Option<f64>; 3] {
+/// rather than a fake 0. Gens with <2 entries stay `Some(0.0)` (formatted like before).
+pub fn collections_rate_from_entries(entries: &[GcEntry], has_timestamps: bool) -> [Option<f64>; 3] {
     if !has_timestamps {
         return [None, None, None];
     }
-    let mut gen_slots: [Vec<&GcSlot>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for slot in slots {
-        let g = slot.generation as usize;
+    let mut gen_entries: [Vec<&GcEntry>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for entry in entries {
+        let g = entry.generation as usize;
         if g < 3 {
-            gen_slots[g].push(slot);
+            gen_entries[g].push(entry);
         }
     }
 
     let mut rates = [Some(0.0f64); 3];
-    for (g, gslots) in gen_slots.iter().enumerate() {
-        if gslots.len() < 2 {
+    for (g, gentries) in gen_entries.iter().enumerate() {
+        if gentries.len() < 2 {
             continue;
         }
-        let min_coll = gslots.iter().min_by_key(|s| s.collections).unwrap();
-        let max_coll = gslots.iter().max_by_key(|s| s.collections).unwrap();
-        let min_ts  = gslots.iter().min_by_key(|s| s.start_ts).unwrap();
-        let max_ts  = gslots.iter().max_by_key(|s| s.stop_ts).unwrap();
+        let min_coll = gentries.iter().min_by_key(|s| s.collections).unwrap();
+        let max_coll = gentries.iter().max_by_key(|s| s.collections).unwrap();
+        let min_ts  = gentries.iter().min_by_key(|s| s.start_ts).unwrap();
+        let max_ts  = gentries.iter().max_by_key(|s| s.stop_ts).unwrap();
 
         let coll_delta = max_coll.collections - min_coll.collections;
         let ts_delta_ns = max_ts.stop_ts - min_ts.start_ts;
@@ -427,10 +427,10 @@ mod tests {
     use crate::remote_debugging::offsets::offset_table::GcItemLayout;
     use crate::remote_debugging::offsets::pre_3_13;
 
-    fn slot(generation: u32, collections: i64, duration: f64, start_ts: i64, stop_ts: i64) -> GcSlot {
-        GcSlot {
+    fn entry(generation: u32, collections: i64, duration: f64, start_ts: i64, stop_ts: i64) -> GcEntry {
+        GcEntry {
             generation,
-            slot: 0,
+            index: 0,
             byte_offset: 0,
             start_ts,
             stop_ts,
@@ -470,62 +470,62 @@ mod tests {
     /// `None` (rendered "n/a"), never a fake 0.
     #[test]
     fn avg_collection_time_is_none_without_the_duration_field() {
-        let slots = vec![slot(0, 1, 5.0, 0, 0), slot(0, 3, 15.0, 0, 0)];
-        assert_eq!(avg_collection_time_per_gen(&slots, false), [None, None, None]);
+        let entries = vec![entry(0, 1, 5.0, 0, 0), entry(0, 3, 15.0, 0, 0)];
+        assert_eq!(avg_collection_time_per_gen(&entries, false), [None, None, None]);
     }
 
     /// With duration, the average is `Δduration / Δcollections` across the ring's
-    /// min/max-collections slots; a generation with fewer than two slots stays 0.0.
+    /// min/max-collections entries; a generation with fewer than two entries stays 0.0.
     #[test]
     fn avg_collection_time_divides_duration_delta_by_collection_delta() {
         // gen0: collections 2..6 (Δ4), duration 10..30 (Δ20) → 5.0.
-        let slots = vec![slot(0, 2, 10.0, 0, 0), slot(0, 6, 30.0, 0, 0)];
-        let avg = avg_collection_time_per_gen(&slots, true);
+        let entries = vec![entry(0, 2, 10.0, 0, 0), entry(0, 6, 30.0, 0, 0)];
+        let avg = avg_collection_time_per_gen(&entries, true);
         assert_eq!(avg[0], Some(5.0));
-        assert_eq!(avg[1], Some(0.0), "gen1 has <2 slots");
+        assert_eq!(avg[1], Some(0.0), "gen1 has <2 entries");
         assert_eq!(avg[2], Some(0.0));
     }
 
-    /// Two slots but no new collections between them (Δcollections == 0) can't yield a
+    /// Two entries but no new collections between them (Δcollections == 0) can't yield a
     /// meaningful average — it stays 0.0 rather than dividing by zero.
     #[test]
     fn avg_collection_time_is_zero_when_no_new_collections() {
-        let slots = vec![slot(0, 5, 10.0, 0, 0), slot(0, 5, 30.0, 0, 0)];
-        assert_eq!(avg_collection_time_per_gen(&slots, true)[0], Some(0.0));
+        let entries = vec![entry(0, 5, 10.0, 0, 0), entry(0, 5, 30.0, 0, 0)];
+        assert_eq!(avg_collection_time_per_gen(&entries, true)[0], Some(0.0));
     }
 
-    // ── collections_rate_from_slots ─────────────────────────────
+    // ── collections_rate_from_entries ─────────────────────────────
 
-    /// No timestamps in the slot layout → no time base in a single snapshot → `None`
+    /// No timestamps in the entry layout → no time base in a single snapshot → `None`
     /// (rendered "n/a"), not a fabricated 0.
     #[test]
     fn collections_rate_is_none_without_timestamps() {
-        let slots = vec![slot(0, 1, 0.0, 0, 100), slot(0, 5, 0.0, 0, 100)];
-        assert_eq!(collections_rate_from_slots(&slots, false), [None, None, None]);
+        let entries = vec![entry(0, 1, 0.0, 0, 100), entry(0, 5, 0.0, 0, 100)];
+        assert_eq!(collections_rate_from_entries(&entries, false), [None, None, None]);
     }
 
     /// The rate is `Δcollections / seconds`, where seconds spans the min `start_ts` to
     /// the max `stop_ts`. 4 collections over 2s (2e9 ns) → 2.0/s.
     #[test]
     fn collections_rate_is_collections_over_elapsed_seconds() {
-        let slots = vec![slot(0, 0, 0.0, 0, 0), slot(0, 4, 0.0, 0, 2_000_000_000)];
-        let rate = collections_rate_from_slots(&slots, true);
+        let entries = vec![entry(0, 0, 0.0, 0, 0), entry(0, 4, 0.0, 0, 2_000_000_000)];
+        let rate = collections_rate_from_entries(&entries, true);
         assert_eq!(rate[0], Some(2.0));
-        assert_eq!(rate[1], Some(0.0), "gen1 has <2 slots");
+        assert_eq!(rate[1], Some(0.0), "gen1 has <2 entries");
     }
 
     /// Zero elapsed time (all timestamps equal) can't yield a rate — stays 0.0 rather
     /// than dividing by zero.
     #[test]
     fn collections_rate_is_zero_when_no_time_elapsed() {
-        let slots = vec![slot(0, 0, 0.0, 5, 5), slot(0, 4, 0.0, 5, 5)];
-        assert_eq!(collections_rate_from_slots(&slots, true)[0], Some(0.0));
+        let entries = vec![entry(0, 0, 0.0, 5, 5), entry(0, 4, 0.0, 5, 5)];
+        assert_eq!(collections_rate_from_entries(&entries, true)[0], Some(0.0));
     }
 
-    // ── parse_gc_slots / parse_slot ─────────────────────────────
+    // ── parse_gc_entries / parse_entry ─────────────────────────────
 
     /// A layout carrying timestamps, so the torn-entry guard is live. Built by hand
-    /// (not `set_ring`, which is private to the offsets module) — three 1-slot gens
+    /// (not `set_ring`, which is private to the offsets module) — three 1-entry gens
     /// with the standard 8-byte inter-generation pad.
     /// Carries `collected`/`uncollectable` because the shared decoder
     /// (`decode_gc_stats`) treats those as required core fields — every real GC layout
@@ -545,16 +545,16 @@ mod tests {
         let mut t = pre_3_13::table_for_version(3, 12).unwrap();
         t.gc_layout = Some(&TS_LAYOUT);
         t.gc_item_size = Some(40);
-        t.gc_slots_per_gen = Some([1, 1, 1]);
-        t.gc_gen_base_offsets = Some([0, 48, 96]); // 40-byte slot + 8-byte cursor per gen
+        t.gc_entries_per_gen = Some([1, 1, 1]);
+        t.gc_gen_base_offsets = Some([0, 48, 96]); // 40-byte entry + 8-byte cursor per gen
         t
     }
 
-    /// A ring slot whose `stop_ts < start_ts` is a torn read (a concurrent writer left
+    /// A ring entry whose `stop_ts < start_ts` is a torn read (a concurrent writer left
     /// the entry half-updated) and must be dropped, not decoded into garbage numbers.
-    /// Only that generation's slot disappears; the intact ones survive with their fields.
+    /// Only that generation's entry disappears; the intact ones survive with their fields.
     #[test]
-    fn parse_drops_torn_ring_slots_but_keeps_intact_ones() {
+    fn parse_drops_torn_ring_entries_but_keeps_intact_ones() {
         let table = ts_ring_table();
         let bases = table.gc_gen_base_offsets.unwrap();
         let mut raw = vec![0u8; bases[2] as usize + 40];
@@ -570,25 +570,25 @@ mod tests {
         put_i64(&mut raw, bases[2] as usize, 300);
         put_i64(&mut raw, bases[2] as usize + 8, 400);
 
-        let slots = parse_gc_slots(&raw, &table);
-        assert_eq!(slots.len(), 2, "the torn gen0 slot must be dropped");
-        assert!(slots.iter().all(|s| s.generation != 0));
-        let g1 = slots.iter().find(|s| s.generation == 1).unwrap();
+        let entries = parse_gc_entries(&raw, &table);
+        assert_eq!(entries.len(), 2, "the torn gen0 entry must be dropped");
+        assert!(entries.iter().all(|s| s.generation != 0));
+        let g1 = entries.iter().find(|s| s.generation == 1).unwrap();
         assert_eq!(g1.collections, 7);
         assert_eq!((g1.start_ts, g1.stop_ts), (100, 200));
     }
 
     /// Inline layouts (3.8–3.14) carry no timestamps, so the torn guard is a no-op and
-    /// every generation's slot is kept even from an all-zero buffer.
+    /// every generation's entry is kept even from an all-zero buffer.
     #[test]
-    fn parse_keeps_every_slot_when_the_layout_has_no_timestamps() {
+    fn parse_keeps_every_entry_when_the_layout_has_no_timestamps() {
         let table = pre_3_13::table_for_version(3, 12).unwrap();
         let bases = table.gc_gen_base_offsets.unwrap();
         let item = table.gc_item_size.unwrap() as usize;
         let raw = vec![0u8; bases[2] as usize + item];
-        let slots = parse_gc_slots(&raw, &table);
-        assert_eq!(slots.len(), 3);
-        assert!(slots.iter().all(|s| s.start_ts == 0 && s.stop_ts == 0));
+        let entries = parse_gc_entries(&raw, &table);
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|s| s.start_ts == 0 && s.stop_ts == 0));
     }
 
     /// A field the layout doesn't define reads back as 0, not a random offset — the
@@ -599,27 +599,27 @@ mod tests {
         let bases = table.gc_gen_base_offsets.unwrap();
         let item = table.gc_item_size.unwrap() as usize;
         let raw = vec![0xffu8; bases[2] as usize + item]; // all-ones payload
-        let slots = parse_gc_slots(&raw, &table);
+        let entries = parse_gc_entries(&raw, &table);
         // collections IS in the legacy layout, so it reads the 0xff bytes; heap_size
         // and duration are NOT, so they stay at the zero default.
-        assert_ne!(slots[0].collections, 0);
-        assert_eq!(slots[0].heap_size, 0);
-        assert_eq!(slots[0].duration, 0.0);
+        assert_ne!(entries[0].collections, 0);
+        assert_eq!(entries[0].heap_size, 0);
+        assert_eq!(entries[0].duration, 0.0);
     }
 
     /// One source of truth: the diagram and the monitor decode the same bytes into the
     /// same numbers because they share one decoder (`OffsetTable::decode_gc_stats`). The
-    /// only sanctioned divergence is the diagram's torn-slot drop; everything else agrees
+    /// only sanctioned divergence is the diagram's torn-entry drop; everything else agrees
     /// field-for-field, and the diagram's `byte_offset` matches the table geometry the
     /// decoder walked.
     #[test]
-    fn diagram_and_monitor_decode_agree_except_for_torn_slots() {
+    fn diagram_and_monitor_decode_agree_except_for_torn_entries() {
         let table = ts_ring_table();
         let bases = table.gc_gen_base_offsets.unwrap();
         let item = table.gc_item_size.unwrap() as usize;
         let mut raw = vec![0u8; bases[2] as usize + item];
 
-        // One intact slot per generation (stop_ts >= start_ts), distinct collections.
+        // One intact entry per generation (stop_ts >= start_ts), distinct collections.
         for (g, &base) in bases.iter().enumerate() {
             put_i64(&mut raw, base as usize, 100 + g as i64); // ts_start
             put_i64(&mut raw, base as usize + 8, 200 + g as i64); // ts_stop
@@ -627,28 +627,28 @@ mod tests {
         }
 
         let monitor = table.decode_gc_stats(&raw, 0); // Vec<GcStat>
-        let diagram = parse_gc_slots(&raw, &table); // Vec<GcSlot>
+        let diagram = parse_gc_entries(&raw, &table); // Vec<GcEntry>
 
-        // No torn slots → identical population, field-for-field.
+        // No torn entries → identical population, field-for-field.
         assert_eq!(monitor.len(), diagram.len());
         for (m, d) in monitor.iter().zip(&diagram) {
-            assert_eq!((m.generation, m.slot), (d.generation, d.slot));
+            assert_eq!((m.generation, m.index), (d.generation, d.index));
             assert_eq!(m.ts_start(), d.start_ts);
             assert_eq!(m.ts_stop(), d.stop_ts);
             assert_eq!(m.collections(), d.collections);
             assert_eq!(m.collected(), d.collected);
             assert_eq!(m.uncollectable(), d.uncollectable);
             // The diagram recovers the exact raw-region offset the decoder walked.
-            assert_eq!(d.byte_offset, table.slot_byte_offset(d.generation, d.slot).unwrap());
+            assert_eq!(d.byte_offset, table.entry_byte_offset(d.generation, d.index).unwrap());
         }
 
-        // Tear gen0's slot (stop_ts < start_ts). The monitor keeps every slot (it dedups
+        // Tear gen0's entry (stop_ts < start_ts). The monitor keeps every entry (it dedups
         // downstream); the diagram drops the torn one so it never renders garbage.
         put_i64(&mut raw, bases[0] as usize + 8, 0);
         let monitor_torn = table.decode_gc_stats(&raw, 0);
-        let diagram_torn = parse_gc_slots(&raw, &table);
-        assert_eq!(monitor_torn.len(), monitor.len(), "monitor keeps torn slots");
-        assert_eq!(diagram_torn.len(), diagram.len() - 1, "diagram drops the torn slot");
+        let diagram_torn = parse_gc_entries(&raw, &table);
+        assert_eq!(monitor_torn.len(), monitor.len(), "monitor keeps torn entries");
+        assert_eq!(diagram_torn.len(), diagram.len() - 1, "diagram drops the torn entry");
         assert!(diagram_torn.iter().all(|s| s.generation != 0));
     }
 }
