@@ -137,6 +137,13 @@ impl SpawnedPython {
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+
+    /// Kill the interpreter now and reap it, for a test that needs it dead mid-run (e.g.
+    /// exercising the monitor's process-exit path). Idempotent with the kill-on-drop.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for SpawnedPython {

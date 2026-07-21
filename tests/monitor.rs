@@ -18,12 +18,14 @@
 mod common;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use common::{test_python, SpawnedPython};
+use common::{pid_alive, test_python, SpawnedPython};
 
 use gcscope::exporters::{EventsExporter, ProcessLifecycle};
 use gcscope::monitor::MonitorContext;
-use gcscope::monitor_loop::PollStatus;
+use gcscope::monitor_loop::{run_loop, PollStatus, StartupTimeoutPolicy};
 use gcscope::remote_debugging::gc_stats::GcStat;
 use gcscope::remote_debugging::session::PySession;
 
@@ -128,4 +130,109 @@ fn poll_gives_up_when_the_retry_also_fails() {
     );
     assert_eq!(exporter.started, 0, "a never-read process must not be reported Started");
     assert_eq!(exporter.died, 0, "nothing to mark Died for a process never reported alive");
+}
+
+/// `mark_died` is the single eviction point (C7): after a process has been reported
+/// Started, marking it died must emit `Died` exactly once and drop its per-PID state, and
+/// a second `mark_died` on the same PID must be a silent no-op (nothing left to report).
+#[test]
+#[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
+fn mark_died_emits_died_once_and_is_idempotent() {
+    let Some(python) = test_python() else {
+        eprintln!("SKIP mark_died_emits_died_once_and_is_idempotent: no Python found");
+        return;
+    };
+    let proc = SpawnedPython::spawn(&python).expect("spin.py should reach READY");
+    let pid = proc.pid();
+    let session = PySession::attach(pid).expect("attach to the live interpreter");
+
+    let mut exporter = RecordingExporter::default();
+    {
+        let mut ctx = MonitorContext::new(&mut exporter);
+        ctx.insert_session_for_test(pid, session);
+        assert_eq!(ctx.poll(pid), PollStatus::Ok, "healthy first poll reports Started");
+        ctx.mark_died(pid);
+        // Already evicted from the alive set — a repeat must not double-report.
+        ctx.mark_died(pid);
+    }
+    assert_eq!(exporter.started, 1);
+    assert_eq!(exporter.died, 1, "mark_died must emit Died exactly once");
+}
+
+/// The process-exit path: a PID reported Started that then exits. The next `gc_stats` read
+/// fails, `revalidate` sees a dead/absent process, and `poll` gives up with
+/// `InvalidProcess` — emitting `Died` once because the process had been alive. (Which
+/// internal failure branch runs — Dead, or a Fresh retry that also fails — is irrelevant;
+/// the observable contract is InvalidProcess + a single Died.)
+#[test]
+#[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
+fn poll_reports_invalid_and_died_when_the_process_exits_after_being_seen() {
+    let Some(python) = test_python() else {
+        eprintln!("SKIP poll_reports_invalid_and_died_when_the_process_exits_after_being_seen: no Python found");
+        return;
+    };
+    let mut proc = SpawnedPython::spawn(&python).expect("spin.py should reach READY");
+    let pid = proc.pid();
+    let session = PySession::attach(pid).expect("attach to the live interpreter");
+
+    let mut exporter = RecordingExporter::default();
+    {
+        let mut ctx = MonitorContext::new(&mut exporter);
+        ctx.insert_session_for_test(pid, session);
+        assert_eq!(ctx.poll(pid), PollStatus::Ok, "healthy first poll");
+
+        // Kill the interpreter and wait until the OS has really reaped it, so the second
+        // read genuinely fails against a gone process rather than racing a live one.
+        proc.kill();
+        for _ in 0..100 {
+            if !pid_alive(pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!pid_alive(pid), "the interpreter must be gone before the second poll");
+
+        assert_eq!(
+            ctx.poll(pid),
+            PollStatus::InvalidProcess,
+            "a process that has exited must poll InvalidProcess"
+        );
+    }
+    assert_eq!(exporter.started, 1);
+    assert_eq!(exporter.died, 1, "an exited-after-Started process must be reported Died once");
+}
+
+/// End-to-end for `run_loop`: it discovers and polls a live process, reports it Started,
+/// and — once `running` is cleared — breaks out and marks the still-tracked PID Died in the
+/// teardown pass. Unlike the TUI loop this needs no terminal, so it runs headless. A stopper
+/// thread flips `running` after the loop has had time to attach and poll a few times.
+#[test]
+#[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
+fn run_loop_tracks_a_live_process_and_marks_it_died_on_stop() {
+    let Some(python) = test_python() else {
+        eprintln!("SKIP run_loop_tracks_a_live_process_and_marks_it_died_on_stop: no Python found");
+        return;
+    };
+    let proc = SpawnedPython::spawn(&python).expect("spin.py should reach READY");
+    let pid = proc.pid();
+
+    let running = AtomicBool::new(true);
+    let mut exporter = RecordingExporter::default();
+    {
+        let mut ctx = MonitorContext::new(&mut exporter);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(500));
+                running.store(false, Ordering::SeqCst);
+            });
+            run_loop(&mut ctx, pid, 50, &running, || {
+                StartupTimeoutPolicy::new(Duration::from_secs(2))
+            })
+            .expect("run_loop should return Ok");
+        });
+    }
+    // `proc` is still alive here, so the Died comes from the loop's teardown pass, not a
+    // process exit.
+    assert!(exporter.started >= 1, "run_loop must report the live process Started");
+    assert!(exporter.died >= 1, "loop teardown must mark the tracked process Died");
 }
