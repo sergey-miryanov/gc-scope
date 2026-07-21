@@ -12,7 +12,7 @@ goblin = "0.10.7"
 remoteprocess = "0.5.2"
 ctrlc = "3.5.2"
 ratatui = "0.26"
-crossterm = "0.27"
+crossterm = "0.29"
 sysinfo = "0.33"
 
 [dev-dependencies]
