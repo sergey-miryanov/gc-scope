@@ -118,15 +118,10 @@ fn has_extended(stats: &[GcStat]) -> bool {
     stats.iter().any(|s| s.has("increment_size"))
 }
 
-pub fn print_stats(stats: &[GcStat]) {
-    if stats.is_empty() {
-        println!("No GC stats found.");
-        return;
-    }
-
-    let has_extended = has_extended(stats);
-
-    let header = if has_extended {
+/// The column header, matched to the column set `has_extended` selects. Pure so the row
+/// formatter's column count can be pinned against it without capturing stdout.
+fn format_header(has_extended: bool) -> String {
+    if has_extended {
         format!(
             "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
             "generation", "Slot", "IntID",
@@ -142,33 +137,51 @@ pub fn print_stats(stats: &[GcStat]) {
             "Collections", "Collected", "Uncollect.", "Candidates",
             "HeapSize", "Duration"
         )
-    };
+    }
+}
 
+/// Format one stats row. On the extended path the six `+inc` columns are appended, each read
+/// with a zero fallback so a slot missing one (an absent field or a torn read) prints `0`
+/// rather than dropping a column and misaligning the whole table. Pure — returns the line — so
+/// the extended column layout and its fallbacks are unit-testable without capturing stdout.
+fn format_row(s: &GcStat, has_extended: bool) -> String {
+    if has_extended {
+        format!(
+            "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10.6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
+            s.generation, s.slot, s.interpreter_id,
+            s.collections(), s.collected(), s.uncollectable(),
+            s.candidates(), s.heap_size(), s.duration(),
+            s.get("increment_size").unwrap_or(0),
+            s.get("alive_size").unwrap_or(0),
+            s.get("finalized_garbage_count").unwrap_or(0),
+            s.get("clear_weakrefs_count").unwrap_or(0),
+            s.get("deleted_garbage_count").unwrap_or(0),
+            s.get("ts_mark_alive_start").unwrap_or(0),
+        )
+    } else {
+        format!(
+            "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10.6}",
+            s.generation, s.slot, s.interpreter_id,
+            s.collections(), s.collected(), s.uncollectable(),
+            s.candidates(), s.heap_size(), s.duration(),
+        )
+    }
+}
+
+pub fn print_stats(stats: &[GcStat]) {
+    if stats.is_empty() {
+        println!("No GC stats found.");
+        return;
+    }
+
+    let has_extended = has_extended(stats);
+
+    let header = format_header(has_extended);
     println!("{}", header);
     println!("{}", "-".repeat(header.len()));
 
     for s in stats {
-        if has_extended {
-            println!(
-                "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10.6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
-                s.generation, s.slot, s.interpreter_id,
-                s.collections(), s.collected(), s.uncollectable(),
-                s.candidates(), s.heap_size(), s.duration(),
-                s.get("increment_size").unwrap_or(0),
-                s.get("alive_size").unwrap_or(0),
-                s.get("finalized_garbage_count").unwrap_or(0),
-                s.get("clear_weakrefs_count").unwrap_or(0),
-                s.get("deleted_garbage_count").unwrap_or(0),
-                s.get("ts_mark_alive_start").unwrap_or(0),
-            );
-        } else {
-            println!(
-                "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10.6}",
-                s.generation, s.slot, s.interpreter_id,
-                s.collections(), s.collected(), s.uncollectable(),
-                s.candidates(), s.heap_size(), s.duration(),
-            );
-        }
+        println!("{}", format_row(s, has_extended));
     }
 }
 
@@ -243,6 +256,74 @@ mod tests {
         assert!(has_extended(&[core, ext, core2, ext2]));
     }
 
+    /// `iter_fields` is the diagram's hex-highlight feed, so it yields the full `(name,
+    /// offset, raw u64 bits)` tuple — not just the name the other tests check. The offset is
+    /// the field's byte position within the slot, and the bits are the exact little-endian
+    /// contents: raw, NOT sign-interpreted the way `get` reads them (a `-1` slot reads back as
+    /// `u64::MAX` here but `Some(-1)` through `get`).
+    #[test]
+    fn iter_fields_yields_name_offset_and_raw_bits() {
+        let s = GcStat::from_fields(
+            0,
+            0,
+            1,
+            *REGULAR,
+            &[("ts_start", 0x1122), ("collections", -1), ("collected", 9)],
+        );
+
+        let fields: Vec<(&str, usize, u64)> = s.iter_fields().collect();
+        assert_eq!(
+            fields,
+            [
+                ("ts_start", 0, 0x1122u64),
+                ("collections", 8, u64::MAX), // raw bits of -1i64, not a signed reading
+                ("collected", 16, 9u64),
+            ]
+        );
+
+        // `get` reinterprets those same bytes as i64 — the contrast that makes the raw-bits
+        // contract matter.
+        assert_eq!(s.get("collections"), Some(-1));
+    }
+
+    /// A slot shorter than the layout (a teardown-race truncation) makes `iter_fields` skip
+    /// the fields that would read past the end: `raw_at` returns `None` and the `filter_map`
+    /// drops them, rather than panicking on an out-of-range slice.
+    #[test]
+    fn iter_fields_skips_fields_past_a_truncated_slot() {
+        // REGULAR wants 24 bytes (fields at 0, 8, 16); give it only 16 so `collected`
+        // (offset 16, needs bytes 16..24) can't be read.
+        let s = GcStat::new(0, 0, 1, vec![0u8; 16], *REGULAR);
+
+        let names: Vec<&str> = s.iter_fields().map(|(n, _, _)| n).collect();
+        assert_eq!(names, ["ts_start", "collections"]);
+        // The dropped field reads back `None` through `get` too — a short slot never panics.
+        assert_eq!(s.get("collected"), None);
+    }
+
+    /// The typed core accessors each read their named field, falling back to zero when the
+    /// build's layout lacks it. `ts_stop` in particular has no other coverage.
+    #[test]
+    fn typed_core_accessors_read_named_fields_with_a_zero_fallback() {
+        let layout = seq_layout(&["ts_start", "ts_stop", "candidates"]);
+        let s = GcStat::from_fields(
+            0,
+            0,
+            1,
+            layout,
+            &[("ts_start", 10), ("ts_stop", 20), ("candidates", 30)],
+        );
+
+        assert_eq!(s.ts_start(), 10);
+        assert_eq!(s.ts_stop(), 20);
+        assert_eq!(s.candidates(), 30);
+
+        // Fields absent from this layout fall back to zero, never a panic.
+        assert_eq!(s.collected(), 0);
+        assert_eq!(s.uncollectable(), 0);
+        assert_eq!(s.heap_size(), 0);
+    }
+
     /// The extended print path reads each `+inc` field by name via `get`. A view over an
     /// extended slot must decode every one of them (not fall back to zero the way a core-only
     /// layout does), while the always-present core stays readable and `iter_fields` yields the
@@ -297,5 +378,76 @@ mod tests {
                 "ts_mark_alive_start",
             ]
         );
+    }
+
+    /// The extended row (the `+inc` print path) must place all 15 columns —
+    /// generation/slot/intid, the six core counters, then the six `+inc` fields — in order.
+    /// A wrong order or a dropped `.unwrap_or` would silently print a value under the wrong
+    /// header; splitting the row on whitespace pins the exact column contents.
+    #[test]
+    fn extended_row_lays_out_every_plus_inc_column_in_order() {
+        let s = GcStat::from_fields(
+            0,
+            1,
+            2,
+            *EXTENDED,
+            &[
+                ("collections", 7),
+                ("collected", 8),
+                ("uncollectable", 9),
+                ("candidates", 10),
+                ("heap_size", 11),
+                ("increment_size", 100),
+                ("alive_size", 200),
+                ("finalized_garbage_count", 3),
+                ("clear_weakrefs_count", 4),
+                ("deleted_garbage_count", 5),
+                ("ts_mark_alive_start", 999),
+            ],
+        );
+
+        let row = format_row(&s, true);
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(
+            cols,
+            [
+                "0", "1", "2", // generation, slot, interpreter_id
+                "7", "8", "9", "10", "11", // collections..heap_size
+                "0.000000", // duration (from_fields can't set an f64; stays 0.0)
+                "100", "200", "3", "4", "5", "999", // the six +inc columns, in order
+            ]
+        );
+        // The row carries exactly as many columns as the extended header.
+        assert_eq!(cols.len(), format_header(true).split_whitespace().count());
+    }
+
+    /// On the extended path a slot whose layout is missing an `+inc` field (a torn read, or a
+    /// partially-extended build) must still print that column as `0` via `.unwrap_or(0)` — the
+    /// column stays present so the table never misaligns.
+    #[test]
+    fn extended_row_prints_zero_for_a_missing_plus_inc_field() {
+        // Extended enough to take the wide path (`increment_size` present) but WITHOUT the
+        // other `+inc` fields, so their `get(...)` returns None and must fall back to 0.
+        let layout = seq_layout(&["collections", "increment_size"]);
+        let s = GcStat::from_fields(0, 0, 0, layout, &[("collections", 1), ("increment_size", 42)]);
+
+        let row = format_row(&s, true);
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(cols.len(), format_header(true).split_whitespace().count());
+        // increment_size prints its value; the fields the layout lacks print 0, not garbage.
+        assert_eq!(cols[9], "42"); // increment_size
+        assert_eq!(&cols[10..], ["0", "0", "0", "0", "0"], "absent +inc fields fall back to 0");
+    }
+
+    /// The core (non-extended) row is the 9-column subset — no `+inc` columns — matching the
+    /// non-extended header.
+    #[test]
+    fn core_row_has_only_the_nine_base_columns() {
+        let s = GcStat::from_fields(0, 0, 1, *REGULAR, &[("collections", 5)]);
+        let row = format_row(&s, false);
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(cols.len(), 9);
+        assert_eq!(cols.len(), format_header(false).split_whitespace().count());
+        assert_eq!(cols[3], "5"); // collections
     }
 }
