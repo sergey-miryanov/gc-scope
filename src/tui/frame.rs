@@ -1276,13 +1276,35 @@ fn slot_field_color(name: &str) -> Option<Color> {
     }
 }
 
+/// The byte offset of each generation's ring index in the raw buffer. CPython stores an `i8`
+/// (plus 7 bytes of padding) right *after* each generation's slots — per
+/// `compute_ring_base_offsets`, generation `g`'s slots start at `bases[g]`, so its index sits
+/// at `bases[g] + slots[g] * item_size`. The index value is the active slot number for that
+/// generation's ring. Empty for inline/legacy builds (one slot per generation, no index).
+fn ring_index_offsets(
+    table: &crate::remote_debugging::offsets::offset_table::OffsetTable,
+    item_size: usize,
+) -> Vec<usize> {
+    use crate::remote_debugging::offsets::offset_table::GcStatsKind;
+    if table.gc_stats_kind != GcStatsKind::RingBuffer || item_size == 0 {
+        return Vec::new();
+    }
+    let (Some(bases), Some(slots)) = (table.gc_gen_base_offsets, table.gc_slots_per_gen) else {
+        return Vec::new();
+    };
+    (0..3)
+        .map(|g| bases[g] as usize + slots[g] as usize * item_size)
+        .collect()
+}
+
 /// The GC-stats-only "buffer view" (`g` toggles it). Left column: the slot table (top,
 /// arrow-selectable) over the selected slot's decoded field→value list (bottom). Right
-/// column: a hexdump of the *whole* stats buffer, with the selected slot's byte range shaded
-/// (`DarkGray`) and its decoded fields colored in place — so the active slot stands out
-/// within the full buffer while other slots stay plain. Reuses the two-column box, the hex
-/// renderer, and `slot_field_color` from the full view; the one difference from
-/// `section_gc_stats` is that the hexdump spans the entire buffer, not one slot.
+/// column: a hexdump of the *whole* stats buffer — the selected slot's byte range shaded
+/// `DarkGray` with its decoded fields colored in place, and (on ring builds) each generation's
+/// `i8` ring index shaded `Red` as a fixed visual anchor, so the reader can watch the active
+/// slot number change in place. Reuses the two-column box, the hex renderer, and
+/// `slot_field_color` from the full view; the one difference from `section_gc_stats` is that
+/// the hexdump spans the entire buffer, not one slot.
 fn build_gc_only_lines(data: &CollectedData, selected_slot: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let gc = &data.interpreter.gc.generation_stats;
@@ -1303,12 +1325,23 @@ fn build_gc_only_lines(data: &CollectedData, selected_slot: usize) -> Vec<Line<'
     let selected = selected_slot.min(gc.slots.len() - 1);
     let sel = &gc.slots[selected];
 
+    // Byte offsets of each generation's ring index (ring builds only), shaded in the hexdump
+    // below as an anchor for reading the active slot number.
+    let index_offsets = ring_index_offsets(&offset_table, item_size);
+
     // ── Left column ──
     let mut left: Vec<Vec<Span<'static>>> = Vec::new();
     left.push(vec![Span::raw(format!(
         "Buffer @ {:#x}  (size: {} bytes, slot: {} bytes)",
         gc.stats_addr, gc.stats_size, item_size
     ))]);
+    if !index_offsets.is_empty() {
+        left.push(vec![
+            Span::raw("legend: ".to_string()),
+            Span::styled(" idx ", Style::new().bg(Color::Red).fg(Color::Black)),
+            Span::raw(" = per-generation ring index (i8, active slot #)".to_string()),
+        ]);
+    }
     left.push(vec![Span::raw(String::new())]);
 
     // Slot table (top) — one row per slot, the selected row shaded. Same columns/format as the
@@ -1373,15 +1406,24 @@ fn build_gc_only_lines(data: &CollectedData, selected_slot: usize) -> Vec<Line<'
     }
 
     // ── Right column: whole-buffer hexdump ──
-    // Field highlights first so `.find` picks a field color over the whole-slot shade; the
-    // trailing range highlight shades the rest of the selected slot. `item_size` is small
-    // (24 inline, the ring-struct size otherwise) but capped to the `u8` highlight length.
+    // `hex_dump_rows` takes the FIRST matching highlight, so order is priority: the selected
+    // slot's colored fields, then its DarkGray whole-slot shade, then each generation's ring
+    // index in Red. The index gaps never overlap a slot, so their order relative to the slot
+    // shades doesn't matter. `item_size` is small (24 inline, the ring-struct size otherwise)
+    // but capped to the `u8` highlight length.
     let mut highlights: Vec<(usize, u8, Color)> = slot_view
         .iter()
         .flat_map(|v| v.iter_fields())
         .filter_map(|(name, off, _)| slot_field_color(name).map(|c| (off + sel.byte_offset, 8u8, c)))
         .collect();
     highlights.push((sel.byte_offset, item_size.min(255) as u8, Color::DarkGray));
+    // The index is an `i8` followed by 7 bytes of padding; shade the whole 8-byte field so it
+    // reads as one anchor block between generations.
+    for &off in &index_offsets {
+        if off + 8 <= gc.raw_stats_bytes.len() {
+            highlights.push((off, 8, Color::Red));
+        }
+    }
 
     // A 16-byte hexdump row is exactly `GC_PR` wide; `gc_two_col` pads the short final row.
     let right = hex_dump_rows(&gc.raw_stats_bytes, gc.raw_stats_bytes.len(), &highlights, 0);
@@ -1953,6 +1995,40 @@ mod tests {
         stats.slots[0].byte_offset = 48;
         let out = join_lines(&build_gc_only_lines(&data, 0));
         assert!(out.contains("Slot #1 (gen 0, slot 0)"), "{out}");
+    }
+
+    #[test]
+    fn ring_index_offsets_point_just_past_each_generations_slots() {
+        use crate::remote_debugging::offsets::offset_table::{compute_ring_base_offsets, GcStatsKind};
+
+        // A GIL ring: slots [11, 3, 3], 24-byte items. Build the geometry from the public
+        // fields (set_ring is private to the offsets module).
+        let item = 24usize;
+        let slots = [11u64, 3, 3];
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        table.gc_stats_kind = GcStatsKind::RingBuffer;
+        table.gc_item_size = Some(item as u64);
+        table.gc_slots_per_gen = Some(slots);
+        table.gc_gen_base_offsets = Some(compute_ring_base_offsets(item as u64, &slots));
+        let bases = table.gc_gen_base_offsets.unwrap();
+
+        // Each index sits immediately after its generation's slots, i.e. 8 bytes before the
+        // next generation's base (and, for the last, at the buffer's trailing cursor).
+        let offs = ring_index_offsets(&table, item);
+        assert_eq!(
+            offs,
+            vec![
+                bases[0] as usize + 11 * item,
+                bases[1] as usize + 3 * item,
+                bases[2] as usize + 3 * item,
+            ]
+        );
+        assert_eq!(offs[0], bases[1] as usize - 8, "gen-0 index is the 8-byte gap before gen 1");
+        assert_eq!(offs[1], bases[2] as usize - 8, "gen-1 index is the 8-byte gap before gen 2");
+
+        // Inline/Legacy is not a ring → no index gaps at all.
+        let legacy = legacy_data(true);
+        assert!(ring_index_offsets(legacy.resolved.table(), 24).is_empty());
     }
 
     #[test]
