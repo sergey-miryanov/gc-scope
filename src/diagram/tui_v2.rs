@@ -13,6 +13,7 @@ use ratatui::Terminal;
 use crate::remote_debugging::collect::{
     avg_collection_time_per_gen, collections_rate_from_slots, CollectRequest, CollectedData,
 };
+use crate::remote_debugging::gc_stats::GcStat;
 use crate::remote_debugging::poller::SnapshotPoller;
 use super::render::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
 use crate::remote_debugging::offsets::VersionedOffsets;
@@ -1094,6 +1095,11 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
     let slot_raw_end = (slot_raw_start + item_size).min(gc.raw_stats_bytes.len());
     let slot_bytes = &gc.raw_stats_bytes[slot_raw_start..slot_raw_end];
     let display_bytes = slot_bytes.len();
+    // Decode this slot's fields through the shared `GcStat` primitive — the same by-name/offset
+    // path the Chrome exporter uses — instead of re-reading the raw bytes inline here.
+    let slot_view = offset_table
+        .gc_layout
+        .map(|l| GcStat::from_slot(slot_bytes, l, slot.generation, slot.slot, 0));
 
     let mut right_items: Vec<Vec<Span<'static>>> = Vec::new();
     // Header
@@ -1116,8 +1122,9 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
         ("duration", Color::Yellow),
         ("heap_size", Color::Cyan),
     ].into_iter().collect();
-    let adjusted_highlights: Vec<(usize, u8, Color)> = slot_fields.iter()
-        .filter_map(|&(name, off)| {
+    let adjusted_highlights: Vec<(usize, u8, Color)> = slot_view.iter()
+        .flat_map(|v| v.iter_fields())
+        .filter_map(|(name, off, _)| {
             slot_label_colors.get(name).map(|&c| (off + slot.byte_offset, 8u8, c))
         })
         .collect();
@@ -1145,22 +1152,15 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
     // `ts_handle_weakref_callbacks_start`). Floored at 15 so short-field builds are unchanged.
     let name_w = slot_fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(15);
 
-    for (name, offset) in slot_fields {
-        let offset = *offset;
-        if offset + 8 > slot_bytes.len() {
-            continue;
-        }
-        let raw = &slot_bytes[offset..offset + 8];
-        let val = u64::from_le_bytes(raw.try_into().unwrap());
-        let val_fmt = if *name == "duration" {
-            let d = f64::from_le_bytes(raw.try_into().unwrap());
-            format!("{:.6}", d)
+    for (name, offset, valbits) in slot_view.iter().flat_map(|v| v.iter_fields()) {
+        let val_fmt = if name == "duration" {
+            format!("{:.6}", f64::from_bits(valbits))
         } else if name.starts_with("ts_") {
-            fmt_thousands(val)
-        } else if val > 0xFFFF_FFFF {
-            format!("{:#x}", val)
+            fmt_thousands(valbits)
+        } else if valbits > 0xFFFF_FFFF {
+            format!("{:#x}", valbits)
         } else {
-            format!("{}", val)
+            format!("{}", valbits)
         };
 
         let content = format!("  {:<name_w$} @ +{:<4}  {}", name, offset, val_fmt, name_w = name_w);

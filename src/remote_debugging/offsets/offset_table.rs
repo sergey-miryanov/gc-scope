@@ -289,58 +289,29 @@ impl OffsetTable {
             None => return vec![],
         };
 
+        // Slice the region into per-slot byte windows; each `GcStat` is a view over its window
+        // plus `layout`, decoding fields lazily by name. No fixed field list to enumerate, so a
+        // build with fields beyond the common set is carried without any struct change.
         let mut stats = Vec::new();
         for gidx in 0..3u32 {
             let base = bases[gidx as usize] as usize;
             let n = slots[gidx as usize] as usize;
             for slot in 0..n {
                 let off = base + slot * item_size;
-                macro_rules! opt {
-                    ($name:expr) => {
-                        layout.field_offset($name).map(|o| raw_i64(raw, off + o))
-                    };
+                if off + item_size > raw.len() {
+                    break; // short region (teardown race) — stop walking this generation
                 }
-                stats.push(GcStat {
-                    generation: gidx, slot, interpreter_id: iid,
-                    ts_start: opt!("ts_start").unwrap_or(0),
-                    ts_stop: opt!("ts_stop").unwrap_or(0),
-                    collections: raw_i64(raw, off + layout.field_offset("collections").unwrap()),
-                    collected: raw_i64(raw, off + layout.field_offset("collected").unwrap()),
-                    uncollectable: raw_i64(raw, off + layout.field_offset("uncollectable").unwrap()),
-                    candidates: opt!("candidates").unwrap_or(0),
-                    duration: layout.field_offset("duration").map(|o| raw_f64(raw, off + o)).unwrap_or(0.0),
-                    heap_size: opt!("heap_size").unwrap_or(0),
-                    increment_size: opt!("increment_size"),
-                    alive_size: opt!("alive_size"),
-                    finalized_garbage_count: opt!("finalized_garbage_count"),
-                    clear_weakrefs_count: opt!("clear_weakrefs_count"),
-                    deleted_garbage_count: opt!("deleted_garbage_count"),
-                    ts_mark_alive_start: opt!("ts_mark_alive_start"),
-                    ts_mark_alive_stop: opt!("ts_mark_alive_stop"),
-                    ts_fill_increment_start: opt!("ts_fill_increment_start"),
-                    ts_fill_increment_stop: opt!("ts_fill_increment_stop"),
-                    ts_deduce_unreachable_start: opt!("ts_deduce_unreachable_start"),
-                    ts_deduce_unreachable_stop: opt!("ts_deduce_unreachable_stop"),
-                    ts_handle_weakref_callbacks_start: opt!("ts_handle_weakref_callbacks_start"),
-                    ts_handle_weakref_callbacks_stop: opt!("ts_handle_weakref_callbacks_stop"),
-                    ts_finalize_garbage_stop: opt!("ts_finalize_garbage_stop"),
-                    ts_handle_resurrected_stop: opt!("ts_handle_resurrected_stop"),
-                    ts_clear_weakrefs_stop: opt!("ts_clear_weakrefs_stop"),
-                    ts_delete_garbage_start: opt!("ts_delete_garbage_start"),
-                    ts_delete_garbage_stop: opt!("ts_delete_garbage_stop"),
-                });
+                stats.push(GcStat::new(
+                    gidx,
+                    slot,
+                    iid,
+                    raw[off..off + item_size].to_vec(),
+                    layout,
+                ));
             }
         }
         stats
     }
-}
-
-fn raw_i64(bytes: &[u8], off: usize) -> i64 {
-    i64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
-}
-
-fn raw_f64(bytes: &[u8], off: usize) -> f64 {
-    f64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
 }
 
 // ── GC generation stats item layout ─────────────────────────────
@@ -363,6 +334,22 @@ impl GcItemLayout {
     pub fn field_offset(&self, name: &str) -> Option<usize> {
         self.fields.iter().find(|(n, _)| *n == name).map(|(_, o)| *o)
     }
+}
+
+/// Test helper: build a leaked `&'static GcItemLayout` from field names, assigning each the
+/// next sequential 8-byte offset. For behavior tests that care only *which* fields a build has,
+/// not their positions — the geometry tests (ring/inline decode, base offsets) still pin
+/// offsets explicitly, because there the offset arithmetic is the contract under test. The
+/// small leak is fine for a test process, and satisfies `GcStat`'s `&'static` layout without a
+/// hand-packed offset table.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn seq_layout(names: &[&'static str]) -> &'static GcItemLayout {
+    let fields: Vec<(&'static str, usize)> =
+        names.iter().enumerate().map(|(i, &name)| (name, i * 8)).collect();
+    Box::leak(Box::new(GcItemLayout {
+        item_size: names.len() * 8,
+        fields: Box::leak(fields.into_boxed_slice()),
+    }))
 }
 
 /// Compute gen_base_offsets for a ring-buffer GC stats layout.
@@ -446,9 +433,9 @@ mod tests {
             assert_eq!(s.generation, g as u32);
             assert_eq!(s.slot, 0);
             assert_eq!(s.interpreter_id, 7);
-            assert_eq!(s.collections, 100 * g as i64 + 1);
-            assert_eq!(s.collected, 100 * g as i64 + 2);
-            assert_eq!(s.uncollectable, 100 * g as i64 + 3);
+            assert_eq!(s.collections(), 100 * g as i64 + 1);
+            assert_eq!(s.collected(), 100 * g as i64 + 2);
+            assert_eq!(s.uncollectable(), 100 * g as i64 + 3);
         }
     }
 
@@ -463,14 +450,16 @@ mod tests {
 
         let stats = table.decode_gc_stats(&[0u8; 72], 0);
         let s = &stats[0];
-        // The legacy layout has only collections/collected/uncollectable.
-        assert_eq!(s.increment_size, None);
-        assert_eq!(s.alive_size, None);
-        assert_eq!(s.ts_mark_alive_start, None);
-        // Non-Option fields with no layout entry fall back to zero.
-        assert_eq!(s.ts_start, 0);
-        assert_eq!(s.heap_size, 0);
-        assert_eq!(s.duration, 0.0);
+        // The legacy layout has only collections/collected/uncollectable, so a field it lacks
+        // reads back `None`, not `Some(0)`.
+        assert_eq!(s.get("increment_size"), None);
+        assert_eq!(s.get("alive_size"), None);
+        assert_eq!(s.get("ts_mark_alive_start"), None);
+        assert!(!s.has("increment_size"));
+        // The core accessors fall back to zero for a field the layout doesn't define.
+        assert_eq!(s.ts_start(), 0);
+        assert_eq!(s.heap_size(), 0);
+        assert_eq!(s.duration(), 0.0);
     }
 
     // ── ring-buffer decode (3.15.0a8+) ──────────────────────────
@@ -505,18 +494,18 @@ mod tests {
         assert_eq!(stats.len(), 11 + 3 + 3);
         for s in &stats {
             assert_eq!(
-                s.ts_start,
+                s.ts_start(),
                 1000 * (s.generation as i64 + 1) + s.slot as i64,
                 "generation {} slot {} read from the wrong offset",
                 s.generation, s.slot
             );
-            assert_eq!(s.increment_size, Some(10 * s.generation as i64 + s.slot as i64));
+            assert_eq!(s.get("increment_size"), Some(10 * s.generation as i64 + s.slot as i64));
         }
 
         // Generation 1 starts one 8-byte pad past the end of generation 0's slots;
         // reading it at `11 * item` instead would land inside the pad and return 0.
         let gen1_first = stats.iter().find(|s| s.generation == 1 && s.slot == 0).unwrap();
-        assert_eq!(gen1_first.ts_start, 2000);
+        assert_eq!(gen1_first.ts_start(), 2000);
     }
 
     #[test]

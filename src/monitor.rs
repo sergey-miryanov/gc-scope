@@ -161,25 +161,31 @@ fn select_fresh<'s>(
     let mut fresh: Vec<&GcStat> = Vec::new();
     for stat in stats {
         let mark = seen.entry((stat.generation, stat.slot)).or_insert(0);
-        if stat.ts_start > *mark {
-            *mark = stat.ts_start;
+        if stat.ts_start() > *mark {
+            *mark = stat.ts_start();
             fresh.push(stat);
         }
     }
-    fresh.sort_by_key(|s| s.ts_start);
+    fresh.sort_by_key(|s| s.ts_start());
     fresh
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_debugging::offsets::offset_table::{seq_layout, GcItemLayout};
+    use std::sync::LazyLock;
+
+    /// Minimal slot layout for the dedup tests — they only ever set/read `ts_start`
+    /// (`generation`/`slot` are identity fields on the view, not layout fields).
+    static TEST_LAYOUT: LazyLock<&'static GcItemLayout> = LazyLock::new(|| seq_layout(&["ts_start"]));
 
     fn stat(generation: u32, slot: usize, ts_start: i64) -> GcStat {
-        GcStat { generation, slot, ts_start, ..Default::default() }
+        GcStat::from_fields(generation, slot, 0, *TEST_LAYOUT, &[("ts_start", ts_start)])
     }
 
     fn fresh_ts(stats: &[GcStat], seen: &mut HashMap<(u32, usize), i64>) -> Vec<i64> {
-        select_fresh(stats, seen).into_iter().map(|s| s.ts_start).collect()
+        select_fresh(stats, seen).into_iter().map(|s| s.ts_start()).collect()
     }
 
     /// Slots that have never been collected read back as zero. The initial mark is

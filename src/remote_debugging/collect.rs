@@ -332,19 +332,19 @@ fn parse_gc_slots(raw: &[u8], table: &offsets::offset_table::OffsetTable) -> Vec
     table
         .decode_gc_stats(raw, 0)
         .into_iter()
-        .filter(|s| !(has_ts && s.ts_stop < s.ts_start))
+        .filter(|s| !(has_ts && s.ts_stop() < s.ts_start()))
         .map(|s| GcSlot {
             generation: s.generation,
             slot: s.slot,
             byte_offset: table.slot_byte_offset(s.generation, s.slot).unwrap_or(0),
-            start_ts: s.ts_start,
-            stop_ts: s.ts_stop,
-            collections: s.collections,
-            collected: s.collected,
-            uncollectable: s.uncollectable,
-            candidates: s.candidates,
-            duration: s.duration,
-            heap_size: s.heap_size,
+            start_ts: s.ts_start(),
+            stop_ts: s.ts_stop(),
+            collections: s.collections(),
+            collected: s.collected(),
+            uncollectable: s.uncollectable(),
+            candidates: s.candidates(),
+            duration: s.duration(),
+            heap_size: s.heap_size(),
         })
         .collect()
 }
@@ -633,11 +633,11 @@ mod tests {
         assert_eq!(monitor.len(), diagram.len());
         for (m, d) in monitor.iter().zip(&diagram) {
             assert_eq!((m.generation, m.slot), (d.generation, d.slot));
-            assert_eq!(m.ts_start, d.start_ts);
-            assert_eq!(m.ts_stop, d.stop_ts);
-            assert_eq!(m.collections, d.collections);
-            assert_eq!(m.collected, d.collected);
-            assert_eq!(m.uncollectable, d.uncollectable);
+            assert_eq!(m.ts_start(), d.start_ts);
+            assert_eq!(m.ts_stop(), d.stop_ts);
+            assert_eq!(m.collections(), d.collections);
+            assert_eq!(m.collected(), d.collected);
+            assert_eq!(m.uncollectable(), d.uncollectable);
             // The diagram recovers the exact raw-region offset the decoder walked.
             assert_eq!(d.byte_offset, table.slot_byte_offset(d.generation, d.slot).unwrap());
         }
