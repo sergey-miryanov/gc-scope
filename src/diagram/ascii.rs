@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use super::collect::CollectedData;
+use crate::remote_debugging::collect::CollectedData;
 use crate::remote_debugging::offsets::VersionedOffsets;
 
 // Total line width: 160 chars including | borders.
@@ -473,7 +473,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::super::collect::{
+    use crate::remote_debugging::collect::{
         CollectedData, GcSlot, GcStatsSnapshot, GcSubState, InterpreterSnapshot,
     };
     use crate::remote_debugging::offsets::pre_3_13;

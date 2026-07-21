@@ -1,3 +1,13 @@
+//! Reader-layer snapshot collector.
+//!
+//! [`collect_data`] walks an attached [`PySession`] once and returns a fully-owned
+//! [`CollectedData`] — the interpreter/GC layout, raw struct bytes, and decoded generation
+//! slots — for a consumer to render. It lives in the reader layer (not `diagram/`) so it is
+//! a single source of truth: it resolves the stats region through
+//! [`PySession::gc_stats_region_addr`] and decodes slots through
+//! [`crate::remote_debugging::offsets::offset_table::OffsetTable::decode_gc_stats`], the same
+//! paths the monitor uses, and the `diagram` renderers merely consume its output.
+
 #![allow(dead_code)]
 
 use std::sync::Arc;

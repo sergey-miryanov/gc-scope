@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use super::collect::{collect_data, CollectedData};
+use crate::remote_debugging::collect::{collect_data, CollectedData};
 use crate::remote_debugging::session::{PySession, Revalidated};
 
 /// Single-PID snapshot producer: owns the attached [`PySession`], hands out a full

@@ -11,7 +11,7 @@ mod common;
 
 use common::{pid_alive, python_version, test_python, SpawnedPython};
 
-use gcscope::diagram::collect::{
+use gcscope::remote_debugging::collect::{
     self, avg_collection_time_per_gen, collections_rate_from_slots,
 };
 use gcscope::diagram::ascii;

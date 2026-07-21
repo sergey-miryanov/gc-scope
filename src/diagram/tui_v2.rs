@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Terminal;
 
-use super::collect::{avg_collection_time_per_gen, collections_rate_from_slots, CollectedData};
+use crate::remote_debugging::collect::{avg_collection_time_per_gen, collections_rate_from_slots, CollectedData};
 use super::poller::SnapshotPoller;
 use super::render::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
 use crate::remote_debugging::offsets::VersionedOffsets;
@@ -1457,7 +1457,7 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::widgets::Widget;
 
-    use super::super::collect::{
+    use crate::remote_debugging::collect::{
         GcSlot, GcStatsSnapshot, GcSubState, InterpreterSnapshot,
     };
     use crate::remote_debugging::offsets::pre_3_13;
