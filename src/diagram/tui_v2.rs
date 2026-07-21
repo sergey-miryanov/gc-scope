@@ -10,7 +10,11 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Terminal;
 
-use super::collect::{avg_collection_time_per_gen, collections_rate_from_slots, CollectedData};
+use crate::remote_debugging::gc_stats::GcStat;
+use crate::snapshot::collect::{
+    avg_collection_time_per_gen, collections_rate_from_slots, CollectRequest, CollectedData,
+};
+use crate::snapshot::poller::SnapshotPoller;
 use super::render::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
 use crate::remote_debugging::offsets::VersionedOffsets;
 
@@ -47,7 +51,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
     terminal.hide_cursor()?;
 
     // PID selection dialog if no PID given
-    let mut pid = match pid {
+    let initial_pid = match pid {
         Some(p) => p,
         None => {
             let (processes, pid_info_map) = crate::list_pids::list_python_processes()?;
@@ -58,7 +62,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         }
     };
 
-    let mut session = crate::remote_debugging::session::PySession::attach(pid)?;
+    let mut poller = SnapshotPoller::attach_with(initial_pid, CollectRequest::diagram())?;
     let mut start = Instant::now();
     let mut frame: u64 = 0;
 
@@ -85,11 +89,11 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
                 KeyOutcome::PickPid => {
                     if let Ok((processes, pid_info_map)) = crate::list_pids::list_python_processes()
                         && let Ok(Some(new_pid)) = super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map)
-                        && let Ok(new_session) = crate::remote_debugging::session::PySession::attach(new_pid)
+                        && poller.retarget(new_pid).is_ok()
                     {
-                        // Commit the switch only once it fully resolves.
-                        session = new_session;
-                        pid = new_pid;
+                        // `retarget` swaps the session in only on a successful attach, so a
+                        // failed re-pick leaves the old session live; commit the view reset
+                        // only once it fully resolves.
                         start = Instant::now();
                         frame = 0;
                         state.reset_view();
@@ -99,7 +103,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
             }
         }
 
-        let data = match crate::diagram::collect::collect_data(&session) {
+        let data = match poller.poll() {
             Ok(d) => d,
             Err(e) => {
                 terminal.draw(|f| {
@@ -155,7 +159,9 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         let (cl_active, cl_jx, cl_jy) = (glitch.cl_active, glitch.cl_jx, glitch.cl_jy);
 
         // Copy the view scalars the render closure reads; `scroll` is taken mutably so the
-        // closure can clamp it, then written back below.
+        // closure can clamp it, then written back below. `pid` is re-read from the poller
+        // each frame so a mid-loop pick-pid retarget is reflected in the title.
+        let pid = poller.pid();
         let rate_ms = state.rate_ms;
         let selected_slot = state.selected_slot;
         let glitch_enabled = state.glitch_enabled;
@@ -1082,10 +1088,18 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
 
     // ── Right panel ──
     let slot = &gc.slots[selected_slot];
-    let slot_raw_start = slot.byte_offset;
+    // Clamp the start too: if the raw stats buffer wasn't collected (empty) while `slots`
+    // was, `byte_offset` can exceed the buffer, which would make `start > end` and panic.
+    // Clamping yields an empty slice instead — the hex panel simply renders nothing.
+    let slot_raw_start = slot.byte_offset.min(gc.raw_stats_bytes.len());
     let slot_raw_end = (slot_raw_start + item_size).min(gc.raw_stats_bytes.len());
     let slot_bytes = &gc.raw_stats_bytes[slot_raw_start..slot_raw_end];
     let display_bytes = slot_bytes.len();
+    // Decode this slot's fields through the shared `GcStat` primitive — the same by-name/offset
+    // path the Chrome exporter uses — instead of re-reading the raw bytes inline here.
+    let slot_view = offset_table
+        .gc_layout
+        .map(|l| GcStat::from_slot(slot_bytes, l, slot.generation, slot.slot, 0));
 
     let mut right_items: Vec<Vec<Span<'static>>> = Vec::new();
     // Header
@@ -1108,8 +1122,9 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
         ("duration", Color::Yellow),
         ("heap_size", Color::Cyan),
     ].into_iter().collect();
-    let adjusted_highlights: Vec<(usize, u8, Color)> = slot_fields.iter()
-        .filter_map(|&(name, off)| {
+    let adjusted_highlights: Vec<(usize, u8, Color)> = slot_view.iter()
+        .flat_map(|v| v.iter_fields())
+        .filter_map(|(name, off, _)| {
             slot_label_colors.get(name).map(|&c| (off + slot.byte_offset, 8u8, c))
         })
         .collect();
@@ -1137,22 +1152,15 @@ fn section_gc_stats(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_co
     // `ts_handle_weakref_callbacks_start`). Floored at 15 so short-field builds are unchanged.
     let name_w = slot_fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(15);
 
-    for (name, offset) in slot_fields {
-        let offset = *offset;
-        if offset + 8 > slot_bytes.len() {
-            continue;
-        }
-        let raw = &slot_bytes[offset..offset + 8];
-        let val = u64::from_le_bytes(raw.try_into().unwrap());
-        let val_fmt = if *name == "duration" {
-            let d = f64::from_le_bytes(raw.try_into().unwrap());
-            format!("{:.6}", d)
+    for (name, offset, valbits) in slot_view.iter().flat_map(|v| v.iter_fields()) {
+        let val_fmt = if name == "duration" {
+            format!("{:.6}", f64::from_bits(valbits))
         } else if name.starts_with("ts_") {
-            fmt_thousands(val)
-        } else if val > 0xFFFF_FFFF {
-            format!("{:#x}", val)
+            fmt_thousands(valbits)
+        } else if valbits > 0xFFFF_FFFF {
+            format!("{:#x}", valbits)
         } else {
-            format!("{}", val)
+            format!("{}", valbits)
         };
 
         let content = format!("  {:<name_w$} @ +{:<4}  {}", name, offset, val_fmt, name_w = name_w);
@@ -1454,7 +1462,7 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::widgets::Widget;
 
-    use super::super::collect::{
+    use crate::snapshot::collect::{
         GcSlot, GcStatsSnapshot, GcSubState, InterpreterSnapshot,
     };
     use crate::remote_debugging::offsets::pre_3_13;
@@ -1634,7 +1642,6 @@ mod tests {
             resolved: Arc::new(Resolved::Legacy { table }),
             interpreter: InterpreterSnapshot {
                 addr: 0x6000,
-                raw_bytes: vec![0u8; 256],
                 gc: GcSubState {
                     raw_bytes: vec![0u8; 64],
                     generation_stats: GcStatsSnapshot {
@@ -1693,6 +1700,20 @@ mod tests {
         let data = legacy_data(false);
         let out = join_lines(&section_gc_stats(&data, [None; 3], [None; 3], 0));
         assert!(out.contains("GC Generation Stats: not available"), "{out}");
+    }
+
+    /// If the raw stats buffer is empty (e.g. a request skipped it) but decoded `slots`
+    /// remain, the right-panel byte slice must not panic even when the selected slot's
+    /// `byte_offset` points past the (empty) buffer — the start clamp keeps `start <= end`.
+    #[test]
+    fn section_gc_stats_does_not_panic_when_raw_is_empty_but_a_slot_is_selected() {
+        let mut data = legacy_data(true);
+        let stats = &mut data.interpreter.gc.generation_stats;
+        stats.raw_stats_bytes = Vec::new();
+        stats.slots[0].byte_offset = 48; // a gen-1/2-style offset, past the empty buffer
+        // Must render (empty hex panel) rather than slice-index panic.
+        let out = join_lines(&section_gc_stats(&data, [None; 3], [None; 3], 0));
+        assert!(out.contains("GC Generation Stats Slot #1"), "{out}");
     }
 
     #[test]

@@ -18,14 +18,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use read_process_memory::ProcessHandle;
 
 use crate::memory::{process, reader};
 use crate::remote_debugging::gc_stats::GcStat;
 use crate::remote_debugging::offsets::{
     self,
-    offset_table::{GcStatsKind, OffsetTable},
+    offset_table::{GcStatsKind, GcStatsRegion, OffsetTable},
     VersionedOffsets,
 };
 use crate::remote_debugging::version::{self, PythonVersion};
@@ -96,6 +96,35 @@ fn classify_cmdline(old: Option<&str>, new: Option<&str>) -> CmdlineCheck {
         }
         _ => CmdlineCheck::Inconclusive,
     }
+}
+
+/// Resolve a [`GcStatsRegion`] to a concrete stats-region address, performing the single
+/// ring-pointer read a `Deref` needs through `read_ptr`. Split out of
+/// [`PySession::gc_stats_region_addr`] so its fail-open branching is unit-testable without a
+/// live target: `Absent` → `None` (no read at all — a read would fail *open* on a bogus
+/// address); `Direct(a)` → `Some(a)` (already an address, no read); `Deref(p)` → read `p` and
+/// treat NULL as the normal "stats not yet allocated / teardown" state (`None`, not an error).
+/// A genuine read failure propagates, since a non-`Absent` region asserted stats should be there.
+fn resolve_stats_region<F>(region: GcStatsRegion, read_ptr: F) -> Result<Option<u64>>
+where
+    F: FnOnce(u64) -> Result<u64>,
+{
+    match region {
+        GcStatsRegion::Absent => Ok(None),
+        GcStatsRegion::Direct(addr) => Ok(Some(addr)),
+        GcStatsRegion::Deref(ptr_addr) => {
+            let ptr = read_ptr(ptr_addr).context("Failed to read gc.generation_stats pointer")?;
+            Ok((ptr != 0).then_some(ptr))
+        }
+    }
+}
+
+/// Whether a stats kind yields any decodable slots. `None` is the one non-reading kind:
+/// [`PySession::supports_gc_stats`] (the capability the TUI picker and `list-pids` "S" column
+/// report) reports it as unsupported, and [`PySession::gc_stats`] fast-returns an empty vec for
+/// it. Both key off this single predicate.
+fn kind_reads_stats(kind: GcStatsKind) -> bool {
+    kind != GcStatsKind::None
 }
 
 /// Where an [`PySession`]'s layout came from on `attach`. Exposed so a caller — or a
@@ -310,11 +339,12 @@ impl PySession {
     }
 
     /// Whether this build exposes decodable GC generation stats. True for 3.13+
-    /// (`Full`/`LayoutOnly`) and pre-3.13 3.9–3.12 (`Legacy` with the inline layout);
-    /// false for 3.8 (global GC, not yet decoded) or any build without a stats layout.
-    /// This is the capability the TUI picker and `list-pids` "S" column report.
+    /// (`Full`/`LayoutOnly`) and all pre-3.13 3.8–3.12 (`Legacy` with the inline layout —
+    /// 3.8 through its global GC, 3.9–3.12 per-interpreter); false only for a build with no
+    /// stats layout (`GcStatsKind::None`). This is the capability the TUI picker and
+    /// `list-pids` "S" column report.
     pub fn supports_gc_stats(&self) -> bool {
-        self.resolved.table().gc_stats_kind != GcStatsKind::None
+        kind_reads_stats(self.resolved.table().gc_stats_kind)
     }
 
     /// Read `size` bytes at `addr` through the held handle (no per-call open).
@@ -332,14 +362,26 @@ impl PySession {
         Ok(self.read_u64(addr)? as i64)
     }
 
-    /// Read GC generation stats for the first (or, with `all_interpreters`, every)
-    /// interpreter. Walks the interpreter chain and resolves each interpreter's
-    /// stats region by its shape (`InlineArray` at a fixed offset, `RingBuffer`
-    /// via the `gc.generation_stats` pointer). Reads go through the held handle.
+    /// Resolve one interpreter's GC generation-stats region address from its
+    /// `_gc_runtime_state` address (`gc_addr`).
     ///
-    /// A NULL stats pointer is a normal transient state (stats not yet allocated,
-    /// or teardown): that interpreter is skipped and the walk still advances — it
-    /// never hangs (C1). A failed buffer read propagates as `Err` (C6).
+    /// The single reader-layer entry point for stats-region resolution: both this
+    /// session's own [`gc_stats`](Self::gc_stats) (the monitor path) and the diagram
+    /// collector call it, so the fail-open "which address, deref the ring, handle NULL"
+    /// logic lives in one place and any fix reaches both. The geometry decision is the pure
+    /// [`OffsetTable::gc_stats_region`]; the one ring-pointer read a `Deref` needs happens
+    /// here through the held handle. A NULL ring pointer (stats not yet allocated /
+    /// teardown) reads back as `Ok(None)`.
+    pub fn gc_stats_region_addr(&self, gc_addr: u64) -> Result<Option<u64>> {
+        let gen_stats_off = self
+            .resolved
+            .offsets()
+            .map(|vo| vo.gc_generation_stats())
+            .unwrap_or(0);
+        let region = self.resolved.table().gc_stats_region(gc_addr, gen_stats_off);
+        resolve_stats_region(region, |ptr_addr| self.read_u64(ptr_addr))
+    }
+
     /// Test hook: force the next `n` `gc_stats` calls on this session to fail with
     /// an error, then read normally. Arms the fault seam so a test can reproduce a
     /// transient read failure on a live process and exercise the monitor's
@@ -362,100 +404,124 @@ impl PySession {
             .is_ok()
     }
 
+    /// Read GC generation stats for the first (or, with `all_interpreters`, every)
+    /// interpreter. Dispatches on this build's stats-region shape; each kind has its own
+    /// reader below. Reads go through the held handle. A NULL / absent stats region is a
+    /// normal transient state and is skipped without hanging (C1); a failed buffer read
+    /// propagates as `Err` (C6).
     pub fn gc_stats(&self, all_interpreters: bool) -> Result<Vec<GcStat>> {
         #[cfg(feature = "test-hooks")]
         if self.take_injected_fault() {
             bail!("gc_stats: injected fault (test hook)");
         }
-        let table = self.resolved.table();
-
-        // Catch-all guard for an unregistered build: the process's own
-        // `gc.generation_stats_size` records the TOTAL byte size of the ring-buffer
-        // region. `attach` already SELECTED the best-matching layout, so for any
-        // recognized build the reconstructed total equals `reported` and this stays
-        // silent. It fires only when selection fell through with no matching
-        // candidate — emitting a regeneration hint (C12). Ring-buffer versions only.
-        if table.gc_stats_kind == GcStatsKind::RingBuffer
-            && let Some(vo) = self.resolved.offsets()
-        {
-            let reported = vo.gc_generation_stats_size();
-            {
-                let expected = table.gc_stats_region_size();
-                if reported != 0 && expected != 0 && reported != expected {
-                    // Fail closed. The process publishes the true byte size of its ring
-                    // region; a disagreement means the per-slot stride or the field
-                    // offsets are wrong, so every number we could decode would be
-                    // garbage. This used to warn and carry on, which is how a 3.15.0b4
-                    // target silently decoded through the 3.15.0a8 layout (96-byte slots
-                    // vs 64) while every CI leg stayed green.
-                    bail!(
-                        "gc_generation_stats size mismatch for {:#010x}: the process reports \
-                         {reported} bytes but gcscope's compiled layout expects {expected}. \
-                         This build's GC ring layout differs from the registered one; decoding \
-                         it would report garbage. Run `gcscope read-runtime <pid>` to see the \
-                         selected layout and its geometry, then regenerate offsets with \
-                         scripts/gen-offsets.py against this exact build.",
-                        table.version_hex
-                    );
-                }
-            }
+        match self.resolved.table().gc_stats_kind {
+            GcStatsKind::None => Ok(Vec::new()),
+            GcStatsKind::InlineArray => self.gc_stats_inline(all_interpreters),
+            GcStatsKind::RingBuffer => self.gc_stats_ring(all_interpreters),
         }
+    }
 
-        let head_addr = self.read_u64(self.runtime_addr + table.runtime_interpreters_head())?;
+    /// `InlineArray` builds (3.8–3.14): the stats sit at a fixed offset inside
+    /// `_gc_runtime_state`. 3.8 keeps that state global in `_PyRuntime` (no per-interpreter
+    /// `gc`); 3.9+ has it per interpreter.
+    fn gc_stats_inline(&self, all_interpreters: bool) -> Result<Vec<GcStat>> {
+        let head_addr = self.read_interpreters_head()?;
+        if self.resolved.table().has_global_gc() {
+            return self.gc_stats_global(head_addr);
+        }
+        self.gc_stats_per_interpreter(head_addr, all_interpreters)
+    }
+
+    /// `RingBuffer` builds (3.15+): the stats hang off the `gc.generation_stats` pointer,
+    /// always per interpreter. The process-published ring size is verified first (fail
+    /// closed on an unregistered build) so a wrong layout can't decode into garbage.
+    fn gc_stats_ring(&self, all_interpreters: bool) -> Result<Vec<GcStat>> {
+        self.verify_ring_stats_size()?;
+        let head_addr = self.read_interpreters_head()?;
+        self.gc_stats_per_interpreter(head_addr, all_interpreters)
+    }
+
+    /// Address of the interpreter-list head (`_PyRuntime.interpreters.head`).
+    fn read_interpreters_head(&self) -> Result<u64> {
+        let head_off = self.resolved.table().runtime_interpreters_head();
+        self.read_u64(self.runtime_addr + head_off)
+    }
+
+    /// Fail-closed size guard for a ring-buffer build (called only from [`gc_stats_ring`]).
+    /// The process publishes the true byte size of its ring region in
+    /// `gc.generation_stats_size`; `attach` has already selected the best-matching layout,
+    /// so for any recognized build the reconstructed size equals what the process reports
+    /// and this stays silent. A mismatch means the per-slot stride or the field offsets are
+    /// wrong — every number we could decode would be garbage — so bail with a regenerate
+    /// hint (C12) rather than decode nonsense. (This is how a 3.15.0b4 target silently
+    /// decoded through the 3.15.0a8 layout, 96-byte slots vs 64, while every CI leg stayed
+    /// green.)
+    fn verify_ring_stats_size(&self) -> Result<()> {
+        let table = self.resolved.table();
+        let Some(vo) = self.resolved.offsets() else {
+            return Ok(());
+        };
+        let reported = vo.gc_generation_stats_size();
+        let expected = table.gc_stats_region_size();
+        if reported != 0 && expected != 0 && reported != expected {
+            bail!(
+                "gc_generation_stats size mismatch for {:#010x}: the process reports \
+                 {reported} bytes but gcscope's compiled layout expects {expected}. \
+                 This build's GC ring layout differs from the registered one; decoding \
+                 it would report garbage. Run `gcscope read-runtime <pid>` to see the \
+                 selected layout and its geometry, then regenerate offsets with \
+                 scripts/gen-offsets.py against this exact build.",
+                table.version_hex
+            );
+        }
+        Ok(())
+    }
+
+    /// 3.8 global-GC path: the GC state lives in `_PyRuntime` itself, not per interpreter.
+    /// Resolve the stats region once from the runtime and read it a single time — reading it
+    /// inside the interpreter walk would emit the same global generations once per
+    /// interpreter under `--all`. The caller has already confirmed the global-GC shape.
+    fn gc_stats_global(&self, head_addr: u64) -> Result<Vec<GcStat>> {
+        let table = self.resolved.table();
+        let iid = if head_addr != 0 {
+            self.read_i64(head_addr + table.interp_id())?
+        } else {
+            0
+        };
+        let gc_addr = table.gc_state_addr(self.runtime_addr, head_addr);
+        let mut global_table = table.clone();
+        global_table.gc_stats_addr = self.gc_stats_region_addr(gc_addr)?;
+        global_table.read_gc_stats(&self.handle, iid)
+    }
+
+    /// Per-interpreter walk, shared by 3.9+ inline and all ring builds: follow the
+    /// interpreter chain from `head_addr`, resolving and reading each interpreter's stats
+    /// region (the shape difference is absorbed by [`gc_stats_region_addr`](Self::gc_stats_region_addr)).
+    /// Stops after the first interpreter unless `all_interpreters`. Always advances the walk
+    /// even for an interpreter with no readable stats, so a NULL region never hangs it (C1).
+    fn gc_stats_per_interpreter(
+        &self,
+        head_addr: u64,
+        all_interpreters: bool,
+    ) -> Result<Vec<GcStat>> {
+        let table = self.resolved.table();
         let next_off = table.interp_next();
         let id_off = table.interp_id();
-
-        // Global-GC path (3.8): the GC state lives in `_PyRuntime` itself, not per
-        // interpreter. Resolve the stats region once from the runtime and read it a
-        // single time — reading it inside the interpreter walk would emit the same
-        // global generations once per interpreter under `--all`.
-        if table.interp_gc.is_none()
-            && table.gc_stats_kind == GcStatsKind::InlineArray
-            && let Some(runtime_gc) = table.runtime_gc
-        {
-            let iid = if head_addr != 0 { self.read_i64(head_addr + id_off)? } else { 0 };
-            let mut global_table = table.clone();
-            global_table.gc_stats_addr =
-                Some(self.runtime_addr + runtime_gc + table.gc_stats_inline_off);
-            return global_table.read_gc_stats(&self.handle, iid);
-        }
-
-        let gc_off = table.interp_gc.unwrap_or(0);
 
         let mut stats = Vec::new();
         let mut current = head_addr;
         let mut first = true;
         while current != 0 {
             let iid = self.read_i64(current + id_off)?;
-            let gc_addr = current + gc_off; // this interpreter's `_gc_runtime_state`
-
-            // Resolve this interpreter's stats address by its region shape.
-            let stats_addr = match table.gc_stats_kind {
-                GcStatsKind::None => None,
-                GcStatsKind::InlineArray => Some(gc_addr + table.gc_stats_inline_off),
-                GcStatsKind::RingBuffer => {
-                    let gen_stats_off = self
-                        .resolved
-                        .offsets()
-                        .map(|vo| vo.gc_generation_stats())
-                        .unwrap_or(0);
-                    if gen_stats_off == 0 {
-                        None
-                    } else {
-                        let ptr = self.read_u64(gc_addr + gen_stats_off)?;
-                        (ptr != 0).then_some(ptr)
-                    }
-                }
-            };
-
-            if let Some(addr) = stats_addr {
+            let gc_addr = table.gc_state_addr(self.runtime_addr, current);
+            if let Some(addr) = self.gc_stats_region_addr(gc_addr)? {
                 let mut interp_table = table.clone();
                 interp_table.gc_stats_addr = Some(addr);
                 stats.extend(interp_table.read_gc_stats(&self.handle, iid)?);
             }
 
-            // Always advance — the walk must make progress even for an interpreter
-            // with no readable stats (this is what previously hung on NULL pointers).
+            // Always advance — the walk must make progress even for an interpreter with no
+            // readable stats (this is what previously hung on NULL pointers).
             current = self.read_u64(current + next_off)?;
             if first && !all_interpreters {
                 break;
@@ -622,5 +688,74 @@ mod tests {
             classify_cmdline(None, Some("python spin.py")),
             CmdlineCheck::Inconclusive
         );
+    }
+
+    // ── stats-region resolution (pure; the one ring read is injected) ──
+
+    /// `Absent` is the "this build exposes no stats" outcome (a `None`-kind build, or a ring
+    /// whose pointer field is unresolved). It must resolve to `None` WITHOUT any pointer read
+    /// — a read here would fail *open* on a bogus address and hand back garbage. The reader
+    /// closure panics to prove it is never called.
+    #[test]
+    fn absent_region_resolves_to_none_without_reading() {
+        let got = resolve_stats_region(GcStatsRegion::Absent, |_| {
+            panic!("Absent must not trigger a pointer read")
+        })
+        .unwrap();
+        assert_eq!(got, None);
+    }
+
+    /// `Direct` (inline builds) is already the stats address — hand it back verbatim, again
+    /// with no read.
+    #[test]
+    fn direct_region_returns_the_address_verbatim() {
+        let got = resolve_stats_region(GcStatsRegion::Direct(0xdead_beef), |_| {
+            panic!("Direct must not trigger a pointer read")
+        })
+        .unwrap();
+        assert_eq!(got, Some(0xdead_beef));
+    }
+
+    /// `Deref` (ring builds) reads the pointer at the *pointer-field* address it is handed; a
+    /// non-NULL value is the stats region, a NULL value is the normal "not allocated yet /
+    /// teardown" state and resolves to `None` — skipped, never an error.
+    #[test]
+    fn deref_region_reads_the_pointer_and_maps_null_to_none() {
+        // Non-NULL → Some(pointer). The closure also confirms it is handed the pointer-FIELD
+        // address (0x1000), not the region address it returns.
+        let got = resolve_stats_region(GcStatsRegion::Deref(0x1000), |addr| {
+            assert_eq!(addr, 0x1000);
+            Ok(0x4000)
+        })
+        .unwrap();
+        assert_eq!(got, Some(0x4000));
+
+        // NULL → None, not an error.
+        let got = resolve_stats_region(GcStatsRegion::Deref(0x1000), |_| Ok(0)).unwrap();
+        assert_eq!(got, None);
+    }
+
+    /// A failed pointer read on a `Deref` is a real error (a non-`Absent` region asserted the
+    /// stats should be there) and propagates *with context* — it is NOT swallowed to `None`.
+    #[test]
+    fn deref_region_propagates_a_read_error() {
+        let err = resolve_stats_region(GcStatsRegion::Deref(0x1000), |_| {
+            Err(anyhow!("simulated read failure"))
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("gc.generation_stats pointer"),
+            "the read error must carry its context: {err}"
+        );
+    }
+
+    /// `None` is the single stats kind that reads nothing — it is what `supports_gc_stats`
+    /// reports as unsupported and what `gc_stats` fast-returns an empty vec for. Every other
+    /// kind reads.
+    #[test]
+    fn only_the_none_kind_reads_no_stats() {
+        assert!(!kind_reads_stats(GcStatsKind::None));
+        assert!(kind_reads_stats(GcStatsKind::InlineArray));
+        assert!(kind_reads_stats(GcStatsKind::RingBuffer));
     }
 }

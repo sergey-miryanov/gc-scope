@@ -1,3 +1,13 @@
+//! Reader-layer snapshot collector.
+//!
+//! [`collect_data`] walks an attached [`PySession`] once and returns a fully-owned
+//! [`CollectedData`] — the interpreter/GC layout, raw struct bytes, and decoded generation
+//! slots — for a consumer to render. It lives in the reader layer (not `diagram/`) so it is
+//! a single source of truth: it resolves the stats region through
+//! [`PySession::gc_stats_region_addr`] and decodes slots through
+//! [`crate::remote_debugging::offsets::offset_table::OffsetTable::decode_gc_stats`], the same
+//! paths the monitor uses, and the `diagram` renderers merely consume its output.
+
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -5,6 +15,43 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crate::remote_debugging::offsets::{self, VersionedOffsets};
 use crate::remote_debugging::session::{PySession, Resolved};
+
+/// Which heavy payload layers of a snapshot a caller wants [`collect_data`] to read.
+///
+/// Each field gates one independent memory read; a skipped layer comes back as an empty
+/// buffer (indistinguishable from a version that legitimately lacks it, which the renderers
+/// already tolerate). The cheap navigation reads and layout scalars are always collected, so
+/// a valid skeleton snapshot is produced regardless of the request.
+#[derive(Debug, Clone, Copy)]
+pub struct CollectRequest {
+    /// The `_Py_DebugOffsets` + `_PyRuntime` struct dump (3.13+ only).
+    pub debug_offsets: bool,
+    /// The `gc` sub-struct raw bytes (for the GC-state hexdump).
+    pub gc_state: bool,
+    /// The GC generation stats — decoded `slots` AND `raw_stats_bytes` together. These two
+    /// always travel as a unit: a renderer that has `slots` but no raw buffer would index a
+    /// buffer it doesn't have, so the layer is atomic by construction.
+    pub gc_stats: bool,
+}
+
+impl CollectRequest {
+    /// Collect every layer — the historical `collect_data` behavior.
+    pub fn all() -> Self {
+        Self { debug_offsets: true, gc_state: true, gc_stats: true }
+    }
+
+    /// Exactly the layers the `diagram` renderers draw. Equal to [`all`](Self::all) today;
+    /// kept distinct so a future focused view can narrow it, and so call sites read as
+    /// "collect what the diagram needs".
+    pub fn diagram() -> Self {
+        Self::all()
+    }
+
+    /// Only the GC generation stats — no struct dumps. For a stats-focused consumer.
+    pub fn gc_stats_only() -> Self {
+        Self { debug_offsets: false, gc_state: false, gc_stats: true }
+    }
+}
 
 #[derive(Debug)]
 pub struct GcSlot {
@@ -53,7 +100,6 @@ pub struct GcSubState {
 #[derive(Debug)]
 pub struct InterpreterSnapshot {
     pub addr: u64,
-    pub raw_bytes: Vec<u8>,
     pub gc: GcSubState,
     pub gc_offset: u64,
     pub gc_size: u64,
@@ -86,130 +132,42 @@ pub struct DebugOffsetField {
     pub value: u64,       // the stored offset value
 }
 
-pub fn collect_data(session: &PySession) -> Result<CollectedData> {
+pub fn collect_data(session: &PySession, request: &CollectRequest) -> Result<CollectedData> {
     let t0 = Instant::now();
     let pid = session.pid();
     let runtime_addr = session.runtime_addr();
-
-    // The `_Py_DebugOffsets` struct dump (diagram sections 1–2) needs a 3.13+ tier.
-    // Pre-3.13 (`Legacy`) has no such struct: navigate via the flat `OffsetTable`
-    // instead and render a focused GC-generation-stats view. The renderers gate the
-    // debug-offsets panels on `offsets()` being present.
+    // `off_opt` is the 3.13+ bindgen view (`None` on pre-3.13 `Legacy`); the table serves both.
     let off_opt = session.resolved().offsets();
-    // The table was built once in `attach`; reuse it for navigation on both tiers.
     let offset_table = session.resolved().table().clone();
 
-    // `_Py_DebugOffsets` bytes for the struct panels — 3.13+ only; empty for Legacy.
-    let (debug_offsets_size, runtime_raw_bytes) = match off_opt {
-        Some(off) => {
-            let sz = off.debug_offsets_total_size();
-            let raw = session
-                .read(runtime_addr, (sz as usize) * 2)
-                .context("Failed to read _Py_DebugOffsets + _PyRuntime memory")?;
-            (sz, raw)
-        }
-        None => (0u64, Vec::new()),
-    };
-
-    // Navigation offsets come from the flat table — identical values to the bindgen
-    // accessors on 3.13+, and the only source available pre-3.13.
-    let head_addr = session
-        .read_u64(runtime_addr + offset_table.runtime_interpreters_head())
-        .context("Failed to read interpreters_head pointer")?;
-
-    let gc_offset = offset_table.interp_gc.unwrap_or(0);
-    // Absolute address of `_gc_runtime_state`: per-interpreter (`interp_gc`) for 3.9+
-    // and every 3.13+ build, or global in `_PyRuntime` (`runtime_gc`) for 3.8 — mirrors
-    // the global-GC branch in `PySession::gc_stats`. Without this, 3.8 would read the
-    // stats at `interpreter + 0x80` (garbage) instead of `runtime + runtime_gc + 0x80`.
-    let gc_addr = match (offset_table.interp_gc, offset_table.runtime_gc) {
-        (None, Some(r)) => runtime_addr + r,
-        _ => head_addr + gc_offset,
-    };
-    // Exact `gc` sub-struct span on 3.13+; on Legacy synthesize the inline stats region
-    // (only used for the section-2 hexdump, which Legacy skips).
-    let gc_size = match off_opt {
-        Some(off) => off.gc_size(),
-        None => offset_table.gc_stats_inline_off + gc_stats_total_bytes(&offset_table) as u64,
-    };
-    let next_addr = session.read_u64(head_addr + offset_table.interp_next())?;
-    let id = session.read_i64(head_addr + offset_table.interp_id())?;
-
-    // Read a reasonable chunk of interpreter state (first 256 bytes) for hex dump
-    let interp_raw = session
-        .read(head_addr, 256)
-        .context("Failed to read interpreter state start")?;
-
-    // Read GC sub-struct at its actual location (`gc_addr`, which handles 3.8's global GC)
-    let gc_raw = session
-        .read(gc_addr, gc_size as usize)
-        .context("Failed to read GC state")?;
-
-    // Resolve the GC generation-stats region by its version-specific shape — same logic as
-    // `gc_stats.rs::read_gc_stats`. `InlineArray` (pre-3.13, 3.13/3.14) stores the stats
-    // inline in `_gc_runtime_state` at a fixed offset; `RingBuffer` (3.15+, always a 3.13+
-    // tier) reaches a ring buffer through the `gc.generation_stats` pointer.
-    let item_size = offset_table.gc_item_size.unwrap_or(0) as usize;
-    let slots_per_gen = offset_table.gc_slots_per_gen.unwrap_or([0, 0, 0]);
-    let (stats_addr, stats_total) = match offset_table.gc_stats_kind {
-        offsets::offset_table::GcStatsKind::None => (0u64, 0usize),
-        offsets::offset_table::GcStatsKind::InlineArray => {
-            let addr = gc_addr + offset_table.gc_stats_inline_off;
-            (addr, gc_stats_total_bytes(&offset_table))
-        }
-        offsets::offset_table::GcStatsKind::RingBuffer => {
-            let gen_stats_field_off = off_opt.map(|o| o.gc_generation_stats()).unwrap_or(0);
-            let ptr = if gen_stats_field_off == 0 {
-                0
-            } else {
-                session
-                    .read_u64(gc_addr + gen_stats_field_off)
-                    .context("Failed to read generation_stats pointer")?
-            };
-            let size = off_opt.map(|o| o.gc_generation_stats_size()).unwrap_or(0) as usize;
-            (ptr, size)
-        }
-    };
-
-    let (raw_stats_bytes, slots) = if stats_addr != 0 && stats_total > 0 {
-        let raw = session
-            .read(stats_addr, stats_total)
-            .context("Failed to read GC stats buffer")?;
-        let parsed = parse_gc_slots(&raw, &offset_table);
-        (raw, parsed)
+    // Each heavy layer is one gated read (skipped → empty). The gating lives here, not inside
+    // the helpers, so this reads as "collect X if requested". `debug_offsets_size` is a cheap
+    // scalar renderers label the panel with, so it is always set; only its byte read is gated.
+    let debug_offsets_size = off_opt.map(|off| off.debug_offsets_total_size()).unwrap_or(0);
+    let runtime_raw_bytes = if request.debug_offsets && off_opt.is_some() {
+        read_debug_offsets_dump(session, runtime_addr, debug_offsets_size)?
     } else {
-        (Vec::new(), Vec::new())
+        Vec::new()
     };
 
-    // Field presence is a property of the version's slot layout (a GcSlot's absent fields
-    // are indistinguishable zeros), so capture it once here alongside the geometry.
-    let (has_timestamps, has_duration) = match offset_table.gc_layout {
-        Some(l) => (l.has_field("ts_start") && l.has_field("ts_stop"), l.has_field("duration")),
-        None => (false, false),
+    let nav = resolve_interpreter_nav(session, &offset_table, off_opt, runtime_addr)?;
+
+    let gc_raw = if request.gc_state {
+        read_gc_state(session, nav.gc_addr, nav.gc_size)?
+    } else {
+        Vec::new()
     };
 
-    let gc = GcSubState {
-        raw_bytes: gc_raw,
-        generation_stats: GcStatsSnapshot {
-            stats_addr,
-            stats_size: stats_total as u64,
-            item_size,
-            slots_per_gen,
-            has_timestamps,
-            has_duration,
-            raw_stats_bytes,
-            slots,
-        },
-    };
+    let generation_stats =
+        collect_gc_stats(session, &offset_table, off_opt, nav.gc_addr, request.gc_stats)?;
 
     let interpreter = InterpreterSnapshot {
-        addr: head_addr,
-        raw_bytes: interp_raw,
-        gc,
-        gc_offset,
-        gc_size,
-        id,
-        next_addr,
+        addr: nav.head_addr,
+        gc: GcSubState { raw_bytes: gc_raw, generation_stats },
+        gc_offset: nav.gc_offset,
+        gc_size: nav.gc_size,
+        id: nav.id,
+        next_addr: nav.next_addr,
     };
 
     Ok(CollectedData {
@@ -221,6 +179,111 @@ pub fn collect_data(session: &PySession) -> Result<CollectedData> {
         resolved: session.resolved_arc(),
         interpreter,
         collect_duration: t0.elapsed(),
+    })
+}
+
+/// L1: the `_Py_DebugOffsets` + `_PyRuntime` struct dump (3.13+ only). The `size*2` span
+/// covers the debug-offsets struct and the `_PyRuntime` that follows it, which the renderers
+/// slice into their two struct panels.
+fn read_debug_offsets_dump(session: &PySession, runtime_addr: u64, size: u64) -> Result<Vec<u8>> {
+    session
+        .read(runtime_addr, (size as usize) * 2)
+        .context("Failed to read _Py_DebugOffsets + _PyRuntime memory")
+}
+
+/// The interpreter/GC navigation values — cheap structural reads resolved regardless of which
+/// payload layers were requested, since every layer hangs off `gc_addr`.
+struct InterpreterNav {
+    head_addr: u64,
+    gc_addr: u64,
+    gc_size: u64,
+    gc_offset: u64,
+    id: i64,
+    next_addr: u64,
+}
+
+fn resolve_interpreter_nav(
+    session: &PySession,
+    table: &offsets::offset_table::OffsetTable,
+    off_opt: Option<&VersionedOffsets>,
+    runtime_addr: u64,
+) -> Result<InterpreterNav> {
+    // Navigation offsets come from the flat table — identical values to the bindgen accessors
+    // on 3.13+, and the only source available pre-3.13.
+    let head_addr = session
+        .read_u64(runtime_addr + table.runtime_interpreters_head())
+        .context("Failed to read interpreters_head pointer")?;
+    let gc_offset = table.interp_gc.unwrap_or(0);
+    let gc_addr = table.gc_state_addr(runtime_addr, head_addr);
+    // Exact `gc` sub-struct span on 3.13+; on Legacy synthesize the inline stats region
+    // (only used for the section-2 hexdump, which Legacy skips).
+    let gc_size = match off_opt {
+        Some(off) => off.gc_size(),
+        None => table.gc_stats_inline_off + table.stats_buffer_len().unwrap_or(0) as u64,
+    };
+    let next_addr = session.read_u64(head_addr + table.interp_next())?;
+    let id = session.read_i64(head_addr + table.interp_id())?;
+    Ok(InterpreterNav { head_addr, gc_addr, gc_size, gc_offset, id, next_addr })
+}
+
+/// L3: the `gc` sub-struct bytes for the GC-state hexdump, read to exactly `gc_size` bytes.
+fn read_gc_state(session: &PySession, gc_addr: u64, gc_size: u64) -> Result<Vec<u8>> {
+    session
+        .read(gc_addr, gc_size as usize)
+        .context("Failed to read GC state")
+}
+
+/// L4: the GC generation stats chunk. The geometry/field-presence scalars and the region
+/// address are always resolved (renderers use them for labels and the "not available" gate);
+/// the heavy `raw_stats_bytes` + decoded `slots` are read only when `collect` is set. Those
+/// two always travel together, so a caller never sees decoded slots without their raw bytes.
+fn collect_gc_stats(
+    session: &PySession,
+    table: &offsets::offset_table::OffsetTable,
+    off_opt: Option<&VersionedOffsets>,
+    gc_addr: u64,
+    collect: bool,
+) -> Result<GcStatsSnapshot> {
+    let item_size = table.gc_item_size.unwrap_or(0) as usize;
+    let slots_per_gen = table.gc_slots_per_gen.unwrap_or([0, 0, 0]);
+    let stats_addr = session.gc_stats_region_addr(gc_addr)?.unwrap_or(0);
+    // How many raw bytes the buffer spans differs by kind: the exact inline span, or the
+    // process-reported ring size (which includes the trailing per-generation cursors the
+    // decoder skips).
+    let stats_total = match table.gc_stats_kind {
+        offsets::offset_table::GcStatsKind::None => 0usize,
+        offsets::offset_table::GcStatsKind::InlineArray => table.stats_buffer_len().unwrap_or(0),
+        offsets::offset_table::GcStatsKind::RingBuffer => {
+            off_opt.map(|o| o.gc_generation_stats_size()).unwrap_or(0) as usize
+        }
+    };
+
+    let (raw_stats_bytes, slots) = if collect && stats_addr != 0 && stats_total > 0 {
+        let raw = session
+            .read(stats_addr, stats_total)
+            .context("Failed to read GC stats buffer")?;
+        let parsed = parse_gc_slots(&raw, table);
+        (raw, parsed)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    // Field presence is a property of the version's slot layout (a GcSlot's absent fields
+    // are indistinguishable zeros), so capture it once here alongside the geometry.
+    let (has_timestamps, has_duration) = match table.gc_layout {
+        Some(l) => (l.has_field("ts_start") && l.has_field("ts_stop"), l.has_field("duration")),
+        None => (false, false),
+    };
+
+    Ok(GcStatsSnapshot {
+        stats_addr,
+        stats_size: stats_total as u64,
+        item_size,
+        slots_per_gen,
+        has_timestamps,
+        has_duration,
+        raw_stats_bytes,
+        slots,
     })
 }
 
@@ -251,90 +314,39 @@ impl CollectedData {
 }
 
 // ── GC slot parsing ────────────────────────────────────────────
-/// Total bytes of the (inline) generation-stats region: `bases[last] + slots[last] *
-/// item_size`. Used only for the `InlineArray` kind (ring buffers use the process-reported
-/// `generation_stats_size` directly).
-fn gc_stats_total_bytes(table: &offsets::offset_table::OffsetTable) -> usize {
-    match (table.gc_item_size, table.gc_gen_base_offsets, table.gc_slots_per_gen) {
-        (Some(item), Some(bases), Some(slots)) => (bases[2] + slots[2] * item) as usize,
-        _ => 0,
-    }
-}
-
-/// Parse GC slots from the raw region using the version's geometry (per-gen slot counts,
-/// gen base offsets, per-slot item size) and per-slot field layout — the same source
-/// `offset_table::read_gc_stats` uses. This handles both inline (3.13/3.14: 1 slot/gen,
-/// 3 fields) and ring-buffer (3.15+: 11/3/3 slots, many fields) layouts uniformly.
+/// Build the diagram's per-slot view from the raw generation-stats region.
+///
+/// Decoding runs through the reader layer's single decoder
+/// ([`OffsetTable::decode_gc_stats`]) — the exact path the monitor uses — then projects
+/// each [`GcStat`](crate::remote_debugging::gc_stats::GcStat) onto the display-oriented
+/// [`GcSlot`], recovering the raw-region `byte_offset` (for the hexdump highlight) from the
+/// table geometry. The one diagram-only policy lives here: torn ring slots
+/// (`stop_ts < start_ts`, a half-written concurrent update) are dropped, whereas the
+/// monitor keeps every slot and dedups downstream. Inline layouts (3.13/3.14) carry no
+/// timestamps, so `has_ts` is false and every slot is kept.
 fn parse_gc_slots(raw: &[u8], table: &offsets::offset_table::OffsetTable) -> Vec<GcSlot> {
-    let (Some(item_size), Some(slots_per_gen), Some(bases), Some(layout)) = (
-        table.gc_item_size.map(|v| v as usize),
-        table.gc_slots_per_gen,
-        table.gc_gen_base_offsets,
-        table.gc_layout,
-    ) else {
-        return Vec::new();
-    };
-    if raw.is_empty() || item_size == 0 {
-        return Vec::new();
-    }
+    let has_ts = table
+        .gc_layout
+        .is_some_and(|l| l.has_field("ts_start") && l.has_field("ts_stop"));
 
-    let mut slots = Vec::new();
-    for gen_idx in 0..3u32 {
-        let n = slots_per_gen[gen_idx as usize] as usize;
-        let base = bases[gen_idx as usize] as usize;
-        for slot in 0..n {
-            let offset = base + slot * item_size;
-            if offset + item_size > raw.len() { break; }
-            if let Some(s) = parse_slot(&raw[offset..offset + item_size], gen_idx, slot, offset, layout) {
-                slots.push(s);
-            }
-        }
-    }
-    slots
-}
-
-fn parse_slot(
-    bytes: &[u8],
-    generation: u32,
-    slot: usize,
-    byte_offset: usize,
-    layout: &offsets::offset_table::GcItemLayout,
-) -> Option<GcSlot> {
-    let rdi = |name: &str| -> i64 {
-        layout.field_offset(name)
-            .filter(|&o| o + 8 <= bytes.len())
-            .map(|o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap()))
-            .unwrap_or(0)
-    };
-    let rdf = |name: &str| -> f64 {
-        layout.field_offset(name)
-            .filter(|&o| o + 8 <= bytes.len())
-            .map(|o| f64::from_le_bytes(bytes[o..o + 8].try_into().unwrap()))
-            .unwrap_or(0.0)
-    };
-
-    let start_ts = rdi("ts_start");
-    let stop_ts = rdi("ts_stop");
-    // Ring-buffer slots carry timestamps: skip torn entries (a concurrent write left
-    // stop_ts stale and below start_ts). Inline layouts (3.13/3.14) have no timestamps —
-    // both read as 0, so the check is a no-op and every slot is kept.
-    if layout.has_field("ts_start") && layout.has_field("ts_stop") && stop_ts < start_ts {
-        return None;
-    }
-
-    Some(GcSlot {
-        generation,
-        slot,
-        byte_offset,
-        start_ts,
-        stop_ts,
-        collections: rdi("collections"),
-        collected: rdi("collected"),
-        uncollectable: rdi("uncollectable"),
-        candidates: rdi("candidates"),
-        duration: rdf("duration"),
-        heap_size: rdi("heap_size"),
-    })
+    table
+        .decode_gc_stats(raw, 0)
+        .into_iter()
+        .filter(|s| !(has_ts && s.ts_stop() < s.ts_start()))
+        .map(|s| GcSlot {
+            generation: s.generation,
+            slot: s.slot,
+            byte_offset: table.slot_byte_offset(s.generation, s.slot).unwrap_or(0),
+            start_ts: s.ts_start(),
+            stop_ts: s.ts_stop(),
+            collections: s.collections(),
+            collected: s.collected(),
+            uncollectable: s.uncollectable(),
+            candidates: s.candidates(),
+            duration: s.duration(),
+            heap_size: s.heap_size(),
+        })
+        .collect()
 }
 
 /// Compute average collection pause time per generation from a single snapshot.
@@ -435,6 +447,22 @@ mod tests {
         buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
 
+    // ── CollectRequest presets ──────────────────────────────────
+
+    /// `all` collects every layer; `diagram` matches it today (both renderers draw all three);
+    /// `gc_stats_only` collects just the stats layer and skips the two struct dumps.
+    #[test]
+    fn collect_request_presets_name_the_expected_layers() {
+        let all = CollectRequest::all();
+        assert!(all.debug_offsets && all.gc_state && all.gc_stats);
+
+        let diagram = CollectRequest::diagram();
+        assert!(diagram.debug_offsets && diagram.gc_state && diagram.gc_stats);
+
+        let lean = CollectRequest::gc_stats_only();
+        assert!(!lean.debug_offsets && !lean.gc_state && lean.gc_stats);
+    }
+
     // ── avg_collection_time_per_gen ─────────────────────────────
 
     /// Inline builds (3.13/3.14) carry no `duration` field, so the pause time is
@@ -499,17 +527,26 @@ mod tests {
     /// A layout carrying timestamps, so the torn-entry guard is live. Built by hand
     /// (not `set_ring`, which is private to the offsets module) — three 1-slot gens
     /// with the standard 8-byte inter-generation pad.
+    /// Carries `collected`/`uncollectable` because the shared decoder
+    /// (`decode_gc_stats`) treats those as required core fields — every real GC layout
+    /// has them; a synthetic one that omits them isn't representative.
     static TS_LAYOUT: GcItemLayout = GcItemLayout {
-        item_size: 24,
-        fields: &[("ts_start", 0), ("ts_stop", 8), ("collections", 16)],
+        item_size: 40,
+        fields: &[
+            ("ts_start", 0),
+            ("ts_stop", 8),
+            ("collections", 16),
+            ("collected", 24),
+            ("uncollectable", 32),
+        ],
     };
 
     fn ts_ring_table() -> offsets::offset_table::OffsetTable {
         let mut t = pre_3_13::table_for_version(3, 12).unwrap();
         t.gc_layout = Some(&TS_LAYOUT);
-        t.gc_item_size = Some(24);
+        t.gc_item_size = Some(40);
         t.gc_slots_per_gen = Some([1, 1, 1]);
-        t.gc_gen_base_offsets = Some([0, 32, 64]); // 24-byte slot + 8-byte pad per gen
+        t.gc_gen_base_offsets = Some([0, 48, 96]); // 40-byte slot + 8-byte cursor per gen
         t
     }
 
@@ -520,7 +557,7 @@ mod tests {
     fn parse_drops_torn_ring_slots_but_keeps_intact_ones() {
         let table = ts_ring_table();
         let bases = table.gc_gen_base_offsets.unwrap();
-        let mut raw = vec![0u8; bases[2] as usize + 24];
+        let mut raw = vec![0u8; bases[2] as usize + 40];
 
         // gen0: torn — stop_ts (50) < start_ts (100).
         put_i64(&mut raw, bases[0] as usize, 100);
@@ -568,5 +605,50 @@ mod tests {
         assert_ne!(slots[0].collections, 0);
         assert_eq!(slots[0].heap_size, 0);
         assert_eq!(slots[0].duration, 0.0);
+    }
+
+    /// One source of truth: the diagram and the monitor decode the same bytes into the
+    /// same numbers because they share one decoder (`OffsetTable::decode_gc_stats`). The
+    /// only sanctioned divergence is the diagram's torn-slot drop; everything else agrees
+    /// field-for-field, and the diagram's `byte_offset` matches the table geometry the
+    /// decoder walked.
+    #[test]
+    fn diagram_and_monitor_decode_agree_except_for_torn_slots() {
+        let table = ts_ring_table();
+        let bases = table.gc_gen_base_offsets.unwrap();
+        let item = table.gc_item_size.unwrap() as usize;
+        let mut raw = vec![0u8; bases[2] as usize + item];
+
+        // One intact slot per generation (stop_ts >= start_ts), distinct collections.
+        for (g, &base) in bases.iter().enumerate() {
+            put_i64(&mut raw, base as usize, 100 + g as i64); // ts_start
+            put_i64(&mut raw, base as usize + 8, 200 + g as i64); // ts_stop
+            put_i64(&mut raw, base as usize + 16, 10 + g as i64); // collections
+        }
+
+        let monitor = table.decode_gc_stats(&raw, 0); // Vec<GcStat>
+        let diagram = parse_gc_slots(&raw, &table); // Vec<GcSlot>
+
+        // No torn slots → identical population, field-for-field.
+        assert_eq!(monitor.len(), diagram.len());
+        for (m, d) in monitor.iter().zip(&diagram) {
+            assert_eq!((m.generation, m.slot), (d.generation, d.slot));
+            assert_eq!(m.ts_start(), d.start_ts);
+            assert_eq!(m.ts_stop(), d.stop_ts);
+            assert_eq!(m.collections(), d.collections);
+            assert_eq!(m.collected(), d.collected);
+            assert_eq!(m.uncollectable(), d.uncollectable);
+            // The diagram recovers the exact raw-region offset the decoder walked.
+            assert_eq!(d.byte_offset, table.slot_byte_offset(d.generation, d.slot).unwrap());
+        }
+
+        // Tear gen0's slot (stop_ts < start_ts). The monitor keeps every slot (it dedups
+        // downstream); the diagram drops the torn one so it never renders garbage.
+        put_i64(&mut raw, bases[0] as usize + 8, 0);
+        let monitor_torn = table.decode_gc_stats(&raw, 0);
+        let diagram_torn = parse_gc_slots(&raw, &table);
+        assert_eq!(monitor_torn.len(), monitor.len(), "monitor keeps torn slots");
+        assert_eq!(diagram_torn.len(), diagram.len() - 1, "diagram drops the torn slot");
+        assert!(diagram_torn.iter().all(|s| s.generation != 0));
     }
 }

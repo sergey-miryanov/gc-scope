@@ -9,14 +9,20 @@
 //!
 //! `src/main.rs` is a thin CLI dispatcher over this crate and holds no logic
 //! beyond argument parsing.
+//!
+//! Module layers, foundation upward:
+//! - [`memory`] — read the target's process memory and parse its binary images.
+//! - [`remote_debugging`] — the CPython runtime model: version detection, the
+//!   offset system, [`PySession`](remote_debugging::session::PySession), GC-stat
+//!   decoding. The single source of truth for *reading* the runtime.
+//! - [`snapshot`] / [`monitor`] — two consumers of that model: a one-shot snapshot
+//!   collector (rendered by [`diagram`]) and a streaming event monitor.
+//! - [`cli`] — command definitions and handlers; the top layer `main.rs` dispatches to.
 
 pub mod cli;
-pub mod cli_monitor;
-pub mod cli_monitor_options;
 pub mod diagram;
-pub mod exporters;
 pub mod list_pids;
 pub mod memory;
 pub mod monitor;
-pub mod monitor_loop;
 pub mod remote_debugging;
+pub mod snapshot;

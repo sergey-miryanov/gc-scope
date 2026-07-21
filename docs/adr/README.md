@@ -16,3 +16,6 @@ next to this folder, not here (e.g. `docs/venv-launcher-child-retarget.md`).
 | [0004](0004-per-platform-image-layout.md) | Per-platform image layout (section names, fat binaries, symbol decoration, image base) is discovered and CI-verified, not assumed |
 | [0005](0005-testing-strategy.md) | Testing is layered — unit tests for pure logic, a live `(OS × version)` matrix asserting decoded *shape* as the correctness gate, and `#[ignore]`d in-process lifecycle tests |
 | [0006](0006-layout-registration-integrity.md) | Layout registration/resolution fails closed — exact-or-refuse fallback, ring-size mismatch guard, provenance-pinned ongoing builds, and gen-offsets guards |
+| [0007](0007-gcstat-layout-driven-view.md) | `GcStat` is a lean layout-driven view over raw slot bytes (not a fixed field superset), giving one decode primitive shared by the exporter and TUI panel |
+| [0008](0008-reader-consumer-package-layering.md) | Package layering `memory → remote_debugging → {snapshot, monitor} → cli`: one reader source of truth, two parallel consumer shapes, CLI-free subsystems |
+| [0009](0009-performance-guarded-by-shape.md) | No benchmarks yet — a wall-clock monitor-loop benchmark measures syscalls not our code; guard cost as complexity/op-count invariants instead, with a defined trigger to revisit |

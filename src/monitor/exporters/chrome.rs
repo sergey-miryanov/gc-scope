@@ -61,135 +61,124 @@ fn write_sub_step(
     write_end(f, first, pid, tid, ts_us(ts_stop), name, cat)
 }
 
+/// How a GC sub-step's start timestamp is found.
+enum Start {
+    /// An explicit start field; the phase emits only if both this and `stop` are present.
+    Explicit(&'static str),
+    /// No own start field — begin where a previous phase ended: the first present candidate
+    /// (else the pause start). Emits whenever `stop` is present. Mirrors how CPython's later
+    /// GC phases chain onto the preceding one.
+    Chained(&'static [&'static str]),
+}
+
+/// One intra-pause GC sub-step, keyed entirely by layout field names so a build's presence or
+/// absence of a phase falls out of whether its fields exist.
+struct Phase {
+    label: &'static str,
+    cat: &'static str,
+    start: Start,
+    stop: &'static str,
+    /// Extra JSON args beyond the always-present `generation`/`iid`: `(json_key, field_name)`.
+    args: &'static [(&'static str, &'static str)],
+}
+
+/// The sub-steps in emission order. Adding a well-behaved phase (own start+stop) is a data-only
+/// change; the irregular chained-start phases are expressed as [`Start::Chained`].
+static PHASES: &[Phase] = &[
+    Phase { label: "Mark Alive", cat: "gc.mark.alive",
+        start: Start::Explicit("ts_mark_alive_start"), stop: "ts_mark_alive_stop",
+        args: &[("alive_size", "alive_size")] },
+    Phase { label: "Fill increment", cat: "gc.increment",
+        start: Start::Explicit("ts_fill_increment_start"), stop: "ts_fill_increment_stop",
+        args: &[("increment_size", "increment_size")] },
+    Phase { label: "Deduce Unreachable", cat: "gc.deduce",
+        start: Start::Explicit("ts_deduce_unreachable_start"), stop: "ts_deduce_unreachable_stop",
+        args: &[("candidates", "candidates")] },
+    Phase { label: "Handle Weakrefs Callbacks", cat: "gc.weakrefs",
+        start: Start::Explicit("ts_handle_weakref_callbacks_start"), stop: "ts_handle_weakref_callbacks_stop",
+        args: &[] },
+    Phase { label: "Finalize Garbage", cat: "gc.finalize",
+        start: Start::Chained(&["ts_handle_weakref_callbacks_stop", "ts_deduce_unreachable_stop"]),
+        stop: "ts_finalize_garbage_stop",
+        args: &[("finalized_garbage_count", "finalized_garbage_count")] },
+    Phase { label: "Handle Resurrected", cat: "gc.resurrect",
+        start: Start::Chained(&["ts_finalize_garbage_stop"]), stop: "ts_handle_resurrected_stop",
+        args: &[] },
+    Phase { label: "Clear Weakrefs", cat: "gc.clear_weakrefs",
+        start: Start::Chained(&["ts_handle_resurrected_stop"]), stop: "ts_clear_weakrefs_stop",
+        args: &[("clear_weakrefs_count", "clear_weakrefs_count")] },
+    Phase { label: "Delete Garbage", cat: "gc.delete",
+        start: Start::Explicit("ts_delete_garbage_start"), stop: "ts_delete_garbage_stop",
+        args: &[("deleted_garbage_count", "deleted_garbage_count")] },
+];
+
 fn write_gc_stat_events(
     f: &mut File, first: &mut bool, pid: u32, s: &GcStat,
 ) -> std::io::Result<()> {
     let tid = s.interpreter_id;
-    let ts_s = s.ts_start;
-    let ts_e = s.ts_stop;
+    let ts_s = s.ts_start();
+    let ts_e = s.ts_stop();
     let g = s.generation;
 
     let pause_name = format!("GC Pause (gen={})", g);
     let pause_cat = format!("gc.pause(gen={})", g);
 
     // Helper to build JSON args string
-    let a = |pairs: &[(&str, &str)]| -> String {
-        pairs.iter().map(|(k,v)| format!(r#""{}":{}"#, k, v)).collect::<Vec<_>>().join(",")
+    let a = |pairs: &[(&str, String)]| -> String {
+        pairs.iter().map(|(k, v)| format!(r#""{}":{}"#, k, v)).collect::<Vec<_>>().join(",")
     };
 
     // Begin GC Pause
     write_begin(f, first, pid, tid, ts_us(ts_s), &pause_name, &pause_cat,
-        &a(&[("generation", &format!("{}", g)),
-             ("iid", &format!("{}", s.interpreter_id)),
-             ("collections", &format!("{}", s.collections)),
-             ("heap_size", &format!("{}", s.heap_size)),
-             ("collected", &format!("{}", s.collected)),
-             ("uncollectable", &format!("{}", s.uncollectable)),
-             ("candidates", &format!("{}", s.candidates))]))?;
+        &a(&[("generation", g.to_string()),
+             ("iid", s.interpreter_id.to_string()),
+             ("collections", s.collections().to_string()),
+             ("heap_size", s.heap_size().to_string()),
+             ("collected", s.collected().to_string()),
+             ("uncollectable", s.uncollectable().to_string()),
+             ("candidates", s.candidates().to_string())]))?;
 
-    // Mark Alive sub-step
-    if let (Some(ss), Some(se)) = (s.ts_mark_alive_start, s.ts_mark_alive_stop) {
-        write_sub_step(f, first, pid, tid,
-            &format!("Mark Alive (gen={})", g),
-            &format!("gc.mark.alive(gen={})", g), ss, se,
-            &a(&[("generation", &format!("{}", g)),
-                 ("iid", &format!("{}", s.interpreter_id)),
-                 ("alive_size", &format!("{}", s.alive_size.unwrap_or(0)))]))?;
-    }
-
-    // Fill Increment sub-step
-    if let (Some(ss), Some(se)) = (s.ts_fill_increment_start, s.ts_fill_increment_stop) {
-        write_sub_step(f, first, pid, tid,
-            &format!("Fill increment (gen={})", g),
-            &format!("gc.increment(gen={})", g), ss, se,
-            &a(&[("generation", &format!("{}", g)),
-                 ("iid", &format!("{}", s.interpreter_id)),
-                 ("increment_size", &format!("{}", s.increment_size.unwrap_or(0)))]))?;
-    }
-
-    // Deduce Unreachable sub-step
-    if let (Some(ss), Some(se)) = (s.ts_deduce_unreachable_start, s.ts_deduce_unreachable_stop) {
-        write_sub_step(f, first, pid, tid,
-            &format!("Deduce Unreachable (gen={})", g),
-            &format!("gc.deduce(gen={})", g), ss, se,
-            &a(&[("generation", &format!("{}", g)),
-                 ("iid", &format!("{}", s.interpreter_id)),
-                 ("candidates", &format!("{}", s.candidates))]))?;
-    }
-
-    // Handle Weakrefs Callbacks sub-step
-    if let (Some(ss), Some(se)) = (s.ts_handle_weakref_callbacks_start, s.ts_handle_weakref_callbacks_stop) {
-        write_sub_step(f, first, pid, tid,
-            &format!("Handle Weakrefs Callbacks (gen={})", g),
-            &format!("gc.weakrefs(gen={})", g), ss, se,
-            &a(&[("generation", &format!("{}", g)),
-                 ("iid", &format!("{}", s.interpreter_id))]))?;
-    }
-
-    // Finalize Garbage — start = weakrefs_stop, end = ts_finalize_garbage_stop
-    if let Some(fg_stop) = s.ts_finalize_garbage_stop {
-        let fg_start = s.ts_handle_weakref_callbacks_stop
-            .or(s.ts_deduce_unreachable_stop)
-            .unwrap_or(ts_s);
-        if fg_stop > fg_start {
-            write_sub_step(f, first, pid, tid,
-                &format!("Finalize Garbage (gen={})", g),
-                &format!("gc.finalize(gen={})", g), fg_start, fg_stop,
-                &a(&[("generation", &format!("{}", g)),
-                     ("iid", &format!("{}", s.interpreter_id)),
-                     ("finalized_garbage_count", &format!("{}", s.finalized_garbage_count.unwrap_or(0)))]))?;
+    // Intra-pause sub-steps, driven by the phase table. A phase whose fields this build lacks
+    // resolves to `None` and is skipped; a zero-width span is dropped by `write_sub_step`.
+    for ph in PHASES {
+        let stop = match s.get(ph.stop) {
+            Some(v) => v,
+            None => continue,
+        };
+        let start = match &ph.start {
+            Start::Explicit(field) => match s.get(field) {
+                Some(v) => v,
+                None => continue,
+            },
+            Start::Chained(cands) => cands.iter().find_map(|&c| s.get(c)).unwrap_or(ts_s),
+        };
+        let mut arg_pairs = vec![
+            ("generation", g.to_string()),
+            ("iid", s.interpreter_id.to_string()),
+        ];
+        for &(key, field) in ph.args {
+            arg_pairs.push((key, s.get(field).unwrap_or(0).to_string()));
         }
-    }
-
-    // Handle Resurrected — start = finalize_garbage_stop, end = ts_handle_resurrected_stop
-    if let Some(hr_stop) = s.ts_handle_resurrected_stop {
-        let hr_start = s.ts_finalize_garbage_stop.unwrap_or(ts_s);
-        if hr_stop > hr_start {
-            write_sub_step(f, first, pid, tid,
-                &format!("Handle Resurrected (gen={})", g),
-                &format!("gc.resurrect(gen={})", g), hr_start, hr_stop,
-                &a(&[("generation", &format!("{}", g)),
-                     ("iid", &format!("{}", s.interpreter_id))]))?;
-        }
-    }
-
-    // Clear Weakrefs — start = handle_resurrected_stop, end = ts_clear_weakrefs_stop
-    if let Some(cw_stop) = s.ts_clear_weakrefs_stop {
-        let cw_start = s.ts_handle_resurrected_stop.unwrap_or(ts_s);
-        if cw_stop > cw_start {
-            write_sub_step(f, first, pid, tid,
-                &format!("Clear Weakrefs (gen={})", g),
-                &format!("gc.clear_weakrefs(gen={})", g), cw_start, cw_stop,
-                &a(&[("generation", &format!("{}", g)),
-                     ("iid", &format!("{}", s.interpreter_id)),
-                     ("clear_weakrefs_count", &format!("{}", s.clear_weakrefs_count.unwrap_or(0)))]))?;
-        }
-    }
-
-    // Delete Garbage sub-step
-    if let (Some(ss), Some(se)) = (s.ts_delete_garbage_start, s.ts_delete_garbage_stop) {
         write_sub_step(f, first, pid, tid,
-            &format!("Delete Garbage (gen={})", g),
-            &format!("gc.delete(gen={})", g), ss, se,
-            &a(&[("generation", &format!("{}", g)),
-                 ("iid", &format!("{}", s.interpreter_id)),
-                 ("deleted_garbage_count", &format!("{}", s.deleted_garbage_count.unwrap_or(0)))]))?;
+            &format!("{} (gen={})", ph.label, g),
+            &format!("{}(gen={})", ph.cat, g),
+            start, stop, &a(&arg_pairs))?;
     }
 
     // End GC Pause
     write_end(f, first, pid, tid, ts_us(ts_e), &pause_name, &pause_cat)?;
 
     // Counter event for generation metrics
-    let other = if s.uncollectable > 0 { format!(r#","uncollectable":{}"#, s.uncollectable) } else { String::new() };
+    let other = if s.uncollectable() > 0 { format!(r#","uncollectable":{}"#, s.uncollectable()) } else { String::new() };
     write_event(f, first, &format!(
         r#"{{"name":"G{}","ph":"C","ts":{},"pid":{},"tid":{},"args":{{"collected":{},"candidates":{},"duration":{}{}}}}}"#,
-        g, ts_us(ts_s), pid, tid, s.collected, s.candidates, s.duration, other
+        g, ts_us(ts_s), pid, tid, s.collected(), s.candidates(), s.duration(), other
     ))?;
 
     // Counter event for heap_size (single arg → encoder sets name to "")
     write_event(f, first, &format!(
         r#"{{"name":"","ph":"C","ts":{},"pid":{},"tid":{},"args":{{"heap_size":{}}}}}"#,
-        ts_us(ts_s), pid, tid, s.heap_size
+        ts_us(ts_s), pid, tid, s.heap_size()
     ))?;
 
     Ok(())
@@ -268,9 +257,39 @@ impl EventsExporter for ChromeTraceExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_debugging::offsets::offset_table::{seq_layout, GcItemLayout};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::LazyLock;
+
+    /// A layout carrying every field the exporter knows about — so a test stat can set any
+    /// phase's timestamps. Only the field *names* matter here (the exporter reads by name), so
+    /// offsets are assigned sequentially. A real regular build's layout has only a subset; the
+    /// exporter skips phases whose fields are absent (see `Start`/`PHASES`).
+    static FULL_LAYOUT: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
+        seq_layout(&[
+            "ts_start", "ts_stop", "collections", "collected", "uncollectable", "candidates",
+            "duration", "heap_size", "increment_size", "alive_size", "finalized_garbage_count",
+            "clear_weakrefs_count", "deleted_garbage_count", "ts_mark_alive_start",
+            "ts_mark_alive_stop", "ts_fill_increment_start", "ts_fill_increment_stop",
+            "ts_deduce_unreachable_start", "ts_deduce_unreachable_stop",
+            "ts_handle_weakref_callbacks_start", "ts_handle_weakref_callbacks_stop",
+            "ts_finalize_garbage_stop", "ts_handle_resurrected_stop", "ts_clear_weakrefs_stop",
+            "ts_delete_garbage_start", "ts_delete_garbage_stop",
+        ])
+    });
+
+    /// A standard build's layout: the core counters + timestamps, but **none** of the `+inc`
+    /// phase fields. A stat over this layout must make the exporter read every phase field as
+    /// genuinely absent (`get(..) == None`), not as a zero-width span — the real regular-build
+    /// path that `FULL_LAYOUT`-based stats never exercise.
+    static REGULAR_LAYOUT: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
+        seq_layout(&[
+            "ts_start", "ts_stop", "collections", "collected", "uncollectable", "candidates",
+            "duration", "heap_size",
+        ])
+    });
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -304,52 +323,31 @@ mod tests {
         hay.matches(needle).count()
     }
 
-    /// A minimally-populated GC pause: no sub-step timestamps set, so only the
-    /// outer pause + the two counter events should be emitted.
+    /// A minimally-populated GC pause: no sub-step timestamps set (all phase fields zero, so
+    /// every sub-step is a zero-width span), so only the outer pause + the two counter events
+    /// should be emitted.
     fn bare_stat() -> GcStat {
-        GcStat {
-            generation: 0,
-            interpreter_id: 1,
-            ts_start: 1_000,
-            ts_stop: 2_000,
-            ..Default::default()
-        }
+        GcStat::from_fields(0, 0, 1, *FULL_LAYOUT, &[("ts_start", 1_000), ("ts_stop", 2_000)])
     }
 
-    /// A pause with every optional sub-step's timestamps set to non-empty,
-    /// monotonically increasing ranges — so every sub-step fires.
+    /// A pause with every sub-step's timestamps set to non-empty, monotonically increasing
+    /// ranges — so every sub-step fires.
     fn full_stat() -> GcStat {
-        GcStat {
-            generation: 1,
-            interpreter_id: 3,
-            ts_start: 1_000,
-            ts_stop: 11_000,
-            collections: 5,
-            collected: 42,
-            uncollectable: 7,
-            candidates: 100,
-            duration: 0.5,
-            heap_size: 4096,
-            increment_size: Some(11),
-            alive_size: Some(22),
-            finalized_garbage_count: Some(3),
-            clear_weakrefs_count: Some(4),
-            deleted_garbage_count: Some(9),
-            ts_mark_alive_start: Some(2_000),
-            ts_mark_alive_stop: Some(3_000),
-            ts_fill_increment_start: Some(3_000),
-            ts_fill_increment_stop: Some(4_000),
-            ts_deduce_unreachable_start: Some(4_000),
-            ts_deduce_unreachable_stop: Some(5_000),
-            ts_handle_weakref_callbacks_start: Some(5_000),
-            ts_handle_weakref_callbacks_stop: Some(6_000),
-            ts_finalize_garbage_stop: Some(7_000),
-            ts_handle_resurrected_stop: Some(8_000),
-            ts_clear_weakrefs_stop: Some(9_000),
-            ts_delete_garbage_start: Some(9_000),
-            ts_delete_garbage_stop: Some(10_000),
-            slot: 0,
-        }
+        GcStat::from_fields(1, 0, 3, *FULL_LAYOUT, &[
+            ("ts_start", 1_000), ("ts_stop", 11_000),
+            ("collections", 5), ("collected", 42), ("uncollectable", 7), ("candidates", 100),
+            ("heap_size", 4096),
+            ("increment_size", 11), ("alive_size", 22),
+            ("finalized_garbage_count", 3), ("clear_weakrefs_count", 4), ("deleted_garbage_count", 9),
+            ("ts_mark_alive_start", 2_000), ("ts_mark_alive_stop", 3_000),
+            ("ts_fill_increment_start", 3_000), ("ts_fill_increment_stop", 4_000),
+            ("ts_deduce_unreachable_start", 4_000), ("ts_deduce_unreachable_stop", 5_000),
+            ("ts_handle_weakref_callbacks_start", 5_000), ("ts_handle_weakref_callbacks_stop", 6_000),
+            ("ts_finalize_garbage_stop", 7_000),
+            ("ts_handle_resurrected_stop", 8_000),
+            ("ts_clear_weakrefs_stop", 9_000),
+            ("ts_delete_garbage_start", 9_000), ("ts_delete_garbage_stop", 10_000),
+        ])
     }
 
     /// Scan for balanced `{}`/`[]` outside of JSON string literals. A cheap
@@ -444,13 +442,40 @@ mod tests {
     /// emitting it would push a begin without a meaningful end into the trace.
     #[test]
     fn zero_width_sub_steps_are_skipped() {
-        let mut stat = bare_stat();
-        stat.ts_mark_alive_start = Some(5_000);
-        stat.ts_mark_alive_stop = Some(5_000); // equal → skipped
+        let stat = GcStat::from_fields(0, 0, 1, *FULL_LAYOUT, &[
+            ("ts_start", 1_000), ("ts_stop", 2_000),
+            ("ts_mark_alive_start", 5_000), ("ts_mark_alive_stop", 5_000), // equal → skipped
+        ]);
         let out = export(&[(1, stat)]);
         assert!(!out.contains("Mark Alive"), "output: {out}");
         // Only the outer pause survives.
         assert_eq!(count(&out, r#""ph":"B""#), 1, "output: {out}");
+    }
+
+    /// A stat from a **standard** build — whose layout lacks every `+inc` phase field — must
+    /// emit only the outer GC Pause: the exporter reads each phase field as absent (`None`) and
+    /// fabricates no sub-step. This exercises the `get(..) == None → skip` branch (both the
+    /// Explicit and Chained phases), which the `FULL_LAYOUT` stats can't reach — there the
+    /// fields exist and are merely zero-width. A regression that made a missing field decode to
+    /// `Some(0)` would slip past every other exporter test but fail here (via the counter/pause
+    /// still being present while no phase span is).
+    #[test]
+    fn a_standard_layout_stat_emits_no_phase_sub_steps() {
+        // A real, non-zero pause so the outer span is genuine — only the phases are absent.
+        let s = GcStat::from_fields(0, 0, 1, *REGULAR_LAYOUT, &[
+            ("ts_start", 1_000), ("ts_stop", 9_000), ("collections", 3), ("heap_size", 4096),
+        ]);
+        let out = export(&[(1, s)]);
+
+        // The outer pause and its two counters, and nothing else.
+        assert_eq!(count(&out, r#""ph":"B""#), 1, "only the outer pause: {out}");
+        assert_eq!(count(&out, r#""ph":"C""#), 2, "still the two counters: {out}");
+        for phase in [
+            "Mark Alive", "Fill increment", "Deduce Unreachable", "Handle Weakrefs Callbacks",
+            "Finalize Garbage", "Handle Resurrected", "Clear Weakrefs", "Delete Garbage",
+        ] {
+            assert!(!out.contains(phase), "no {phase:?} span for a standard-set stat: {out}");
+        }
     }
 
     /// CPython hands us nanoseconds; the trace format is microseconds. The pause
@@ -470,8 +495,8 @@ mod tests {
     /// dedup guards against a metadata line per event.
     #[test]
     fn process_and_thread_metadata_are_deduped() {
-        let a = GcStat { interpreter_id: 1, ts_start: 1_000, ts_stop: 2_000, ..Default::default() };
-        let b = GcStat { interpreter_id: 1, ts_start: 3_000, ts_stop: 4_000, ..Default::default() };
+        let a = GcStat::from_fields(0, 0, 1, *FULL_LAYOUT, &[("ts_start", 1_000), ("ts_stop", 2_000)]);
+        let b = GcStat::from_fields(0, 0, 1, *FULL_LAYOUT, &[("ts_start", 3_000), ("ts_stop", 4_000)]);
         let out = export(&[(100, a), (100, b)]);
         assert_eq!(count(&out, r#""name":"process_name""#), 1, "output: {out}");
         assert_eq!(count(&out, r#""name":"thread_name""#), 1, "output: {out}");
@@ -481,8 +506,8 @@ mod tests {
     /// line — otherwise a second process/thread would inherit the first's name.
     #[test]
     fn distinct_pids_and_tids_each_get_metadata() {
-        let p1 = GcStat { interpreter_id: 1, ts_start: 1_000, ts_stop: 2_000, ..Default::default() };
-        let p2 = GcStat { interpreter_id: 2, ts_start: 1_000, ts_stop: 2_000, ..Default::default() };
+        let p1 = GcStat::from_fields(0, 0, 1, *FULL_LAYOUT, &[("ts_start", 1_000), ("ts_stop", 2_000)]);
+        let p2 = GcStat::from_fields(0, 0, 2, *FULL_LAYOUT, &[("ts_start", 1_000), ("ts_stop", 2_000)]);
         let out = export(&[(100, p1), (200, p2)]);
         assert_eq!(count(&out, r#""name":"process_name""#), 2, "output: {out}");
         assert_eq!(count(&out, r#""name":"thread_name""#), 2, "output: {out}");

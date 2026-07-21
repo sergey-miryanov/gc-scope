@@ -22,6 +22,24 @@ pub enum GcStatsKind {
     RingBuffer,
 }
 
+/// Where an interpreter's GC generation-stats live, as a pure function of the layout —
+/// no process access, so the fail-open offset arithmetic is unit-testable without a
+/// target. Produced by [`OffsetTable::gc_stats_region`]; the caller
+/// ([`crate::remote_debugging::session::PySession::gc_stats_region_addr`]) turns it into a
+/// concrete address, performing the one read a `Deref` needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcStatsRegion {
+    /// This build exposes no readable stats (no stats kind, or a ring whose pointer
+    /// field wasn't resolved).
+    Absent,
+    /// Stats sit at this absolute address (inline: `gc_addr + gc_stats_inline_off`).
+    Direct(u64),
+    /// Stats hang off a pointer stored at this address (ring:
+    /// `gc_addr + gen_stats_ptr_off`); the caller reads it and treats NULL as "no stats
+    /// yet" (not-yet-allocated / teardown).
+    Deref(u64),
+}
+
 #[derive(Debug, Clone)]
 pub struct OffsetTable {
     pub version_hex: u64,
@@ -81,6 +99,73 @@ impl OffsetTable {
     /// Panics if `runtime_gc` is `None` (i.e. on Python 3.9+).
     pub fn runtime_gc_unwrap(&self) -> u64 {
         self.runtime_gc.expect("runtime_gc is only available on Python 3.8")
+    }
+
+    /// True for the 3.8 global-GC layout: the GC state lives in `_PyRuntime` (`runtime_gc`),
+    /// not per interpreter. Every 3.9+ build is per-interpreter (`interp_gc`). The single
+    /// predicate for "is this 3.8?" — both `PySession::gc_stats` and the diagram collector
+    /// branch on it, so dropping 3.8 is a matter of deleting this plus the `runtime_gc`
+    /// field (the compiler then flags every dependent site).
+    pub fn has_global_gc(&self) -> bool {
+        self.interp_gc.is_none() && self.runtime_gc.is_some()
+    }
+
+    /// Absolute address of the `_gc_runtime_state` for the interpreter at `interp_addr`.
+    /// 3.8's global GC lives at `runtime_addr + runtime_gc` (the interpreter is irrelevant);
+    /// 3.9+ is per-interpreter at `interp_addr + interp_gc`. Pure address arithmetic — the
+    /// single definition both `PySession::gc_stats` and the diagram collector use, composed
+    /// with [`gc_stats_region`](Self::gc_stats_region) to reach the actual stats region.
+    pub fn gc_state_addr(&self, runtime_addr: u64, interp_addr: u64) -> u64 {
+        if self.has_global_gc() {
+            runtime_addr + self.runtime_gc.unwrap_or(0)
+        } else {
+            interp_addr + self.interp_gc.unwrap_or(0)
+        }
+    }
+
+    /// Locate one interpreter's GC generation-stats region from its `_gc_runtime_state`
+    /// address (`gc_addr`) and the ring `generation_stats` pointer field offset
+    /// (`gen_stats_ptr_off`; 0 / ignored for inline builds). Pure — no process access —
+    /// so this fail-open offset arithmetic is unit-testable without a target.
+    ///
+    /// - `InlineArray` → [`GcStatsRegion::Direct`] at `gc_addr + gc_stats_inline_off`.
+    /// - `RingBuffer` → [`GcStatsRegion::Deref`] at `gc_addr + gen_stats_ptr_off` (the
+    ///   caller reads that pointer); [`GcStatsRegion::Absent`] if the field is unresolved.
+    /// - `None` → [`GcStatsRegion::Absent`].
+    ///
+    /// This is the single source of truth for stats-region location: the monitor
+    /// ([`crate::remote_debugging::session::PySession::gc_stats`]) and the diagram
+    /// collector both resolve through here (via
+    /// [`crate::remote_debugging::session::PySession::gc_stats_region_addr`]), so a fix to
+    /// this logic reaches both.
+    pub fn gc_stats_region(&self, gc_addr: u64, gen_stats_ptr_off: u64) -> GcStatsRegion {
+        match self.gc_stats_kind {
+            GcStatsKind::None => GcStatsRegion::Absent,
+            GcStatsKind::InlineArray => GcStatsRegion::Direct(gc_addr + self.gc_stats_inline_off),
+            GcStatsKind::RingBuffer => {
+                if gen_stats_ptr_off == 0 {
+                    GcStatsRegion::Absent
+                } else {
+                    GcStatsRegion::Deref(gc_addr + gen_stats_ptr_off)
+                }
+            }
+        }
+    }
+
+    /// Byte offset of generation `gen`'s slot `slot` within the stats region
+    /// (`gc_gen_base_offsets[gen] + slot * gc_item_size`) — the same arithmetic
+    /// [`decode_gc_stats`](Self::decode_gc_stats) walks, exposed so the diagram can map a
+    /// decoded slot back to its raw-region location for its hexdump highlight. `None` when
+    /// this build has no slot geometry, or `gen`/`slot` is out of range.
+    pub fn slot_byte_offset(&self, generation: u32, slot: usize) -> Option<usize> {
+        let item = self.gc_item_size? as usize;
+        let bases = self.gc_gen_base_offsets?;
+        let slots = self.gc_slots_per_gen?;
+        let g = generation as usize;
+        if g >= 3 || slot >= slots[g] as usize {
+            return None;
+        }
+        Some(bases[g] as usize + slot * item)
     }
 
     /// Read GC generation stats for one interpreter through an already-open handle.
@@ -169,8 +254,9 @@ impl OffsetTable {
 
     /// Byte length of one interpreter's stats region — the last generation's base
     /// plus its slots. `None` when this build exposes no decodable stats (those are
-    /// shape facts, not failures; see [`Self::read_gc_stats`]).
-    fn stats_buffer_len(&self) -> Option<usize> {
+    /// shape facts, not failures; see [`Self::read_gc_stats`]). The single definition of
+    /// this formula, shared by `read_gc_stats`/`decode_gc_stats` and the diagram collector.
+    pub fn stats_buffer_len(&self) -> Option<usize> {
         let item_size = self.gc_item_size? as usize;
         if item_size == 0 {
             return None;
@@ -203,58 +289,29 @@ impl OffsetTable {
             None => return vec![],
         };
 
+        // Slice the region into per-slot byte windows; each `GcStat` is a view over its window
+        // plus `layout`, decoding fields lazily by name. No fixed field list to enumerate, so a
+        // build with fields beyond the common set is carried without any struct change.
         let mut stats = Vec::new();
         for gidx in 0..3u32 {
             let base = bases[gidx as usize] as usize;
             let n = slots[gidx as usize] as usize;
             for slot in 0..n {
                 let off = base + slot * item_size;
-                macro_rules! opt {
-                    ($name:expr) => {
-                        layout.field_offset($name).map(|o| raw_i64(raw, off + o))
-                    };
+                if off + item_size > raw.len() {
+                    break; // short region (teardown race) — stop walking this generation
                 }
-                stats.push(GcStat {
-                    generation: gidx, slot, interpreter_id: iid,
-                    ts_start: opt!("ts_start").unwrap_or(0),
-                    ts_stop: opt!("ts_stop").unwrap_or(0),
-                    collections: raw_i64(raw, off + layout.field_offset("collections").unwrap()),
-                    collected: raw_i64(raw, off + layout.field_offset("collected").unwrap()),
-                    uncollectable: raw_i64(raw, off + layout.field_offset("uncollectable").unwrap()),
-                    candidates: opt!("candidates").unwrap_or(0),
-                    duration: layout.field_offset("duration").map(|o| raw_f64(raw, off + o)).unwrap_or(0.0),
-                    heap_size: opt!("heap_size").unwrap_or(0),
-                    increment_size: opt!("increment_size"),
-                    alive_size: opt!("alive_size"),
-                    finalized_garbage_count: opt!("finalized_garbage_count"),
-                    clear_weakrefs_count: opt!("clear_weakrefs_count"),
-                    deleted_garbage_count: opt!("deleted_garbage_count"),
-                    ts_mark_alive_start: opt!("ts_mark_alive_start"),
-                    ts_mark_alive_stop: opt!("ts_mark_alive_stop"),
-                    ts_fill_increment_start: opt!("ts_fill_increment_start"),
-                    ts_fill_increment_stop: opt!("ts_fill_increment_stop"),
-                    ts_deduce_unreachable_start: opt!("ts_deduce_unreachable_start"),
-                    ts_deduce_unreachable_stop: opt!("ts_deduce_unreachable_stop"),
-                    ts_handle_weakref_callbacks_start: opt!("ts_handle_weakref_callbacks_start"),
-                    ts_handle_weakref_callbacks_stop: opt!("ts_handle_weakref_callbacks_stop"),
-                    ts_finalize_garbage_stop: opt!("ts_finalize_garbage_stop"),
-                    ts_handle_resurrected_stop: opt!("ts_handle_resurrected_stop"),
-                    ts_clear_weakrefs_stop: opt!("ts_clear_weakrefs_stop"),
-                    ts_delete_garbage_start: opt!("ts_delete_garbage_start"),
-                    ts_delete_garbage_stop: opt!("ts_delete_garbage_stop"),
-                });
+                stats.push(GcStat::new(
+                    gidx,
+                    slot,
+                    iid,
+                    raw[off..off + item_size].to_vec(),
+                    layout,
+                ));
             }
         }
         stats
     }
-}
-
-fn raw_i64(bytes: &[u8], off: usize) -> i64 {
-    i64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
-}
-
-fn raw_f64(bytes: &[u8], off: usize) -> f64 {
-    f64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
 }
 
 // ── GC generation stats item layout ─────────────────────────────
@@ -277,6 +334,22 @@ impl GcItemLayout {
     pub fn field_offset(&self, name: &str) -> Option<usize> {
         self.fields.iter().find(|(n, _)| *n == name).map(|(_, o)| *o)
     }
+}
+
+/// Test helper: build a leaked `&'static GcItemLayout` from field names, assigning each the
+/// next sequential 8-byte offset. For behavior tests that care only *which* fields a build has,
+/// not their positions — the geometry tests (ring/inline decode, base offsets) still pin
+/// offsets explicitly, because there the offset arithmetic is the contract under test. The
+/// small leak is fine for a test process, and satisfies `GcStat`'s `&'static` layout without a
+/// hand-packed offset table.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn seq_layout(names: &[&'static str]) -> &'static GcItemLayout {
+    let fields: Vec<(&'static str, usize)> =
+        names.iter().enumerate().map(|(i, &name)| (name, i * 8)).collect();
+    Box::leak(Box::new(GcItemLayout {
+        item_size: names.len() * 8,
+        fields: Box::leak(fields.into_boxed_slice()),
+    }))
 }
 
 /// Compute gen_base_offsets for a ring-buffer GC stats layout.
@@ -360,9 +433,9 @@ mod tests {
             assert_eq!(s.generation, g as u32);
             assert_eq!(s.slot, 0);
             assert_eq!(s.interpreter_id, 7);
-            assert_eq!(s.collections, 100 * g as i64 + 1);
-            assert_eq!(s.collected, 100 * g as i64 + 2);
-            assert_eq!(s.uncollectable, 100 * g as i64 + 3);
+            assert_eq!(s.collections(), 100 * g as i64 + 1);
+            assert_eq!(s.collected(), 100 * g as i64 + 2);
+            assert_eq!(s.uncollectable(), 100 * g as i64 + 3);
         }
     }
 
@@ -377,14 +450,16 @@ mod tests {
 
         let stats = table.decode_gc_stats(&[0u8; 72], 0);
         let s = &stats[0];
-        // The legacy layout has only collections/collected/uncollectable.
-        assert_eq!(s.increment_size, None);
-        assert_eq!(s.alive_size, None);
-        assert_eq!(s.ts_mark_alive_start, None);
-        // Non-Option fields with no layout entry fall back to zero.
-        assert_eq!(s.ts_start, 0);
-        assert_eq!(s.heap_size, 0);
-        assert_eq!(s.duration, 0.0);
+        // The legacy layout has only collections/collected/uncollectable, so a field it lacks
+        // reads back `None`, not `Some(0)`.
+        assert_eq!(s.get("increment_size"), None);
+        assert_eq!(s.get("alive_size"), None);
+        assert_eq!(s.get("ts_mark_alive_start"), None);
+        assert!(!s.has("increment_size"));
+        // The core accessors fall back to zero for a field the layout doesn't define.
+        assert_eq!(s.ts_start(), 0);
+        assert_eq!(s.heap_size(), 0);
+        assert_eq!(s.duration(), 0.0);
     }
 
     // ── ring-buffer decode (3.15.0a8+) ──────────────────────────
@@ -419,18 +494,18 @@ mod tests {
         assert_eq!(stats.len(), 11 + 3 + 3);
         for s in &stats {
             assert_eq!(
-                s.ts_start,
+                s.ts_start(),
                 1000 * (s.generation as i64 + 1) + s.slot as i64,
                 "generation {} slot {} read from the wrong offset",
                 s.generation, s.slot
             );
-            assert_eq!(s.increment_size, Some(10 * s.generation as i64 + s.slot as i64));
+            assert_eq!(s.get("increment_size"), Some(10 * s.generation as i64 + s.slot as i64));
         }
 
         // Generation 1 starts one 8-byte pad past the end of generation 0's slots;
         // reading it at `11 * item` instead would land inside the pad and return 0.
         let gen1_first = stats.iter().find(|s| s.generation == 1 && s.slot == 0).unwrap();
-        assert_eq!(gen1_first.ts_start, 2000);
+        assert_eq!(gen1_first.ts_start(), 2000);
     }
 
     #[test]
@@ -443,6 +518,115 @@ mod tests {
         let stats = table.decode_gc_stats(&buf, 0);
         assert_eq!(stats.len(), 3);
         assert!(stats.iter().all(|s| s.slot == 0));
+    }
+
+    // ── GC topology (pure, no process) ──────────────────────────
+
+    /// 3.8 is the one build with global GC (`interp_gc` None + `runtime_gc` Some); every
+    /// 3.9+/3.13+ build is per-interpreter. `has_global_gc` is the single predicate both
+    /// the monitor and the collector branch on, and the one place to delete when 3.8 goes.
+    #[test]
+    fn has_global_gc_is_true_only_for_the_3_8_shape() {
+        // 3.12 legacy: per-interpreter (`interp_gc` Some, `runtime_gc` None).
+        let per_interp = pre_3_13::table_for_version(3, 12).unwrap();
+        assert!(!per_interp.has_global_gc());
+
+        // Synthesize the 3.8 shape from it: global GC lives in `_PyRuntime`.
+        let mut global = per_interp.clone();
+        global.interp_gc = None;
+        global.runtime_gc = Some(0x158);
+        assert!(global.has_global_gc());
+    }
+
+    /// `gc_state_addr` locates `_gc_runtime_state`: `interp_addr + interp_gc` per interpreter
+    /// (3.9+), or `runtime_addr + runtime_gc` for 3.8's global GC (interpreter ignored).
+    #[test]
+    fn gc_state_addr_picks_global_vs_per_interpreter() {
+        let per_interp = pre_3_13::table_for_version(3, 12).unwrap();
+        let interp_gc = per_interp.interp_gc.unwrap();
+        // Per-interpreter: interp addr + interp_gc; the runtime addr is irrelevant.
+        assert_eq!(per_interp.gc_state_addr(0xdead_0000, 0x1000), 0x1000 + interp_gc);
+
+        let mut global = per_interp.clone();
+        global.interp_gc = None;
+        global.runtime_gc = Some(0x158);
+        // Global: runtime addr + runtime_gc; the interpreter addr is ignored.
+        assert_eq!(global.gc_state_addr(0x2_0000, 0x9999), 0x2_0000 + 0x158);
+    }
+
+    // ── stats-region location (pure, no process) ────────────────
+
+    /// Inline builds put the stats at a fixed offset from the gc state — a `Direct`
+    /// address, no pointer to chase. The offset is the version's `gc_stats_inline_off`;
+    /// the ring pointer-field argument is irrelevant and must be ignored.
+    #[test]
+    fn gc_stats_region_inline_is_direct_at_the_fixed_offset() {
+        let table = pre_3_13::table_for_version(3, 12).unwrap();
+        assert_eq!(table.gc_stats_inline_off, 0x80);
+        assert_eq!(
+            table.gc_stats_region(0x1_0000, 0x999),
+            GcStatsRegion::Direct(0x1_0000 + 0x80)
+        );
+    }
+
+    /// Ring builds hand back the *address of the pointer* to dereference
+    /// (`gc_addr + generation_stats field offset`), leaving the read to the caller.
+    #[test]
+    fn gc_stats_region_ring_defers_the_pointer_read() {
+        let table = ring_table(0);
+        assert_eq!(
+            table.gc_stats_region(0x2_0000, 0x40),
+            GcStatsRegion::Deref(0x2_0000 + 0x40)
+        );
+    }
+
+    /// A ring build whose `generation_stats` field offset wasn't resolved (0) has no way
+    /// to reach the stats — `Absent`, never a bogus read at `gc_addr + 0`.
+    #[test]
+    fn gc_stats_region_ring_without_a_pointer_field_is_absent() {
+        let table = ring_table(0);
+        assert_eq!(table.gc_stats_region(0x2_0000, 0), GcStatsRegion::Absent);
+    }
+
+    /// A build with no stats kind is `Absent` whatever addresses are passed.
+    #[test]
+    fn gc_stats_region_none_is_absent() {
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        table.gc_stats_kind = GcStatsKind::None;
+        assert_eq!(table.gc_stats_region(0x1000, 0x40), GcStatsRegion::Absent);
+    }
+
+    // ── slot_byte_offset ────────────────────────────────────────
+
+    /// `slot_byte_offset` is exactly the arithmetic `decode_gc_stats` walks, so the
+    /// diagram can map a decoded slot back to its bytes. Ring bases include the pad.
+    #[test]
+    fn slot_byte_offset_matches_the_decode_walk() {
+        let table = ring_table(0);
+        let bases = table.gc_gen_base_offsets.unwrap();
+        let item = table.gc_item_size.unwrap() as usize;
+        assert_eq!(table.slot_byte_offset(0, 0), Some(bases[0] as usize));
+        assert_eq!(table.slot_byte_offset(0, 5), Some(bases[0] as usize + 5 * item));
+        assert_eq!(table.slot_byte_offset(1, 0), Some(bases[1] as usize));
+        assert_eq!(table.slot_byte_offset(2, 2), Some(bases[2] as usize + 2 * item));
+    }
+
+    /// Out-of-range generation or slot yields `None`, not an offset that spills into the
+    /// next generation's region.
+    #[test]
+    fn slot_byte_offset_rejects_out_of_range() {
+        let table = ring_table(0); // slots [11, 3, 3]
+        assert_eq!(table.slot_byte_offset(0, 11), None, "gen0 has slots 0..=10");
+        assert_eq!(table.slot_byte_offset(1, 3), None, "gen1 has 3 slots");
+        assert_eq!(table.slot_byte_offset(3, 0), None, "no generation 3");
+    }
+
+    /// A build without slot geometry has no offsets to give.
+    #[test]
+    fn slot_byte_offset_is_none_without_geometry() {
+        let mut table = pre_3_13::table_for_version(3, 12).unwrap();
+        table.gc_item_size = None;
+        assert_eq!(table.slot_byte_offset(0, 0), None);
     }
 
     // ── shape guards ────────────────────────────────────────────
