@@ -76,7 +76,7 @@ pub enum Command {
         #[arg(short = 'C', long)]
         no_cmdline: bool,
     },
-    /// Live TUI diagram of Python runtime memory layout
+    /// Full-screen TUI of Python runtime memory layout (or `--output` to dump a frame)
     Tui {
         /// PID (0 = show interactive process list)
         #[arg(allow_hyphen_values = true, default_value = "0")]

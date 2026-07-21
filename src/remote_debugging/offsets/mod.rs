@@ -386,7 +386,7 @@ impl VersionedOffsets {
     }
 
     /// The `gc` sub-struct fields as `(name, absolute byte offset within
-    /// `_Py_DebugOffsets`)`, version-correct. Used to drive the diagram's GC-state
+    /// `_Py_DebugOffsets`)`, version-correct. Used to drive the TUI's GC-state
     /// subtree from actual layout instead of hardcoded offsets.
     ///
     /// The `gc` sub-struct is append-only across CPython versions (`size`@0,

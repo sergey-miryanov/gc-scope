@@ -1,9 +1,9 @@
-//! Shared `_Py_DebugOffsets` tree helpers for the ascii and TUI renderers.
+//! Shared `_Py_DebugOffsets` tree model for the TUI renderer.
 //!
-//! Originally this module also built an SVG diagram (`render_svg` + the
-//! `diagram` subcommand); that image path was removed as obsolete. What remains
-//! is the version-correct debug-offsets tree model consumed by `ascii.rs` and
-//! `tui_v2.rs` to draw the `_Py_DebugOffsets` field subtree (3.13+ only).
+//! Originally this module also built an SVG diagram (`render_svg` + a `diagram`
+//! subcommand) and fed an ASCII renderer; both were removed as obsolete. What
+//! remains is the version-correct debug-offsets tree model consumed by `frame.rs`
+//! to draw the `_Py_DebugOffsets` field subtree (3.13+ only).
 
 // ── Tree entries for _Py_DebugOffsets ─────────────────────────
 #[derive(Debug, Clone, Copy)]

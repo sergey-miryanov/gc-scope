@@ -33,7 +33,7 @@ impl GcStat {
     }
 
     /// Wrap a borrowed slot-byte window (copies it). For consumers that already hold the raw
-    /// region — e.g. the diagram building a view over one selected slot.
+    /// region — e.g. the TUI building a view over one selected slot.
     pub fn from_slot(
         bytes: &[u8],
         layout: &'static GcItemLayout,
@@ -67,7 +67,7 @@ impl GcStat {
     }
 
     /// Every field the layout defines, in layout order, as `(name, offset-within-slot, raw u64
-    /// bits)`. The offset feeds the diagram's hex-highlight; the caller formats the bits by
+    /// bits)`. The offset feeds the TUI's hex-highlight; the caller formats the bits by
     /// name (`duration` via `f64::from_bits`, `ts_*` as timestamps, large values as hex).
     pub fn iter_fields(&self) -> impl Iterator<Item = (&'static str, usize, u64)> + '_ {
         self.layout
@@ -256,7 +256,7 @@ mod tests {
         assert!(has_extended(&[core, ext, core2, ext2]));
     }
 
-    /// `iter_fields` is the diagram's hex-highlight feed, so it yields the full `(name,
+    /// `iter_fields` is the TUI's hex-highlight feed, so it yields the full `(name,
     /// offset, raw u64 bits)` tuple — not just the name the other tests check. The offset is
     /// the field's byte position within the slot, and the bits are the exact little-endian
     /// contents: raw, NOT sign-interpreted the way `get` reads them (a `-1` slot reads back as

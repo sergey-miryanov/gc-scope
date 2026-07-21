@@ -2,11 +2,11 @@
 //!
 //! [`collect_data`] walks an attached [`PySession`] once and returns a fully-owned
 //! [`CollectedData`] — the interpreter/GC layout, raw struct bytes, and decoded generation
-//! slots — for a consumer to render. It lives in the reader layer (not `diagram/`) so it is
+//! slots — for a consumer to render. It lives in the reader layer (not `tui/`) so it is
 //! a single source of truth: it resolves the stats region through
 //! [`PySession::gc_stats_region_addr`] and decodes slots through
 //! [`crate::remote_debugging::offsets::offset_table::OffsetTable::decode_gc_stats`], the same
-//! paths the monitor uses, and the `diagram` renderers merely consume its output.
+//! paths the monitor uses, and the `tui` renderer merely consumes its output.
 
 #![allow(dead_code)]
 
@@ -40,10 +40,10 @@ impl CollectRequest {
         Self { debug_offsets: true, gc_state: true, gc_stats: true }
     }
 
-    /// Exactly the layers the `diagram` renderers draw. Equal to [`all`](Self::all) today;
+    /// Exactly the layers the `tui` renderer draws. Equal to [`all`](Self::all) today;
     /// kept distinct so a future focused view can narrow it, and so call sites read as
-    /// "collect what the diagram needs".
-    pub fn diagram() -> Self {
+    /// "collect what the TUI needs".
+    pub fn tui() -> Self {
         Self::all()
     }
 
@@ -314,13 +314,13 @@ impl CollectedData {
 }
 
 // ── GC slot parsing ────────────────────────────────────────────
-/// Build the diagram's per-slot view from the raw generation-stats region.
+/// Build the TUI's per-slot view from the raw generation-stats region.
 ///
 /// Decoding runs through the reader layer's single decoder
 /// ([`OffsetTable::decode_gc_stats`]) — the exact path the monitor uses — then projects
 /// each [`GcStat`](crate::remote_debugging::gc_stats::GcStat) onto the display-oriented
 /// [`GcSlot`], recovering the raw-region `byte_offset` (for the hexdump highlight) from the
-/// table geometry. The one diagram-only policy lives here: torn ring slots
+/// table geometry. The one TUI-only policy lives here: torn ring slots
 /// (`stop_ts < start_ts`, a half-written concurrent update) are dropped, whereas the
 /// monitor keeps every slot and dedups downstream. Inline layouts (3.13/3.14) carry no
 /// timestamps, so `has_ts` is false and every slot is kept.
@@ -449,15 +449,15 @@ mod tests {
 
     // ── CollectRequest presets ──────────────────────────────────
 
-    /// `all` collects every layer; `diagram` matches it today (both renderers draw all three);
+    /// `all` collects every layer; `tui` matches it today (the renderer draws all three);
     /// `gc_stats_only` collects just the stats layer and skips the two struct dumps.
     #[test]
     fn collect_request_presets_name_the_expected_layers() {
         let all = CollectRequest::all();
         assert!(all.debug_offsets && all.gc_state && all.gc_stats);
 
-        let diagram = CollectRequest::diagram();
-        assert!(diagram.debug_offsets && diagram.gc_state && diagram.gc_stats);
+        let tui = CollectRequest::tui();
+        assert!(tui.debug_offsets && tui.gc_state && tui.gc_stats);
 
         let lean = CollectRequest::gc_stats_only();
         assert!(!lean.debug_offsets && !lean.gc_state && lean.gc_stats);

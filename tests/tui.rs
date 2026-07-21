@@ -1,4 +1,4 @@
-//! Live coverage for the diagram collect→render pipeline. The pure pieces
+//! Live coverage for the TUI collect→render pipeline. The pure pieces
 //! (`parse_gc_slots`, the rate/avg summaries, the tree model, the Legacy snapshot
 //! render) are unit-tested in-crate; this exercises `collect_data` against a real
 //! interpreter and renders the **3.13+ (Full) tier** the synthetic Legacy unit test
@@ -12,7 +12,7 @@ mod common;
 use common::{pid_alive, python_version, test_python, SpawnedPython};
 
 use gcscope::snapshot::collect::{self, CollectRequest};
-use gcscope::diagram::tui_v2::render_snapshot;
+use gcscope::tui::render_snapshot;
 use gcscope::snapshot::poller::SnapshotPoller;
 use gcscope::remote_debugging::session::PySession;
 
@@ -141,7 +141,7 @@ fn collect_request_skips_only_the_unrequested_layers() {
 
 /// The TUI body's **Full-tier** section builders (`section_debug_offsets`,
 /// `section_interpreter`) only run against a real 3.13+ `_Py_DebugOffsets` struct, so the
-/// synthetic-Legacy unit tests in `tui_v2.rs` can't reach them. This drives them over a
+/// synthetic-Legacy unit tests in `frame.rs` can't reach them. This drives them over a
 /// live snapshot through `render_snapshot` and checks the frame is coherent across the
 /// tree/hex toggles.
 #[test]

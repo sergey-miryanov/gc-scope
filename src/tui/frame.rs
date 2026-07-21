@@ -15,7 +15,7 @@ use crate::snapshot::collect::{
     avg_collection_time_per_gen, collections_rate_from_slots, CollectRequest, CollectedData,
 };
 use crate::snapshot::poller::SnapshotPoller;
-use super::render::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
+use super::tree::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
 use crate::remote_debugging::offsets::VersionedOffsets;
 
 // ── Layout constants ──────────────────────────────────────────────
@@ -62,7 +62,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         }
     };
 
-    let mut poller = SnapshotPoller::attach_with(initial_pid, CollectRequest::diagram())?;
+    let mut poller = SnapshotPoller::attach_with(initial_pid, CollectRequest::tui())?;
     let mut start = Instant::now();
     let mut frame: u64 = 0;
 
@@ -772,19 +772,19 @@ fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets, show_tree
         for (i, entry) in tree.iter().enumerate() {
             let pfx = &prefixes[i];
             let line = match entry.kind {
-                super::render::TreeEntryKind::RawValue { offset } => {
+                super::tree::TreeEntryKind::RawValue { offset } => {
                     let val = read_u64(offset);
                     let f = fmt_val(val, entry.label);
                     format_tree_line(pfx, &format!("0x{:04x}  ", offset), entry.label, &f)
                 }
-                super::render::TreeEntryKind::Group => {
+                super::tree::TreeEntryKind::Group => {
                     format_tree_line(pfx, "", entry.label, "")
                 }
-                super::render::TreeEntryKind::Derived => {
+                super::tree::TreeEntryKind::Derived => {
                     let val_str = derived_val(entry.label);
                     format_tree_line(pfx, "", entry.label, &val_str)
                 }
-                super::render::TreeEntryKind::Layout { field_type: _, field_offset } => {
+                super::tree::TreeEntryKind::Layout { field_type: _, field_offset } => {
                     let val_str = format!("+{}", field_offset);
                     format_tree_line(pfx, "", entry.label, &val_str)
                 }

@@ -1,19 +1,21 @@
 # 0008 — Reader/consumer package layering
 
-**Status:** Accepted — implemented 2026-07-21. (Realizes the long-standing "diagram is a
-renderer only; one source of truth for reading" direction. Relates to
+**Status:** Accepted — implemented 2026-07-21. (Realizes the long-standing "the TUI is a
+renderer only; one source of truth for reading" direction. The renderer package was named
+`diagram` at the time of this ADR and later renamed to `tui`; names below are updated to the
+current `tui`. Relates to
 [ADR 0007](0007-gcstat-layout-driven-view.md), the decode primitive this layering centralizes,
 and [ADR 0001](0001-pysession-resolve-once-facade.md), the `PySession` facade consumers attach
 through.)
 
 ## Context
 
-The guiding principle predates this change: the **diagram renders only**; all data *reading*
-lives in one reader-layer source of truth shared by the monitor and the diagram, so a bugfix
+The guiding principle predates this change: the **TUI renders only**; all data *reading*
+lives in one reader-layer source of truth shared by the monitor and the TUI, so a bugfix
 in reading benefits both. The module tree, however, was flat under `src/` and hid the layering:
 
 - `collect` and `poller` lived **inside `remote_debugging`** (the runtime model) even though
-  they are consumers of it — orchestrating `session` + `offsets` into a diagram-shaped
+  they are consumers of it — orchestrating `session` + `offsets` into a renderer-shaped
   snapshot. (An earlier step had moved them *into* `remote_debugging`; that turned out to be
   the wrong side of the boundary.)
 - `monitor`, `monitor_loop`, and `exporters/` were scattered top-level siblings.
@@ -23,7 +25,7 @@ in reading benefits both. The module tree, however, was flat under `src/` and hi
 Two distinct data shapes exist over the same bytes, and conflating them was the trap:
 
 - The **snapshot** consumer wants a fully-owned `CollectedData` (the `GcSlot` projection,
-  torn ring slots dropped, diagram-shaped) — one picture per call.
+  torn ring slots dropped, renderer-shaped) — one picture per call.
 - The **monitor** consumer wants `Vec<GcStat>` deltas (deduped by `ts_start`, per-interpreter,
   streamed) — and never consumes `CollectedData`.
 
@@ -37,7 +39,7 @@ shapes diverge above it.
 Make the layering **structural**, with dependency arrows pointing one way:
 
 ```
-memory → remote_debugging → { snapshot, monitor, diagram } → cli
+memory → remote_debugging → { snapshot, monitor, tui } → cli
 ```
 
 1. **`memory` (L1)** — read the target's process memory and parse its binary images.
@@ -45,7 +47,7 @@ memory → remote_debugging → { snapshot, monitor, diagram } → cli
    `gc_stats`, `check_interpreter`) **and the single decode primitive**. The one source of
    truth for reading the runtime; it holds no consumer-shaped types.
 3. **`snapshot`** — the one-shot consumer: `collect` (`CollectedData`) + `poller`
-   (`SnapshotPoller`), **lifted out of `remote_debugging`**. Consumed by `diagram`, which
+   (`SnapshotPoller`), **lifted out of `remote_debugging`**. Consumed by `tui`, which
    stays a pure renderer.
 4. **`monitor`** — the streaming consumer: `context` (`MonitorContext`), `run_loop`, and
    `exporters/`. `monitor/mod.rs` re-exports `MonitorContext`/`run_loop`/`PollStatus`/… so
@@ -59,15 +61,15 @@ Supporting decisions:
   sharing is at the decode primitive, never at the shaped type — which is *why* the monitor
   can't and shouldn't route through `collect_data`.
 - **Per-layer snapshot reads via `CollectRequest`** (`debug_offsets` / `gc_state` /
-  `gc_stats`, with `all()`/`diagram()`/`gc_stats_only()` presets). A caller declares which
+  `gc_stats`, with `all()`/`tui()`/`gc_stats_only()` presets). A caller declares which
   heavy payload layers `collect_data` reads; a skipped layer comes back empty — indistinguishable
   from a version that legitimately lacks it, which the renderers already tolerate. The cheap
   navigation reads and layout scalars are always collected, so a valid skeleton snapshot is
   produced regardless of the request. `collect_data` is split into one function per chunk,
   with the request-gating kept visible in the orchestrator rather than buried in helpers.
 - **`list_pids` stays a top-level shared utility.** It is consumed by both the `ListPids`
-  command *and* the diagram's interactive PID picker (`pid_dialog`, `tui_v2`); filing it under
-  `cli/` would invert the arrow (`diagram → cli`). It is process-discovery over
+  command *and* the TUI's interactive PID picker (`pid_dialog`, `frame`); filing it under
+  `cli/` would invert the arrow (`tui → cli`). It is process-discovery over
   `memory` + `remote_debugging`, so it sits as a peer.
 
 ## Consequences

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use gcscope::cli::{monitor as cli_monitor, Cli, Command};
-use gcscope::{diagram, list_pids, memory, remote_debugging};
+use gcscope::{list_pids, memory, remote_debugging, tui};
 
 fn resolve_pid(pid: i32) -> u32 {
     if pid == -1 { std::process::id() } else { pid as u32 }
@@ -104,11 +104,11 @@ fn main() -> Result<()> {
                 if pid == 0 {
                     anyhow::bail!("tui --output requires an explicit PID");
                 }
-                diagram::run_tui_snapshot(resolve_pid(pid), &path)?;
+                tui::run_tui_snapshot(resolve_pid(pid), &path)?;
             } else {
                 let dur = if duration > 0 { Some(duration) } else { None };
                 let pid_opt = if pid == 0 { None } else { Some(resolve_pid(pid)) };
-                diagram::run_tui(pid_opt, rate, dur, glitch)?;
+                tui::run_tui(pid_opt, rate, dur, glitch)?;
             }
         }
     }

@@ -103,7 +103,7 @@ impl OffsetTable {
 
     /// True for the 3.8 global-GC layout: the GC state lives in `_PyRuntime` (`runtime_gc`),
     /// not per interpreter. Every 3.9+ build is per-interpreter (`interp_gc`). The single
-    /// predicate for "is this 3.8?" — both `PySession::gc_stats` and the diagram collector
+    /// predicate for "is this 3.8?" — both `PySession::gc_stats` and the TUI collector
     /// branch on it, so dropping 3.8 is a matter of deleting this plus the `runtime_gc`
     /// field (the compiler then flags every dependent site).
     pub fn has_global_gc(&self) -> bool {
@@ -113,7 +113,7 @@ impl OffsetTable {
     /// Absolute address of the `_gc_runtime_state` for the interpreter at `interp_addr`.
     /// 3.8's global GC lives at `runtime_addr + runtime_gc` (the interpreter is irrelevant);
     /// 3.9+ is per-interpreter at `interp_addr + interp_gc`. Pure address arithmetic — the
-    /// single definition both `PySession::gc_stats` and the diagram collector use, composed
+    /// single definition both `PySession::gc_stats` and the TUI collector use, composed
     /// with [`gc_stats_region`](Self::gc_stats_region) to reach the actual stats region.
     pub fn gc_state_addr(&self, runtime_addr: u64, interp_addr: u64) -> u64 {
         if self.has_global_gc() {
@@ -134,7 +134,7 @@ impl OffsetTable {
     /// - `None` → [`GcStatsRegion::Absent`].
     ///
     /// This is the single source of truth for stats-region location: the monitor
-    /// ([`crate::remote_debugging::session::PySession::gc_stats`]) and the diagram
+    /// ([`crate::remote_debugging::session::PySession::gc_stats`]) and the TUI
     /// collector both resolve through here (via
     /// [`crate::remote_debugging::session::PySession::gc_stats_region_addr`]), so a fix to
     /// this logic reaches both.
@@ -154,7 +154,7 @@ impl OffsetTable {
 
     /// Byte offset of generation `gen`'s slot `slot` within the stats region
     /// (`gc_gen_base_offsets[gen] + slot * gc_item_size`) — the same arithmetic
-    /// [`decode_gc_stats`](Self::decode_gc_stats) walks, exposed so the diagram can map a
+    /// [`decode_gc_stats`](Self::decode_gc_stats) walks, exposed so the TUI can map a
     /// decoded slot back to its raw-region location for its hexdump highlight. `None` when
     /// this build has no slot geometry, or `gen`/`slot` is out of range.
     pub fn slot_byte_offset(&self, generation: u32, slot: usize) -> Option<usize> {
@@ -255,7 +255,7 @@ impl OffsetTable {
     /// Byte length of one interpreter's stats region — the last generation's base
     /// plus its slots. `None` when this build exposes no decodable stats (those are
     /// shape facts, not failures; see [`Self::read_gc_stats`]). The single definition of
-    /// this formula, shared by `read_gc_stats`/`decode_gc_stats` and the diagram collector.
+    /// this formula, shared by `read_gc_stats`/`decode_gc_stats` and the TUI collector.
     pub fn stats_buffer_len(&self) -> Option<usize> {
         let item_size = self.gc_item_size? as usize;
         if item_size == 0 {

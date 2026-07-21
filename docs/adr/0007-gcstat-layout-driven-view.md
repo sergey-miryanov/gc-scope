@@ -50,7 +50,7 @@ wrong shape:
    borrows, it never copies the field table. Tests build throwaway layouts via a `seq_layout`
    helper (`Box::leak`) and slots via a `from_fields` builder under `test`/`test-hooks`.
 
-`GcSlot` (the diagram's 11-field projection that drops torn ring slots) and the left summary
+`GcSlot` (the TUI's 11-field projection that drops torn ring slots) and the left summary
 table are **unchanged** — the view refactor is confined to the exporter/right-panel decode.
 
 ## Consequences

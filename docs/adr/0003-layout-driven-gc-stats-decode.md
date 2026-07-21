@@ -20,7 +20,7 @@ path 3.13/3.14 already use.
 
 Decode is keyed by a **`GcStatsKind` { None, InlineArray, RingBuffer }** on the flat
 `OffsetTable`, with a `GcItemLayout` mapping field names → byte offsets within one
-slot. Both the stats loop (`PySession::gc_stats`) and the diagram (`collect.rs`)
+slot. Both the stats loop (`PySession::gc_stats`) and the TUI collector (`snapshot::collect`)
 branch on the **kind**, never on the version.
 
 - **Pre-3.13 (3.8–3.12)** decode through `InlineArray` with a hand-written
@@ -38,15 +38,16 @@ branch on the **kind**, never on the version.
 ## Consequences
 
 - GC stats decode across **all of 3.8–3.16** (`gc-stats`, `monitor`, `run`,
-  `ascii`, `tui`). Verified live: pre-3.13 pyramids match each build's semantics —
+  `tui`). Verified live: pre-3.13 pyramids match each build's semantics —
   including 3.8's rarer full (gen-2) collections, which fire off the
   `long_lived_pending/total` heuristic, not a fixed 10× counter.
-- The diagram has no `_Py_DebugOffsets` struct to visualize pre-3.13, so it renders
+- The TUI has no `_Py_DebugOffsets` struct to visualize pre-3.13, so it renders
   a **focused GC-stats-only view** for `Legacy`; the obsolete SVG `render_svg`
-  builder and the `diagram` subcommand were removed (the shared tree helpers stay).
+  builder and the old `diagram`/`ascii` subcommands were removed (the shared tree
+  helpers stay). (The renderer package, then named `diagram`, was later renamed `tui`.)
 - Adding a version's GC layout = set the kind + provide a `GcItemLayout`/geometry;
   no call-site edits.
-- Gotcha this exposed: the CLI (`PySession::gc_stats`) and the diagram
-  (`collect.rs`) each compute the stats address independently, so the 3.8 global-GC
-  branch had to be added in **both** — fixing only one left the diagram reading
+- Gotcha this exposed: the CLI (`PySession::gc_stats`) and the TUI collector
+  (`snapshot::collect`) each compute the stats address independently, so the 3.8 global-GC
+  branch had to be added in **both** — fixing only one left the TUI reading
   garbage at `interp_head + 0x80`.

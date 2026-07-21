@@ -52,7 +52,7 @@ A session holds fields with different lifetimes, so caching is split in two:
 
 - One resolve per process; the per-frame goblin-parse storm is gone.
 - `collect_data` stayed a **free function taking `&PySession`** (not a method) to
-  avoid a `remote_debugging`→`diagram` layering inversion.
+  avoid a `remote_debugging`→`tui` layering inversion.
 - **Later changes** that built on this:
   - The separate `Tier` enum this introduced was **removed**; the `Resolved`
     variants plus `PySession::supports_gc_stats()` now carry the capability

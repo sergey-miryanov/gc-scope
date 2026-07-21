@@ -16,11 +16,11 @@
 //!   offset system, [`PySession`](remote_debugging::session::PySession), GC-stat
 //!   decoding. The single source of truth for *reading* the runtime.
 //! - [`snapshot`] / [`monitor`] — two consumers of that model: a one-shot snapshot
-//!   collector (rendered by [`diagram`]) and a streaming event monitor.
+//!   collector (rendered by [`tui`]) and a streaming event monitor.
 //! - [`cli`] — command definitions and handlers; the top layer `main.rs` dispatches to.
 
 pub mod cli;
-pub mod diagram;
+pub mod tui;
 pub mod list_pids;
 pub mod memory;
 pub mod monitor;

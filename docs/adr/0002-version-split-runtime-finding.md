@@ -40,7 +40,7 @@ picks the nearest micro). `check_runtime`'s sole caller is the pre-3.13 finder;
 
 ## Consequences
 
-- `find-runtime` / `list-pids` / `diagram` / `tui` resolve pre-3.13 runtimes and
+- `find-runtime` / `list-pids` / `tui` resolve pre-3.13 runtimes and
   versions. ~~**ELF/Mach-O symbol visibility is unverified**~~ — **resolved
   2026-07-20** by the live smoke matrix: `_PyRuntime` is exported on all three
   formats, so the blind data-segment scan fallback stays unnecessary. Mach-O took
