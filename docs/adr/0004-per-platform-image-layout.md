@@ -93,7 +93,7 @@ format spec.**
   ahead of it picked the wrong culprit. The cheap diagnostics that settled them —
   `file`/`otool`/`nm`/`codesign` on the image, a mapped-region dump on failure, and
   the per-module symbol-vs-cross-reference breakdown — are retained in the workflow
-  and in `tests/live_smoke.py`.
+  and in `tests/live_smoke.rs`.
 
 ## Verification
 

@@ -42,9 +42,18 @@ fn gen_summary_lines(
 ) -> [String; 3] {
     const LABELS: [&str; 3] = ["Gen 0 (Young)", "Gen 1 (Middle)", "Gen 2 (Oldest)"];
     std::array::from_fn(|g| {
-        let rate = match rate_per_gen[g] { Some(r) => fmt_rate(r), None => "n/a".to_string() };
-        let coll = match avg_coll_time_per_gen[g] { Some(d) => fmt_duration(d), None => "n/a".to_string() };
-        format!("{} - {} entries  (rate = {}, avg coll = {})", LABELS[g], entries_per_gen[g], rate, coll)
+        let rate = match rate_per_gen[g] {
+            Some(r) => fmt_rate(r),
+            None => "n/a".to_string(),
+        };
+        let coll = match avg_coll_time_per_gen[g] {
+            Some(d) => fmt_duration(d),
+            None => "n/a".to_string(),
+        };
+        format!(
+            "{} - {} entries  (rate = {}, avg coll = {})",
+            LABELS[g], entries_per_gen[g], rate, coll
+        )
     })
 }
 
@@ -60,8 +69,12 @@ fn entry_table_header() -> String {
 fn entry_table_row(entry: &GcEntry) -> String {
     format!(
         "  {:<5} {:>4}  {:>12}  {:>12}  {:>10}  {:>11.3}",
-        entry.generation, entry.index, entry.collections, entry.collected,
-        fmt_bytes(entry.heap_size as u64), entry.duration
+        entry.generation,
+        entry.index,
+        entry.collections,
+        entry.collected,
+        fmt_bytes(entry.heap_size as u64),
+        entry.duration
     )
 }
 
@@ -128,7 +141,9 @@ mod tests {
 
     #[test]
     fn ring_index_offsets_point_just_past_each_generations_entries() {
-        use crate::remote_debugging::offsets::offset_table::{compute_ring_base_offsets, GcStatsKind};
+        use crate::remote_debugging::offsets::offset_table::{
+            GcStatsKind, compute_ring_base_offsets,
+        };
 
         // A GIL ring: entries [11, 3, 3], 24-byte items. Build the geometry from the public
         // fields (set_ring is private to the offsets module).
@@ -152,8 +167,16 @@ mod tests {
                 bases[2] as usize + 3 * item,
             ]
         );
-        assert_eq!(offs[0], bases[1] as usize - 8, "gen-0 index is the 8-byte gap before gen 1");
-        assert_eq!(offs[1], bases[2] as usize - 8, "gen-1 index is the 8-byte gap before gen 2");
+        assert_eq!(
+            offs[0],
+            bases[1] as usize - 8,
+            "gen-0 index is the 8-byte gap before gen 1"
+        );
+        assert_eq!(
+            offs[1],
+            bases[2] as usize - 8,
+            "gen-1 index is the 8-byte gap before gen 2"
+        );
 
         // Inline/Legacy is not a ring → no index gaps at all.
         let legacy = legacy_data(true);

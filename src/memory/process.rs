@@ -17,12 +17,7 @@ pub fn get_child_pids(parent: u32) -> Vec<u32> {
     process
         .child_processes()
         .ok()
-        .map(|pairs| {
-            pairs
-                .into_iter()
-                .map(|(child, _)| child as u32)
-                .collect()
-        })
+        .map(|pairs| pairs.into_iter().map(|(child, _)| child as u32).collect())
         .unwrap_or_default()
 }
 
@@ -41,7 +36,11 @@ fn find_section_in_elf(bytes: &[u8], region_start: usize) -> Option<u64> {
                 // (`__attribute__((section("." #name)))`, pycore_debug_offsets.h)
                 // but not on Windows/macOS, so ELF carries `.PyRuntime`. Accept
                 // the undotted spelling too for any toolchain that drops it.
-                if s == ".PyRuntime" || s == "PyRuntime" { Some(true) } else { None }
+                if s == ".PyRuntime" || s == "PyRuntime" {
+                    Some(true)
+                } else {
+                    None
+                }
             })
             .unwrap_or(false)
     })?;
@@ -82,10 +81,8 @@ fn find_section_in_macho(bytes: &[u8], region_start: usize) -> Option<u64> {
                 let sectname = sect.0.name().ok()?;
                 if sectname == "PyRuntime" {
                     let vmaddr = text_vmaddr?;
-                    runtime_addr = Some(
-                        (region_start as u64)
-                            .wrapping_add(sect.0.addr.wrapping_sub(vmaddr)),
-                    );
+                    runtime_addr =
+                        Some((region_start as u64).wrapping_add(sect.0.addr.wrapping_sub(vmaddr)));
                 }
             }
         }
@@ -210,10 +207,7 @@ fn try_find_runtime(pid: u32) -> Result<(u64, String)> {
         }
     }
 
-    anyhow::bail!(
-        "Could not find valid PyRuntime section in process {}",
-        pid
-    );
+    anyhow::bail!("Could not find valid PyRuntime section in process {}", pid);
 }
 
 fn search_pid_and_children(pid: u32, depth: u32) -> Result<(u64, String)> {

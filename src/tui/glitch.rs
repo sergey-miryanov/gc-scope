@@ -201,7 +201,11 @@ pub(super) fn apply_one_glitch(buffer: &mut ratatui::buffer::Buffer, rng: &mut u
 }
 
 // ── Connection-lost sequence ───────────────────────────────────────
-pub(super) fn apply_connection_lost_buildup(buffer: &mut ratatui::buffer::Buffer, rng: &mut u32, progress: f64) {
+pub(super) fn apply_connection_lost_buildup(
+    buffer: &mut ratatui::buffer::Buffer,
+    rng: &mut u32,
+    progress: f64,
+) {
     let w = buffer.area.width as usize;
     let h = buffer.area.height as usize;
     if w < 4 || h < 2 {
@@ -224,8 +228,7 @@ pub(super) fn apply_connection_lost_buildup(buffer: &mut ratatui::buffer::Buffer
                 let y = (h - bh + dy).min(h - 1);
                 let row_base = y * w;
                 for x in bx..bx + bw {
-                    buffer.content[row_base + x]
-                        .set_char(rand_range(rng, 33, 126) as u8 as char);
+                    buffer.content[row_base + x].set_char(rand_range(rng, 33, 126) as u8 as char);
                 }
             }
         }
@@ -322,7 +325,11 @@ mod tests {
             for _ in 0..200 {
                 apply_glitch(&mut buf, &mut rng);
             }
-            assert_eq!(buf.area, Rect::new(0, 0, 80, 24), "glitch must not resize the buffer");
+            assert_eq!(
+                buf.area,
+                Rect::new(0, 0, 80, 24),
+                "glitch must not resize the buffer"
+            );
         }
     }
 
@@ -354,7 +361,10 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 12));
         draw_connection_lost_box(&mut buf, 0, 0);
         let text: String = buf.content.iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("CONNECTION LOST"), "box message must be drawn: {text:?}");
+        assert!(
+            text.contains("CONNECTION LOST"),
+            "box message must be drawn: {text:?}"
+        );
         // Jitter offsets and a clamped-tiny buffer must not write out of bounds.
         draw_connection_lost_box(&mut buf, 1, -1);
         draw_connection_lost_box(&mut Buffer::empty(Rect::new(0, 0, 10, 3)), 0, 0);
@@ -400,7 +410,10 @@ mod tests {
         let enter = t0 + Duration::from_secs(31);
         g.tick(enter, true, &mut rng);
         assert!(g.cl_active && g.cl_phase == 1);
-        assert!(g.should_buildup(true) && !g.should_glitch(true), "CL outranks the plain glitch");
+        assert!(
+            g.should_buildup(true) && !g.should_glitch(true),
+            "CL outranks the plain glitch"
+        );
 
         // Build-up lasts 1s → message phase.
         g.tick(enter + Duration::from_millis(1001), true, &mut rng);
@@ -430,6 +443,9 @@ mod tests {
 
         // A second update inside the 200ms window is throttled out.
         g.update_jitter(j + Duration::from_millis(100), &mut rng);
-        assert_eq!(g.cl_last_jitter, j, "jitter must not update faster than ~5 Hz");
+        assert_eq!(
+            g.cl_last_jitter, j,
+            "jitter must not update faster than ~5 Hz"
+        );
     }
 }

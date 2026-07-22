@@ -9,12 +9,12 @@
 
 mod common;
 
-use common::{pid_alive, python_version, test_python, SpawnedPython};
+use common::{SpawnedPython, pid_alive, python_version, test_python};
 
-use gcscope::snapshot::collect::{self, CollectRequest};
-use gcscope::tui::render_snapshot;
-use gcscope::snapshot::poller::SnapshotPoller;
 use gcscope::remote_debugging::session::PySession;
+use gcscope::snapshot::collect::{self, CollectRequest};
+use gcscope::snapshot::poller::SnapshotPoller;
+use gcscope::tui::render_snapshot;
 
 /// `collect_data` gathers a coherent snapshot from a live interpreter, and
 /// `render_snapshot` turns it into a static TUI frame (the `tui --output` path) without
@@ -36,11 +36,17 @@ fn collect_and_render_snapshot_on_a_live_interpreter() {
 
     assert_eq!(data.pid, pid);
     assert_ne!(data.runtime_addr, 0, "_PyRuntime address must be non-zero");
-    assert_ne!(data.interpreter.addr, 0, "interpreter head address must be non-zero");
+    assert_ne!(
+        data.interpreter.addr, 0,
+        "interpreter head address must be non-zero"
+    );
 
     let out = render_snapshot(&data, 0, true, true, false, false);
 
-    assert!(out.contains(&format!("PID {pid}")), "header must name the PID:\n{out}");
+    assert!(
+        out.contains(&format!("PID {pid}")),
+        "header must name the PID:\n{out}"
+    );
     // The frame stays within its fixed width even on the wider Full-tier panels.
     assert!(
         out.lines().all(|line| line.chars().count() <= 200),
@@ -48,7 +54,10 @@ fn collect_and_render_snapshot_on_a_live_interpreter() {
     );
 
     if python_version(&python).is_some_and(|v| v >= (3, 13)) {
-        assert!(data.offsets().is_some(), "3.13+ must carry _Py_DebugOffsets");
+        assert!(
+            data.offsets().is_some(),
+            "3.13+ must carry _Py_DebugOffsets"
+        );
         assert!(
             out.contains("_Py_DebugOffsets"),
             "the 3.13+ header must name _Py_DebugOffsets:\n{out}"
@@ -85,7 +94,10 @@ fn poller_errors_after_the_target_process_exits() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(!pid_alive(pid), "the interpreter must be gone before the next poll");
+    assert!(
+        !pid_alive(pid),
+        "the interpreter must be gone before the next poll"
+    );
 
     let err = poller
         .poll()
@@ -119,7 +131,10 @@ fn collect_request_skips_only_the_unrequested_layers() {
 
     let lean = collect::collect_data(&session, &CollectRequest::gc_stats_only())
         .expect("a gc_stats_only snapshot");
-    assert!(lean.runtime_raw_bytes.is_empty(), "debug-offsets layer must be skipped");
+    assert!(
+        lean.runtime_raw_bytes.is_empty(),
+        "debug-offsets layer must be skipped"
+    );
     assert!(
         lean.interpreter.gc.raw_bytes.is_empty(),
         "gc sub-struct layer must be skipped"
@@ -129,9 +144,12 @@ fn collect_request_skips_only_the_unrequested_layers() {
         "the requested gc-stats layer must still be decoded"
     );
 
-    let full = collect::collect_data(&session, &CollectRequest::all())
-        .expect("an all-layers snapshot");
-    assert!(!full.runtime_raw_bytes.is_empty(), "3.13+ all must fill the debug-offsets layer");
+    let full =
+        collect::collect_data(&session, &CollectRequest::all()).expect("an all-layers snapshot");
+    assert!(
+        !full.runtime_raw_bytes.is_empty(),
+        "3.13+ all must fill the debug-offsets layer"
+    );
     assert!(
         !full.interpreter.gc.raw_bytes.is_empty(),
         "all must fill the gc sub-struct layer"
@@ -148,7 +166,9 @@ fn collect_request_skips_only_the_unrequested_layers() {
 #[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
 fn tui_frame_renders_the_full_tier_sections_on_a_live_interpreter() {
     let Some(python) = test_python() else {
-        eprintln!("SKIP tui_frame_renders_the_full_tier_sections_on_a_live_interpreter: no Python found");
+        eprintln!(
+            "SKIP tui_frame_renders_the_full_tier_sections_on_a_live_interpreter: no Python found"
+        );
         return;
     };
     let is_3_13_plus = python_version(&python).is_some_and(|v| v >= (3, 13));
@@ -160,10 +180,20 @@ fn tui_frame_renders_the_full_tier_sections_on_a_live_interpreter() {
 
     // Exercise the toggle combinations the loop can drive: full tree+hex, both collapsed,
     // and the runtime-hex view. None may panic and all must produce a non-empty frame.
-    for (tree, hex, rt_hex) in [(true, true, false), (false, false, false), (true, true, true)] {
+    for (tree, hex, rt_hex) in [
+        (true, true, false),
+        (false, false, false),
+        (true, true, true),
+    ] {
         let out = render_snapshot(&data, 0, tree, hex, rt_hex, false);
-        assert!(!out.is_empty(), "frame must have content for ({tree},{hex},{rt_hex})");
-        assert!(out.contains("GC Generation Stats"), "GC section must render:\n{out}");
+        assert!(
+            !out.is_empty(),
+            "frame must have content for ({tree},{hex},{rt_hex})"
+        );
+        assert!(
+            out.contains("GC Generation Stats"),
+            "GC section must render:\n{out}"
+        );
         if is_3_13_plus {
             assert!(
                 out.contains("_Py_DebugOffsets"),
@@ -174,5 +204,8 @@ fn tui_frame_renders_the_full_tier_sections_on_a_live_interpreter() {
 
     // The GC-stats-only buffer view (`g`) renders on the same live snapshot for every tier.
     let gc_view = render_snapshot(&data, 0, true, true, false, true);
-    assert!(gc_view.contains("GC Stats Buffer View"), "buffer view must render:\n{gc_view}");
+    assert!(
+        gc_view.contains("GC Stats Buffer View"),
+        "buffer view must render:\n{gc_view}"
+    );
 }

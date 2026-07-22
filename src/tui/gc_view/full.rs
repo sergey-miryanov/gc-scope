@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use crate::remote_debugging::gc_stats::GcStat;
 use crate::snapshot::collect::CollectedData;
 
-use crate::tui::layout::{gc_two_col, hex_dump_rows, l, top, GC_PL};
+use crate::tui::layout::{GC_PL, gc_two_col, hex_dump_rows, l, top};
 
 use super::{
     entry_field_color, entry_table_header, entry_table_row, field_highlights, format_field_value,
@@ -33,17 +33,25 @@ pub(in crate::tui) fn build_gc_buffer_view(
     let gc = &data.interpreter.gc.generation_stats;
 
     lines.push(Line::from(Span::raw(top())));
-    lines.push(Line::from(Span::raw(l("GC Stats Buffer View  ([g] back to full layout)"))));
+    lines.push(Line::from(Span::raw(l(
+        "GC Stats Buffer View  ([g] back to full layout)",
+    ))));
     lines.push(Line::from(Span::raw(top())));
 
     if gc.stats_addr == 0 || gc.entries.is_empty() {
-        lines.push(Line::from(Span::raw(l("GC Generation Stats: not available"))));
+        lines.push(Line::from(Span::raw(l(
+            "GC Generation Stats: not available",
+        ))));
         lines.push(Line::from(Span::raw(top())));
         return lines;
     }
 
     let offset_table = data.resolved.table().clone();
-    let item_size = if gc.item_size > 0 { gc.item_size } else { gc.raw_stats_bytes.len().min(64) };
+    let item_size = if gc.item_size > 0 {
+        gc.item_size
+    } else {
+        gc.raw_stats_bytes.len().min(64)
+    };
     let entry_fields: &[(&str, usize)] = offset_table.gc_layout.map(|l| l.fields).unwrap_or(&[]);
     let selected = selected_entry.min(gc.entries.len() - 1);
     let sel = &gc.entries[selected];
@@ -98,12 +106,26 @@ pub(in crate::tui) fn build_gc_buffer_view(
     left.push(vec![Span::raw(String::new())]);
     left.push(vec![Span::raw(format!(
         "Entry #{} (gen {}, entry {}) @ {:#x}",
-        selected + 1, sel.generation, sel.index, gc.stats_addr + sel.byte_offset as u64
+        selected + 1,
+        sel.generation,
+        sel.index,
+        gc.stats_addr + sel.byte_offset as u64
     ))]);
-    let name_w = entry_fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(12);
+    let name_w = entry_fields
+        .iter()
+        .map(|(n, _)| n.len())
+        .max()
+        .unwrap_or(0)
+        .max(12);
     for (name, offset, valbits) in entry_view.iter().flat_map(|v| v.iter_fields()) {
         let val_fmt = format_field_value(name, valbits);
-        let content = format!("  {:<name_w$} @ +{:<4}  {}", name, offset, val_fmt, name_w = name_w);
+        let content = format!(
+            "  {:<name_w$} @ +{:<4}  {}",
+            name,
+            offset,
+            val_fmt,
+            name_w = name_w
+        );
         match entry_field_color(name) {
             Some(c) => left.push(vec![Span::styled(
                 format!("{:<pl$}", content, pl = GC_PL),
@@ -130,7 +152,12 @@ pub(in crate::tui) fn build_gc_buffer_view(
     }
 
     // A 16-byte hexdump row is exactly `GC_PR` wide; `gc_two_col` pads the short final row.
-    let right = hex_dump_rows(&gc.raw_stats_bytes, gc.raw_stats_bytes.len(), &highlights, 0);
+    let right = hex_dump_rows(
+        &gc.raw_stats_bytes,
+        gc.raw_stats_bytes.len(),
+        &highlights,
+        0,
+    );
 
     // ── Combine ──
     let max_rows = left.len().max(right.len());
@@ -163,7 +190,7 @@ mod tests {
     /// index highlight can be found positionally in the hexdump.
     fn ring_data() -> CollectedData {
         use crate::remote_debugging::offsets::offset_table::{
-            compute_ring_base_offsets, GcItemLayout, GcStatsKind,
+            GcItemLayout, GcStatsKind, compute_ring_base_offsets,
         };
         static RING_LAYOUT: GcItemLayout = GcItemLayout {
             item_size: 24,
@@ -240,16 +267,28 @@ mod tests {
         let lines = build_gc_buffer_view(&data, [None; 3], [None; 3], 0);
         let out = join_lines(&lines);
         assert!(out.contains("GC Stats Buffer View"), "mode header: {out}");
-        assert!(out.contains("Buffer @ 0x7000"), "buffer address line: {out}");
+        assert!(
+            out.contains("Buffer @ 0x7000"),
+            "buffer address line: {out}"
+        );
         // Left: the entry table row and the selected entry's decoded field list.
         assert!(out.contains("collections"), "field table: {out}");
-        assert!(out.contains("Entry #1 (gen 0, entry 0)"), "selected-entry header: {out}");
+        assert!(
+            out.contains("Entry #1 (gen 0, entry 0)"),
+            "selected-entry header: {out}"
+        );
         // Right: a whole-buffer hexdump — the 72-byte buffer spans past the first entry, so an
         // offset row beyond the first 16 bytes proves it dumps the whole buffer, not one entry.
-        assert!(out.contains("00000010"), "hexdump must cover the whole buffer: {out}");
+        assert!(
+            out.contains("00000010"),
+            "hexdump must cover the whole buffer: {out}"
+        );
         // No line overflows the fixed frame width.
         let border = format!("+{}+", "-".repeat(OUTER_W));
-        assert!(out.lines().any(|l| l == border), "a full-width border must appear");
+        assert!(
+            out.lines().any(|l| l == border),
+            "a full-width border must appear"
+        );
         assert!(
             out.lines().all(|l| l.chars().count() <= OUTER_W + 2),
             "a line exceeded the frame width: {out}"
@@ -259,7 +298,12 @@ mod tests {
     #[test]
     fn build_gc_buffer_view_reports_absent_stats_and_never_panics_on_an_empty_buffer() {
         // No entries → the not-available short-circuit.
-        let out = join_lines(&build_gc_buffer_view(&legacy_data(false), [None; 3], [None; 3], 0));
+        let out = join_lines(&build_gc_buffer_view(
+            &legacy_data(false),
+            [None; 3],
+            [None; 3],
+            0,
+        ));
         assert!(out.contains("GC Generation Stats: not available"), "{out}");
         // Entries but an empty raw buffer with a past-the-end offset must clamp, not panic.
         let mut data = legacy_data(true);
@@ -285,34 +329,61 @@ mod tests {
 
         // The per-generation summary header renders (entry counts + rate/avg, "n/a" where absent).
         let text = join_lines(&lines);
-        assert!(text.contains("Gen 0 (Young) - 11 entries  (rate = 15.0/s, avg coll = n/a)"), "summary: {text}");
-        assert!(text.contains("Gen 2 (Oldest) - 3 entries"), "gen-2 summary: {text}");
+        assert!(
+            text.contains("Gen 0 (Young) - 11 entries  (rate = 15.0/s, avg coll = n/a)"),
+            "summary: {text}"
+        );
+        assert!(
+            text.contains("Gen 2 (Oldest) - 3 entries"),
+            "gen-2 summary: {text}"
+        );
 
         // The legend appears (ring builds only) with a Red swatch.
-        assert!(text.contains("per-generation ring index"), "legend text missing");
         assert!(
-            lines.iter().flat_map(|l| &l.spans)
+            text.contains("per-generation ring index"),
+            "legend text missing"
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| &l.spans)
                 .any(|s| s.style.bg == Some(Color::Red) && s.content.trim() == "ring"),
             "legend must carry a Red swatch"
         );
 
         // The one index byte of each generation (0x5A) is Red in the hexdump — exactly three,
         // one per generation, and the only 0x5A bytes in the otherwise-zero buffer.
-        assert_eq!(red_bytes(&lines, "5a"), 3, "all three ring index bytes must be highlighted");
+        assert_eq!(
+            red_bytes(&lines, "5a"),
+            3,
+            "all three ring index bytes must be highlighted"
+        );
 
         // Selected-entry decoration still works alongside the index anchors: its `collections`
         // field keeps Green and its whole-entry range keeps the DarkGray shade.
         let spans = || lines.iter().flat_map(|l| &l.spans);
-        assert!(spans().any(|s| s.style.bg == Some(Color::Green)), "field colours must survive");
-        assert!(spans().any(|s| s.style.bg == Some(Color::DarkGray)), "selected-entry shade must survive");
+        assert!(
+            spans().any(|s| s.style.bg == Some(Color::Green)),
+            "field colours must survive"
+        );
+        assert!(
+            spans().any(|s| s.style.bg == Some(Color::DarkGray)),
+            "selected-entry shade must survive"
+        );
     }
 
     #[test]
     fn build_gc_buffer_view_on_an_inline_build_has_no_index_highlight_or_legend() {
         let lines = build_gc_buffer_view(&legacy_data(true), [None; 3], [None; 3], 0);
-        assert!(!join_lines(&lines).contains("ring index"), "inline/legacy must show no legend");
         assert!(
-            !lines.iter().flat_map(|l| &l.spans).any(|s| s.style.bg == Some(Color::Red)),
+            !join_lines(&lines).contains("ring index"),
+            "inline/legacy must show no legend"
+        );
+        assert!(
+            !lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.bg == Some(Color::Red)),
             "inline/legacy has no ring index to highlight"
         );
     }

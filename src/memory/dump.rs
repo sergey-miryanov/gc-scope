@@ -79,10 +79,7 @@ mod tests {
     #[test]
     fn pads_a_short_row_and_emits_no_second_group() {
         let out = format_hex_dump(b"\xde\xad\xbe\xef", 0);
-        assert_eq!(
-            out,
-            "0x0000000000000000  de ad be ef              ....\n"
-        );
+        assert_eq!(out, "0x0000000000000000  de ad be ef              ....\n");
         assert_eq!(out.lines().count(), 1);
     }
 

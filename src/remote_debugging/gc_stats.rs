@@ -29,7 +29,13 @@ impl GcStat {
         bytes: Vec<u8>,
         layout: &'static GcItemLayout,
     ) -> Self {
-        Self { generation, index, interpreter_id, bytes, layout }
+        Self {
+            generation,
+            index,
+            interpreter_id,
+            bytes,
+            layout,
+        }
     }
 
     /// Wrap a borrowed entry-byte window (copies it). For consumers that already hold the raw
@@ -47,18 +53,22 @@ impl GcStat {
     /// The 8 little-endian bytes at `off` as a `u64`, or `None` if the entry is too short (a
     /// plausible teardown race — never panics, unlike a raw slice+`unwrap`).
     fn raw_at(&self, off: usize) -> Option<u64> {
-        self.bytes.get(off..off + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        self.bytes
+            .get(off..off + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
     }
 
     /// The `i64` value of `name`, or `None` if this build's layout lacks the field (or the
     /// entry is short). `None` — not `Some(0)` — is what marks a field genuinely absent.
     pub fn get(&self, name: &str) -> Option<i64> {
-        self.raw_at(self.layout.field_offset(name)?).map(|v| v as i64)
+        self.raw_at(self.layout.field_offset(name)?)
+            .map(|v| v as i64)
     }
 
     /// The `f64` value of `name` (e.g. `duration`), reinterpreting the raw bits.
     pub fn get_f64(&self, name: &str) -> Option<f64> {
-        self.raw_at(self.layout.field_offset(name)?).map(f64::from_bits)
+        self.raw_at(self.layout.field_offset(name)?)
+            .map(f64::from_bits)
     }
 
     /// Whether this build's layout defines `name`.
@@ -77,14 +87,30 @@ impl GcStat {
     }
 
     // Typed convenience for the always-present core fields (dedup, summaries, exporter core).
-    pub fn ts_start(&self) -> i64 { self.get("ts_start").unwrap_or(0) }
-    pub fn ts_stop(&self) -> i64 { self.get("ts_stop").unwrap_or(0) }
-    pub fn collections(&self) -> i64 { self.get("collections").unwrap_or(0) }
-    pub fn collected(&self) -> i64 { self.get("collected").unwrap_or(0) }
-    pub fn uncollectable(&self) -> i64 { self.get("uncollectable").unwrap_or(0) }
-    pub fn candidates(&self) -> i64 { self.get("candidates").unwrap_or(0) }
-    pub fn duration(&self) -> f64 { self.get_f64("duration").unwrap_or(0.0) }
-    pub fn heap_size(&self) -> i64 { self.get("heap_size").unwrap_or(0) }
+    pub fn ts_start(&self) -> i64 {
+        self.get("ts_start").unwrap_or(0)
+    }
+    pub fn ts_stop(&self) -> i64 {
+        self.get("ts_stop").unwrap_or(0)
+    }
+    pub fn collections(&self) -> i64 {
+        self.get("collections").unwrap_or(0)
+    }
+    pub fn collected(&self) -> i64 {
+        self.get("collected").unwrap_or(0)
+    }
+    pub fn uncollectable(&self) -> i64 {
+        self.get("uncollectable").unwrap_or(0)
+    }
+    pub fn candidates(&self) -> i64 {
+        self.get("candidates").unwrap_or(0)
+    }
+    pub fn duration(&self) -> f64 {
+        self.get_f64("duration").unwrap_or(0.0)
+    }
+    pub fn heap_size(&self) -> i64 {
+        self.get("heap_size").unwrap_or(0)
+    }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -124,18 +150,34 @@ fn format_header(has_extended: bool) -> String {
     if has_extended {
         format!(
             "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
-            "generation", "Entry", "IntID",
-            "Collections", "Collected", "Uncollect.", "Candidates",
-            "HeapSize", "Duration",
-            "IncrSize", "AliveSize", "Finalized", "ClearWKRef",
-            "DeletedGC", "MarkAlive"
+            "generation",
+            "Entry",
+            "IntID",
+            "Collections",
+            "Collected",
+            "Uncollect.",
+            "Candidates",
+            "HeapSize",
+            "Duration",
+            "IncrSize",
+            "AliveSize",
+            "Finalized",
+            "ClearWKRef",
+            "DeletedGC",
+            "MarkAlive"
         )
     } else {
         format!(
             "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10}",
-            "generation", "Entry", "IntID",
-            "Collections", "Collected", "Uncollect.", "Candidates",
-            "HeapSize", "Duration"
+            "generation",
+            "Entry",
+            "IntID",
+            "Collections",
+            "Collected",
+            "Uncollect.",
+            "Candidates",
+            "HeapSize",
+            "Duration"
         )
     }
 }
@@ -148,9 +190,15 @@ fn format_row(s: &GcStat, has_extended: bool) -> String {
     if has_extended {
         format!(
             "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10.6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}",
-            s.generation, s.index, s.interpreter_id,
-            s.collections(), s.collected(), s.uncollectable(),
-            s.candidates(), s.heap_size(), s.duration(),
+            s.generation,
+            s.index,
+            s.interpreter_id,
+            s.collections(),
+            s.collected(),
+            s.uncollectable(),
+            s.candidates(),
+            s.heap_size(),
+            s.duration(),
             s.get("increment_size").unwrap_or(0),
             s.get("alive_size").unwrap_or(0),
             s.get("finalized_garbage_count").unwrap_or(0),
@@ -161,9 +209,15 @@ fn format_row(s: &GcStat, has_extended: bool) -> String {
     } else {
         format!(
             "{:>3} {:>4} {:>6} {:>14} {:>14} {:>14} {:>14} {:>14} {:>10.6}",
-            s.generation, s.index, s.interpreter_id,
-            s.collections(), s.collected(), s.uncollectable(),
-            s.candidates(), s.heap_size(), s.duration(),
+            s.generation,
+            s.index,
+            s.interpreter_id,
+            s.collections(),
+            s.collected(),
+            s.uncollectable(),
+            s.candidates(),
+            s.heap_size(),
+            s.duration(),
         )
     }
 }
@@ -248,8 +302,14 @@ mod tests {
         let ext = GcStat::from_fields(0, 0, 1, *EXTENDED, &[("increment_size", 1)]);
 
         assert!(!has_extended(&[]), "empty slice is not extended");
-        assert!(!has_extended(std::slice::from_ref(&core)), "core-only is not extended");
-        assert!(has_extended(std::slice::from_ref(&ext)), "an extended entry is extended");
+        assert!(
+            !has_extended(std::slice::from_ref(&core)),
+            "core-only is not extended"
+        );
+        assert!(
+            has_extended(std::slice::from_ref(&ext)),
+            "an extended entry is extended"
+        );
         // A mixed slice is extended as soon as one entry has the field.
         let core2 = GcStat::from_fields(0, 0, 1, *REGULAR, &[("collections", 2)]);
         let ext2 = GcStat::from_fields(0, 0, 1, *EXTENDED, &[("increment_size", 2)]);
@@ -412,7 +472,7 @@ mod tests {
             cols,
             [
                 "0", "1", "2", // generation, entry, interpreter_id
-                "7", "8", "9", "10", "11", // collections..heap_size
+                "7", "8", "9", "10", "11",       // collections..heap_size
                 "0.000000", // duration (from_fields can't set an f64; stays 0.0)
                 "100", "200", "3", "4", "5", "999", // the six +inc columns, in order
             ]
@@ -429,14 +489,24 @@ mod tests {
         // Extended enough to take the wide path (`increment_size` present) but WITHOUT the
         // other `+inc` fields, so their `get(...)` returns None and must fall back to 0.
         let layout = seq_layout(&["collections", "increment_size"]);
-        let s = GcStat::from_fields(0, 0, 0, layout, &[("collections", 1), ("increment_size", 42)]);
+        let s = GcStat::from_fields(
+            0,
+            0,
+            0,
+            layout,
+            &[("collections", 1), ("increment_size", 42)],
+        );
 
         let row = format_row(&s, true);
         let cols: Vec<&str> = row.split_whitespace().collect();
         assert_eq!(cols.len(), format_header(true).split_whitespace().count());
         // increment_size prints its value; the fields the layout lacks print 0, not garbage.
         assert_eq!(cols[9], "42"); // increment_size
-        assert_eq!(&cols[10..], ["0", "0", "0", "0", "0"], "absent +inc fields fall back to 0");
+        assert_eq!(
+            &cols[10..],
+            ["0", "0", "0", "0", "0"],
+            "absent +inc fields fall back to 0"
+        );
     }
 
     /// The core (non-extended) row is the 9-column subset — no `+inc` columns — matching the

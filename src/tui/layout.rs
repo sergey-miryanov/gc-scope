@@ -6,7 +6,9 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::snapshot::collect::{avg_collection_time_per_gen, collections_rate_from_entries, CollectedData};
+use crate::snapshot::collect::{
+    CollectedData, avg_collection_time_per_gen, collections_rate_from_entries,
+};
 
 use super::gc_view::{build_gc_buffer_view, section_gc_stats};
 use super::sections::{section_debug_offsets, section_interpreter, section_interpreter_legacy};
@@ -15,7 +17,7 @@ use super::sections::{section_debug_offsets, section_interpreter, section_interp
 pub(super) const OUTER_W: usize = 158;
 pub(super) const PL: usize = 65;
 pub(super) const PR: usize = 90;
-pub(super) const INNER_W: usize = PL - 4;      // 61
+pub(super) const INNER_W: usize = PL - 4; // 61
 pub(super) const INNER_TW: usize = INNER_W - 2; // 59
 
 // The GC-stats buffer view splits the same 160-col frame differently from the full view: a
@@ -28,7 +30,15 @@ pub(super) const GC_PL: usize = OUTER_W + 2 - GC_PR - 5; // 77 (frame 160 minus 
 // Seven heterogeneous scalars, all read off the render loop's local state at the single
 // call site below. Poll rate and poll time live in the header title instead, so they don't
 // appear here twice.
-pub(super) fn status_bar(scroll: u16, max_scroll: u16, entry: usize, entry_count: usize, glitch_active: bool, cl_active: bool, glitch_enabled: bool) -> Paragraph<'static> {
+pub(super) fn status_bar(
+    scroll: u16,
+    max_scroll: u16,
+    entry: usize,
+    entry_count: usize,
+    glitch_active: bool,
+    cl_active: bool,
+    glitch_enabled: bool,
+) -> Paragraph<'static> {
     let style = Style::new().bg(Color::Blue).fg(Color::White);
     // u32 math on purpose: `scroll` is a u16 and `scroll * 100` overflows it once the
     // scrollback passes 655 rows — a debug-build panic in a view that can easily be
@@ -43,14 +53,30 @@ pub(super) fn status_bar(scroll: u16, max_scroll: u16, entry: usize, entry_count
         " no entries ".to_string()
     };
     let badge = if cl_active {
-        Span::styled(" [CL] ", style.bg(Color::Red).fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD))
+        Span::styled(
+            " [CL] ",
+            style
+                .bg(Color::Red)
+                .fg(Color::White)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )
     } else if glitch_active {
-        Span::styled(" [FX] ", style.bg(Color::Red).fg(Color::White).add_modifier(ratatui::style::Modifier::BOLD))
+        Span::styled(
+            " [FX] ",
+            style
+                .bg(Color::Red)
+                .fg(Color::White)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )
     } else {
         Span::raw("")
     };
     let glitch_label = if glitch_enabled { "on" } else { "off" };
-    let glitch_style = if glitch_enabled { style } else { style.bg(Color::DarkGray) };
+    let glitch_style = if glitch_enabled {
+        style
+    } else {
+        style.bg(Color::DarkGray)
+    };
     let text = Line::from(vec![
         Span::styled(" [q] quit ", style.bg(Color::DarkGray)),
         Span::styled(" [s] save ", style),
@@ -68,14 +94,28 @@ pub(super) fn status_bar(scroll: u16, max_scroll: u16, entry: usize, entry_count
 }
 
 // ── Main line builder ─────────────────────────────────────────────
-pub(super) fn build_lines(data: &CollectedData, rate_per_gen: [Option<f64>; 3], avg_coll_time_per_gen: [Option<f64>; 3], selected_entry: usize, debug_offsets_show_tree: bool, debug_offsets_show_hex: bool, show_runtime_hex: bool) -> (Vec<Line<'static>>, usize) {
+pub(super) fn build_lines(
+    data: &CollectedData,
+    rate_per_gen: [Option<f64>; 3],
+    avg_coll_time_per_gen: [Option<f64>; 3],
+    selected_entry: usize,
+    debug_offsets_show_tree: bool,
+    debug_offsets_show_hex: bool,
+    show_runtime_hex: bool,
+) -> (Vec<Line<'static>>, usize) {
     let mut lines = Vec::new();
     // Sections 1–2 render the `_Py_DebugOffsets` struct — 3.13+ only. Pre-3.13 skips
     // section 1 entirely and shows a focused interpreter header (section 2), then the
     // GC generation-stats table.
     let (s1, s2) = match data.offsets() {
         Some(off) => (
-            section_debug_offsets(data, off, debug_offsets_show_tree, debug_offsets_show_hex, show_runtime_hex),
+            section_debug_offsets(
+                data,
+                off,
+                debug_offsets_show_tree,
+                debug_offsets_show_hex,
+                show_runtime_hex,
+            ),
             section_interpreter(data, off),
         ),
         None => (Vec::new(), section_interpreter_legacy(data)),
@@ -84,10 +124,20 @@ pub(super) fn build_lines(data: &CollectedData, rate_per_gen: [Option<f64>; 3], 
     let s2_len = s2.len();
     lines.extend(s1);
     // Blank separator after section 1 only when it was rendered (3.13+).
-    let sep1 = if s1_len > 0 { lines.push(Line::from("")); 1 } else { 0 };
+    let sep1 = if s1_len > 0 {
+        lines.push(Line::from(""));
+        1
+    } else {
+        0
+    };
     lines.extend(s2);
     lines.push(Line::from(""));
-    lines.extend(section_gc_stats(data, rate_per_gen, avg_coll_time_per_gen, selected_entry));
+    lines.extend(section_gc_stats(
+        data,
+        rate_per_gen,
+        avg_coll_time_per_gen,
+        selected_entry,
+    ));
     // Entry row in section_gc_stats starts at index 3 (top/buffer/top) + 7 header lines in the interleave
     let entry_line_idx = s1_len + sep1 + s2_len + 1 + 3 + 7 + selected_entry;
     (lines, entry_line_idx)
@@ -109,7 +159,10 @@ pub(super) fn l(content: &str) -> String {
 pub(super) fn plain_line(left: &str, right: &str) -> Line<'static> {
     Line::from(Span::raw(format!(
         "|{:<pl$} | {:<pr$}|",
-        left, right, pl = PL, pr = PR
+        left,
+        right,
+        pl = PL,
+        pr = PR
     )))
 }
 
@@ -124,7 +177,10 @@ pub(super) fn full_line(left: &str, right_spans: Vec<Span<'static>>) -> Line<'st
     Line::from(spans)
 }
 
-pub(super) fn span_line(left_spans: Vec<Span<'static>>, right_spans: Vec<Span<'static>>) -> Line<'static> {
+pub(super) fn span_line(
+    left_spans: Vec<Span<'static>>,
+    right_spans: Vec<Span<'static>>,
+) -> Line<'static> {
     let mut spans = vec![Span::raw("|")];
     let lw: usize = left_spans.iter().map(|s| s.content.len()).sum();
     spans.extend(left_spans);
@@ -199,13 +255,11 @@ pub(super) fn hex_dump_rows(
         spans.push(Span::raw(format!("  {:08x}  ", base)));
         for (i, &b) in chunk.iter().enumerate() {
             let global_off = base + i;
-            let hl = highlights.iter().find(|&&(off, len, _)| {
-                global_off >= off && global_off < off + len as usize
-            });
+            let hl = highlights
+                .iter()
+                .find(|&&(off, len, _)| global_off >= off && global_off < off + len as usize);
             let hl_color = hl.map(|&(_, _, c)| c);
-            let next_in_same = hl.is_some_and(|&(off, len, _)| {
-                global_off + 1 < off + len as usize
-            });
+            let next_in_same = hl.is_some_and(|&(off, len, _)| global_off + 1 < off + len as usize);
 
             // Emit the two hex digits
             if let Some(c) = hl_color {
@@ -238,7 +292,13 @@ pub(super) fn hex_dump_rows(
         }
         let ascii: String = chunk
             .iter()
-            .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+            .map(|&b| {
+                if b.is_ascii_graphic() || b == b' ' {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         spans.push(Span::raw(format!(" |{}", ascii)));
         rows.push(spans);
@@ -251,7 +311,13 @@ pub(super) fn hex_dump_rows(
 /// mid-row gap `i == 7`, else 1). A full 16-byte row is 48 chars wide.
 pub(super) fn hex_col_emitted(n: usize) -> usize {
     (0..n)
-        .map(|i| 2 + if i < 15 { if i == 7 { 2 } else { 1 } } else { 0 })
+        .map(|i| {
+            2 + if i < 15 {
+                if i == 7 { 2 } else { 1 }
+            } else {
+                0
+            }
+        })
         .sum()
 }
 
@@ -278,7 +344,16 @@ pub fn render_snapshot(
     let lines = if gc_only {
         build_gc_buffer_view(data, rate, avg, selected_entry)
     } else {
-        build_lines(data, rate, avg, selected_entry, show_tree, show_hex, show_runtime_hex).0
+        build_lines(
+            data,
+            rate,
+            avg,
+            selected_entry,
+            show_tree,
+            show_hex,
+            show_runtime_hex,
+        )
+        .0
     };
     let mut out = format!(
         "gcscope tui — PID {} — Python 0x{:08x}\n",
@@ -353,7 +428,10 @@ mod tests {
         let (lines, _entry_idx) = build_lines(&data, [None; 3], [None; 3], 0, true, true, false);
         let out = join_lines(&lines);
         // Pre-3.13 → no _Py_DebugOffsets section, straight to the legacy header + GC table.
-        assert!(!out.contains("_Py_DebugOffsets (embedded"), "legacy must skip section 1: {out}");
+        assert!(
+            !out.contains("_Py_DebugOffsets (embedded"),
+            "legacy must skip section 1: {out}"
+        );
         assert!(out.contains("pre-3.13: no _Py_DebugOffsets"), "{out}");
         assert!(out.contains("Gen 0 (Young) - 1 entries"), "{out}");
     }
@@ -374,7 +452,10 @@ mod tests {
         assert!(out.contains("Gen 0 (Young) - 1 entries"), "{out}");
         // A full-width border appears and no line overflows the frame (header aside).
         let border = format!("+{}+", "-".repeat(OUTER_W));
-        assert!(out.lines().any(|line| line == border), "a full-width border must appear");
+        assert!(
+            out.lines().any(|line| line == border),
+            "a full-width border must appear"
+        );
         assert!(
             out.lines().all(|line| line.chars().count() <= OUTER_W + 2),
             "a line exceeded the frame width"
@@ -395,8 +476,16 @@ mod tests {
         glitch_enabled: bool,
     ) -> String {
         let mut buf = Buffer::empty(Rect::new(0, 0, 220, 1));
-        status_bar(scroll, max_scroll, entry, entry_count, glitch_active, cl_active, glitch_enabled)
-            .render(buf.area, &mut buf);
+        status_bar(
+            scroll,
+            max_scroll,
+            entry,
+            entry_count,
+            glitch_active,
+            cl_active,
+            glitch_enabled,
+        )
+        .render(buf.area, &mut buf);
         buf.content.iter().map(|c| c.symbol()).collect()
     }
 

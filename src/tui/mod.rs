@@ -1,5 +1,5 @@
-pub mod frame;
 mod format;
+pub mod frame;
 mod gc_view;
 mod glitch;
 mod layout;
@@ -17,7 +17,12 @@ use crate::snapshot::poller::SnapshotPoller;
 
 pub use layout::render_snapshot;
 
-pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitch: bool) -> Result<()> {
+pub fn run_tui(
+    pid: Option<u32>,
+    rate_ms: u64,
+    duration_secs: Option<u64>,
+    glitch: bool,
+) -> Result<()> {
     frame::run_tui(pid, rate_ms, duration_secs, glitch)
 }
 

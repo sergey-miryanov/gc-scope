@@ -123,7 +123,8 @@ where
         for &current_pid in &alive_pids.clone() {
             let status = ctx.poll(current_pid);
 
-            let policy = pid_policies.entry(current_pid)
+            let policy = pid_policies
+                .entry(current_pid)
                 .or_insert_with(&mut wait_policy_factory);
 
             if policy.wait(status) {
@@ -155,7 +156,10 @@ where
     if alive_pids.is_empty() {
         eprintln!("All processes have exited.");
     } else {
-        eprintln!("Monitoring stopped. {} process(es) still alive.", alive_pids.len());
+        eprintln!(
+            "Monitoring stopped. {} process(es) still alive.",
+            alive_pids.len()
+        );
     }
 
     Ok(())
@@ -177,11 +181,17 @@ mod tests {
         // A generous window: before any successful read, an invalid process is retried
         // rather than dropped (it may just not be ready yet).
         let mut p = StartupTimeoutPolicy::new(Duration::from_secs(3600));
-        assert!(p.wait(PollStatus::InvalidProcess), "retry while inside the startup window");
+        assert!(
+            p.wait(PollStatus::InvalidProcess),
+            "retry while inside the startup window"
+        );
         // The first Ok marks the process alive and keeps polling.
         assert!(p.wait(PollStatus::Ok));
         // After a success, an invalid process gives up at once — no more grace period.
-        assert!(!p.wait(PollStatus::InvalidProcess), "post-startup failure stops immediately");
+        assert!(
+            !p.wait(PollStatus::InvalidProcess),
+            "post-startup failure stops immediately"
+        );
     }
 
     #[test]

@@ -70,7 +70,15 @@ pub fn list_python_processes() -> Result<(Vec<ProcessInfo>, PidInfoMap)> {
             .map(|s| s.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
-        result.push(ProcessInfo { pid, ppid, name: name_orig, cmdline, version: None, runtime_found: false, supports_stats: false });
+        result.push(ProcessInfo {
+            pid,
+            ppid,
+            name: name_orig,
+            cmdline,
+            version: None,
+            runtime_found: false,
+            supports_stats: false,
+        });
     }
     result.sort_by_key(|p| p.pid);
 
@@ -104,46 +112,58 @@ pub fn print_process_table(processes: &[ProcessInfo], no_cmdline: bool) {
         return;
     }
     if no_cmdline {
-        println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25}", "PID", "PPID", "Name", "R", "S", "Version");
+        println!(
+            "{:<8} {:<6} {:<18} {:<4} {:<4} {:<25}",
+            "PID", "PPID", "Name", "R", "S", "Version"
+        );
         println!("{}", "-".repeat(65));
         for p in processes {
             let ver = p.version.as_deref().unwrap_or("-");
             let rnt = if p.runtime_found { "Y" } else { "N" };
             let off = if p.supports_stats { "Y" } else { "N" };
-            println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25}", p.pid, p.ppid, p.name, rnt, off, ver);
+            println!(
+                "{:<8} {:<6} {:<18} {:<4} {:<4} {:<25}",
+                p.pid, p.ppid, p.name, rnt, off, ver
+            );
         }
     } else {
-        println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25} Command Line", "PID", "PPID", "Name", "R", "S", "Version");
+        println!(
+            "{:<8} {:<6} {:<18} {:<4} {:<4} {:<25} Command Line",
+            "PID", "PPID", "Name", "R", "S", "Version"
+        );
         println!("{}", "-".repeat(128));
         for p in processes {
             let ver = p.version.as_deref().unwrap_or("-");
             let rnt = if p.runtime_found { "Y" } else { "N" };
             let off = if p.supports_stats { "Y" } else { "N" };
-            println!("{:<8} {:<6} {:<18} {:<4} {:<4} {:<25} {}", p.pid, p.ppid, p.name, rnt, off, ver, p.cmdline);
+            println!(
+                "{:<8} {:<6} {:<18} {:<4} {:<4} {:<25} {}",
+                p.pid, p.ppid, p.name, rnt, off, ver, p.cmdline
+            );
         }
     }
 }
 
 // ── Tree builder ──────────────────────────────────────────────────
 
-pub fn build_flat_rows(
-    processes: &[ProcessInfo],
-    pid_info_map: &PidInfoMap,
-) -> Vec<FlatRow> {
+pub fn build_flat_rows(processes: &[ProcessInfo], pid_info_map: &PidInfoMap) -> Vec<FlatRow> {
     let python_pids: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
 
     let mut entries: HashMap<u32, ProcessEntry> = HashMap::new();
     for p in processes {
-        entries.insert(p.pid, ProcessEntry {
-            pid: p.pid,
-            ppid: p.ppid,
-            name: p.name.clone(),
-            cmdline: p.cmdline.clone(),
-            is_python: true,
-            version: p.version.clone(),
-            runtime_found: p.runtime_found,
-            supports_stats: p.supports_stats,
-        });
+        entries.insert(
+            p.pid,
+            ProcessEntry {
+                pid: p.pid,
+                ppid: p.ppid,
+                name: p.name.clone(),
+                cmdline: p.cmdline.clone(),
+                is_python: true,
+                version: p.version.clone(),
+                runtime_found: p.runtime_found,
+                supports_stats: p.supports_stats,
+            },
+        );
     }
 
     // Walk up the Python parent chain, then create a context entry
@@ -157,19 +177,23 @@ pub fn build_flat_rows(
                 break;
             }
         }
-        if current_ppid > 4 && !entries.contains_key(&current_ppid)
+        if current_ppid > 4
+            && !entries.contains_key(&current_ppid)
             && let Some((name, ppid)) = pid_info_map.get(&current_ppid)
         {
-            entries.insert(current_ppid, ProcessEntry {
-                pid: current_ppid,
-                ppid: *ppid,
-                name: name.clone(),
-                cmdline: String::new(),
-                is_python: false,
-                version: None,
-                runtime_found: false,
-                supports_stats: false,
-            });
+            entries.insert(
+                current_ppid,
+                ProcessEntry {
+                    pid: current_ppid,
+                    ppid: *ppid,
+                    name: name.clone(),
+                    cmdline: String::new(),
+                    is_python: false,
+                    version: None,
+                    runtime_found: false,
+                    supports_stats: false,
+                },
+            );
         }
     }
 
@@ -194,7 +218,14 @@ pub fn build_flat_rows(
     // Flatten recursively
     let mut flat_rows = Vec::new();
     for (i, &root_pid) in roots.iter().enumerate() {
-        flatten_node(root_pid, &entries, &children_by_ppid, &[], i == roots.len() - 1, &mut flat_rows);
+        flatten_node(
+            root_pid,
+            &entries,
+            &children_by_ppid,
+            &[],
+            i == roots.len() - 1,
+            &mut flat_rows,
+        );
     }
 
     flat_rows
@@ -212,8 +243,11 @@ fn flatten_node(
 
     let mut prefix = String::new();
     for &is_last in ancestor_is_last {
-        if is_last { prefix.push_str("    "); }
-        else { prefix.push_str("|   "); }
+        if is_last {
+            prefix.push_str("    ");
+        } else {
+            prefix.push_str("|   ");
+        }
     }
     prefix.push_str("+-- ");
 
@@ -232,7 +266,14 @@ fn flatten_node(
         for (i, &child_pid) in children.iter().enumerate() {
             let mut child_ancestor = ancestor_is_last.to_vec();
             child_ancestor.push(node_is_last);
-            flatten_node(child_pid, entries, children_by_ppid, &child_ancestor, i == children.len() - 1, flat_rows);
+            flatten_node(
+                child_pid,
+                entries,
+                children_by_ppid,
+                &child_ancestor,
+                i == children.len() - 1,
+                flat_rows,
+            );
         }
     }
 }
@@ -249,15 +290,28 @@ fn write_row(no_cmdline: bool, row: &FlatRow) {
     };
     let indent = "  ".repeat(prefix_depth(&row.prefix));
     let full_name = format!("{}{}", indent, display_name);
-    let r_char = if row.is_python && row.runtime_found { "Y" } else if row.is_python { "N" } else { "-" };
-    let s_char = if row.is_python && row.supports_stats { "Y" } else if row.is_python { "N" } else { "-" };
+    let r_char = if row.is_python && row.runtime_found {
+        "Y"
+    } else if row.is_python {
+        "N"
+    } else {
+        "-"
+    };
+    let s_char = if row.is_python && row.supports_stats {
+        "Y"
+    } else if row.is_python {
+        "N"
+    } else {
+        "-"
+    };
 
     if no_cmdline {
-        println!("{:>8}  {}  {}  {:<22}",
-            row.pid, r_char, s_char, full_name);
+        println!("{:>8}  {}  {}  {:<22}", row.pid, r_char, s_char, full_name);
     } else {
-        println!("{:>8}  {}  {}  {:<22}    {}",
-            row.pid, r_char, s_char, full_name, row.cmdline);
+        println!(
+            "{:>8}  {}  {}  {:<22}    {}",
+            row.pid, r_char, s_char, full_name, row.cmdline
+        );
     }
 }
 

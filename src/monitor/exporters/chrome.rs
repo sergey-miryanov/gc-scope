@@ -17,41 +17,77 @@ fn write_event(f: &mut File, first: &mut bool, json: &str) -> std::io::Result<()
 }
 
 fn write_process_meta(f: &mut File, first: &mut bool, pid: u32) -> std::io::Result<()> {
-    write_event(f, first, &format!(
-        r#"{{"ph":"M","pid":{},"name":"process_name","args":{{"name":"python {}"}}}}"#,
-        pid, pid
-    ))
+    write_event(
+        f,
+        first,
+        &format!(
+            r#"{{"ph":"M","pid":{},"name":"process_name","args":{{"name":"python {}"}}}}"#,
+            pid, pid
+        ),
+    )
 }
 
 fn write_thread_meta(f: &mut File, first: &mut bool, pid: u32, tid: i64) -> std::io::Result<()> {
-    write_event(f, first, &format!(
-        r#"{{"ph":"M","pid":{},"tid":{},"name":"thread_name","args":{{"name":"{}:{}"}}}}"#,
-        pid, tid, pid, tid
-    ))
+    write_event(
+        f,
+        first,
+        &format!(
+            r#"{{"ph":"M","pid":{},"tid":{},"name":"thread_name","args":{{"name":"{}:{}"}}}}"#,
+            pid, tid, pid, tid
+        ),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn write_begin(
-    f: &mut File, first: &mut bool, pid: u32, tid: i64, ts: i64,
-    name: &str, cat: &str, args_json: &str,
+    f: &mut File,
+    first: &mut bool,
+    pid: u32,
+    tid: i64,
+    ts: i64,
+    name: &str,
+    cat: &str,
+    args_json: &str,
 ) -> std::io::Result<()> {
-    write_event(f, first, &format!(
-        r#"{{"ph":"B","pid":{},"tid":{},"ts":{},"name":"{}","cat":"{}","args":{{{}}}}}"#,
-        pid, tid, ts, name, cat, args_json
-    ))
+    write_event(
+        f,
+        first,
+        &format!(
+            r#"{{"ph":"B","pid":{},"tid":{},"ts":{},"name":"{}","cat":"{}","args":{{{}}}}}"#,
+            pid, tid, ts, name, cat, args_json
+        ),
+    )
 }
 
-fn write_end(f: &mut File, first: &mut bool, pid: u32, tid: i64, ts: i64, name: &str, cat: &str) -> std::io::Result<()> {
-    write_event(f, first, &format!(
-        r#"{{"ph":"E","pid":{},"tid":{},"ts":{},"name":"{}","cat":"{}"}}"#,
-        pid, tid, ts, name, cat
-    ))
+fn write_end(
+    f: &mut File,
+    first: &mut bool,
+    pid: u32,
+    tid: i64,
+    ts: i64,
+    name: &str,
+    cat: &str,
+) -> std::io::Result<()> {
+    write_event(
+        f,
+        first,
+        &format!(
+            r#"{{"ph":"E","pid":{},"tid":{},"ts":{},"name":"{}","cat":"{}"}}"#,
+            pid, tid, ts, name, cat
+        ),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn write_sub_step(
-    f: &mut File, first: &mut bool, pid: u32, tid: i64,
-    name: &str, cat: &str, ts_start: i64, ts_stop: i64,
+    f: &mut File,
+    first: &mut bool,
+    pid: u32,
+    tid: i64,
+    name: &str,
+    cat: &str,
+    ts_start: i64,
+    ts_stop: i64,
     args_json: &str,
 ) -> std::io::Result<()> {
     if ts_stop <= ts_start {
@@ -85,35 +121,72 @@ struct Phase {
 /// The sub-steps in emission order. Adding a well-behaved phase (own start+stop) is a data-only
 /// change; the irregular chained-start phases are expressed as [`Start::Chained`].
 static PHASES: &[Phase] = &[
-    Phase { label: "Mark Alive", cat: "gc.mark.alive",
-        start: Start::Explicit("ts_mark_alive_start"), stop: "ts_mark_alive_stop",
-        args: &[("alive_size", "alive_size")] },
-    Phase { label: "Fill increment", cat: "gc.increment",
-        start: Start::Explicit("ts_fill_increment_start"), stop: "ts_fill_increment_stop",
-        args: &[("increment_size", "increment_size")] },
-    Phase { label: "Deduce Unreachable", cat: "gc.deduce",
-        start: Start::Explicit("ts_deduce_unreachable_start"), stop: "ts_deduce_unreachable_stop",
-        args: &[("candidates", "candidates")] },
-    Phase { label: "Handle Weakrefs Callbacks", cat: "gc.weakrefs",
-        start: Start::Explicit("ts_handle_weakref_callbacks_start"), stop: "ts_handle_weakref_callbacks_stop",
-        args: &[] },
-    Phase { label: "Finalize Garbage", cat: "gc.finalize",
-        start: Start::Chained(&["ts_handle_weakref_callbacks_stop", "ts_deduce_unreachable_stop"]),
+    Phase {
+        label: "Mark Alive",
+        cat: "gc.mark.alive",
+        start: Start::Explicit("ts_mark_alive_start"),
+        stop: "ts_mark_alive_stop",
+        args: &[("alive_size", "alive_size")],
+    },
+    Phase {
+        label: "Fill increment",
+        cat: "gc.increment",
+        start: Start::Explicit("ts_fill_increment_start"),
+        stop: "ts_fill_increment_stop",
+        args: &[("increment_size", "increment_size")],
+    },
+    Phase {
+        label: "Deduce Unreachable",
+        cat: "gc.deduce",
+        start: Start::Explicit("ts_deduce_unreachable_start"),
+        stop: "ts_deduce_unreachable_stop",
+        args: &[("candidates", "candidates")],
+    },
+    Phase {
+        label: "Handle Weakrefs Callbacks",
+        cat: "gc.weakrefs",
+        start: Start::Explicit("ts_handle_weakref_callbacks_start"),
+        stop: "ts_handle_weakref_callbacks_stop",
+        args: &[],
+    },
+    Phase {
+        label: "Finalize Garbage",
+        cat: "gc.finalize",
+        start: Start::Chained(&[
+            "ts_handle_weakref_callbacks_stop",
+            "ts_deduce_unreachable_stop",
+        ]),
         stop: "ts_finalize_garbage_stop",
-        args: &[("finalized_garbage_count", "finalized_garbage_count")] },
-    Phase { label: "Handle Resurrected", cat: "gc.resurrect",
-        start: Start::Chained(&["ts_finalize_garbage_stop"]), stop: "ts_handle_resurrected_stop",
-        args: &[] },
-    Phase { label: "Clear Weakrefs", cat: "gc.clear_weakrefs",
-        start: Start::Chained(&["ts_handle_resurrected_stop"]), stop: "ts_clear_weakrefs_stop",
-        args: &[("clear_weakrefs_count", "clear_weakrefs_count")] },
-    Phase { label: "Delete Garbage", cat: "gc.delete",
-        start: Start::Explicit("ts_delete_garbage_start"), stop: "ts_delete_garbage_stop",
-        args: &[("deleted_garbage_count", "deleted_garbage_count")] },
+        args: &[("finalized_garbage_count", "finalized_garbage_count")],
+    },
+    Phase {
+        label: "Handle Resurrected",
+        cat: "gc.resurrect",
+        start: Start::Chained(&["ts_finalize_garbage_stop"]),
+        stop: "ts_handle_resurrected_stop",
+        args: &[],
+    },
+    Phase {
+        label: "Clear Weakrefs",
+        cat: "gc.clear_weakrefs",
+        start: Start::Chained(&["ts_handle_resurrected_stop"]),
+        stop: "ts_clear_weakrefs_stop",
+        args: &[("clear_weakrefs_count", "clear_weakrefs_count")],
+    },
+    Phase {
+        label: "Delete Garbage",
+        cat: "gc.delete",
+        start: Start::Explicit("ts_delete_garbage_start"),
+        stop: "ts_delete_garbage_stop",
+        args: &[("deleted_garbage_count", "deleted_garbage_count")],
+    },
 ];
 
 fn write_gc_stat_events(
-    f: &mut File, first: &mut bool, pid: u32, s: &GcStat,
+    f: &mut File,
+    first: &mut bool,
+    pid: u32,
+    s: &GcStat,
 ) -> std::io::Result<()> {
     let tid = s.interpreter_id;
     let ts_s = s.ts_start();
@@ -125,18 +198,32 @@ fn write_gc_stat_events(
 
     // Helper to build JSON args string
     let a = |pairs: &[(&str, String)]| -> String {
-        pairs.iter().map(|(k, v)| format!(r#""{}":{}"#, k, v)).collect::<Vec<_>>().join(",")
+        pairs
+            .iter()
+            .map(|(k, v)| format!(r#""{}":{}"#, k, v))
+            .collect::<Vec<_>>()
+            .join(",")
     };
 
     // Begin GC Pause
-    write_begin(f, first, pid, tid, ts_us(ts_s), &pause_name, &pause_cat,
-        &a(&[("generation", g.to_string()),
-             ("iid", s.interpreter_id.to_string()),
-             ("collections", s.collections().to_string()),
-             ("heap_size", s.heap_size().to_string()),
-             ("collected", s.collected().to_string()),
-             ("uncollectable", s.uncollectable().to_string()),
-             ("candidates", s.candidates().to_string())]))?;
+    write_begin(
+        f,
+        first,
+        pid,
+        tid,
+        ts_us(ts_s),
+        &pause_name,
+        &pause_cat,
+        &a(&[
+            ("generation", g.to_string()),
+            ("iid", s.interpreter_id.to_string()),
+            ("collections", s.collections().to_string()),
+            ("heap_size", s.heap_size().to_string()),
+            ("collected", s.collected().to_string()),
+            ("uncollectable", s.uncollectable().to_string()),
+            ("candidates", s.candidates().to_string()),
+        ]),
+    )?;
 
     // Intra-pause sub-steps, driven by the phase table. A phase whose fields this build lacks
     // resolves to `None` and is skipped; a zero-width span is dropped by `write_sub_step`.
@@ -159,27 +246,56 @@ fn write_gc_stat_events(
         for &(key, field) in ph.args {
             arg_pairs.push((key, s.get(field).unwrap_or(0).to_string()));
         }
-        write_sub_step(f, first, pid, tid,
+        write_sub_step(
+            f,
+            first,
+            pid,
+            tid,
             &format!("{} (gen={})", ph.label, g),
             &format!("{}(gen={})", ph.cat, g),
-            start, stop, &a(&arg_pairs))?;
+            start,
+            stop,
+            &a(&arg_pairs),
+        )?;
     }
 
     // End GC Pause
     write_end(f, first, pid, tid, ts_us(ts_e), &pause_name, &pause_cat)?;
 
     // Counter event for generation metrics
-    let other = if s.uncollectable() > 0 { format!(r#","uncollectable":{}"#, s.uncollectable()) } else { String::new() };
-    write_event(f, first, &format!(
-        r#"{{"name":"G{}","ph":"C","ts":{},"pid":{},"tid":{},"args":{{"collected":{},"candidates":{},"duration":{}{}}}}}"#,
-        g, ts_us(ts_s), pid, tid, s.collected(), s.candidates(), s.duration(), other
-    ))?;
+    let other = if s.uncollectable() > 0 {
+        format!(r#","uncollectable":{}"#, s.uncollectable())
+    } else {
+        String::new()
+    };
+    write_event(
+        f,
+        first,
+        &format!(
+            r#"{{"name":"G{}","ph":"C","ts":{},"pid":{},"tid":{},"args":{{"collected":{},"candidates":{},"duration":{}{}}}}}"#,
+            g,
+            ts_us(ts_s),
+            pid,
+            tid,
+            s.collected(),
+            s.candidates(),
+            s.duration(),
+            other
+        ),
+    )?;
 
     // Counter event for heap_size (single arg → encoder sets name to "")
-    write_event(f, first, &format!(
-        r#"{{"name":"","ph":"C","ts":{},"pid":{},"tid":{},"args":{{"heap_size":{}}}}}"#,
-        ts_us(ts_s), pid, tid, s.heap_size()
-    ))?;
+    write_event(
+        f,
+        first,
+        &format!(
+            r#"{{"name":"","ph":"C","ts":{},"pid":{},"tid":{},"args":{{"heap_size":{}}}}}"#,
+            ts_us(ts_s),
+            pid,
+            tid,
+            s.heap_size()
+        ),
+    )?;
 
     Ok(())
 }
@@ -257,11 +373,11 @@ impl EventsExporter for ChromeTraceExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote_debugging::offsets::offset_table::{seq_layout, GcItemLayout};
+    use crate::remote_debugging::offsets::offset_table::{GcItemLayout, seq_layout};
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A layout carrying every field the exporter knows about — so a test stat can set any
     /// phase's timestamps. Only the field *names* matter here (the exporter reads by name), so
@@ -269,14 +385,32 @@ mod tests {
     /// exporter skips phases whose fields are absent (see `Start`/`PHASES`).
     static FULL_LAYOUT: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
         seq_layout(&[
-            "ts_start", "ts_stop", "collections", "collected", "uncollectable", "candidates",
-            "duration", "heap_size", "increment_size", "alive_size", "finalized_garbage_count",
-            "clear_weakrefs_count", "deleted_garbage_count", "ts_mark_alive_start",
-            "ts_mark_alive_stop", "ts_fill_increment_start", "ts_fill_increment_stop",
-            "ts_deduce_unreachable_start", "ts_deduce_unreachable_stop",
-            "ts_handle_weakref_callbacks_start", "ts_handle_weakref_callbacks_stop",
-            "ts_finalize_garbage_stop", "ts_handle_resurrected_stop", "ts_clear_weakrefs_stop",
-            "ts_delete_garbage_start", "ts_delete_garbage_stop",
+            "ts_start",
+            "ts_stop",
+            "collections",
+            "collected",
+            "uncollectable",
+            "candidates",
+            "duration",
+            "heap_size",
+            "increment_size",
+            "alive_size",
+            "finalized_garbage_count",
+            "clear_weakrefs_count",
+            "deleted_garbage_count",
+            "ts_mark_alive_start",
+            "ts_mark_alive_stop",
+            "ts_fill_increment_start",
+            "ts_fill_increment_stop",
+            "ts_deduce_unreachable_start",
+            "ts_deduce_unreachable_stop",
+            "ts_handle_weakref_callbacks_start",
+            "ts_handle_weakref_callbacks_stop",
+            "ts_finalize_garbage_stop",
+            "ts_handle_resurrected_stop",
+            "ts_clear_weakrefs_stop",
+            "ts_delete_garbage_start",
+            "ts_delete_garbage_stop",
         ])
     });
 
@@ -286,8 +420,14 @@ mod tests {
     /// path that `FULL_LAYOUT`-based stats never exercise.
     static REGULAR_LAYOUT: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
         seq_layout(&[
-            "ts_start", "ts_stop", "collections", "collected", "uncollectable", "candidates",
-            "duration", "heap_size",
+            "ts_start",
+            "ts_stop",
+            "collections",
+            "collected",
+            "uncollectable",
+            "candidates",
+            "duration",
+            "heap_size",
         ])
     });
 
@@ -327,27 +467,51 @@ mod tests {
     /// every sub-step is a zero-width span), so only the outer pause + the two counter events
     /// should be emitted.
     fn bare_stat() -> GcStat {
-        GcStat::from_fields(0, 0, 1, *FULL_LAYOUT, &[("ts_start", 1_000), ("ts_stop", 2_000)])
+        GcStat::from_fields(
+            0,
+            0,
+            1,
+            *FULL_LAYOUT,
+            &[("ts_start", 1_000), ("ts_stop", 2_000)],
+        )
     }
 
     /// A pause with every sub-step's timestamps set to non-empty, monotonically increasing
     /// ranges — so every sub-step fires.
     fn full_stat() -> GcStat {
-        GcStat::from_fields(1, 0, 3, *FULL_LAYOUT, &[
-            ("ts_start", 1_000), ("ts_stop", 11_000),
-            ("collections", 5), ("collected", 42), ("uncollectable", 7), ("candidates", 100),
-            ("heap_size", 4096),
-            ("increment_size", 11), ("alive_size", 22),
-            ("finalized_garbage_count", 3), ("clear_weakrefs_count", 4), ("deleted_garbage_count", 9),
-            ("ts_mark_alive_start", 2_000), ("ts_mark_alive_stop", 3_000),
-            ("ts_fill_increment_start", 3_000), ("ts_fill_increment_stop", 4_000),
-            ("ts_deduce_unreachable_start", 4_000), ("ts_deduce_unreachable_stop", 5_000),
-            ("ts_handle_weakref_callbacks_start", 5_000), ("ts_handle_weakref_callbacks_stop", 6_000),
-            ("ts_finalize_garbage_stop", 7_000),
-            ("ts_handle_resurrected_stop", 8_000),
-            ("ts_clear_weakrefs_stop", 9_000),
-            ("ts_delete_garbage_start", 9_000), ("ts_delete_garbage_stop", 10_000),
-        ])
+        GcStat::from_fields(
+            1,
+            0,
+            3,
+            *FULL_LAYOUT,
+            &[
+                ("ts_start", 1_000),
+                ("ts_stop", 11_000),
+                ("collections", 5),
+                ("collected", 42),
+                ("uncollectable", 7),
+                ("candidates", 100),
+                ("heap_size", 4096),
+                ("increment_size", 11),
+                ("alive_size", 22),
+                ("finalized_garbage_count", 3),
+                ("clear_weakrefs_count", 4),
+                ("deleted_garbage_count", 9),
+                ("ts_mark_alive_start", 2_000),
+                ("ts_mark_alive_stop", 3_000),
+                ("ts_fill_increment_start", 3_000),
+                ("ts_fill_increment_stop", 4_000),
+                ("ts_deduce_unreachable_start", 4_000),
+                ("ts_deduce_unreachable_stop", 5_000),
+                ("ts_handle_weakref_callbacks_start", 5_000),
+                ("ts_handle_weakref_callbacks_stop", 6_000),
+                ("ts_finalize_garbage_stop", 7_000),
+                ("ts_handle_resurrected_stop", 8_000),
+                ("ts_clear_weakrefs_stop", 9_000),
+                ("ts_delete_garbage_start", 9_000),
+                ("ts_delete_garbage_stop", 10_000),
+            ],
+        )
     }
 
     /// Scan for balanced `{}`/`[]` outside of JSON string literals. A cheap
@@ -433,7 +597,11 @@ mod tests {
             "Clear Weakrefs (gen=1)",
             "Delete Garbage (gen=1)",
         ] {
-            assert_eq!(count(&out, name), 2, "expected exactly one begin+end {name:?} in: {out}");
+            assert_eq!(
+                count(&out, name),
+                2,
+                "expected exactly one begin+end {name:?} in: {out}"
+            );
         }
     }
 
@@ -442,10 +610,18 @@ mod tests {
     /// emitting it would push a begin without a meaningful end into the trace.
     #[test]
     fn zero_width_sub_steps_are_skipped() {
-        let stat = GcStat::from_fields(0, 0, 1, *FULL_LAYOUT, &[
-            ("ts_start", 1_000), ("ts_stop", 2_000),
-            ("ts_mark_alive_start", 5_000), ("ts_mark_alive_stop", 5_000), // equal → skipped
-        ]);
+        let stat = GcStat::from_fields(
+            0,
+            0,
+            1,
+            *FULL_LAYOUT,
+            &[
+                ("ts_start", 1_000),
+                ("ts_stop", 2_000),
+                ("ts_mark_alive_start", 5_000),
+                ("ts_mark_alive_stop", 5_000), // equal → skipped
+            ],
+        );
         let out = export(&[(1, stat)]);
         assert!(!out.contains("Mark Alive"), "output: {out}");
         // Only the outer pause survives.
@@ -462,19 +638,41 @@ mod tests {
     #[test]
     fn a_standard_layout_stat_emits_no_phase_sub_steps() {
         // A real, non-zero pause so the outer span is genuine — only the phases are absent.
-        let s = GcStat::from_fields(0, 0, 1, *REGULAR_LAYOUT, &[
-            ("ts_start", 1_000), ("ts_stop", 9_000), ("collections", 3), ("heap_size", 4096),
-        ]);
+        let s = GcStat::from_fields(
+            0,
+            0,
+            1,
+            *REGULAR_LAYOUT,
+            &[
+                ("ts_start", 1_000),
+                ("ts_stop", 9_000),
+                ("collections", 3),
+                ("heap_size", 4096),
+            ],
+        );
         let out = export(&[(1, s)]);
 
         // The outer pause and its two counters, and nothing else.
         assert_eq!(count(&out, r#""ph":"B""#), 1, "only the outer pause: {out}");
-        assert_eq!(count(&out, r#""ph":"C""#), 2, "still the two counters: {out}");
+        assert_eq!(
+            count(&out, r#""ph":"C""#),
+            2,
+            "still the two counters: {out}"
+        );
         for phase in [
-            "Mark Alive", "Fill increment", "Deduce Unreachable", "Handle Weakrefs Callbacks",
-            "Finalize Garbage", "Handle Resurrected", "Clear Weakrefs", "Delete Garbage",
+            "Mark Alive",
+            "Fill increment",
+            "Deduce Unreachable",
+            "Handle Weakrefs Callbacks",
+            "Finalize Garbage",
+            "Handle Resurrected",
+            "Clear Weakrefs",
+            "Delete Garbage",
         ] {
-            assert!(!out.contains(phase), "no {phase:?} span for a standard-set stat: {out}");
+            assert!(
+                !out.contains(phase),
+                "no {phase:?} span for a standard-set stat: {out}"
+            );
         }
     }
 
@@ -495,8 +693,20 @@ mod tests {
     /// dedup guards against a metadata line per event.
     #[test]
     fn process_and_thread_metadata_are_deduped() {
-        let a = GcStat::from_fields(0, 0, 1, *FULL_LAYOUT, &[("ts_start", 1_000), ("ts_stop", 2_000)]);
-        let b = GcStat::from_fields(0, 0, 1, *FULL_LAYOUT, &[("ts_start", 3_000), ("ts_stop", 4_000)]);
+        let a = GcStat::from_fields(
+            0,
+            0,
+            1,
+            *FULL_LAYOUT,
+            &[("ts_start", 1_000), ("ts_stop", 2_000)],
+        );
+        let b = GcStat::from_fields(
+            0,
+            0,
+            1,
+            *FULL_LAYOUT,
+            &[("ts_start", 3_000), ("ts_stop", 4_000)],
+        );
         let out = export(&[(100, a), (100, b)]);
         assert_eq!(count(&out, r#""name":"process_name""#), 1, "output: {out}");
         assert_eq!(count(&out, r#""name":"thread_name""#), 1, "output: {out}");
@@ -506,8 +716,20 @@ mod tests {
     /// line — otherwise a second process/thread would inherit the first's name.
     #[test]
     fn distinct_pids_and_tids_each_get_metadata() {
-        let p1 = GcStat::from_fields(0, 0, 1, *FULL_LAYOUT, &[("ts_start", 1_000), ("ts_stop", 2_000)]);
-        let p2 = GcStat::from_fields(0, 0, 2, *FULL_LAYOUT, &[("ts_start", 1_000), ("ts_stop", 2_000)]);
+        let p1 = GcStat::from_fields(
+            0,
+            0,
+            1,
+            *FULL_LAYOUT,
+            &[("ts_start", 1_000), ("ts_stop", 2_000)],
+        );
+        let p2 = GcStat::from_fields(
+            0,
+            0,
+            2,
+            *FULL_LAYOUT,
+            &[("ts_start", 1_000), ("ts_stop", 2_000)],
+        );
         let out = export(&[(100, p1), (200, p2)]);
         assert_eq!(count(&out, r#""name":"process_name""#), 2, "output: {out}");
         assert_eq!(count(&out, r#""name":"thread_name""#), 2, "output: {out}");

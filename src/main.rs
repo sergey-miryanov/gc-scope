@@ -1,10 +1,14 @@
 use anyhow::Result;
 use clap::Parser;
-use gcscope::cli::{monitor as cli_monitor, Cli, Command};
+use gcscope::cli::{Cli, Command, monitor as cli_monitor};
 use gcscope::{list_pids, memory, remote_debugging, tui};
 
 fn resolve_pid(pid: i32) -> u32 {
-    if pid == -1 { std::process::id() } else { pid as u32 }
+    if pid == -1 {
+        std::process::id()
+    } else {
+        pid as u32
+    }
 }
 
 fn main() -> Result<()> {
@@ -83,10 +87,21 @@ fn main() -> Result<()> {
             let exit_code = cli_monitor::monitor(pid, &opts)?;
             std::process::exit(exit_code);
         }
-        Command::Run { python, script, module, script_args, opts } => {
+        Command::Run {
+            python,
+            script,
+            module,
+            script_args,
+            opts,
+        } => {
             let python = python.unwrap_or_else(|| "python".to_string());
-            let exit_code = cli_monitor::run(&python, script.as_deref(), module.as_deref(),
-                &script_args, &opts)?;
+            let exit_code = cli_monitor::run(
+                &python,
+                script.as_deref(),
+                module.as_deref(),
+                &script_args,
+                &opts,
+            )?;
             std::process::exit(exit_code);
         }
         Command::ListPids { tree, no_cmdline } => {
@@ -97,7 +112,13 @@ fn main() -> Result<()> {
                 list_pids::print_process_table(&processes, no_cmdline);
             }
         }
-        Command::Tui { pid, rate, duration, glitch, output } => {
+        Command::Tui {
+            pid,
+            rate,
+            duration,
+            glitch,
+            output,
+        } => {
             if let Some(path) = output {
                 // Snapshot mode: a file gets one static frame, not the interactive UI, so a
                 // PID is required (no terminal to run the picker in).
@@ -107,7 +128,11 @@ fn main() -> Result<()> {
                 tui::run_tui_snapshot(resolve_pid(pid), &path)?;
             } else {
                 let dur = if duration > 0 { Some(duration) } else { None };
-                let pid_opt = if pid == 0 { None } else { Some(resolve_pid(pid)) };
+                let pid_opt = if pid == 0 {
+                    None
+                } else {
+                    Some(resolve_pid(pid))
+                };
                 tui::run_tui(pid_opt, rate, dur, glitch)?;
             }
         }
