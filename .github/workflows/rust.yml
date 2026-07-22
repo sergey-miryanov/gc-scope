@@ -29,28 +29,34 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
-          tool: cargo-llvm-cov  # pinned action SHA; the `tool` input selects what to install
+          tool: cargo-llvm-cov
+
+      # run `cargo fmt --all` if red
+      - name: Format check
+        run: cargo fmt --all --check
 
       - name: Build
         run: cargo build --verbose
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --verbose
 
       - name: Coverage (unit tests)
-        uses: ./.github/actions/coverage-report
+        run: cargo llvm-cov --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
-          test-cmd: cargo test --quiet
+          files: lcov.info
           flags: unit,${{ matrix.os }}
           name: unit-${{ matrix.os }}
-          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      # run `cargo fmt --all` if red
-      - name: Format check
-        run: cargo fmt --all --check
 
   live-smoke:
     name: gc-stats smoke (${{ matrix.os }} py${{ matrix.python }})
@@ -121,31 +127,51 @@ jobs:
         run: cargo llvm-cov --test live_smoke --lcov --output-path lcov.info -- --ignored --nocapture
 
       # macOS pre-3.13 needs root to attach, and cargo/rustup live in the user's HOME, not
-      # root's — so instrument via show-env, build the test binary unprivileged, run it under
-      # sudo -E (which carries LLVM_PROFILE_FILE + GCSCOPE_TEST_PYTHON through; sudo resets
-      # PATH, hence the explicit path), make the root-written profiles readable, then report.
+      # root's — so instrument via show-env, build the test binary unprivileged, run it as
+      # root, make the root-written profiles readable, then report.
       - name: Attach, detect version, assert GC-stats shape (sudo)
         if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
         shell: bash
         run: |
           set -euo pipefail
-          source <(cargo llvm-cov show-env --export-prefix)
+          # Write-then-source, NOT `source <(...)`: process substitution discards show-env's
+          # exit status, so a failure there silently leaves the run uninstrumented and only
+          # surfaces later as "not found *.profraw files".
+          cargo llvm-cov show-env --export-prefix > "$RUNNER_TEMP/llvm-cov-env.sh"
+          echo "--- cargo llvm-cov show-env ---"; cat "$RUNNER_TEMP/llvm-cov-env.sh"
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
           cargo llvm-cov clean --workspace
           export GCSCOPE_TEST_PYTHON="$(command -v python)"
           BIN=$(cargo test --test live_smoke --no-run --message-format=json \
                 | jq -r 'select(.executable != null and .target.name == "live_smoke") | .executable' \
                 | head -1)
           echo "test binary: $BIN"
-          sudo -E "$BIN" --ignored --nocapture
-          sudo chown -R "$(whoami)" "$CARGO_LLVM_COV_TARGET_DIR" || true
+          # Fail here, named, if instrumentation env never applied — rather than letting it
+          # surface downstream as the misleading "not found *.profraw files".
+          : "${LLVM_PROFILE_FILE:?show-env set no LLVM_PROFILE_FILE; the run would not be instrumented}"
+          # `sudo env VAR=...` rather than `sudo -E`: -E depends on sudoers env_keep/SETENV and
+          # silently drops vars, leaving the root-run binary writing its profile elsewhere.
+          sudo env LLVM_PROFILE_FILE="$LLVM_PROFILE_FILE" \
+                   GCSCOPE_TEST_PYTHON="$GCSCOPE_TEST_PYTHON" \
+                   "$BIN" --ignored --nocapture
+          # Default rather than a bare reference: show-env's exact variable names are not a
+          # stable contract, and `set -u` turns a wrong guess into a hard failure here.
+          COV_DIR="${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+          sudo chown -R "$(whoami)" "$COV_DIR" || true
+          echo "--- profraw in $COV_DIR ---"
+          find "$COV_DIR" -name '*.profraw' 2>/dev/null | head -20 \
+            || echo "(none — the root-run binary wrote no profile)"
           cargo llvm-cov report --lcov --output-path lcov.info
 
-      - name: Upload coverage
-        uses: ./.github/actions/coverage-report
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
+          files: lcov.info
           flags: smoke,${{ matrix.os }}
           name: smoke-${{ matrix.os }}-py${{ matrix.python }}
-          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   custom-build-smoke:
     name: gc-stats smoke (source ${{ matrix.label }})
@@ -222,12 +248,15 @@ jobs:
           [ "${{ matrix.expect_extended }}" = "yes" ] && export GCSCOPE_EXPECT_EXTENDED=1
           cargo llvm-cov --test live_smoke --lcov --output-path lcov.info -- --ignored --nocapture
 
-      - name: Upload coverage
-        uses: ./.github/actions/coverage-report
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
+          files: lcov.info
           flags: smoke,custom-build
           name: smoke-custom-${{ matrix.label }}
-          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   integration-tests:
     name: integration tests (attach)
@@ -253,9 +282,14 @@ jobs:
         run: cargo test --features test-hooks --tests -- --ignored
 
       - name: Coverage (integration tests)
-        uses: ./.github/actions/coverage-report
+        run: cargo llvm-cov --features test-hooks --tests --lcov --output-path lcov.info -- --ignored
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
-          test-cmd: cargo test --features test-hooks --tests -- --ignored
+          files: lcov.info
           flags: integration,ubuntu-latest
           name: integration-ubuntu-latest
-          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
