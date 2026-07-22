@@ -9,6 +9,9 @@ coverage:
         informational: true
         if_no_uploads: success
 
+ignore:
+  - "src/remote_debugging/offsets/v_*.rs"
+  - "tests/"
 
 flag_management:
   default_rules:
