@@ -6,9 +6,11 @@ coverage:
     project:
       default:
         informational: true
+        if_no_uploads: success
     patch:
       default:
         informational: true
+        if_no_uploads: success
 
 
 flag_management:
