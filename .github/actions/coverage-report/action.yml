@@ -54,5 +54,5 @@ runs:
         name: ${{ inputs.name }}
         # Explicit path; searching the tree would also pick up stale local reports.
         disable_search: true
-        fail_ci_if_error: false
+        fail_ci_if_error: true
         token: ${{ inputs.codecov-token }}
