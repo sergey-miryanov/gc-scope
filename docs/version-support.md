@@ -22,146 +22,55 @@ authoritative; this document restates what the code computes and can drift.
 
 ## Contents
 
-1. [Support matrix](#1-support-matrix)
-2. [Attach pipeline](#2-attach-pipeline)
-3. [Locating `_PyRuntime`](#3-locating-_pyruntime)
-4. [Selecting the offset layout](#4-selecting-the-offset-layout)
-5. [Offset sources](#5-offset-sources)
-6. [Validation guards](#6-validation-guards)
-7. [Reading GC stats](#7-reading-gc-stats)
-8. [Per-version capabilities](#8-per-version-capabilities)
-9. [Verification and adding a version](#9-verification-and-adding-a-version)
+1. [Attach pipeline](#1-attach-pipeline)
+2. [Locating `_PyRuntime`](#2-locating-_pyruntime)
+3. [Selecting the offset layout](#3-selecting-the-offset-layout)
+4. [Offset sources](#4-offset-sources)
+5. [Validation guards](#5-validation-guards)
+6. [Reading GC stats](#6-reading-gc-stats)
+7. [Per-version capabilities](#7-per-version-capabilities)
+8. [Verification and adding a version](#8-verification-and-adding-a-version)
 
 ---
 
-## 1. Support matrix
-
-| Target | `_PyRuntime` anchor | Offset source | `Resolved` tier | GC stats kind | TUI |
-|---|---|---|---|---|---|
-| 3.8 | `_PyRuntime` symbol + cross-ref | hardcoded `pre_3_13.rs` | `Legacy` | `InlineArray`, global GC | GC-only view |
-| 3.9 – 3.12 | `_PyRuntime` symbol + cross-ref | hardcoded `pre_3_13.rs` | `Legacy` | `InlineArray`, per-interpreter | GC-only view |
-| 3.13.x | `"xdebugpy"` cookie | bindgen `v_3_13_*.rs` | `Full` (registered micro) / `LayoutOnly` | `InlineArray` @ `0x80` | full |
-| 3.14.x | `"xdebugpy"` cookie | bindgen `v_3_14_4.rs` | `Full` / `LayoutOnly` | `InlineArray` @ `0x78` | full |
-| 3.15.0a8 | `"xdebugpy"` cookie | bindgen `v_3_15_0a8.rs` | `Full` | `RingBuffer`, 96-byte entries | full |
-| 3.15.0b1 / b3 / b4 | `"xdebugpy"` cookie | bindgen `v_3_15_0b*.rs` | `Full` | `RingBuffer`, 64-byte entries | full |
-| 3.15.0b1 `+inc` | `"xdebugpy"` cookie | bindgen `v_3_15_0b1_gcinc.rs` | `Full` | `RingBuffer`, 208-byte entries | full |
-| 3.16.0a0 (dev) | `"xdebugpy"` cookie | bindgen `v_3_16_0a0.rs` | `Full` | `RingBuffer`, 64-byte entries | full |
-| unregistered final 3.13+ patch | `"xdebugpy"` cookie | nearest final same-minor layout | `LayoutOnly` + warning | as that layout | full |
-| unregistered pre-release 3.13+ | — | — | refused | — | — |
-| 3.7 and older, or 4.x | — | — | refused | — | — |
-
-### 1.1 Registered layouts
-
-`LAYOUTS` is the list of compiled `_Py_DebugOffsets` layouts, one row per version
-hex. Each row's closure reads the target's struct bytes through that build's
-generated Rust mirror.
-
-| Version hex | Version | Module | Named sub-structs | Validate/Display tier |
-|---|---|---|---|---|
-| `0x030d01f0` | 3.13.1 | `v_3_13_1.rs` | 15 | basic |
-| `0x030d0df0` | 3.13.13 | `v_3_13_13_53e07256802.rs` | 15 | basic |
-| `0x030e04f0` | 3.14.4 | `v_3_14_4.rs` | 19 | basic |
-| `0x030f00a8` | 3.15.0a8 | `v_3_15_0a8.rs` | 20 | basic |
-| `0x030f00b1` | 3.15.0b1 | `v_3_15_0b1.rs` | 21 | full |
-| `0x030f00b3` | 3.15.0b3 | `v_3_15_0b3.rs` | 21 | full |
-| `0x030f00b4` | 3.15.0b4 | `v_3_15_0b4.rs` | 21 | full |
-| `0x031000a0` | 3.16.0a0 | `v_3_16_0a0.rs` | 21 | full |
-
-`0x030f00b1` additionally carries a same-hex GC candidate: the GC-instrumented
-`gc-gen-3.15+inc` fork, via `v_3_15_0b1_gcinc.rs`. Both builds publish the same
-`PY_VERSION_HEX` and a byte-identical `_Py_DebugOffsets`, and differ only in the
-per-entry `gc_generation_stats` struct (64 vs 208 bytes). They are distinguished at
-read time by the ring size the process publishes; see
-[§4.2](#42-same-hex-candidates-clean-vs-instrumented-builds).
-
-Pre-3.13 has no registry. `pre_3_13::table_for_version(major, minor)` matches
-`(3, 8) … (3, 12)` and returns `None` otherwise.
-
-### 1.2 Version hex encoding
-
-```
-(major << 24) | (minor << 16) | (micro << 8) | (release_level << 4) | serial
-
-release_level:  0xA = alpha   0xB = beta   0xC = rc   0xF = final
-
-0x030f00b4  =  3 . 15 . 0 b4        0x030d01f0  =  3 . 13 . 1  (final)
-```
-
-*Source:* `src/remote_debugging/offsets/mod.rs` (`LAYOUTS`, `GC_CANDIDATES`),
-`src/remote_debugging/offsets/pre_3_13.rs` (`table_for_version`),
-`src/remote_debugging/version.rs` (`PythonVersion::from_hex`).
-
----
-
-## 2. Attach pipeline
+## 1. Attach pipeline
 
 All analysis commands (`gc-stats`, `monitor`, `run`, `tui`, `list-pids`) go through
-`PySession::attach`, which resolves a process's immutable facts once and serves
-subsequent reads from a single held handle.
+`PySession::attach`, which resolves a process once and serves subsequent reads from a
+single held handle. It is the only caller of `find_runtime`, `version::detect`, and
+`read_offsets`; a new command calls `attach` and matches on `Resolved`.
 
-```mermaid
-flowchart TD
-    A["PySession::attach(pid)"] --> B["reader::open_handle"]
-    B --> C["find_runtime_versioned"]
-    C --> D["version::detect(pid)"]
-    D --> E{"major == 3?"}
-    E -->|no| X1["error: unsupported major"]
-    E -->|yes| F{"minor >= 13?"}
-    F -->|yes| G["process::find_runtime_module<br/>(xdebugpy cookie)"]
-    F -->|no| H["pre_3_13::table_for_version<br/>+ find_runtime_pre_3_13<br/>(symbol + cross-ref)"]
-    G --> I["(runtime_addr, module_path, version)"]
-    H --> I
-    I --> J["exe_key = (module_path, mtime)"]
-    J --> K{"LAYOUT_CACHE hit<br/>AND live version word<br/>still matches?"}
-    K -->|yes| L["LayoutSource::Cached"]
-    K -->|no| M["resolve_layout"]
-    M --> N["LayoutSource::Parsed<br/>+ insert into LAYOUT_CACHE"]
-    L --> O["PySession { handle, runtime_addr,<br/>version, Arc&lt;Resolved&gt; }"]
-    N --> O
-```
+### 1.1 Stage sequence
 
-`attach` is the only caller of `find_runtime`, `version::detect`, and
-`read_offsets`. A new command calls `attach` and matches on `Resolved`.
+Each stage consumes the previous stage's output. The right column names the section
+covering that stage in detail.
 
-### 2.1 Version detection
+| # | Stage | Input | Output | Detail |
+|---|---|---|---|---|
+| 1 | Open the process | PID | a handle held for the session's lifetime |  |
+| 2 | Find the Python modules | PID | every mapped module whose path names Python, with its load base | [§1.2](#12-module-discovery-and-image-base) |
+| 3 | Scan for the `Py_Version` symbol | modules | the version hex, read from live memory at that symbol; nothing on 3.8–3.10 or a stripped binary | [§1.3](#13-version-detection) |
+| 4 | Scan for a version string | modules, only if step 3 found nothing | the version, parsed out of the image's read-only data | [§1.3](#13-version-detection) |
+| 5 | Choose the runtime anchor | the detected version | reject a non-3 major, then branch on `minor >= 13` | [§2](#2-locating-_pyruntime) |
+| 6a | 3.13+: find the runtime by cookie | modules | locate the `PyRuntime` section, translate to a load address, confirm `"xdebugpy"` there → runtime address + the module it came from | [§2.1](#21-313--cookie-path) |
+| 6b | pre-3.13: find the runtime by symbol | modules, plus gcscope's predefined `_PyRuntime` layout for this minor | resolve the `_PyRuntime` symbol, accept the address only if memory there matches that layout — the interpreter/thread pointer graph must close → runtime address + module | [§2.2](#22-pre-313--symbol--cross-reference-path) |
+| 7 | 3.13+: identify the build | runtime address | the version the process publishes about itself — authoritative, and a disagreement with steps 3–4 warns and the live value wins — matched to a `_Py_DebugOffsets` definition: the one registered for exactly that build, else a same-minor substitute when both it and the target are final releases, else refused | [§3](#3-selecting-the-offset-layout) |
+| 8 | 3.13+: read `_Py_DebugOffsets` | that definition | the field offsets the process publishes for itself, read out of its memory | [§4.1](#41-bindgen-generated-structs-313) |
+| 9 | Reduce to the layout gcscope walks — the `OffsetTable` | `_Py_DebugOffsets`, or the predefined pre-3.13 layout | the fields gcscope actually needs, plus the GC-stats geometry the build's entry struct implies; when one version hex covers two builds, the geometry is picked here by published ring size ([§3.2](#32-same-hex-candidates-clean-vs-instrumented-builds)) | [§4.3](#43-the-versionedoffsets-abstraction) |
+| 10 | Dispatch on the stats shape | the `OffsetTable` | inline-array or ring-buffer reader; ring builds verify the published region size first | [§5](#5-validation-guards) |
+| 11 | Walk to the stats region | runtime address | runtime → interpreter chain → GC state → the stats region address. 3.9+ keeps GC state per interpreter, so each one in the chain yields its own region; 3.8 keeps a single GC state for the whole runtime, reached from `_PyRuntime` directly and read once no matter how many interpreters exist | [§6.1](#61-the-pointer-walk) |
+| 12 | Read and decode the region | region address | the entries buffer, split and decoded into GC stat records — the fields a record carries are whatever this build defines | [§6.4](#64-per-entry-fields-by-build) |
 
-`version::detect(pid)` runs two passes over every mapped module whose path contains
-`python` (case-insensitive):
+Steps 1–9 resolve the process and produce the `OffsetTable`; 10–12 read stats and
+repeat per poll. A pre-3.13 target skips steps 7–8: its layout is already in hand
+from step 6b, for the reason [§2](#2-locating-_pyruntime) gives.
 
-1. **Symbol pass (authoritative).** Resolve the `Py_Version` symbol from the
-   on-disk image's symbol table, then read `PY_VERSION_HEX` at that address from
-   live process memory — 8 bytes first, then 4 as a fallback. The first result with
-   `major == 3` wins.
-2. **String-scan pass (fallback).** If no module yielded a symbol, scan the image's
-   read-only data section — PE `.rdata`, ELF `.rodata`, Mach-O `__TEXT,__cstring` —
-   for an embedded `PY_VERSION` literal, falling back to the whole image if that
-   section cannot be located.
+Steps 3, 4, and 6 each try every Python module and take the first that succeeds, so a
+process carrying both a `python` executable and a `libpython` shared library can
+resolve its version from one and its runtime from the other. The runtime address is
+located twice: at step 6, and again while reading the offsets at steps 7–8.
 
-`Py_Version` was added to the C API in **CPython 3.11**. On 3.8 – 3.10 the symbol
-does not exist, so those targets always resolve through the string-scan pass; it is
-the only detection path they have. The two passes are otherwise version-blind —
-`detect` tries the symbol on every module regardless of version and falls through on
-absence — so a stripped symbol table on any version degrades to the same fallback.
-
-The scanner accepts `3.<minor>.<micro>[a|b|rc<serial>]` only when:
-
-- the `3` is not preceded by a digit (otherwise `lib13.12.0` parses as a version);
-- a micro component is present (a bare `"3.1 "` must not shadow a `"3.10.4"` later
-  in the same section);
-- the next byte is a terminator (`NUL`, space, `(`, `"`, `\n`, `\r`, `\t`).
-
-Each component accumulates into a `u8` with checked arithmetic, so `3.999.0`
-returns `None` rather than wrapping.
-
-For 3.13+ the detected version selects the finder only. The authoritative version
-is the `_Py_DebugOffsets.version` word read from the live process in §4. On
-disagreement — an in-place upgrade of a running process, or a string-scan mis-hit —
-gcscope warns and uses the live value.
-
-*Source:* `src/remote_debugging/version.rs` (`detect`, `scan_for_version_string`,
-`resolve_symbol_in_bytes`).
-
-### 2.2 Module discovery and image base
+### 1.2 Module discovery and image base
 
 `binary::find_python_modules` walks the target's mapped regions and keeps every
 mapping whose backing file path contains `python`, recording `(path, base_addr)`
@@ -177,42 +86,95 @@ The base address is platform-specific:
   which is the executable mapping, and section `vmaddr` values are relative to it.
   macOS therefore skips non-executable mappings (`cfg`-gated; ELF/PE unchanged).
 
-A wrong base lands the read inside some mapped region, so it succeeds and returns
-garbage. The cookie is the only check that catches it; see
-[§3.3](#33-per-platform-image-facts).
+A wrong base still lands inside some mapped region, so the read succeeds and returns
+garbage. The cookie is the only check that catches it
+([§2.3](#23-per-platform-image-facts)).
 
 *Source:* `src/memory/binary.rs` (`find_python_modules`).
 
-### 2.3 Child-process search
+### 1.3 Version detection
+
+`version::detect(pid)` runs two passes over the modules from
+[§1.2](#12-module-discovery-and-image-base):
+
+1. **Symbol pass (authoritative).** Resolve the `Py_Version` symbol from the
+   on-disk image's symbol table, then read `PY_VERSION_HEX` at that address from
+   live process memory — 8 bytes first, then 4 as a fallback. The first result with
+   `major == 3` wins.
+2. **String-scan pass (fallback).** If no module yielded a symbol, scan the image's
+   read-only data section — PE `.rdata`, ELF `.rodata`, Mach-O `__TEXT,__cstring` —
+   for an embedded `PY_VERSION` literal, falling back to the whole image if that
+   section cannot be located.
+
+`Py_Version` was added to the C API in CPython 3.11, so 3.8 – 3.10 resolve through
+the string-scan pass, their only detection path. `detect` itself does not branch on
+version: it tries the symbol on every module and falls through when absent, so a
+stripped symbol table on any version degrades to the same fallback.
+
+The scanner accepts `3.<minor>.<micro>[a|b|rc<serial>]` only when:
+
+- the `3` is not preceded by a digit (otherwise `lib13.12.0` parses as a version);
+- a micro component is present (a bare `"3.1 "` must not shadow a `"3.10.4"` later
+  in the same section);
+- the next byte is a terminator (`NUL`, space, `(`, `"`, `\n`, `\r`, `\t`).
+
+Each component accumulates into a `u8` with checked arithmetic, so `3.999.0`
+returns `None` rather than wrapping.
+
+Both passes yield the same thing: a version in CPython's packed encoding, which the
+symbol pass reads directly as `PY_VERSION_HEX` and the string pass reconstructs from
+text. That encoding is also what the process publishes about itself, and the key the
+layout registry is indexed by.
+
+```
+(major << 24) | (minor << 16) | (micro << 8) | (release_level << 4) | serial
+
+release_level:  0xA = alpha   0xB = beta   0xC = rc   0xF = final
+
+0x030f00b4  =  3 . 15 . 0 b4        0x030d01f0  =  3 . 13 . 1  (final)
+```
+
+The release-level nibble separates a pre-release from a released build, which is the
+distinction [§3.1](#31-exact-or-refuse-fallback) turns into a fallback rule.
+
+For 3.13+ the detected version selects the finder only; the authoritative version is
+the `_Py_DebugOffsets.version` word read from the live process
+([§3](#3-selecting-the-offset-layout)). The two can disagree after an in-place
+upgrade of a running process, or on a string-scan mis-hit, in which case gcscope
+warns and uses the live value.
+
+*Source:* `src/remote_debugging/version.rs` (`detect`, `scan_for_version_string`,
+`resolve_symbol_in_bytes`, `PythonVersion::from_hex`).
+
+### 1.4 Child-process search
 
 `search_pid_and_children` tries the given PID first, then recurses into child
-processes up to `MAX_DEPTH = 3`.
+processes up to `MAX_DEPTH = 3`. This covers venv launchers: a Windows redirector
+`python.exe` execs the real interpreter as a child, whose `_PyRuntime` lives in a
+different address space, and a single-shot attach on the launcher PID finds nothing.
 
-This handles venv launchers: a Windows redirector `python.exe` execs the real
-interpreter as a child, whose `_PyRuntime` lives in a different address space. A
-single-shot attach on the launcher PID finds nothing.
-
-Known gap: `search_pid_and_children` returns `(addr, path)` and drops the child PID
-it found them in, so it can locate a runtime it cannot then read — the session's
-handle remains open on the parent. Target the child PID directly; `list-pids`
-surfaces the tree. Plan of record: `docs/venv-launcher-child-retarget.md`.
+Known gap: `search_pid_and_children` returns `(addr, path)` and drops the child PID it
+found them in, so it can locate a runtime it cannot then read — the session's handle
+remains open on the parent. Target the child PID directly; `list-pids` surfaces the
+tree. Plan of record: `docs/venv-launcher-child-retarget.md`.
 
 *Source:* `src/memory/process.rs` (`search_pid_and_children`, `get_child_pids`).
 
-### 2.4 Layout cache
+### 1.5 Layout cache
 
-A resolved layout is a pure function of the binary — `to_offset_table` reads only
-the already-read struct, never live memory — so it is cached process-wide, keyed by
-`(module path, mtime)`, and shared across every PID running that binary.
+Steps 7–9 depend only on the binary. What they read from process memory is static
+data the compiler emitted into the image, identical in every process running it, so
+their result is cached process-wide, keyed by `(module path, mtime)`, and shared
+across every PID running that binary.
 
 | | Scope | Evicted by |
 |---|---|---|
 | Instance state — handle, `runtime_addr`, per-entry freshness | one PID | `mark_died` (single site) |
 | Layout — `Arc<Resolved>` | one `(path, mtime)` | never; survives process death |
 
-The multi-MB goblin parse therefore happens once per binary rather than once per
-PID, which is what makes a relaunch, a sibling worker process, or a multiprocessing
-pool cheap.
+The multi-MB goblin parse therefore happens once per binary rather than once per PID,
+which is what makes a relaunch, a sibling worker process, or a multiprocessing pool
+cheap.
 
 Two backstops:
 
@@ -226,10 +188,10 @@ Two backstops:
 `PySession::layout_source()` reports `Parsed` vs `Cached`, which lifecycle tests use
 to observe the fast path.
 
-### 2.5 Reused PIDs — `revalidate`
+### 1.6 Reused PIDs — `revalidate`
 
-On a failed read the session does not retry (that decision belongs to the caller's
-`WaitPolicy`). It calls `revalidate`, which returns `Fresh` / `Changed` / `Dead`:
+On a failed read the session does not retry; that decision belongs to the caller's
+`WaitPolicy`. It calls `revalidate`, which returns `Fresh` / `Changed` / `Dead`:
 
 ```mermaid
 flowchart TD
@@ -244,26 +206,153 @@ flowchart TD
     G -->|"open/find failed"| J["Dead"]
 ```
 
-An empty command line is treated as unknown rather than as a difference.
-`read_cmdline` returns `Some("")` when the OS still has the process but its command
-line cannot be read — a transient access failure, or a process caught mid-teardown,
-which is when `revalidate` runs. `Changed` requires both sides non-empty and
-differing.
+An empty command line is treated as unknown rather than as a difference, so `Changed`
+requires both sides non-empty and differing. `read_cmdline` returns `Some("")` when
+the OS still has the process but its command line cannot be read — a transient access
+failure, or a process caught mid-teardown, which is the state `revalidate` runs in.
 
-On Windows this also requires asking sysinfo explicitly for `cmd`;
-`refresh_processes` alone leaves it empty there, which made the check compare `""`
-against `""`.
+On Windows this also requires asking sysinfo explicitly for `cmd`; `refresh_processes`
+alone leaves it empty there, which made the check compare `""` against `""`.
 
 *Source:* `src/remote_debugging/session.rs` (`attach`, `revalidate`,
 `classify_cmdline`, `soft_reattach`, `layout_still_valid`).
 
+### 1.7 Traces through the same pipeline
+
+**CPython 3.8.18 on macOS, `sudo gcscope gc-stats <pid>`** — the global-GC build
+
+```
+ 1  open_handle(pid)         → needs root: 3.8 ships no get-task-allow (§7.3)
+ 2  find_python_modules      → skips the low no-access reservations; base is the
+                               first *executable* mapping (the __TEXT mapping)
+ 3  Py_Version symbol        → absent (added in 3.11)
+ 4  string scan              → parse_macho cuts the host slice out of the universal2
+                               image; scan __TEXT,__cstring → "3.8.18 (default, …"
+                               accepted: micro present, next byte is a space
+ 5  minor 8 < 13             → pre-3.13 finder
+ 6b table_for_version(3,8)   → runtime_interpreters_head 0x20, interp_id 0x10,
+                               interp_threads_head 0x08, thread_interp 0x10,
+                               interp_gc None, runtime_gc 0x158
+    _PyRuntime symbol        → Mach-O underscore-prefixes it: "__PyRuntime"
+    cross-ref round-trip     → *(cand+0x08) = tstate; *(tstate+0x10) == cand ✓
+                               and == *(runtime+0x20) ✓  → accepted
+    steps 7–8 skipped (no _Py_DebugOffsets on 3.8)
+ 9  the predefined layout is already the OffsetTable → Resolved::Legacy { table }
+10  gc_stats → kind InlineArray → gc_stats_inline
+11  has_global_gc() true (interp_gc None, runtime_gc Some) → gc_stats_global:
+    gc_addr = runtime + 0x158   ← from the runtime, not from any interpreter
+    region  = Direct(gc_addr + 0x80); read once, not once per interpreter
+    the interpreter id still comes from the head, at head + 0x10
+12  read 72 bytes → 3 entries × 24, bases [0,24,48]
+```
+
+**CPython 3.10.14 on Linux, `gc-stats <pid>` on a second worker process**
+
+```
+ 1  open_handle(pid)
+ 2  find_python_modules      → [("/usr/bin/python3.10", …),
+                                ("/usr/lib/libpython3.10.so.1.0", …)]
+ 3  Py_Version symbol        → absent (pre-3.11)
+ 4  string scan              → ELF .rodata → "3.10.14 (main, …"
+                               a bare "3.1 " earlier in the section is rejected:
+                               no micro component
+ 5  minor 10 < 13            → pre-3.13 finder
+ 6b table_for_version(3,10)  → v3_10 delegates to v3_9 verbatim:
+                               runtime_interpreters_head 0x20, interp_id 0x18,
+                               interp_threads_head 0x08, interp_gc 0x268
+    _PyRuntime symbol        → ELF, undecorated
+    cross-ref round-trip     → *(cand+0x08) = tstate; *(tstate+0x10) == cand ✓
+    steps 7–8 skipped (no _Py_DebugOffsets on 3.10)
+    layout cache hit on ("/usr/lib/libpython3.10.so.1.0", mtime) — the first
+    worker already resolved this binary, so no goblin parse runs. Pre-3.13 has
+    no live version word, so (path, mtime) identity is the whole check.
+ 9  the cached OffsetTable is reused → LayoutSource::Cached
+10  gc_stats → kind InlineArray → gc_stats_inline
+11  has_global_gc() false → per-interpreter walk from *(runtime + 0x20);
+    gc_addr = interp + 0x268;  region = Direct(gc_addr + 0x80)
+12  read 72 bytes → 3 entries × 24, bases [0,24,48]
+```
+
+Against 3.11 below, the only differences are the four numbers step 6b supplies: 3.11
+moved `interpreters.head` to `0x28`, `threads.head` to `0x10`, `id` to `0x30`, and
+`gc` to `0x288`. Steps 10–12 are identical, which is what makes 3.9–3.12 a
+table-only addition.
+
+**CPython 3.11.9 on Linux, `gc-stats <pid>`**
+
+```
+ 1  open_handle(pid)
+ 2  find_python_modules      → [("/usr/bin/python3.11", 0x55f0_0000_0000),
+                                ("/usr/lib/libpython3.11.so.1.0", 0x7f2a_…)]
+ 3  Py_Version symbol        → present (3.11 has it) → PY_VERSION_HEX = 0x030b09f0
+ 4  string scan              → skipped
+ 5  minor 11 < 13            → pre-3.13 finder
+ 6b table_for_version(3,11)  → runtime_interpreters_head 0x28, interp_gc 0x288,
+                               interp_threads_head 0x10, thread_interp 0x10
+    _PyRuntime symbol        → 0x7f2a_…_c1a0
+    cross-ref round-trip     → *(cand+0x10) = tstate; *(tstate+0x10) == cand ✓
+                               and == *(runtime+0x28) ✓  → accepted
+    steps 7–8 skipped (no _Py_DebugOffsets on 3.11)
+ 9  the predefined layout is already the OffsetTable → Resolved::Legacy { table }
+10  gc_stats → kind InlineArray → gc_stats_inline
+11  head = *(runtime + 0x28); has_global_gc() false (interp_gc is Some)
+    gc_addr = interp + 0x288;  region = Direct(gc_addr + 0x80)
+12  read 72 bytes → 3 entries × 24, bases [0,24,48],
+    fields collections@0 / collected@8 / uncollectable@16
+```
+
+**CPython 3.15.0b4 on Windows, `gc-stats <pid>`**
+
+```
+ 1  open_handle(pid)
+ 2  find_python_modules      → [("C:\\…\\python.exe", …), ("C:\\…\\python315.dll", …)]
+ 3  Py_Version symbol        → 0x030f00b4
+ 4  string scan              → skipped
+ 5  minor 15 >= 13           → cookie finder
+ 6a PE section "PyRuntim" (8-char truncation)
+    addr = base + virtual_address; read 8 bytes → b"xdebugpy" ✓
+ 7  *(runtime_addr + 8)      → 0x030f00b4; agrees with step 3, no warning
+    exact LAYOUTS hit        → VersionedOffsets::V3_15_0b4 → Resolved::Full
+ 8  read_struct              → the live _Py_DebugOffsets, 21 sub-structs
+ 9  to_offset_table          → 0x030f00b4 is not in GC_CANDIDATES (0x030f00b1 is),
+                               so the variant's own gc_stats_shape() is used:
+                               RingBuffer, item 64, entries [11,3,3],
+                               bases [0, 712, 912]
+10  gc_stats → kind RingBuffer → verify_ring_stats_size:
+    reported gc.generation_stats_size == 1112 == gc_stats_region_size() ✓
+11  head = *(runtime + interpreters_head); gc_addr = interp + interp_gc;
+    region = Deref(gc_addr + gc.generation_stats) → one u64 read → ring base
+12  read 1104 bytes → 17 entries × 64 across 3 generations,
+    each decoded through GC_LAYOUT (8 named fields)
+```
+
+Two guards cover the b4 trace. Had that layout not been registered, step 7 would
+refuse rather than substitute 3.15.0a8, since `release_level(0x030f00b4)` is `0xB`,
+not `0xF` ([§3.1](#31-exact-or-refuse-fallback)). Step 10 catches the same case
+independently: the a8 layout's 96-byte entries reconstruct 1656, against the 1112 the
+process reports.
+
+*Source:* step order from `src/remote_debugging/session.rs` (`attach`); the pre-3.13
+offsets from `src/remote_debugging/offsets/pre_3_13.rs`; the 3.15.0b4 geometry from
+`src/remote_debugging/offsets/v_3_15_0b4.rs`.
+
 ---
 
-## 3. Locating `_PyRuntime`
+## 2. Locating `_PyRuntime`
 
 CPython 3.13 added the `"xdebugpy"` cookie inside `_Py_DebugOffsets`, in a dedicated
 `PyRuntime` section, as part of PEP 768. Earlier versions have neither, so runtime
 finding splits by version.
+
+The two anchors confirm an address in different ways, and that difference sets the
+order of the pipeline's stages. On 3.13+ the confirmation is a fixed marker:
+`"xdebugpy"` is the same 8 bytes on every build, so an address is confirmed without
+knowing that version's layout, and the offsets are read from the runtime once it is
+found. Pre-3.13 has no marker, so the layout is itself the test — an address is
+accepted only if the memory there matches gcscope's description of that minor, with
+the interpreter/thread pointer graph closing and agreeing with `interpreters.head`.
+That description is needed before the search can start and follows from the version
+alone, so a pre-3.13 target has its offsets before it has its runtime address.
 
 ```mermaid
 flowchart LR
@@ -281,7 +370,7 @@ flowchart LR
     C2 -->|no| C3["try next module, record why"]
 ```
 
-### 3.1 3.13+ — cookie path
+### 2.1 3.13+ — cookie path
 
 For each Python module: read it off disk, classify the format, find the `PyRuntime`
 section, translate to a load address, and read 8 bytes there.
@@ -299,7 +388,7 @@ Section names differ per format. CPython's `GENERATE_DEBUG_SECTION` macro emits
 comparison is the only confirmation that the address is correct, and the only check
 that catches an image-base or fat-slice mistake.
 
-### 3.2 Pre-3.13 — symbol + cross-reference path
+### 2.2 Pre-3.13 — symbol + cross-reference path
 
 The anchor is the `_PyRuntime` symbol plus a structural confirmation:
 
@@ -331,13 +420,15 @@ symbol" versus "symbol found at `0x…` but the cross-reference disagreed" — b
 they have different fixes (an absent or differently-decorated symbol table, versus
 wrong field offsets for this build), and a collapsed message makes a CI failure
 undiagnosable from its output. This distinction located the Mach-O fat-slice defect
-in §3.3.
+in [§2.3](#23-per-platform-image-facts).
 
-A blind data-segment scan was designed as a fallback for a platform that strips the
-symbol. The live matrix confirmed `_PyRuntime` is exported on ELF, PE, and Mach-O,
-so it is not built.
+The symbol supplies the address and the layout match validates it; memory at large is
+never searched for a match. The only searching is over the candidate words inside the
+runtime window, and over modules when one fails. A blind data-segment scan was
+designed as a fallback for a platform that strips the symbol, but the live matrix
+confirmed `_PyRuntime` is exported on ELF, PE, and Mach-O, so it is not built.
 
-### 3.3 Per-platform image facts
+### 2.3 Per-platform image facts
 
 The first live run of the three-OS matrix failed every non-Windows leg on five
 defects, none version-related. Each assumed a PE-shaped fact was universal.
@@ -374,13 +465,33 @@ Two fixes remain correct-but-inferred:
 
 ---
 
-## 4. Selecting the offset layout
+## 3. Selecting the offset layout
 
 For 3.13+ the target publishes its own offsets: `_Py_DebugOffsets` is a struct of
 `uint64_t` field offsets that CPython emits into the binary. gcscope reads those
 bytes out of the process and casts them through a compiled Rust mirror of the same
 struct. The question is which struct definition to read the bytes through; a wrong
 choice shifts every field and fails open.
+
+The candidate definitions are the `LAYOUTS` registry rows, one per version hex. Each
+row's closure reads the target's struct bytes through that build's generated Rust
+mirror ([§4.1](#41-bindgen-generated-structs-313)).
+
+| Version hex | Version | Module | Named sub-structs | Validate/Display tier |
+|---|---|---|---|---|
+| `0x030d01f0` | 3.13.1 | `v_3_13_1.rs` | 15 | basic |
+| `0x030d0df0` | 3.13.13 | `v_3_13_13_53e07256802.rs` | 15 | basic |
+| `0x030e04f0` | 3.14.4 | `v_3_14_4.rs` | 19 | basic |
+| `0x030f00a8` | 3.15.0a8 | `v_3_15_0a8.rs` | 20 | basic |
+| `0x030f00b1` | 3.15.0b1 | `v_3_15_0b1.rs` | 21 | full |
+| `0x030f00b3` | 3.15.0b3 | `v_3_15_0b3.rs` | 21 | full |
+| `0x030f00b4` | 3.15.0b4 | `v_3_15_0b4.rs` | 21 | full |
+| `0x031000a0` | 3.16.0a0 | `v_3_16_0a0.rs` | 21 | full |
+
+`0x030f00b1` additionally carries a same-hex GC candidate, the GC-instrumented
+`gc-gen-3.15+inc` fork ([§3.2](#32-same-hex-candidates-clean-vs-instrumented-builds)).
+Pre-3.13 has no registry: `pre_3_13::table_for_version(major, minor)` matches
+`(3, 8) … (3, 12)` and returns `None` otherwise.
 
 ```mermaid
 flowchart TD
@@ -405,7 +516,7 @@ flowchart TD
     N --> O
 ```
 
-### 4.1 Exact-or-refuse fallback
+### 3.1 Exact-or-refuse fallback
 
 Within a released line — 3.15.0, 3.15.1, 3.15.2 — the structs `_Py_DebugOffsets`
 describes are ABI-frozen by CPython's stability rule, so any final same-minor layout
@@ -430,7 +541,7 @@ inserted field means no neighbouring layout fits.
 The fallback resolution and its warning are memoized in `FALLBACK_CACHE` keyed by
 `(pid, stored hex)`, so a monitor polling at 100 Hz warns once.
 
-### 4.2 Same-hex candidates: clean vs instrumented builds
+### 3.2 Same-hex candidates: clean vs instrumented builds
 
 Two builds can report the same `PY_VERSION_HEX` with a byte-identical
 `_Py_DebugOffsets` and differ only in the per-entry `gc_generation_stats` struct.
@@ -461,15 +572,28 @@ unit test enforces this; a colliding pair must be dropped rather than ordered.
 
 A hex absent from `GC_CANDIDATES` skips selection entirely.
 
-*Source:* `src/remote_debugging/offsets/mod.rs` (`read_offsets`,
+*Source:* `src/remote_debugging/offsets/mod.rs` (`LAYOUTS`, `read_offsets`,
 `resolve_fallback_layout`, `FALLBACK_CACHE`, `GC_CANDIDATES`, `select_gc_shape`,
-`expected_ring_size`), [ADR 0006](adr/0006-layout-registration-integrity.md).
+`expected_ring_size`), `src/remote_debugging/offsets/pre_3_13.rs`
+(`table_for_version`), [ADR 0006](adr/0006-layout-registration-integrity.md).
 
 ---
 
-## 5. Offset sources
+## 4. Offset sources
 
-### 5.1 Bindgen-generated structs (3.13+)
+Both branches produce the same description: where each field sits inside `_PyRuntime`
+for this build. On 3.13+ the build supplies it — CPython's compiler bakes its own
+`offsetof()` values into the binary as `_Py_DebugOffsets`, which gcscope reads back
+out of the running process. Before 3.13 nothing is published, and gcscope carries a
+predefined description of that minor's `_PyRuntime` — the hardcoded tables of
+[§4.2](#42-hardcoded-tables-38--312).
+
+Either one reduces to the `OffsetTable`: the fields gcscope walks — a subset of what
+`_Py_DebugOffsets` carries — plus the GC-stats geometry, which no build publishes and
+which follows from that build's entry struct and threading model. Consumers below
+that point see only the `OffsetTable`.
+
+### 4.1 Bindgen-generated structs (3.13+)
 
 `scripts/gen-offsets.py` builds a `#[repr(C)]` Rust mirror of the C
 `_Py_DebugOffsets` type for one CPython checkout.
@@ -537,10 +661,10 @@ expect. The generator counts named sub-structs and selects:
 The tier reflects what the build's struct can support. Basic-tier builds are fully
 supported for reads.
 
-### 5.2 Hardcoded tables (3.8 – 3.12)
+### 4.2 Hardcoded tables (3.8 – 3.12)
 
 `_Py_DebugOffsets` did not exist before 3.13, so these offsets were extracted from
-CPython headers by hand. Each version supplies nine numbers; the other ~20
+CPython headers by hand. Each version supplies eight numbers; the other ~20
 `OffsetTable` fields are identical across all five and come from a shared
 constructor.
 
@@ -568,13 +692,13 @@ Shared across all five: `GC_STATS_INLINE_OFF = 0x80`, `GC_ITEM_SIZE = 24`,
 `GC_ENTRIES = [1, 1, 1]`, `GC_BASES = [0, 24, 48]`, `GC_COLLECTING = 0xC8`, and
 `LEGACY_GC_LAYOUT` = `collections@0`, `collected@8`, `uncollectable@16`.
 
-The nine varying offsets are passed positionally into the constructor, as a compact
-table of magic numbers with aligned trailing comments. A named-field struct would
+The eight per-version offsets are passed positionally into the constructor, as a
+compact table of magic numbers with aligned trailing comments. A named-field struct would
 make a transposition compiler-checkable; that tradeoff is not taken because any
 transposition is caught end-to-end by the 3.8–3.12 live-smoke legs, and the aligned
 table is clearer for hand-extracted offsets. Revisit if the live coverage narrows.
 
-### 5.3 The `VersionedOffsets` abstraction
+### 4.3 The `VersionedOffsets` abstraction
 
 `VersionedOffsets` is an enum with one variant per registered layout.
 Version-specific behavior lives in exactly two places:
@@ -617,7 +741,7 @@ consumers use.
 
 ---
 
-## 6. Validation guards
+## 5. Validation guards
 
 Because a wrong layout fails open, each guard below is individually the only check
 standing between a mis-resolution and a reported number.
@@ -661,9 +785,9 @@ for any future mid-cycle struct change, with no new test, and would have caught 
 
 ---
 
-## 7. Reading GC stats
+## 6. Reading GC stats
 
-### 7.1 The pointer walk
+### 6.1 The pointer walk
 
 Every version reaches the stats the same way; only the last hop differs.
 
@@ -704,7 +828,7 @@ TUI read garbage at `interp_head + 0x80`. Both now route through `gc_state_addr`
 Decode branches on kind, not on version, which lets 3.8–3.12 reuse the inline path
 with no decode logic of their own.
 
-### 7.2 `InlineArray` — 3.8 through 3.14
+### 6.2 `InlineArray` — 3.8 through 3.14
 
 One entry per generation, contiguous, at a fixed offset inside `_gc_runtime_state`:
 
@@ -741,7 +865,7 @@ The item struct and the inline array position are identical across 3.8–3.13, w
 is why pre-3.13 GC support required no new decode logic — only the inline path
 3.13/3.14 already used.
 
-### 7.3 `RingBuffer` — 3.15.0a8 and later
+### 6.3 `RingBuffer` — 3.15.0a8 and later
 
 3.15 replaced the per-generation counter struct with a ring of recent collection
 records, reached through the `gc.generation_stats` pointer. Each generation's ring is
@@ -810,7 +934,7 @@ The ring geometry is written twice — in `expected_ring_size` for selection and
 `set_ring` for decoding — so a test asserts they agree. Drift there would select one
 layout and decode with another layout's bases, making every stat wrong.
 
-### 7.4 Per-entry fields, by build
+### 6.4 Per-entry fields, by build
 
 The field set an entry carries is a property of the build, so it lives in
 `GcItemLayout` (name → byte offset) rather than in Rust struct fields.
@@ -827,7 +951,7 @@ The field set an entry carries is a property of the build, so it lives in
 `objects_*_transitively_reachable` counters. A layout substitution across that
 boundary would misalign fields and report counters that no longer exist.
 
-### 7.5 `GcStat` as a layout-driven view
+### 6.5 `GcStat` as a layout-driven view
 
 `GcStat` holds one entry's raw bytes plus its build's `GcItemLayout`, and decodes
 fields lazily by name:
@@ -865,9 +989,9 @@ propagate as an error.
 
 ---
 
-## 8. Per-version capabilities
+## 7. Per-version capabilities
 
-### 8.1 Resolution tiers
+### 7.1 Resolution tiers
 
 `Resolved` is the enum every consumer matches on:
 
@@ -881,7 +1005,7 @@ propagate as an error.
 a real `_Py_DebugOffsets` struct out of the process. They differ in confidence and in
 the one-time warning `LayoutOnly` emits.
 
-### 8.2 Capability matrix
+### 7.2 Capability matrix
 
 | Capability | 3.8 | 3.9 – 3.12 | 3.13 / 3.14 | 3.15+ |
 |---|---|---|---|---|
@@ -903,7 +1027,7 @@ The TUI's struct panels are the one genuine version gate, since they visualize t
 `_Py_DebugOffsets` struct that pre-3.13 lacks. `Legacy` gets a focused GC-stats-only
 view.
 
-### 8.3 Attach permissions
+### 7.3 Attach permissions
 
 | Platform | Requirement |
 |---|---|
@@ -928,9 +1052,9 @@ ignored on ad-hoc signatures. Re-sign after every build.
 
 ---
 
-## 9. Verification and adding a version
+## 8. Verification and adding a version
 
-### 9.1 Test layers
+### 8.1 Test layers
 
 Unit tests (`#[cfg(test)]`, in-file, no Python needed, under a second) cover the pure
 logic: version hex encoding, the `LAYOUTS` registry's self-consistency, GC-shape
@@ -946,7 +1070,7 @@ The correctness gate is the live matrix: `tests/live_smoke.rs` spawns
 shape. A resolution error surfaces as a shape assertion failure on the specific
 `(os, version)` leg that depends on it.
 
-### 9.2 CI matrix
+### 8.2 CI matrix
 
 | Job | Coverage |
 |---|---|
@@ -971,7 +1095,7 @@ Policy details:
 `-1` as the PID targets gcscope's own process, using the same self-read capability
 the registry tests rely on.
 
-### 9.3 Adding a version
+### 8.3 Adding a version
 
 Full support via bindgen is maintainer-only; building, testing, and running gcscope
 need none of it, since the generated `v_*.rs` files are checked in. `gen-offsets.py`
@@ -1016,7 +1140,7 @@ Rules:
 
 - Every pre-release needs its own entry; patch releases do not. `_Py_DebugOffsets` is
   ABI-frozen across 3.15.0/3.15.1/3.15.2 but not across a pre-release cycle; see
-  [§4.1](#41-exact-or-refuse-fallback).
+  [§3.1](#31-exact-or-refuse-fallback).
 - At most one `ONGOING` (dev-build) layout may be registered at a time, since two
   drifting `main` snapshots have no oracle for which is current. The generator refuses
   the second.
