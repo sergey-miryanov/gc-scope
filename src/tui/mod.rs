@@ -1,13 +1,21 @@
 pub mod frame;
+mod format;
+mod gc_view;
+mod glitch;
+mod layout;
 pub mod pid_dialog;
+mod sections;
 pub mod tree;
+
+#[cfg(test)]
+mod test_support;
 
 use anyhow::{Context, Result};
 
 use crate::snapshot::collect::CollectRequest;
 use crate::snapshot::poller::SnapshotPoller;
 
-pub use frame::render_snapshot;
+pub use layout::render_snapshot;
 
 pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitch: bool) -> Result<()> {
     frame::run_tui(pid, rate_ms, duration_secs, glitch)
@@ -19,7 +27,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
 pub fn run_tui_snapshot(pid: u32, path: &str) -> Result<()> {
     let mut poller = SnapshotPoller::attach_with(pid, CollectRequest::tui())?;
     let data = poller.poll()?;
-    let frame = frame::render_snapshot(&data, 0, true, true, false, false);
+    let frame = render_snapshot(&data, 0, true, true, false, false);
     std::fs::write(path, frame).with_context(|| format!("writing TUI snapshot to {path}"))?;
     Ok(())
 }
