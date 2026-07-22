@@ -57,6 +57,11 @@ jobs:
 
   # Attach to a real interpreter and decode its GC stats, per (OS, Python minor). Covers
   # both finding paths across all three binary parsers. See ADR 0004 for the full cross-product.
+  # Runs INSTRUMENTED: this matrix is both the correctness gate and the coverage source, so
+  # there is no separate coverage-smoke job. Instrumentation cannot cause the characteristic
+  # bug (a wrong offset reads the *target's* memory; -Cinstrument-coverage only changes
+  # gcscope's own binary). Only the Codecov upload is non-blocking, so a coverage-service
+  # failure can't redden the gate while a real test/build failure still does.
   live-smoke:
     name: gc-stats smoke (${{ matrix.os }} py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
@@ -83,15 +88,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
         with:
           toolchain: stable
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: cargo-llvm-cov  # pinned action SHA; the `tool` input selects what to install
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: ${{ matrix.python }}
           # Required for the beta-only 3.15.
           allow-prereleases: true
 
-      - name: Build gcscope
-        run: cargo build --verbose
+      # No separate `cargo build`: the instrumented run below builds both the test target and
+      # the gcscope binary it spawns, so a second uninstrumented build would be wasted work.
 
       - name: Allow ptrace (best-effort)
         if: runner.os == 'Linux'
@@ -125,24 +134,43 @@ jobs:
           done
 
       # Unprivileged where it works, so a target that drops get-task-allow fails here
-      # instead of being masked by blanket sudo. test_python() picks up setup-python's
-      # interpreter from PATH; the command works in bash and pwsh (Windows).
+      # instead of being masked by blanket sudo. One instrumented invocation builds the test +
+      # gcscope binary, asserts the shape (the gate), and captures the spawned binary's
+      # profile. test_python() picks up setup-python's interpreter from PATH.
       - name: Attach, detect version, assert GC-stats shape
         if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
-        run: cargo test --test live_smoke -- --ignored --nocapture
+        shell: bash
+        run: cargo llvm-cov --test live_smoke --lcov --output-path lcov.info -- --ignored --nocapture
 
-      # macOS pre-3.13 needs root to attach. cargo/rustup live in the user's HOME, not root's,
-      # so build the test binary unprivileged, then run it under sudo -E (which carries
-      # GCSCOPE_TEST_PYTHON through; sudo resets PATH, hence the explicit path).
+      # macOS pre-3.13 needs root to attach, and cargo/rustup live in the user's HOME, not
+      # root's — so instrument via show-env, build the test binary unprivileged, run it under
+      # sudo -E (which carries LLVM_PROFILE_FILE + GCSCOPE_TEST_PYTHON through; sudo resets
+      # PATH, hence the explicit path), make the root-written profiles readable, then report.
       - name: Attach, detect version, assert GC-stats shape (sudo)
         if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
+        shell: bash
         run: |
+          set -euo pipefail
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov clean --workspace
           export GCSCOPE_TEST_PYTHON="$(command -v python)"
           BIN=$(cargo test --test live_smoke --no-run --message-format=json \
                 | jq -r 'select(.executable != null and .target.name == "live_smoke") | .executable' \
                 | head -1)
           echo "test binary: $BIN"
           sudo -E "$BIN" --ignored --nocapture
+          sudo chown -R "$(whoami)" "$CARGO_LLVM_COV_TARGET_DIR" || true
+          cargo llvm-cov report --lcov --output-path lcov.info
+
+      # Upload-only (the action skips generation when test-cmd is empty). Non-blocking: a
+      # Codecov outage must not redden the correctness gate above.
+      - name: Upload coverage
+        continue-on-error: true
+        uses: ./.github/actions/coverage-report
+        with:
+          flags: smoke,${{ matrix.os }}
+          name: smoke-${{ matrix.os }}-py${{ matrix.python }}
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
 
   # Build custom interpreters setup-python can't supply, then run the live_smoke driver.
   # Linux-only (version/decode coverage is OS-independent). Blocking gate. Rationale:
@@ -175,7 +203,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
         with:
           toolchain: stable
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: cargo-llvm-cov  # pinned action SHA; the `tool` input selects what to install
 
       # Resolve to an exact commit (empty ref → read the pin from provenance_file). The
       # cache key is that commit, so a moving branch re-keys and a pinned SHA stays a hit.
@@ -216,21 +248,35 @@ jobs:
           make -j"$(nproc)"
           make install
 
-      - name: Build gcscope
-        run: cargo build --verbose
+      # No separate `cargo build`: the instrumented run below builds both the test target and
+      # the gcscope binary it spawns.
 
       - name: Allow ptrace (best-effort)
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      # GCSCOPE_TEST_PYTHON points the test at the source-built interpreter; the +inc leg
-      # additionally requires the extended GC columns via GCSCOPE_EXPECT_EXTENDED.
+      # Instrumented, so these two source-built layouts (v_3_15_0b1_*.rs / v_3_16_0a0.rs) get
+      # coverage — they execute nowhere else in the matrix. GCSCOPE_TEST_PYTHON points the test
+      # at the source-built interpreter; the +inc leg additionally requires the extended GC
+      # columns via GCSCOPE_EXPECT_EXTENDED.
       - name: Attach, detect version, assert GC-stats shape
+        shell: bash
         run: |
           PY="$HOME/cpython-build/bin/python3"
           "$PY" --version
           export GCSCOPE_TEST_PYTHON="$PY"
           [ "${{ matrix.expect_extended }}" = "yes" ] && export GCSCOPE_EXPECT_EXTENDED=1
-          cargo test --test live_smoke -- --ignored --nocapture
+          cargo llvm-cov --test live_smoke --lcov --output-path lcov.info -- --ignored --nocapture
+
+      # Upload-only. Non-blocking: a Codecov outage must not redden the gate above. The label
+      # carries the build identity; it stays out of `flags` because Codecov flag names don't
+      # accept the '+' in "3.15+inc".
+      - name: Upload coverage
+        continue-on-error: true
+        uses: ./.github/actions/coverage-report
+        with:
+          flags: smoke,custom-build
+          name: smoke-custom-${{ matrix.label }}
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
 
   # The integration suites (lifecycle, memory, monitor, remote_debugging, diagram) are
   # #[ignore]d because they attach to a live interpreter; this leg grants attach
@@ -274,82 +320,4 @@ jobs:
           test-cmd: cargo test --features test-hooks --tests -- --ignored
           flags: integration,ubuntu-latest
           name: integration-ubuntu-latest
-          codecov-token: ${{ secrets.CODECOV_TOKEN }}
-
-  # Coverage-only sibling of live-smoke — every step is non-blocking; live-smoke is the gate,
-  # not this. Enough legs (3.8/3.12/3.15 × 3 OS) to reach each decode path. cargo-llvm-cov runs
-  # the live_smoke test target natively and captures the gcscope binary it spawns; Codecov
-  # normalizes the absolute paths so the per-OS uploads merge.
-  coverage-smoke:
-    name: coverage smoke (${{ matrix.os }} py${{ matrix.python }})
-    runs-on: ${{ matrix.os }}
-    # Job-level: an instrumented-build/tool failure can't block a merge. This masks the
-    # job's API `conclusion` — judge by whether a report reached Codecov, not GitHub status.
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ['3.8', '3.12', '3.15']
-        include:
-          - { python: '3.8',  macos_needs_root: 'yes' }
-          - { python: '3.12', macos_needs_root: 'yes' }
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
-        with:
-          toolchain: stable
-          components: llvm-tools-preview
-      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
-        with:
-          tool: cargo-llvm-cov  # pinned action SHA; the `tool` input selects what to install
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
-        with:
-          python-version: ${{ matrix.python }}
-          allow-prereleases: true
-
-      - name: Allow ptrace (best-effort)
-        if: runner.os == 'Linux'
-        run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
-
-      - name: Configure macOS taskport permissions
-        if: runner.os == 'macOS'
-        continue-on-error: true
-        run: sudo security authorizationdb write system.privilege.taskport is-developer
-
-      # Unprivileged legs: one native invocation builds the instrumented test + gcscope binary,
-      # runs the shape test (which attaches), and captures the spawned binary's coverage.
-      - name: Coverage (unprivileged)
-        if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
-        continue-on-error: true
-        shell: bash
-        run: cargo llvm-cov --test live_smoke --lcov --output-path lcov.info -- --ignored
-
-      # macOS pre-3.13 needs root to attach: instrument via show-env, build the test binary
-      # unprivileged, run it under sudo -E (LLVM_PROFILE_FILE + GCSCOPE_TEST_PYTHON carried
-      # through), make the root-written profiles readable, then report.
-      - name: Coverage (sudo)
-        if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euo pipefail
-          source <(cargo llvm-cov show-env --export-prefix)
-          cargo llvm-cov clean --workspace
-          export GCSCOPE_TEST_PYTHON="$(command -v python)"
-          BIN=$(cargo test --test live_smoke --no-run --message-format=json \
-                | jq -r 'select(.executable != null and .target.name == "live_smoke") | .executable' \
-                | head -1)
-          echo "test binary: $BIN"
-          sudo -E "$BIN" --ignored --nocapture
-          sudo chown -R "$(whoami)" "$CARGO_LLVM_COV_TARGET_DIR" || true
-          cargo llvm-cov report --lcov --output-path lcov.info
-          echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
-
-      - name: Upload coverage
-        continue-on-error: true
-        uses: ./.github/actions/coverage-report
-        with:
-          flags: smoke,${{ matrix.os }}
-          name: smoke-${{ matrix.os }}-py${{ matrix.python }}
           codecov-token: ${{ secrets.CODECOV_TOKEN }}

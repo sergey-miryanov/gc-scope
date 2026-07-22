@@ -3,11 +3,10 @@ description: >
   Produce an lcov report with cargo-llvm-cov and upload it to Codecov. With `test-cmd`
   set, this action instruments through cargo-llvm-cov's own target dir, runs the command,
   and reports; with `test-cmd` empty it uploads a `lcov.info` the caller already generated
-  (the coverage-smoke job builds+runs the gcscope binary itself, then reports, before
-  calling here). Non-blocking by design — wrap the `uses` call in `continue-on-error: true`
-  at the call site (ADR 0005: the gate asserts against an uninstrumented binary, so a
-  coverage-tool failure must not block it). Requires cargo-llvm-cov and the
-  llvm-tools-preview component on the runner.
+  (the live-smoke matrix runs instrumented and reports before calling here). Wrap the
+  `uses` call in `continue-on-error: true` at the call site so a coverage-service failure
+  can't redden a correctness gate. Requires cargo-llvm-cov and the llvm-tools-preview
+  component on the runner.
 
 inputs:
   flags:
@@ -24,7 +23,7 @@ inputs:
   test-cmd:
     description: >
       Command to instrument and run under cargo-llvm-cov (e.g. `cargo test --quiet`).
-      Leave empty when the caller already produced lcov.info (the coverage-smoke job).
+      Leave empty when the caller already produced lcov.info (the live-smoke matrix).
     required: false
     default: ''
 
