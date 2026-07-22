@@ -22,6 +22,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
         with:
           toolchain: stable
@@ -45,7 +47,7 @@ jobs:
         run: cargo test --verbose
 
       - name: Coverage (unit tests)
-        run: cargo llvm-cov --lcov --output-path lcov.info
+        run: cargo llvm-cov --lcov --output-path lcov.info --fail-under-lines 1
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
@@ -81,6 +83,8 @@ jobs:
           - { python: '3.12', macos_needs_root: 'yes' }
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
         with:
           toolchain: stable
@@ -124,7 +128,7 @@ jobs:
       - name: Attach, detect version, assert GC-stats shape
         if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
         shell: bash
-        run: cargo llvm-cov --test live_smoke --lcov --output-path lcov.info -- --ignored --nocapture
+        run: cargo llvm-cov --test live_smoke --lcov --output-path lcov.info --fail-under-lines 1 -- --ignored --nocapture
 
       # macOS pre-3.13 needs root to attach, and cargo/rustup live in the user's HOME, not
       # root's — so instrument via show-env, build the test binary unprivileged, run it as
@@ -161,7 +165,7 @@ jobs:
           echo "--- profraw in $COV_DIR ---"
           find "$COV_DIR" -name '*.profraw' 2>/dev/null | head -20 \
             || echo "(none — the root-run binary wrote no profile)"
-          cargo llvm-cov report --lcov --output-path lcov.info
+          cargo llvm-cov report --lcov --output-path lcov.info --fail-under-lines 1
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
@@ -192,6 +196,8 @@ jobs:
             expect_extended: 'no'
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
         with:
           toolchain: stable
@@ -246,7 +252,7 @@ jobs:
           "$PY" --version
           export GCSCOPE_TEST_PYTHON="$PY"
           [ "${{ matrix.expect_extended }}" = "yes" ] && export GCSCOPE_EXPECT_EXTENDED=1
-          cargo llvm-cov --test live_smoke --lcov --output-path lcov.info -- --ignored --nocapture
+          cargo llvm-cov --test live_smoke --lcov --output-path lcov.info --fail-under-lines 1 -- --ignored --nocapture
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
@@ -263,6 +269,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
         with:
           toolchain: stable
@@ -282,7 +290,7 @@ jobs:
         run: cargo test --features test-hooks --tests -- --ignored
 
       - name: Coverage (integration tests)
-        run: cargo llvm-cov --features test-hooks --tests --lcov --output-path lcov.info -- --ignored
+        run: cargo llvm-cov --features test-hooks --tests --lcov --output-path lcov.info --fail-under-lines 1 -- --ignored
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
