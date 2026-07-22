@@ -45,13 +45,11 @@ jobs:
           name: unit-${{ matrix.os }}
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
 
-      # Non-blocking until the existing warning/format baseline is cleaned up.
-      - name: Clippy (non-blocking)
-        continue-on-error: true
+      - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Format check (non-blocking)
-        continue-on-error: true
+      # run `cargo fmt --all` if red
+      - name: Format check
         run: cargo fmt --all --check
 
   live-smoke:
@@ -96,7 +94,6 @@ jobs:
 
       - name: Configure macOS taskport permissions
         if: runner.os == 'macOS'
-        continue-on-error: true
         run: |
           id $(whoami)
           sudo security authorizationdb write system.privilege.taskport is-developer
@@ -104,7 +101,6 @@ jobs:
 
       - name: Describe the macOS Python image
         if: runner.os == 'macOS'
-        continue-on-error: true
         run: |
           PYBIN="$(python -c 'import sys; print(sys.executable)')"
           # The executable is a stub; the runtime lives in the framework dylib.
