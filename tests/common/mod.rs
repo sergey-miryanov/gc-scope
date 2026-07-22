@@ -57,7 +57,11 @@ pub fn test_python() -> Option<PathBuf> {
 /// rare toolchain that still uses it.
 pub fn python_version(python: &Path) -> Option<(u8, u8)> {
     let out = Command::new(python).arg("--version").output().ok()?;
-    let text = if out.stdout.is_empty() { out.stderr } else { out.stdout };
+    let text = if out.stdout.is_empty() {
+        out.stderr
+    } else {
+        out.stdout
+    };
     let s = String::from_utf8_lossy(&text);
     let ver = s.split_whitespace().nth(1)?; // "Python" "3.13.1"
     let mut parts = ver.split('.');

@@ -33,7 +33,12 @@ impl fmt::Display for ValidationReport {
         writeln!(f, "\n[validation]")?;
         let mut all_passed = true;
         for check in &self.checks {
-            let mark = if check.passed { "✓" } else { all_passed = false; "✗" };
+            let mark = if check.passed {
+                "✓"
+            } else {
+                all_passed = false;
+                "✗"
+            };
             writeln!(f, "  {:<24} {}  {}", check.name, mark, check.detail)?;
         }
         if all_passed {
@@ -48,7 +53,6 @@ macro_rules! impl_validate_debug_offsets {
     ($main:ty, $rst:ty, $ist:ty, $tst:ty, $est:ty, $ift:ty, $cot:ty, $pyt:ty, $tyt:ty,
      $hpt:ty, $tut:ty, $lit:ty, $sot:ty, $dit:ty, $flt:ty, $lot:ty, $byt:ty, $unt:ty,
      $gct:ty, $got:ty, $llt:ty, $dbt:ty) => {
-
         fn _check_section<T>(f: &T) -> u64
         where
             T: SectionSize,
@@ -60,24 +64,96 @@ macro_rules! impl_validate_debug_offsets {
             fn section_size(&self) -> u64;
         }
 
-        impl SectionSize for $rst { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $ist { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $tst { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $ift { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $cot { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $pyt { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $tyt { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $hpt { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $tut { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $lit { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $sot { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $dit { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $flt { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $lot { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $byt { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $unt { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $gct { fn section_size(&self) -> u64 { self.size } }
-        impl SectionSize for $got { fn section_size(&self) -> u64 { self.size } }
+        impl SectionSize for $rst {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $ist {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $tst {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $ift {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $cot {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $pyt {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $tyt {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $hpt {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $tut {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $lit {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $sot {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $dit {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $flt {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $lot {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $byt {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $unt {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $gct {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
+        impl SectionSize for $got {
+            fn section_size(&self) -> u64 {
+                self.size
+            }
+        }
 
         pub fn validate_offsets(
             off: &$main,
@@ -87,16 +163,17 @@ macro_rules! impl_validate_debug_offsets {
 
             // Cookie
             let cookie_bytes: &[u8] = unsafe {
-                ::std::slice::from_raw_parts(
-                    off.cookie.as_ptr() as *const u8,
-                    off.cookie.len(),
-                )
+                ::std::slice::from_raw_parts(off.cookie.as_ptr() as *const u8, off.cookie.len())
             };
             let cookie_ok = cookie_bytes.starts_with(b"xdebugpy");
             checks.push($crate::remote_debugging::offsets::validation::Check::new(
                 "cookie",
                 cookie_ok,
-                if cookie_ok { "\"xdebugpy\"" } else { "mismatch" },
+                if cookie_ok {
+                    "\"xdebugpy\""
+                } else {
+                    "mismatch"
+                },
             ));
 
             // Version
@@ -104,8 +181,10 @@ macro_rules! impl_validate_debug_offsets {
             checks.push($crate::remote_debugging::offsets::validation::Check::new(
                 "version",
                 ver_ok,
-                format!("expected 0x{:08x}, got 0x{:08x}",
-                    expected_version, off.version),
+                format!(
+                    "expected 0x{:08x}, got 0x{:08x}",
+                    expected_version, off.version
+                ),
             ));
 
             // Free-threaded
@@ -124,7 +203,11 @@ macro_rules! impl_validate_debug_offsets {
                     checks.push($crate::remote_debugging::offsets::validation::Check::new(
                         $name,
                         ok,
-                        if ok { format!("{}", sz) } else { "0 (expected > 0)".into() },
+                        if ok {
+                            format!("{}", sz)
+                        } else {
+                            "0 (expected > 0)".into()
+                        },
                     ));
                 };
             }
@@ -164,43 +247,74 @@ macro_rules! impl_validate_debug_offsets {
                 };
             }
 
-            check_field!("runtime_state.finalizing",
-                off.runtime_state.finalizing, off.runtime_state.size);
-            check_field!("runtime_state.interpreters_head",
-                off.runtime_state.interpreters_head, off.runtime_state.size);
-            check_field!("interpreter_state.gc",
-                off.interpreter_state.gc, off.interpreter_state.size);
-            check_field!("interpreter_state.threads_head",
-                off.interpreter_state.threads_head, off.interpreter_state.size);
-            check_field!("interpreter_state.threads_main",
-                off.interpreter_state.threads_main, off.interpreter_state.size);
-            check_field!("thread_state.interp",
-                off.thread_state.interp, off.thread_state.size);
-            check_field!("thread_state.current_frame",
-                off.thread_state.current_frame, off.thread_state.size);
-            check_field!("gc.collecting",
-                off.gc.collecting, off.gc.size);
-            check_field!("gc.frame",
-                off.gc.frame, off.gc.size);
-            check_field!("gc.generation_stats",
-                off.gc.generation_stats, off.gc.size);
-            check_field!("interpreter_frame.previous",
-                off.interpreter_frame.previous, off.interpreter_frame.size);
-            check_field!("code_object.filename",
-                off.code_object.filename, off.code_object.size);
-            check_field!("code_object.co_code_adaptive",
-                off.code_object.co_code_adaptive, off.code_object.size);
-            check_field!("set_object.table",
-                off.set_object.table, off.set_object.size);
-            check_field!("dict_object.ma_keys",
-                off.dict_object.ma_keys, off.dict_object.size);
+            check_field!(
+                "runtime_state.finalizing",
+                off.runtime_state.finalizing,
+                off.runtime_state.size
+            );
+            check_field!(
+                "runtime_state.interpreters_head",
+                off.runtime_state.interpreters_head,
+                off.runtime_state.size
+            );
+            check_field!(
+                "interpreter_state.gc",
+                off.interpreter_state.gc,
+                off.interpreter_state.size
+            );
+            check_field!(
+                "interpreter_state.threads_head",
+                off.interpreter_state.threads_head,
+                off.interpreter_state.size
+            );
+            check_field!(
+                "interpreter_state.threads_main",
+                off.interpreter_state.threads_main,
+                off.interpreter_state.size
+            );
+            check_field!(
+                "thread_state.interp",
+                off.thread_state.interp,
+                off.thread_state.size
+            );
+            check_field!(
+                "thread_state.current_frame",
+                off.thread_state.current_frame,
+                off.thread_state.size
+            );
+            check_field!("gc.collecting", off.gc.collecting, off.gc.size);
+            check_field!("gc.frame", off.gc.frame, off.gc.size);
+            check_field!("gc.generation_stats", off.gc.generation_stats, off.gc.size);
+            check_field!(
+                "interpreter_frame.previous",
+                off.interpreter_frame.previous,
+                off.interpreter_frame.size
+            );
+            check_field!(
+                "code_object.filename",
+                off.code_object.filename,
+                off.code_object.size
+            );
+            check_field!(
+                "code_object.co_code_adaptive",
+                off.code_object.co_code_adaptive,
+                off.code_object.size
+            );
+            check_field!(
+                "set_object.table",
+                off.set_object.table,
+                off.set_object.size
+            );
+            check_field!(
+                "dict_object.ma_keys",
+                off.dict_object.ma_keys,
+                off.dict_object.size
+            );
 
             $crate::remote_debugging::offsets::validation::ValidationReport::new(checks)
         }
     };
 }
-
-
 
 #[cfg(test)]
 mod tests {

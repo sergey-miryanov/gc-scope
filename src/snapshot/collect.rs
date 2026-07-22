@@ -10,11 +10,11 @@
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use anyhow::{Context, Result};
 use crate::remote_debugging::offsets::{self, VersionedOffsets};
 use crate::remote_debugging::session::{PySession, Resolved};
+use anyhow::{Context, Result};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Which heavy payload layers of a snapshot a caller wants [`collect_data`] to read.
 ///
@@ -37,7 +37,11 @@ pub struct CollectRequest {
 impl CollectRequest {
     /// Collect every layer — the historical `collect_data` behavior.
     pub fn all() -> Self {
-        Self { debug_offsets: true, gc_state: true, gc_stats: true }
+        Self {
+            debug_offsets: true,
+            gc_state: true,
+            gc_stats: true,
+        }
     }
 
     /// Exactly the layers the `tui` renderer draws. Equal to [`all`](Self::all) today;
@@ -49,7 +53,11 @@ impl CollectRequest {
 
     /// Only the GC generation stats — no struct dumps. For a stats-focused consumer.
     pub fn gc_stats_only() -> Self {
-        Self { debug_offsets: false, gc_state: false, gc_stats: true }
+        Self {
+            debug_offsets: false,
+            gc_state: false,
+            gc_stats: true,
+        }
     }
 }
 
@@ -129,7 +137,7 @@ pub struct CollectedData {
 #[derive(Debug)]
 pub struct DebugOffsetField {
     pub name: &'static str,
-    pub value: u64,       // the stored offset value
+    pub value: u64, // the stored offset value
 }
 
 pub fn collect_data(session: &PySession, request: &CollectRequest) -> Result<CollectedData> {
@@ -143,7 +151,9 @@ pub fn collect_data(session: &PySession, request: &CollectRequest) -> Result<Col
     // Each heavy layer is one gated read (skipped → empty). The gating lives here, not inside
     // the helpers, so this reads as "collect X if requested". `debug_offsets_size` is a cheap
     // scalar renderers label the panel with, so it is always set; only its byte read is gated.
-    let debug_offsets_size = off_opt.map(|off| off.debug_offsets_total_size()).unwrap_or(0);
+    let debug_offsets_size = off_opt
+        .map(|off| off.debug_offsets_total_size())
+        .unwrap_or(0);
     let runtime_raw_bytes = if request.debug_offsets && off_opt.is_some() {
         read_debug_offsets_dump(session, runtime_addr, debug_offsets_size)?
     } else {
@@ -158,12 +168,20 @@ pub fn collect_data(session: &PySession, request: &CollectRequest) -> Result<Col
         Vec::new()
     };
 
-    let generation_stats =
-        collect_gc_stats(session, &offset_table, off_opt, nav.gc_addr, request.gc_stats)?;
+    let generation_stats = collect_gc_stats(
+        session,
+        &offset_table,
+        off_opt,
+        nav.gc_addr,
+        request.gc_stats,
+    )?;
 
     let interpreter = InterpreterSnapshot {
         addr: nav.head_addr,
-        gc: GcSubState { raw_bytes: gc_raw, generation_stats },
+        gc: GcSubState {
+            raw_bytes: gc_raw,
+            generation_stats,
+        },
         gc_offset: nav.gc_offset,
         gc_size: nav.gc_size,
         id: nav.id,
@@ -223,7 +241,14 @@ fn resolve_interpreter_nav(
     };
     let next_addr = session.read_u64(head_addr + table.interp_next())?;
     let id = session.read_i64(head_addr + table.interp_id())?;
-    Ok(InterpreterNav { head_addr, gc_addr, gc_size, gc_offset, id, next_addr })
+    Ok(InterpreterNav {
+        head_addr,
+        gc_addr,
+        gc_size,
+        gc_offset,
+        id,
+        next_addr,
+    })
 }
 
 /// L3: the `gc` sub-struct bytes for the GC-state hexdump, read to exactly `gc_size` bytes.
@@ -271,7 +296,10 @@ fn collect_gc_stats(
     // Field presence is a property of the version's entry layout (a GcEntry's absent fields
     // are indistinguishable zeros), so capture it once here alongside the geometry.
     let (has_timestamps, has_duration) = match table.gc_layout {
-        Some(l) => (l.has_field("ts_start") && l.has_field("ts_stop"), l.has_field("duration")),
+        Some(l) => (
+            l.has_field("ts_start") && l.has_field("ts_stop"),
+            l.has_field("duration"),
+        ),
         None => (false, false),
     };
 
@@ -297,18 +325,50 @@ impl CollectedData {
 
     /// Key `_Py_DebugOffsets` field values for the interpreter panel; empty pre-3.13.
     pub fn runtime_offset_fields(&self) -> Vec<DebugOffsetField> {
-        let Some(off) = self.offsets() else { return Vec::new(); };
+        let Some(off) = self.offsets() else {
+            return Vec::new();
+        };
         vec![
-            DebugOffsetField { name: "runtime_state.finalizing", value: off.runtime_state_finalizing() },
-            DebugOffsetField { name: "runtime_state.interpreters_head", value: off.runtime_interpreters_head() },
-            DebugOffsetField { name: "interpreter_state.id", value: off.interpreter_state_id() },
-            DebugOffsetField { name: "interpreter_state.next", value: off.interpreter_state_next() },
-            DebugOffsetField { name: "interpreter_state.threads_head", value: off.interpreter_state_threads_head() },
-            DebugOffsetField { name: "interpreter_state.threads_main", value: off.interpreter_state_threads_main() },
-            DebugOffsetField { name: "interpreter_state.gc", value: off.interpreter_state_gc() },
-            DebugOffsetField { name: "gc.collecting", value: off.gc_collecting() },
-            DebugOffsetField { name: "gc.generation_stats", value: off.gc_generation_stats() },
-            DebugOffsetField { name: "gc.generation_stats_size", value: off.gc_generation_stats_size() },
+            DebugOffsetField {
+                name: "runtime_state.finalizing",
+                value: off.runtime_state_finalizing(),
+            },
+            DebugOffsetField {
+                name: "runtime_state.interpreters_head",
+                value: off.runtime_interpreters_head(),
+            },
+            DebugOffsetField {
+                name: "interpreter_state.id",
+                value: off.interpreter_state_id(),
+            },
+            DebugOffsetField {
+                name: "interpreter_state.next",
+                value: off.interpreter_state_next(),
+            },
+            DebugOffsetField {
+                name: "interpreter_state.threads_head",
+                value: off.interpreter_state_threads_head(),
+            },
+            DebugOffsetField {
+                name: "interpreter_state.threads_main",
+                value: off.interpreter_state_threads_main(),
+            },
+            DebugOffsetField {
+                name: "interpreter_state.gc",
+                value: off.interpreter_state_gc(),
+            },
+            DebugOffsetField {
+                name: "gc.collecting",
+                value: off.gc_collecting(),
+            },
+            DebugOffsetField {
+                name: "gc.generation_stats",
+                value: off.gc_generation_stats(),
+            },
+            DebugOffsetField {
+                name: "gc.generation_stats_size",
+                value: off.gc_generation_stats_size(),
+            },
         ]
     }
 }
@@ -389,7 +449,10 @@ pub fn avg_collection_time_per_gen(entries: &[GcEntry], has_duration: bool) -> [
 /// Returns `[None; 3]` when the entry layout has no `ts_start`/`ts_stop` fields (e.g. inline
 /// 3.13/3.14): there is no time base in a single snapshot, so the summary renders "n/a"
 /// rather than a fake 0. Gens with <2 entries stay `Some(0.0)` (formatted like before).
-pub fn collections_rate_from_entries(entries: &[GcEntry], has_timestamps: bool) -> [Option<f64>; 3] {
+pub fn collections_rate_from_entries(
+    entries: &[GcEntry],
+    has_timestamps: bool,
+) -> [Option<f64>; 3] {
     if !has_timestamps {
         return [None, None, None];
     }
@@ -408,8 +471,8 @@ pub fn collections_rate_from_entries(entries: &[GcEntry], has_timestamps: bool) 
         }
         let min_coll = gentries.iter().min_by_key(|s| s.collections).unwrap();
         let max_coll = gentries.iter().max_by_key(|s| s.collections).unwrap();
-        let min_ts  = gentries.iter().min_by_key(|s| s.start_ts).unwrap();
-        let max_ts  = gentries.iter().max_by_key(|s| s.stop_ts).unwrap();
+        let min_ts = gentries.iter().min_by_key(|s| s.start_ts).unwrap();
+        let max_ts = gentries.iter().max_by_key(|s| s.stop_ts).unwrap();
 
         let coll_delta = max_coll.collections - min_coll.collections;
         let ts_delta_ns = max_ts.stop_ts - min_ts.start_ts;
@@ -427,7 +490,13 @@ mod tests {
     use crate::remote_debugging::offsets::offset_table::GcItemLayout;
     use crate::remote_debugging::offsets::pre_3_13;
 
-    fn entry(generation: u32, collections: i64, duration: f64, start_ts: i64, stop_ts: i64) -> GcEntry {
+    fn entry(
+        generation: u32,
+        collections: i64,
+        duration: f64,
+        start_ts: i64,
+        stop_ts: i64,
+    ) -> GcEntry {
         GcEntry {
             generation,
             index: 0,
@@ -471,7 +540,10 @@ mod tests {
     #[test]
     fn avg_collection_time_is_none_without_the_duration_field() {
         let entries = vec![entry(0, 1, 5.0, 0, 0), entry(0, 3, 15.0, 0, 0)];
-        assert_eq!(avg_collection_time_per_gen(&entries, false), [None, None, None]);
+        assert_eq!(
+            avg_collection_time_per_gen(&entries, false),
+            [None, None, None]
+        );
     }
 
     /// With duration, the average is `Δduration / Δcollections` across the ring's
@@ -501,7 +573,10 @@ mod tests {
     #[test]
     fn collections_rate_is_none_without_timestamps() {
         let entries = vec![entry(0, 1, 0.0, 0, 100), entry(0, 5, 0.0, 0, 100)];
-        assert_eq!(collections_rate_from_entries(&entries, false), [None, None, None]);
+        assert_eq!(
+            collections_rate_from_entries(&entries, false),
+            [None, None, None]
+        );
     }
 
     /// The rate is `Δcollections / seconds`, where seconds spans the min `start_ts` to
@@ -639,7 +714,10 @@ mod tests {
             assert_eq!(m.collected(), d.collected);
             assert_eq!(m.uncollectable(), d.uncollectable);
             // The diagram recovers the exact raw-region offset the decoder walked.
-            assert_eq!(d.byte_offset, table.entry_byte_offset(d.generation, d.index).unwrap());
+            assert_eq!(
+                d.byte_offset,
+                table.entry_byte_offset(d.generation, d.index).unwrap()
+            );
         }
 
         // Tear gen0's entry (stop_ts < start_ts). The monitor keeps every entry (it dedups
@@ -647,8 +725,16 @@ mod tests {
         put_i64(&mut raw, bases[0] as usize + 8, 0);
         let monitor_torn = table.decode_gc_stats(&raw, 0);
         let diagram_torn = parse_gc_entries(&raw, &table);
-        assert_eq!(monitor_torn.len(), monitor.len(), "monitor keeps torn entries");
-        assert_eq!(diagram_torn.len(), diagram.len() - 1, "diagram drops the torn entry");
+        assert_eq!(
+            monitor_torn.len(),
+            monitor.len(),
+            "monitor keeps torn entries"
+        );
+        assert_eq!(
+            diagram_torn.len(),
+            diagram.len() - 1,
+            "diagram drops the torn entry"
+        );
         assert!(diagram_torn.iter().all(|s| s.generation != 0));
     }
 }

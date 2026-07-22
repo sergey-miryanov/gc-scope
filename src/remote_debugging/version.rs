@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use goblin::{elf, pe};
 
 use crate::memory::{binary, reader};
@@ -52,7 +52,9 @@ impl PythonVersion {
 
         let mut chars = s.char_indices().peekable();
         let major = parse_digits(&mut chars)?;
-        if chars.next()?.1 != '.' { return None; }
+        if chars.next()?.1 != '.' {
+            return None;
+        }
         let minor = parse_digits(&mut chars)?;
 
         let micro = if chars.peek().map(|&(_, c)| c) == Some('.') {
@@ -71,14 +73,22 @@ impl PythonVersion {
             }
             Some(&(_, 'r')) => {
                 chars.next();
-                if chars.next()?.1 != 'c' { return None; }
+                if chars.next()?.1 != 'c' {
+                    return None;
+                }
                 let serial = parse_digits(&mut chars)?;
                 (0xC, serial.min(0xF))
             }
             _ => (0xF, 0),
         };
 
-        Some(PythonVersion { major, minor, micro, release_level, serial })
+        Some(PythonVersion {
+            major,
+            minor,
+            micro,
+            release_level,
+            serial,
+        })
     }
 }
 
@@ -194,17 +204,13 @@ fn resolve_symbol_elf(bytes: &[u8], base_addr: usize, sym_name: &str) -> Option<
 
     for sym in elf_obj.dynsyms.iter() {
         if elf_obj.dynstrtab.get_at(sym.st_name) == Some(sym_name) {
-            return Some(
-                (base_addr as u64).wrapping_add(sym.st_value.wrapping_sub(load_bias)),
-            );
+            return Some((base_addr as u64).wrapping_add(sym.st_value.wrapping_sub(load_bias)));
         }
     }
 
     for sym in elf_obj.syms.iter() {
         if elf_obj.strtab.get_at(sym.st_name) == Some(sym_name) {
-            return Some(
-                (base_addr as u64).wrapping_add(sym.st_value.wrapping_sub(load_bias)),
-            );
+            return Some((base_addr as u64).wrapping_add(sym.st_value.wrapping_sub(load_bias)));
         }
     }
 
@@ -227,17 +233,14 @@ fn resolve_symbol_macho(bytes: &[u8], base_addr: usize, sym_name: &str) -> Optio
     // Virtual addresses only below, so the slice offset is not needed here.
     let (macho, _) = binary::parse_macho(bytes)?;
 
-    let text_vmaddr = macho
-        .segments
-        .iter()
-        .find_map(|seg| {
-            let name = seg.name().ok()?;
-            if name == "__TEXT" {
-                Some(seg.vmaddr)
-            } else {
-                None
-            }
-        })?;
+    let text_vmaddr = macho.segments.iter().find_map(|seg| {
+        let name = seg.name().ok()?;
+        if name == "__TEXT" {
+            Some(seg.vmaddr)
+        } else {
+            None
+        }
+    })?;
 
     if let Some(symbols) = &macho.symbols {
         for (name, nlist) in symbols.iter().flatten() {
@@ -247,8 +250,7 @@ fn resolve_symbol_macho(bytes: &[u8], base_addr: usize, sym_name: &str) -> Optio
             let matches = name == sym_name || name.strip_prefix('_') == Some(sym_name);
             if matches && !nlist.is_undefined() {
                 return Some(
-                    (base_addr as u64)
-                        .wrapping_add(nlist.n_value.wrapping_sub(text_vmaddr)),
+                    (base_addr as u64).wrapping_add(nlist.n_value.wrapping_sub(text_vmaddr)),
                 );
             }
         }
@@ -275,7 +277,9 @@ fn ro_data_range(bytes: &[u8]) -> Option<(usize, usize)> {
         binary::BinaryKind::Pe => {
             let pe = pe::PE::parse(bytes).ok()?;
             let s = pe.sections.iter().find(|s| {
-                s.name().map(|n| n.trim_end_matches('\0') == ".rdata").unwrap_or(false)
+                s.name()
+                    .map(|n| n.trim_end_matches('\0') == ".rdata")
+                    .unwrap_or(false)
             })?;
             Some((s.pointer_to_raw_data as usize, s.size_of_raw_data as usize))
         }
@@ -392,10 +396,21 @@ fn scan_for_version_string(bytes: &[u8]) -> Option<PythonVersion> {
 
         // Validate trailing context
         let next = bytes.get(j).copied().unwrap_or(0);
-        if next == 0 || next == b' ' || next == b'(' || next == b'\n' || next == b'\r'
-            || next == b'\t' || next == b'"'
+        if next == 0
+            || next == b' '
+            || next == b'('
+            || next == b'\n'
+            || next == b'\r'
+            || next == b'\t'
+            || next == b'"'
         {
-            return Some(PythonVersion { major: 3, minor, micro, release_level, serial });
+            return Some(PythonVersion {
+                major: 3,
+                minor,
+                micro,
+                release_level,
+                serial,
+            });
         }
         i = j;
     }
@@ -407,7 +422,13 @@ mod tests {
     use super::*;
 
     fn v(major: u8, minor: u8, micro: u8, release_level: u8, serial: u8) -> PythonVersion {
-        PythonVersion { major, minor, micro, release_level, serial }
+        PythonVersion {
+            major,
+            minor,
+            micro,
+            release_level,
+            serial,
+        }
     }
 
     #[test]
@@ -443,10 +464,22 @@ mod tests {
 
     #[test]
     fn from_string_parses_the_shapes_detect_actually_sees() {
-        assert_eq!(PythonVersion::from_string("3.15.0a8"), Some(v(3, 15, 0, 0xA, 8)));
-        assert_eq!(PythonVersion::from_string("3.12.0"), Some(v(3, 12, 0, 0xF, 0)));
-        assert_eq!(PythonVersion::from_string("3.11.0rc1"), Some(v(3, 11, 0, 0xC, 1)));
-        assert_eq!(PythonVersion::from_string("Python 3.11.0"), Some(v(3, 11, 0, 0xF, 0)));
+        assert_eq!(
+            PythonVersion::from_string("3.15.0a8"),
+            Some(v(3, 15, 0, 0xA, 8))
+        );
+        assert_eq!(
+            PythonVersion::from_string("3.12.0"),
+            Some(v(3, 12, 0, 0xF, 0))
+        );
+        assert_eq!(
+            PythonVersion::from_string("3.11.0rc1"),
+            Some(v(3, 11, 0, 0xC, 1))
+        );
+        assert_eq!(
+            PythonVersion::from_string("Python 3.11.0"),
+            Some(v(3, 11, 0, 0xF, 0))
+        );
         // Trailing content is allowed: this is what `python --version` and the
         // binary's embedded version string look like.
         assert_eq!(
@@ -454,7 +487,10 @@ mod tests {
             Some(v(3, 12, 0, 0xF, 0))
         );
         // Micro is optional.
-        assert_eq!(PythonVersion::from_string("3.12"), Some(v(3, 12, 0, 0xF, 0)));
+        assert_eq!(
+            PythonVersion::from_string("3.12"),
+            Some(v(3, 12, 0, 0xF, 0))
+        );
     }
 
     #[test]
@@ -509,7 +545,10 @@ mod tests {
     /// micro guard the scan would lock onto the first `"3.<minor>"` it sees.
     #[test]
     fn scan_skips_a_version_without_a_micro_and_keeps_looking() {
-        assert_eq!(scan_for_version_string(b"3.13 then 3.13.4 "), Some(v(3, 13, 4, 0xF, 0)));
+        assert_eq!(
+            scan_for_version_string(b"3.13 then 3.13.4 "),
+            Some(v(3, 13, 4, 0xF, 0))
+        );
         // A lone minor-only string yields nothing.
         assert_eq!(scan_for_version_string(b"python 3.13\x00"), None);
     }
@@ -529,8 +568,14 @@ mod tests {
     /// not accepted at that position.
     #[test]
     fn scan_requires_a_terminator_after_the_version() {
-        assert_eq!(scan_for_version_string(b"3.12.0\""), Some(v(3, 12, 0, 0xF, 0)));
-        assert_eq!(scan_for_version_string(b"3.12.0("), Some(v(3, 12, 0, 0xF, 0)));
+        assert_eq!(
+            scan_for_version_string(b"3.12.0\""),
+            Some(v(3, 12, 0, 0xF, 0))
+        );
+        assert_eq!(
+            scan_for_version_string(b"3.12.0("),
+            Some(v(3, 12, 0, 0xF, 0))
+        );
         // 'z' is neither a release suffix nor a terminator → not a match here.
         assert_eq!(scan_for_version_string(b"3.12.0z"), None);
     }

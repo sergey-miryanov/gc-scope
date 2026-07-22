@@ -16,7 +16,7 @@
 
 mod common;
 
-use common::{is_free_threaded, python_version, test_python, SpawnedPython};
+use common::{SpawnedPython, is_free_threaded, python_version, test_python};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -90,7 +90,10 @@ fn gcscope(args: &[&str]) -> (i32, String) {
 /// `(kind, entries-per-generation)` gcscope should decode for this interpreter. Mirrors
 /// `GcStatsKind` selection: one inline entry per generation through 3.14, ring buffers from
 /// 3.15 — 11/3/3 on a GIL build, 1/1/1 free-threaded. `None` if the version is unknown.
-fn expected_shape(version: Option<(u8, u8)>, free_threaded: bool) -> Option<(&'static str, [usize; 3])> {
+fn expected_shape(
+    version: Option<(u8, u8)>,
+    free_threaded: bool,
+) -> Option<(&'static str, [usize; 3])> {
     let v = version?;
     if v < (3, 15) {
         Some(("InlineArray", [1, 1, 1]))
@@ -113,8 +116,15 @@ fn parse_rows(out: &str) -> Vec<Row> {
         }
         let p = |i: usize| parts[i].parse::<i128>();
         // gen entry interp collections collected uncollectable candidates heap_size duration
-        let (Ok(generation), Ok(entry), Ok(collections), Ok(collected), Ok(uncollectable), Ok(candidates), Ok(heap_size)) =
-            (p(0), p(1), p(3), p(4), p(5), p(6), p(7))
+        let (
+            Ok(generation),
+            Ok(entry),
+            Ok(collections),
+            Ok(collected),
+            Ok(uncollectable),
+            Ok(candidates),
+            Ok(heap_size),
+        ) = (p(0), p(1), p(3), p(4), p(5), p(6), p(7))
         else {
             continue;
         };
@@ -237,7 +247,11 @@ fn live_smoke_attaches_and_decodes_shape() {
     let (rc, find_out) = gcscope(&["find-runtime", &pid]);
     if rc != 0 {
         let (_, regions) = gcscope(&["list", &pid]);
-        let mapped: Vec<&str> = regions.lines().filter(|l| l.contains("ython")).take(25).collect();
+        let mapped: Vec<&str> = regions
+            .lines()
+            .filter(|l| l.contains("ython"))
+            .take(25)
+            .collect();
         panic!(
             "{}",
             diag(format!(
@@ -264,7 +278,10 @@ fn live_smoke_attaches_and_decodes_shape() {
         Some((kind, entries)) => {
             let rows = parse_rows(&stats_out);
             if let Err(e) = check_stats(&rows, kind, entries) {
-                panic!("{}", diag(format!("{e}\n----- gc-stats -----\n{stats_out}")));
+                panic!(
+                    "{}",
+                    diag(format!("{e}\n----- gc-stats -----\n{stats_out}"))
+                );
             }
         }
     }

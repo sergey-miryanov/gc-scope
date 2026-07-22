@@ -18,11 +18,7 @@ pub const GC_COLLECTING: u64 = 0xC8;
 /// `InlineArray` decode path in `PySession::gc_stats` handle Legacy interpreters.
 pub static LEGACY_GC_LAYOUT: GcItemLayout = GcItemLayout {
     item_size: GC_ITEM_SIZE as usize,
-    fields: &[
-        ("collections", 0),
-        ("collected", 8),
-        ("uncollectable", 16),
-    ],
+    fields: &[("collections", 0), ("collected", 8), ("uncollectable", 16)],
 };
 
 // A private constructor for the hand-extracted legacy tables: it fills the ~20 constant
@@ -36,9 +32,17 @@ pub static LEGACY_GC_LAYOUT: GcItemLayout = GcItemLayout {
 // 3.8–3.12 live-smoke legs, and (b) the aligned-comment table is the clearer form for
 // hand-extracted offsets. If the live coverage ever narrows, revisit this.
 #[allow(clippy::too_many_arguments)]
-fn table(version_hex: u64, runtime_ih: u64, interp_next: u64, interp_id: u64,
-         interp_ts_head: u64, interp_gc: Option<u64>, thread_interp: u64,
-         gc_gen: u64, runtime_gc: Option<u64>) -> OffsetTable {
+fn table(
+    version_hex: u64,
+    runtime_ih: u64,
+    interp_next: u64,
+    interp_id: u64,
+    interp_ts_head: u64,
+    interp_gc: Option<u64>,
+    thread_interp: u64,
+    gc_gen: u64,
+    runtime_gc: Option<u64>,
+) -> OffsetTable {
     OffsetTable {
         version_hex,
         runtime_interpreters_head: runtime_ih,
@@ -58,7 +62,7 @@ fn table(version_hex: u64, runtime_ih: u64, interp_next: u64, interp_id: u64,
         // `runtime_gc`, so 3.8 decodes through this same `InlineArray` layout too.)
         gc_stats_kind: GcStatsKind::InlineArray,
         gc_layout: Some(&LEGACY_GC_LAYOUT),
-        gc_stats_addr: None,  // filled per-interpreter by the stats loop (gc_state + GC_STATS_INLINE_OFF)
+        gc_stats_addr: None, // filled per-interpreter by the stats loop (gc_state + GC_STATS_INLINE_OFF)
         gc_item_size: Some(GC_ITEM_SIZE),
         gc_entries_per_gen: Some(GC_ENTRIES),
         gc_gen_base_offsets: Some(GC_BASES),
@@ -72,12 +76,12 @@ fn table(version_hex: u64, runtime_ih: u64, interp_next: u64, interp_id: u64,
 pub fn table_for_version(major: u8, minor: u8) -> Option<OffsetTable> {
     let version_hex = (major as u64) << 24 | (minor as u64) << 16;
     match (major, minor) {
-        (3, 8)  => Some(v3_8(version_hex)),
-        (3, 9)  => Some(v3_9(version_hex)),
+        (3, 8) => Some(v3_8(version_hex)),
+        (3, 9) => Some(v3_9(version_hex)),
         (3, 10) => Some(v3_10(version_hex)),
         (3, 11) => Some(v3_11(version_hex)),
         (3, 12) => Some(v3_12(version_hex)),
-        _       => None,
+        _ => None,
     }
 }
 
@@ -90,13 +94,13 @@ pub fn table_for_version(major: u8, minor: u8) -> Option<OffsetTable> {
 fn v3_8(version_hex: u64) -> OffsetTable {
     table(
         version_hex,
-        0x20,    // runtime_interpreters_head
-        0x00,    // interp_next
-        0x10,    // interp_id
-        0x08,    // interp_tstate_head
-        None,    // interp_gc (global GC)
-        0x10,    // thread_interp
-        0x18,    // gc_generations
+        0x20,        // runtime_interpreters_head
+        0x00,        // interp_next
+        0x10,        // interp_id
+        0x08,        // interp_tstate_head
+        None,        // interp_gc (global GC)
+        0x10,        // thread_interp
+        0x18,        // gc_generations
         Some(0x158), // runtime_gc
     )
 }
@@ -105,14 +109,14 @@ fn v3_8(version_hex: u64) -> OffsetTable {
 fn v3_9(version_hex: u64) -> OffsetTable {
     table(
         version_hex,
-        0x20,    // runtime_interpreters_head
-        0x00,    // interp_next
-        0x18,    // interp_id
-        0x08,    // interp_tstate_head
+        0x20,        // runtime_interpreters_head
+        0x00,        // interp_next
+        0x18,        // interp_id
+        0x08,        // interp_tstate_head
         Some(0x268), // interp_gc
-        0x10,    // thread_interp
-        0x18,    // gc_generations
-        None,    // runtime_gc
+        0x10,        // thread_interp
+        0x18,        // gc_generations
+        None,        // runtime_gc
     )
 }
 
@@ -125,14 +129,14 @@ fn v3_10(version_hex: u64) -> OffsetTable {
 fn v3_11(version_hex: u64) -> OffsetTable {
     table(
         version_hex,
-        0x28,    // runtime_interpreters_head
-        0x00,    // interp_next
-        0x30,    // interp_id
-        0x10,    // interp_threads_head (threads.head at offset 0x10)
+        0x28,        // runtime_interpreters_head
+        0x00,        // interp_next
+        0x30,        // interp_id
+        0x10,        // interp_threads_head (threads.head at offset 0x10)
         Some(0x288), // interp_gc
-        0x10,    // thread_interp
-        0x18,    // gc_generations
-        None,    // runtime_gc
+        0x10,        // thread_interp
+        0x18,        // gc_generations
+        None,        // runtime_gc
     )
 }
 
@@ -140,14 +144,14 @@ fn v3_11(version_hex: u64) -> OffsetTable {
 fn v3_12(version_hex: u64) -> OffsetTable {
     table(
         version_hex,
-        0x28,    // runtime_interpreters_head
-        0x00,    // interp_next
-        0x08,    // interp_id
-        0x48,    // interp_threads_head
+        0x28,       // runtime_interpreters_head
+        0x00,       // interp_next
+        0x08,       // interp_id
+        0x48,       // interp_threads_head
         Some(0x70), // interp_gc
-        0x10,    // thread_interp
-        0x18,    // gc_generations
-        None,    // runtime_gc
+        0x10,       // thread_interp
+        0x18,       // gc_generations
+        None,       // runtime_gc
     )
 }
 
@@ -183,12 +187,21 @@ mod tests {
     fn only_3_8_has_global_gc_state() {
         let t38 = table_for_version(3, 8).unwrap();
         assert!(t38.runtime_gc.is_some(), "3.8 GC state lives in _PyRuntime");
-        assert!(t38.interp_gc.is_none(), "3.8 has no per-interpreter GC state");
+        assert!(
+            t38.interp_gc.is_none(),
+            "3.8 has no per-interpreter GC state"
+        );
 
         for (major, minor) in [(3, 9), (3, 10), (3, 11), (3, 12)] {
             let t = table_for_version(major, minor).unwrap();
-            assert!(t.runtime_gc.is_none(), "{major}.{minor} must not use the global-GC branch");
-            assert!(t.interp_gc.is_some(), "{major}.{minor} has per-interpreter GC state");
+            assert!(
+                t.runtime_gc.is_none(),
+                "{major}.{minor} must not use the global-GC branch"
+            );
+            assert!(
+                t.interp_gc.is_some(),
+                "{major}.{minor} has per-interpreter GC state"
+            );
         }
     }
 
@@ -232,7 +245,10 @@ mod tests {
         // Fields introduced in later builds must be absent, so the decoder leaves
         // their `Option`s as None rather than reading past the 24-byte item.
         for absent in ["ts_start", "duration", "heap_size", "increment_size"] {
-            assert!(!LEGACY_GC_LAYOUT.has_field(absent), "{absent} must not be in the legacy layout");
+            assert!(
+                !LEGACY_GC_LAYOUT.has_field(absent),
+                "{absent} must not be in the legacy layout"
+            );
         }
     }
 }

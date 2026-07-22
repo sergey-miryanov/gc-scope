@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use read_process_memory::{copy_address, ProcessHandle};
+use read_process_memory::{ProcessHandle, copy_address};
 
 /// Open a process handle once and reuse it for many reads.
 ///

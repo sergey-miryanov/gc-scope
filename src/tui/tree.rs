@@ -9,10 +9,15 @@
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub enum TreeEntryKind {
-    RawValue { offset: usize },
+    RawValue {
+        offset: usize,
+    },
     Group,
     Derived,
-    Layout { field_type: &'static str, field_offset: u32 },
+    Layout {
+        field_type: &'static str,
+        field_offset: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -43,56 +48,163 @@ pub fn debug_offsets_tree(
     // `_Py_DebugOffsets` layout, so they are literals rather than table lookups.
     let mut e = vec![
         // depth 0
-        TreeEntry { depth: 0, label: "_Py_DebugOffsets", kind: TreeEntryKind::Group },
+        TreeEntry {
+            depth: 0,
+            label: "_Py_DebugOffsets",
+            kind: TreeEntryKind::Group,
+        },
         // depth 1
-        TreeEntry { depth: 1, label: "cookie[8]",          kind: TreeEntryKind::RawValue { offset: 0 } },
-        TreeEntry { depth: 1, label: "version",            kind: TreeEntryKind::RawValue { offset: 8 } },
-        TreeEntry { depth: 1, label: "free_threaded",      kind: TreeEntryKind::RawValue { offset: 16 } },
-        TreeEntry { depth: 1, label: "runtime_state",      kind: TreeEntryKind::Group },
+        TreeEntry {
+            depth: 1,
+            label: "cookie[8]",
+            kind: TreeEntryKind::RawValue { offset: 0 },
+        },
+        TreeEntry {
+            depth: 1,
+            label: "version",
+            kind: TreeEntryKind::RawValue { offset: 8 },
+        },
+        TreeEntry {
+            depth: 1,
+            label: "free_threaded",
+            kind: TreeEntryKind::RawValue { offset: 16 },
+        },
+        TreeEntry {
+            depth: 1,
+            label: "runtime_state",
+            kind: TreeEntryKind::Group,
+        },
         // depth 2 under runtime_state
-        TreeEntry { depth: 2, label: "size",               kind: TreeEntryKind::RawValue { offset: 24 } },
-        TreeEntry { depth: 2, label: "finalizing",         kind: TreeEntryKind::RawValue { offset: 32 } },
-        TreeEntry { depth: 2, label: "interpreters_head",  kind: TreeEntryKind::RawValue { offset: 40 } },
-
-        TreeEntry { depth: 1, label: "interpreter_state",  kind: TreeEntryKind::Group },
+        TreeEntry {
+            depth: 2,
+            label: "size",
+            kind: TreeEntryKind::RawValue { offset: 24 },
+        },
+        TreeEntry {
+            depth: 2,
+            label: "finalizing",
+            kind: TreeEntryKind::RawValue { offset: 32 },
+        },
+        TreeEntry {
+            depth: 2,
+            label: "interpreters_head",
+            kind: TreeEntryKind::RawValue { offset: 40 },
+        },
+        TreeEntry {
+            depth: 1,
+            label: "interpreter_state",
+            kind: TreeEntryKind::Group,
+        },
         // depth 2 under interpreter_state
-        TreeEntry { depth: 2, label: "size",               kind: TreeEntryKind::RawValue { offset: 48 } },
-        TreeEntry { depth: 2, label: "id",                 kind: TreeEntryKind::RawValue { offset: 56 } },
-        TreeEntry { depth: 2, label: "next",               kind: TreeEntryKind::RawValue { offset: 64 } },
-        TreeEntry { depth: 2, label: "threads_head",       kind: TreeEntryKind::RawValue { offset: 72 } },
-        TreeEntry { depth: 2, label: "threads_main",       kind: TreeEntryKind::RawValue { offset: 80 } },
-        TreeEntry { depth: 2, label: "gc",                 kind: TreeEntryKind::RawValue { offset: 88 } },
+        TreeEntry {
+            depth: 2,
+            label: "size",
+            kind: TreeEntryKind::RawValue { offset: 48 },
+        },
+        TreeEntry {
+            depth: 2,
+            label: "id",
+            kind: TreeEntryKind::RawValue { offset: 56 },
+        },
+        TreeEntry {
+            depth: 2,
+            label: "next",
+            kind: TreeEntryKind::RawValue { offset: 64 },
+        },
+        TreeEntry {
+            depth: 2,
+            label: "threads_head",
+            kind: TreeEntryKind::RawValue { offset: 72 },
+        },
+        TreeEntry {
+            depth: 2,
+            label: "threads_main",
+            kind: TreeEntryKind::RawValue { offset: 80 },
+        },
+        TreeEntry {
+            depth: 2,
+            label: "gc",
+            kind: TreeEntryKind::RawValue { offset: 88 },
+        },
     ];
 
     // depth 3 under gc: actual gc sub-struct fields at their real offsets.
     for &(name, offset) in gc_fields {
-        e.push(TreeEntry { depth: 3, label: name, kind: TreeEntryKind::RawValue { offset: offset as usize } });
+        e.push(TreeEntry {
+            depth: 3,
+            label: name,
+            kind: TreeEntryKind::RawValue {
+                offset: offset as usize,
+            },
+        });
     }
 
     // Ring-buffer builds publish a `generation_stats` pointer; only then does the
     // derived per-generation entry layout apply. Inline (3.13/3.14) and stat-less builds
     // have no such subtree.
-    if gc_fields.iter().any(|&(name, _)| name == "generation_stats") {
+    if gc_fields
+        .iter()
+        .any(|&(name, _)| name == "generation_stats")
+    {
         // depth 4 derived entries under generation_stats
-        e.push(TreeEntry { depth: 4, label: "item_size",          kind: TreeEntryKind::Derived });
-        e.push(TreeEntry { depth: 4, label: "young_entries (11)",   kind: TreeEntryKind::Derived });
+        e.push(TreeEntry {
+            depth: 4,
+            label: "item_size",
+            kind: TreeEntryKind::Derived,
+        });
+        e.push(TreeEntry {
+            depth: 4,
+            label: "young_entries (11)",
+            kind: TreeEntryKind::Derived,
+        });
 
         // depth 5 entry group under young_entries
-        e.push(TreeEntry { depth: 5, label: "entry",               kind: TreeEntryKind::Group });
+        e.push(TreeEntry {
+            depth: 5,
+            label: "entry",
+            kind: TreeEntryKind::Group,
+        });
 
         // depth 6 actual entry fields
         if let Some(fields) = entry_fields {
             for &(name, off) in fields {
-                e.push(TreeEntry { depth: 6, label: name, kind: TreeEntryKind::Layout { field_type: "", field_offset: off as u32 } });
+                e.push(TreeEntry {
+                    depth: 6,
+                    label: name,
+                    kind: TreeEntryKind::Layout {
+                        field_type: "",
+                        field_offset: off as u32,
+                    },
+                });
             }
         }
 
         // depth 4 more derived entries
-        e.push(TreeEntry { depth: 4, label: "index0",             kind: TreeEntryKind::Derived });
-        e.push(TreeEntry { depth: 4, label: "old0_entries (3)",     kind: TreeEntryKind::Derived });
-        e.push(TreeEntry { depth: 4, label: "index1",             kind: TreeEntryKind::Derived });
-        e.push(TreeEntry { depth: 4, label: "old1_entries (3)",     kind: TreeEntryKind::Derived });
-        e.push(TreeEntry { depth: 4, label: "index2",             kind: TreeEntryKind::Derived });
+        e.push(TreeEntry {
+            depth: 4,
+            label: "index0",
+            kind: TreeEntryKind::Derived,
+        });
+        e.push(TreeEntry {
+            depth: 4,
+            label: "old0_entries (3)",
+            kind: TreeEntryKind::Derived,
+        });
+        e.push(TreeEntry {
+            depth: 4,
+            label: "index1",
+            kind: TreeEntryKind::Derived,
+        });
+        e.push(TreeEntry {
+            depth: 4,
+            label: "old1_entries (3)",
+            kind: TreeEntryKind::Derived,
+        });
+        e.push(TreeEntry {
+            depth: 4,
+            label: "index2",
+            kind: TreeEntryKind::Derived,
+        });
     }
 
     e
@@ -129,7 +241,11 @@ pub fn tree_prefixes(entries: &[TreeEntry]) -> Vec<String> {
 
 /// Compute gen_stats layout values
 pub fn gen_stats_layout(gen_stats_size: u64) -> (u64, u64, u64, u64, u64, u64, u64) {
-    let item_size = if gen_stats_size >= 24 { (gen_stats_size - 24) / 17 } else { 0 };
+    let item_size = if gen_stats_size >= 24 {
+        (gen_stats_size - 24) / 17
+    } else {
+        0
+    };
     let young_bytes = 11 * item_size;
     let old_bytes = 3 * item_size;
     let index0_off = young_bytes;
@@ -137,7 +253,15 @@ pub fn gen_stats_layout(gen_stats_size: u64) -> (u64, u64, u64, u64, u64, u64, u
     let index1_off = old0_off + old_bytes;
     let old1_off = index1_off + 8;
     let index2_off = old1_off + old_bytes;
-    (item_size, young_bytes, old_bytes, index0_off, index1_off, index2_off, old0_off)
+    (
+        item_size,
+        young_bytes,
+        old_bytes,
+        index0_off,
+        index1_off,
+        index2_off,
+        old0_off,
+    )
 }
 
 #[cfg(test)]
@@ -162,13 +286,23 @@ mod tests {
     /// entry subtree, and the resolved entry fields nest under it at depth 6.
     #[test]
     fn tree_adds_the_ring_subtree_when_generation_stats_is_present() {
-        let gc_fields = [("size", 96u64), ("collecting", 104), ("generation_stats", 112)];
+        let gc_fields = [
+            ("size", 96u64),
+            ("collecting", 104),
+            ("generation_stats", 112),
+        ];
         let entry_fields = [("ts_start", 0usize), ("collections", 8)];
         let tree = debug_offsets_tree(&gc_fields, Some(&entry_fields));
-        assert!(tree.iter().any(|e| e.label == "young_entries (11)" && e.depth == 4));
+        assert!(
+            tree.iter()
+                .any(|e| e.label == "young_entries (11)" && e.depth == 4)
+        );
         assert!(tree.iter().any(|e| e.label == "old0_entries (3)"));
         assert!(tree.iter().any(|e| e.label == "ts_start" && e.depth == 6));
-        assert!(tree.iter().any(|e| e.label == "collections" && e.depth == 6));
+        assert!(
+            tree.iter()
+                .any(|e| e.label == "collections" && e.depth == 6)
+        );
     }
 
     /// Characterization guard: `tree_prefixes` documents a "\-- " last-child
@@ -182,7 +316,10 @@ mod tests {
         assert_eq!(prefixes[0], "", "the root entry has no connector");
         for (e, p) in tree.iter().zip(&prefixes).skip(1) {
             assert!(p.ends_with("+-- "), "depth {} prefix was {p:?}", e.depth);
-            assert!(!p.contains("\\-- "), "last-child connector leaked into {p:?}");
+            assert!(
+                !p.contains("\\-- "),
+                "last-child connector leaked into {p:?}"
+            );
         }
     }
 

@@ -154,10 +154,7 @@ impl<'a> MonitorContext<'a> {
 ///
 /// `ts_start == 0` means an untouched entry (never collected) and is never selected —
 /// the initial mark is 0 and selection is strictly greater-than.
-fn select_fresh<'s>(
-    stats: &'s [GcStat],
-    seen: &mut HashMap<(u32, usize), i64>,
-) -> Vec<&'s GcStat> {
+fn select_fresh<'s>(stats: &'s [GcStat], seen: &mut HashMap<(u32, usize), i64>) -> Vec<&'s GcStat> {
     let mut fresh: Vec<&GcStat> = Vec::new();
     for stat in stats {
         let mark = seen.entry((stat.generation, stat.index)).or_insert(0);
@@ -173,19 +170,29 @@ fn select_fresh<'s>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote_debugging::offsets::offset_table::{seq_layout, GcItemLayout};
+    use crate::remote_debugging::offsets::offset_table::{GcItemLayout, seq_layout};
     use std::sync::LazyLock;
 
     /// Minimal entry layout for the dedup tests — they only ever set/read `ts_start`
     /// (`generation`/`entry` are identity fields on the view, not layout fields).
-    static TEST_LAYOUT: LazyLock<&'static GcItemLayout> = LazyLock::new(|| seq_layout(&["ts_start"]));
+    static TEST_LAYOUT: LazyLock<&'static GcItemLayout> =
+        LazyLock::new(|| seq_layout(&["ts_start"]));
 
     fn stat(generation: u32, index: usize, ts_start: i64) -> GcStat {
-        GcStat::from_fields(generation, index, 0, *TEST_LAYOUT, &[("ts_start", ts_start)])
+        GcStat::from_fields(
+            generation,
+            index,
+            0,
+            *TEST_LAYOUT,
+            &[("ts_start", ts_start)],
+        )
     }
 
     fn fresh_ts(stats: &[GcStat], seen: &mut HashMap<(u32, usize), i64>) -> Vec<i64> {
-        select_fresh(stats, seen).into_iter().map(|s| s.ts_start()).collect()
+        select_fresh(stats, seen)
+            .into_iter()
+            .map(|s| s.ts_start())
+            .collect()
     }
 
     /// Entries that have never been collected read back as zero. The initial mark is
@@ -221,7 +228,10 @@ mod tests {
         assert_eq!(fresh_ts(&[stat(2, 0, 900)], &mut seen), vec![900]);
         // Tick 2: generation 0 collected at t=100 — older than the gen-2 mark, but
         // new for its own entry. A per-PID mark would drop it.
-        assert_eq!(fresh_ts(&[stat(0, 0, 100), stat(2, 0, 900)], &mut seen), vec![100]);
+        assert_eq!(
+            fresh_ts(&[stat(0, 0, 100), stat(2, 0, 900)], &mut seen),
+            vec![100]
+        );
     }
 
     /// Same hazard inside one generation: the ring's entries are overwritten in turn,
@@ -230,7 +240,10 @@ mod tests {
     fn entries_within_a_generation_are_tracked_independently() {
         let mut seen = HashMap::new();
         assert_eq!(fresh_ts(&[stat(0, 3, 500)], &mut seen), vec![500]);
-        assert_eq!(fresh_ts(&[stat(0, 3, 500), stat(0, 7, 200)], &mut seen), vec![200]);
+        assert_eq!(
+            fresh_ts(&[stat(0, 3, 500), stat(0, 7, 200)], &mut seen),
+            vec![200]
+        );
     }
 
     /// Entries arrive generation-major but the trace must be ordered by time, or

@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{pid_alive, test_python, SpawnedPython};
+use common::{SpawnedPython, pid_alive, test_python};
 use std::thread;
 use std::time::{Duration, Instant};
 

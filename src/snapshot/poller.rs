@@ -1,7 +1,7 @@
 use anyhow::Result;
 
-use crate::snapshot::collect::{collect_data, CollectRequest, CollectedData};
 use crate::remote_debugging::session::{PySession, Revalidated};
+use crate::snapshot::collect::{CollectRequest, CollectedData, collect_data};
 
 /// Single-PID snapshot producer: owns the attached [`PySession`], hands out a full
 /// [`CollectedData`] per tick, and absorbs transient read failures with the monitor's
@@ -73,6 +73,9 @@ impl SnapshotPoller {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn from_session(session: PySession) -> Self {
-        Self { session, request: CollectRequest::all() }
+        Self {
+            session,
+            request: CollectRequest::all(),
+        }
     }
 }

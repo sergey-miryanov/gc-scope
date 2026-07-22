@@ -18,15 +18,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use read_process_memory::ProcessHandle;
 
 use crate::memory::{process, reader};
 use crate::remote_debugging::gc_stats::GcStat;
 use crate::remote_debugging::offsets::{
-    self,
+    self, VersionedOffsets,
     offset_table::{GcStatsKind, GcStatsRegion, OffsetTable},
-    VersionedOffsets,
 };
 use crate::remote_debugging::version::{self, PythonVersion};
 
@@ -150,9 +149,17 @@ pub enum LayoutSource {
 /// `_Py_DebugOffsets` struct panels of the TUI.
 #[derive(Debug)]
 pub enum Resolved {
-    Full { offsets: VersionedOffsets, table: OffsetTable },
-    LayoutOnly { offsets: VersionedOffsets, table: OffsetTable },
-    Legacy { table: OffsetTable },
+    Full {
+        offsets: VersionedOffsets,
+        table: OffsetTable,
+    },
+    LayoutOnly {
+        offsets: VersionedOffsets,
+        table: OffsetTable,
+    },
+    Legacy {
+        table: OffsetTable,
+    },
 }
 
 impl Resolved {
@@ -236,7 +243,10 @@ impl PySession {
             None => {
                 let entry = resolve_layout(pid, runtime_addr, version)?;
                 if let Some(key) = &exe_key {
-                    LAYOUT_CACHE.lock().unwrap().insert(key.clone(), entry.clone());
+                    LAYOUT_CACHE
+                        .lock()
+                        .unwrap()
+                        .insert(key.clone(), entry.clone());
                 }
                 (entry, LayoutSource::Parsed)
             }
@@ -378,7 +388,10 @@ impl PySession {
             .offsets()
             .map(|vo| vo.gc_generation_stats())
             .unwrap_or(0);
-        let region = self.resolved.table().gc_stats_region(gc_addr, gen_stats_off);
+        let region = self
+            .resolved
+            .table()
+            .gc_stats_region(gc_addr, gen_stats_off);
         resolve_stats_region(region, |ptr_addr| self.read_u64(ptr_addr))
     }
 
@@ -576,14 +589,15 @@ fn find_runtime_versioned(pid: u32) -> Result<(u64, String, PythonVersion)> {
     let (addr, path) = if version.minor >= 13 {
         process::find_runtime_module(pid)?
     } else {
-        let table = offsets::pre_3_13::table_for_version(version.major, version.minor)
-            .ok_or_else(|| {
+        let table = offsets::pre_3_13::table_for_version(version.major, version.minor).ok_or_else(
+            || {
                 anyhow!(
                     "Unsupported Python version {}.{} (no pre-3.13 offset table)",
                     version.major,
                     version.minor
                 )
-            })?;
+            },
+        )?;
         process::find_runtime_pre_3_13(pid, &table)?
     };
     Ok((addr, path, version))
@@ -644,7 +658,10 @@ mod tests {
     /// A `None` new read means the process is gone, whatever the old cmdline was.
     #[test]
     fn a_none_new_read_is_gone() {
-        assert_eq!(classify_cmdline(Some("python spin.py"), None), CmdlineCheck::Gone);
+        assert_eq!(
+            classify_cmdline(Some("python spin.py"), None),
+            CmdlineCheck::Gone
+        );
         assert_eq!(classify_cmdline(None, None), CmdlineCheck::Gone);
     }
 
@@ -677,7 +694,10 @@ mod tests {
             CmdlineCheck::Inconclusive
         );
         // Both unreadable.
-        assert_eq!(classify_cmdline(Some(""), Some("")), CmdlineCheck::Inconclusive);
+        assert_eq!(
+            classify_cmdline(Some(""), Some("")),
+            CmdlineCheck::Inconclusive
+        );
     }
 
     /// No baseline captured at attach ⇒ nothing to compare, so a new read alone

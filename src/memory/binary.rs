@@ -157,7 +157,10 @@ mod tests {
     #[test]
     fn rejects_short_and_unknown_input() {
         assert!(kind(b"").is_none());
-        assert!(kind(b"\x7fEL").is_none(), "3 bytes is below the 4-byte magic");
+        assert!(
+            kind(b"\x7fEL").is_none(),
+            "3 bytes is below the 4-byte magic"
+        );
         assert!(kind(b"not a binary").is_none());
         assert!(kind(&[0u8; 4]).is_none());
     }
