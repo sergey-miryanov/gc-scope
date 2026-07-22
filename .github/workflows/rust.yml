@@ -252,6 +252,15 @@ jobs:
       - name: "Run the 'ignored' integration tests"
         run: cargo test --features test-hooks --tests -- --ignored
 
+      # Trial run of the Rust successor to tests/live_smoke.py. Gated by GCSCOPE_LIVE_SMOKE so
+      # the blocking step above skips it; here it runs on this leg's interpreter (py3.13) to
+      # prove it green before the full-matrix cutover. Non-blocking during the trial.
+      - name: "Live-smoke (Rust successor, trial)"
+        continue-on-error: true
+        env:
+          GCSCOPE_LIVE_SMOKE: '1'
+        run: cargo test --test live_smoke -- --ignored --nocapture
+
       # Separate instrumented re-run so the integration suites' live-attach code
       # paths (find_runtime, read_offsets, session reads, collect/render, the monitor
       # retry) are measured — the unit-coverage leg never runs the #[ignore]d tests.

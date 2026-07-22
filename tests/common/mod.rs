@@ -77,6 +77,21 @@ fn runs(python: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// True for a free-threaded (no-GIL) build, whose GC ring holds one entry per generation
+/// instead of the GIL build's 11/3/3 — the live-smoke shape check needs this to pick the
+/// expected entry counts. `false` if it can't be determined (the common GIL case).
+pub fn is_free_threaded(python: &Path) -> bool {
+    Command::new(python)
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_config_var('Py_GIL_DISABLED') or 0)",
+        ])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+        .unwrap_or(false)
+}
+
 /// A running `spin.py` interpreter, killed on drop.
 pub struct SpawnedPython {
     child: Child,
