@@ -2,12 +2,12 @@
 //!
 //! These are *live* tests: they need a Python interpreter but **not** attach permission
 //! (no ptrace), so they run under plain `cargo test` in the unit `build` CI job. Attach +
-//! decode is covered separately by the live-smoke matrix (tests/live_smoke.py). With no
+//! decode is covered separately by the live-smoke matrix (tests/live_smoke.rs). With no
 //! Python present they skip with a log rather than fail.
 
 mod common;
 
-use common::{pid_alive, test_python, SpawnedPython};
+use common::{SpawnedPython, pid_alive, test_python};
 use std::thread;
 use std::time::{Duration, Instant};
 

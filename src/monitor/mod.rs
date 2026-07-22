@@ -11,4 +11,4 @@ pub mod exporters;
 pub mod run_loop;
 
 pub use context::MonitorContext;
-pub use run_loop::{run_loop, NoWaitPolicy, PollStatus, StartupTimeoutPolicy, WaitPolicy};
+pub use run_loop::{NoWaitPolicy, PollStatus, StartupTimeoutPolicy, WaitPolicy, run_loop};

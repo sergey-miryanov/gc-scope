@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build & test (${{ matrix.os }})
@@ -26,37 +29,35 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
-          tool: grcov  # pinned SHA: the ref no longer selects the tool
+          tool: cargo-llvm-cov
+
+      # run `cargo fmt --all` if red
+      - name: Format check
+        run: cargo fmt --all --check
 
       - name: Build
         run: cargo build --verbose
 
-      # Unit tests only; live-smoke below is the integration gate.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Test
         run: cargo test --verbose
 
-      # Separate instrumented run so a coverage-tool failure isn't mistaken for a test
-      # failure and the gate keeps running an uninstrumented binary. Non-blocking.
       - name: Coverage (unit tests)
-        continue-on-error: true
-        uses: ./.github/actions/coverage-report
+        run: cargo llvm-cov --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
-          test-cmd: cargo test --quiet
+          files: lcov.info
           flags: unit,${{ matrix.os }}
           name: unit-${{ matrix.os }}
-          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
 
-      # Non-blocking until the existing warning/format baseline is cleaned up.
-      - name: Clippy (non-blocking)
-        continue-on-error: true
-        run: cargo clippy --all-targets -- -D warnings
 
-      - name: Format check (non-blocking)
-        continue-on-error: true
-        run: cargo fmt --all --check
-
-  # Attach to a real interpreter and decode its GC stats, per (OS, Python minor). Covers
-  # both finding paths across all three binary parsers. See ADR 0004 for the full cross-product.
   live-smoke:
     name: gc-stats smoke (${{ matrix.os }} py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
@@ -83,33 +84,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
         with:
           toolchain: stable
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: cargo-llvm-cov
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: ${{ matrix.python }}
-          # Required for the beta-only 3.15.
           allow-prereleases: true
-
-      - name: Build gcscope
-        run: cargo build --verbose
 
       - name: Allow ptrace (best-effort)
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      # macOS gates attach behind task_for_pid. Non-blocking so it can't mask a code failure.
       - name: Configure macOS taskport permissions
         if: runner.os == 'macOS'
-        continue-on-error: true
         run: |
           id $(whoami)
           sudo security authorizationdb write system.privilege.taskport is-developer
           sudo security authorizationdb read system.privilege.taskport
 
-      # Dump image facts so a macOS failure is diagnosable without another CI round-trip.
       - name: Describe the macOS Python image
         if: runner.os == 'macOS'
-        continue-on-error: true
         run: |
           PYBIN="$(python -c 'import sys; print(sys.executable)')"
           # The executable is a stub; the runtime lives in the framework dylib.
@@ -124,26 +121,58 @@ jobs:
               || echo "(unsigned / no signing info)"
           done
 
-      # Unprivileged where it works, so a target that drops get-task-allow fails here
-      # instead of being masked by blanket sudo.
-      - name: Attach, detect version, assert non-empty GC stats
+      - name: Attach, detect version, assert GC-stats shape
         if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
-        run: python tests/live_smoke.py --label ${{ matrix.os }}-py${{ matrix.python }}
+        shell: bash
+        run: cargo llvm-cov --test live_smoke --lcov --output-path lcov.info -- --ignored --nocapture
 
-      - name: Attach, detect version, assert non-empty GC stats (sudo)
+      # macOS pre-3.13 needs root to attach, and cargo/rustup live in the user's HOME, not
+      # root's — so instrument via show-env, build the test binary unprivileged, run it as
+      # root, make the root-written profiles readable, then report.
+      - name: Attach, detect version, assert GC-stats shape (sudo)
         if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
+        shell: bash
         run: |
-          PY="$(command -v python)"
-          sudo -E "$PY" tests/live_smoke.py \
-            --label ${{ matrix.os }}-py${{ matrix.python }}
+          set -euo pipefail
+          # Write-then-source, NOT `source <(...)`: process substitution discards show-env's
+          # exit status, so a failure there silently leaves the run uninstrumented and only
+          # surfaces later as "not found *.profraw files".
+          cargo llvm-cov show-env --export-prefix > "$RUNNER_TEMP/llvm-cov-env.sh"
+          echo "--- cargo llvm-cov show-env ---"; cat "$RUNNER_TEMP/llvm-cov-env.sh"
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          cargo llvm-cov clean --workspace
+          export GCSCOPE_TEST_PYTHON="$(command -v python)"
+          BIN=$(cargo test --test live_smoke --no-run --message-format=json \
+                | jq -r 'select(.executable != null and .target.name == "live_smoke") | .executable' \
+                | head -1)
+          echo "test binary: $BIN"
+          # Fail here, named, if instrumentation env never applied — rather than letting it
+          # surface downstream as the misleading "not found *.profraw files".
+          : "${LLVM_PROFILE_FILE:?show-env set no LLVM_PROFILE_FILE; the run would not be instrumented}"
+          # `sudo env VAR=...` rather than `sudo -E`: -E depends on sudoers env_keep/SETENV and
+          # silently drops vars, leaving the root-run binary writing its profile elsewhere.
+          sudo env LLVM_PROFILE_FILE="$LLVM_PROFILE_FILE" \
+                   GCSCOPE_TEST_PYTHON="$GCSCOPE_TEST_PYTHON" \
+                   "$BIN" --ignored --nocapture
+          # Default rather than a bare reference: show-env's exact variable names are not a
+          # stable contract, and `set -u` turns a wrong guess into a hard failure here.
+          COV_DIR="${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
+          sudo chown -R "$(whoami)" "$COV_DIR" || true
+          echo "--- profraw in $COV_DIR ---"
+          find "$COV_DIR" -name '*.profraw' 2>/dev/null | head -20 \
+            || echo "(none — the root-run binary wrote no profile)"
+          cargo llvm-cov report --lcov --output-path lcov.info
 
-  # Build custom interpreters setup-python can't supply, then run the live_smoke driver.
-  # Linux-only (version/decode coverage is OS-independent). Blocking gate. Rationale:
-  # docs/adr/0006-layout-registration-integrity.md.
-  #   - 3.15+inc: shares hex 0x030f00b1 with clean 3.15.0b1; --expect-extended proves the
-  #     +inc candidate (not the clean one) was decoded.
-  #   - 3.16.0a0: pinned commit read from the gcscope-source: line in v_3_16_0a0.rs, so
-  #     regenerating 3.16 moves the pin with no YAML edit.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: lcov.info
+          flags: smoke,${{ matrix.os }}
+          name: smoke-${{ matrix.os }}-py${{ matrix.python }}
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
   custom-build-smoke:
     name: gc-stats smoke (source ${{ matrix.label }})
     runs-on: ubuntu-latest
@@ -151,8 +180,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ref: branch/SHA to build. provenance_file: read the pin from a layout's
-          # gcscope-source: line instead (leave ref empty).
           - label: '3.15+inc'
             repo: sergey-miryanov/cpython
             ref: 'feat/gc-gen-3.15+inc'
@@ -168,10 +195,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
         with:
           toolchain: stable
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: cargo-llvm-cov
 
-      # Resolve to an exact commit (empty ref → read the pin from provenance_file). The
-      # cache key is that commit, so a moving branch re-keys and a pinned SHA stays a hit.
       - name: Resolve interpreter commit
         id: rev
         run: |
@@ -194,8 +223,6 @@ jobs:
           path: ~/cpython-build
           key: cpython-${{ matrix.label }}-${{ steps.rev.outputs.sha }}
 
-      # Fetch the resolved SHA (branch or pinned commit both work). Only C build deps
-      # needed; spin.py imports gc/os/sys/time only.
       - name: Build CPython from source
         if: steps.cache-py.outputs.cache-hit != 'true'
         run: |
@@ -209,24 +236,28 @@ jobs:
           make -j"$(nproc)"
           make install
 
-      - name: Build gcscope
-        run: cargo build --verbose
-
       - name: Allow ptrace (best-effort)
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      - name: Attach, detect version, assert GC stats
+      - name: Attach, detect version, assert GC-stats shape
+        shell: bash
         run: |
           PY="$HOME/cpython-build/bin/python3"
           "$PY" --version
-          EXTRA=""
-          [ "${{ matrix.expect_extended }}" = "yes" ] && EXTRA="--expect-extended"
-          python3 tests/live_smoke.py --python "$PY" --label "${{ matrix.label }}" $EXTRA
+          export GCSCOPE_TEST_PYTHON="$PY"
+          [ "${{ matrix.expect_extended }}" = "yes" ] && export GCSCOPE_EXPECT_EXTENDED=1
+          cargo llvm-cov --test live_smoke --lcov --output-path lcov.info -- --ignored --nocapture
 
-  # The integration suites (lifecycle, memory, monitor, remote_debugging, diagram) are
-  # #[ignore]d because they attach to a live interpreter; this leg grants attach
-  # permission and runs them all. --features test-hooks is required by tests/monitor.rs
-  # and a no-op elsewhere. Linux/py3.13. Blocking gate.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: lcov.info
+          flags: smoke,custom-build
+          name: smoke-custom-${{ matrix.label }}
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
   integration-tests:
     name: integration tests (attach)
     runs-on: ubuntu-latest
@@ -239,8 +270,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
-          tool: grcov  # pinned SHA: the ref no longer selects the tool
-      # Guarantees an interpreter, so the tests run rather than skip (a false green).
+          tool: cargo-llvm-cov
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: '3.13'
@@ -248,98 +278,18 @@ jobs:
       - name: Allow ptrace (best-effort)
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      # Blocking gate, uninstrumented (ADR 0005: assert against a clean binary).
       - name: "Run the 'ignored' integration tests"
         run: cargo test --features test-hooks --tests -- --ignored
 
-      # Separate instrumented re-run so the integration suites' live-attach code
-      # paths (find_runtime, read_offsets, session reads, collect/render, the monitor
-      # retry) are measured — the unit-coverage leg never runs the #[ignore]d tests.
-      # Non-blocking so a coverage-tool failure can't fail the gate above.
       - name: Coverage (integration tests)
-        continue-on-error: true
-        uses: ./.github/actions/coverage-report
+        run: cargo llvm-cov --features test-hooks --tests --lcov --output-path lcov.info -- --ignored
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
-          test-cmd: cargo test --features test-hooks --tests -- --ignored
+          files: lcov.info
           flags: integration,ubuntu-latest
           name: integration-ubuntu-latest
-          codecov-token: ${{ secrets.CODECOV_TOKEN }}
-
-  # grcov (not cargo-llvm-cov): `-s .` emits repo-relative paths so Windows uploads merge
-  # with Linux/macOS instead of double-counting under absolute paths.
-  # Coverage-only sibling of live-smoke: the gate must assert against an UNINSTRUMENTED
-  # binary, and coverage needs only enough legs (3.8/3.12/3.15 × 3 OS) to reach each decode
-  # path. Every step is non-blocking — live-smoke is the gate, not this.
-  coverage-smoke:
-    name: coverage smoke (${{ matrix.os }} py${{ matrix.python }})
-    runs-on: ${{ matrix.os }}
-    # Job-level: an instrumented-build/tool failure can't block a merge. This masks the
-    # job's API `conclusion` — judge by whether a report reached Codecov, not GitHub status.
-    continue-on-error: true
-    env:
-      # Coverage comes from the gcscope subprocess itself (%p = pid, %m = binary signature).
-      RUSTFLAGS: -Cinstrument-coverage
-      LLVM_PROFILE_FILE: ${{ github.workspace }}/target/profraw/gcscope-%p-%m.profraw
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ['3.8', '3.12', '3.15']
-        include:
-          - { python: '3.8',  macos_needs_root: 'yes' }
-          - { python: '3.12', macos_needs_root: 'yes' }
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
-        with:
-          toolchain: stable
-          components: llvm-tools-preview
-      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
-        with:
-          tool: grcov  # pinned SHA: the ref no longer selects the tool
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
-        with:
-          python-version: ${{ matrix.python }}
-          allow-prereleases: true
-
-      # No rust-cache here: RUSTFLAGS forces a full instrumented rebuild anyway.
-      - name: Build instrumented gcscope
-        run: cargo build
-
-      - name: Allow ptrace (best-effort)
-        if: runner.os == 'Linux'
-        run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
-
-      - name: Configure macOS taskport permissions
-        if: runner.os == 'macOS'
-        continue-on-error: true
-        run: sudo security authorizationdb write system.privilege.taskport is-developer
-
-      - name: Smoke run
-        if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
-        continue-on-error: true
-        run: python tests/live_smoke.py --label cov-${{ matrix.os }}-py${{ matrix.python }}
-
-      - name: Smoke run (sudo)
-        if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
-        continue-on-error: true
-        run: |
-          PY="$(command -v python)"
-          sudo -E "$PY" tests/live_smoke.py \
-            --label cov-${{ matrix.os }}-py${{ matrix.python }}
-
-      # The sudo legs write root-owned .profraw that grcov then cannot read.
-      - name: Make profiles readable
-        if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
-        continue-on-error: true
-        run: sudo chown -R "$(whoami)" target/profraw || true
-
-      # Profraw was already emitted by the smoke run above (job-level RUSTFLAGS), so
-      # no test-cmd here — just grcov + upload.
-      - name: Generate and upload coverage
-        continue-on-error: true
-        uses: ./.github/actions/coverage-report
-        with:
-          flags: smoke,${{ matrix.os }}
-          name: smoke-${{ matrix.os }}-py${{ matrix.python }}
-          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}

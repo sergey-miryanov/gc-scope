@@ -11,13 +11,19 @@ use crate::snapshot::collect::CollectedData;
 
 use super::format::fmt_val;
 use super::layout::{
-    full_line, hex_dump_rows, l, padding_hex_right, plain_line, span_line, styled_left_inner_box,
-    top, INNER_TW, INNER_W, PL,
+    INNER_TW, INNER_W, PL, full_line, hex_dump_rows, l, padding_hex_right, plain_line, span_line,
+    styled_left_inner_box, top,
 };
 use super::tree::{debug_offsets_tree, gen_stats_layout, tree_prefixes};
 
 // ── Section 1: _Py_DebugOffsets ───────────────────────────────────
-pub(super) fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets, show_tree: bool, show_hex: bool, show_runtime_hex: bool) -> Vec<Line<'static>> {
+pub(super) fn section_debug_offsets(
+    data: &CollectedData,
+    off: &VersionedOffsets,
+    show_tree: bool,
+    show_hex: bool,
+    show_runtime_hex: bool,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let debug_size = data.debug_offsets_size as usize;
 
@@ -71,7 +77,8 @@ pub(super) fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets
     } else {
         vec![]
     };
-    let hex_highlights: Vec<(usize, u8, Color)> = debug_highlights.iter()
+    let hex_highlights: Vec<(usize, u8, Color)> = debug_highlights
+        .iter()
         .filter(|(off, len, _, _)| hex_slice.len() >= off + *len as usize)
         .map(|(off, len, label, _)| {
             let color = match *label {
@@ -131,11 +138,12 @@ pub(super) fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets
         }
     };
 
-    let format_tree_line = |prefix: &str, offset_str: &str, name: &str, value_str: &str| -> String {
-        let before = format!("{}{}{}", prefix, offset_str, name);
-        let pad = PL.saturating_sub(before.len() + value_str.len());
-        format!("{}{}{}", before, " ".repeat(pad), value_str)
-    };
+    let format_tree_line =
+        |prefix: &str, offset_str: &str, name: &str, value_str: &str| -> String {
+            let before = format!("{}{}{}", prefix, offset_str, name);
+            let pad = PL.saturating_sub(before.len() + value_str.len());
+            format!("{}{}{}", before, " ".repeat(pad), value_str)
+        };
 
     let mut tree_highlight_rows: Vec<(usize, Color)> = Vec::new();
 
@@ -150,14 +158,15 @@ pub(super) fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets
                     let f = fmt_val(val, entry.label);
                     format_tree_line(pfx, &format!("0x{:04x}  ", offset), entry.label, &f)
                 }
-                super::tree::TreeEntryKind::Group => {
-                    format_tree_line(pfx, "", entry.label, "")
-                }
+                super::tree::TreeEntryKind::Group => format_tree_line(pfx, "", entry.label, ""),
                 super::tree::TreeEntryKind::Derived => {
                     let val_str = derived_val(entry.label);
                     format_tree_line(pfx, "", entry.label, &val_str)
                 }
-                super::tree::TreeEntryKind::Layout { field_type: _, field_offset } => {
+                super::tree::TreeEntryKind::Layout {
+                    field_type: _,
+                    field_offset,
+                } => {
                     let val_str = format!("+{}", field_offset);
                     format_tree_line(pfx, "", entry.label, &val_str)
                 }
@@ -168,7 +177,11 @@ pub(super) fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets
             }
         }
     } else {
-        left_owned.push(format!("{:<pl$}", "[Tree hidden - press t to show]", pl = PL));
+        left_owned.push(format!(
+            "{:<pl$}",
+            "[Tree hidden - press t to show]",
+            pl = PL
+        ));
     }
 
     if !show_tree && show_hex {
@@ -180,15 +193,21 @@ pub(super) fn section_debug_offsets(data: &CollectedData, off: &VersionedOffsets
             hex_label, hex_start, hex_end_off, hex_len
         )))));
         for row in &hex_rows {
-            let hex_content: String = row.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>().concat();
+            let hex_content: String = row
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>()
+                .concat();
             lines.push(Line::from(Span::raw(l(&hex_content))));
         }
     } else {
         let hex_header: String = if show_hex {
             let hex_len = hex_slice.len();
             let hex_end_off = hex_start + hex_len.saturating_sub(1);
-            format!("Hex Dump ({}, 0x{:04x}-0x{:04x}, {} bytes):",
-                hex_label, hex_start, hex_end_off, hex_len)
+            format!(
+                "Hex Dump ({}, 0x{:04x}-0x{:04x}, {} bytes):",
+                hex_label, hex_start, hex_end_off, hex_len
+            )
         } else {
             "[Hex dump hidden - press h to show]".into()
         };
@@ -241,7 +260,10 @@ pub(super) fn section_interpreter_legacy(data: &CollectedData) -> Vec<Line<'stat
     lines
 }
 
-pub(super) fn section_interpreter(data: &CollectedData, off: &VersionedOffsets) -> Vec<Line<'static>> {
+pub(super) fn section_interpreter(
+    data: &CollectedData,
+    off: &VersionedOffsets,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let interp = &data.interpreter;
     // Show the whole GC state struct (raw_bytes is read to exactly gc.size bytes), so the
@@ -292,7 +314,12 @@ pub(super) fn section_interpreter(data: &CollectedData, off: &VersionedOffsets) 
     let present: Vec<&'static str> = off.gc_debug_fields().into_iter().map(|(n, _)| n).collect();
 
     let collecting_off = off.gc_collecting() as usize;
-    let collecting_val = interp.gc.raw_bytes.get(collecting_off).copied().unwrap_or(0);
+    let collecting_val = interp
+        .gc
+        .raw_bytes
+        .get(collecting_off)
+        .copied()
+        .unwrap_or(0);
     if present.contains(&"size") {
         left_items.push(LeftItem::Plain(format!(
             "  | {:<tw$} |",
@@ -312,16 +339,17 @@ pub(super) fn section_interpreter(data: &CollectedData, off: &VersionedOffsets) 
 
     let frame_off = off.gc_frame() as usize;
     let frame_val = if frame_off + 8 <= interp.gc.raw_bytes.len() {
-        u64::from_le_bytes(interp.gc.raw_bytes[frame_off..frame_off + 8].try_into().unwrap())
+        u64::from_le_bytes(
+            interp.gc.raw_bytes[frame_off..frame_off + 8]
+                .try_into()
+                .unwrap(),
+        )
     } else {
         0
     };
     if present.contains(&"frame") {
         left_items.push(LeftItem::Styled(
-            format!(
-                "  {:<15} @ gc+{:<4}  {:#x}",
-                "frame", frame_off, frame_val
-            ),
+            format!("  {:<15} @ gc+{:<4}  {:#x}", "frame", frame_off, frame_val),
             Color::Cyan,
         ));
     }
@@ -340,7 +368,11 @@ pub(super) fn section_interpreter(data: &CollectedData, off: &VersionedOffsets) 
 
     let gen_stats_off = off.gc_generation_stats() as usize;
     let gen_stats_ptr = if gen_stats_off + 8 <= interp.gc.raw_bytes.len() {
-        u64::from_le_bytes(interp.gc.raw_bytes[gen_stats_off..gen_stats_off + 8].try_into().unwrap())
+        u64::from_le_bytes(
+            interp.gc.raw_bytes[gen_stats_off..gen_stats_off + 8]
+                .try_into()
+                .unwrap(),
+        )
     } else {
         0
     };
@@ -352,14 +384,21 @@ pub(super) fn section_interpreter(data: &CollectedData, off: &VersionedOffsets) 
     if present.contains(&"generation_stats") {
         left_items.push(LeftItem::Plain(format!(
             "  | {:<tw$} |",
-            format!("  {:<15} @ gc+{:<4}  {}", "gen_stats", gen_stats_off, ptr_str),
+            format!(
+                "  {:<15} @ gc+{:<4}  {}",
+                "gen_stats", gen_stats_off, ptr_str
+            ),
             tw = INNER_TW
         )));
     }
     left_items.push(LeftItem::Plain(format!("  +{}+", "-".repeat(INNER_W))));
 
     // ── Right panel: hex dump ──
-    let right_header = format!("{:<pr$}", format!("GC struct ({} bytes) hex dump:", interp.gc_size), pr = super::layout::PR);
+    let right_header = format!(
+        "{:<pr$}",
+        format!("GC struct ({} bytes) hex dump:", interp.gc_size),
+        pr = super::layout::PR
+    );
 
     // GC struct highlights: collecting field (8 bytes) + frame field (8 bytes). Two separate
     // gates: the outer one is presence + bounds — it keeps absent fields on 3.13/3.14 (whose
@@ -442,7 +481,10 @@ mod tests {
     fn section_interpreter_legacy_names_the_interpreter_and_flags_the_missing_struct() {
         let data = legacy_data(true);
         let out = join_lines(&section_interpreter_legacy(&data));
-        assert!(out.contains("PyInterpreterState @ 0x6000  (id: 0)"), "{out}");
+        assert!(
+            out.contains("PyInterpreterState @ 0x6000  (id: 0)"),
+            "{out}"
+        );
         assert!(out.contains("pre-3.13: no _Py_DebugOffsets"), "{out}");
     }
 
@@ -450,14 +492,35 @@ mod tests {
     fn debug_tree_row_color_shades_named_fields_and_every_first_entry_item() {
         use crate::tui::tree::TreeEntryKind;
         // Named runtime fields keep their hexdump-region colors.
-        assert_eq!(debug_tree_row_color("cookie[8]", TreeEntryKind::RawValue { offset: 0 }), Some(Color::Green));
-        assert_eq!(debug_tree_row_color("gc", TreeEntryKind::RawValue { offset: 88 }), Some(Color::Magenta));
+        assert_eq!(
+            debug_tree_row_color("cookie[8]", TreeEntryKind::RawValue { offset: 0 }),
+            Some(Color::Green)
+        );
+        assert_eq!(
+            debug_tree_row_color("gc", TreeEntryKind::RawValue { offset: 88 }),
+            Some(Color::Magenta)
+        );
         // Every first-entry field item (Layout) shares one color, whatever its field name.
-        let layout = |off| TreeEntryKind::Layout { field_type: "", field_offset: off };
-        assert_eq!(debug_tree_row_color("ts_start", layout(0)), Some(Color::Blue));
-        assert_eq!(debug_tree_row_color("increment_size", layout(32)), Some(Color::Blue));
+        let layout = |off| TreeEntryKind::Layout {
+            field_type: "",
+            field_offset: off,
+        };
+        assert_eq!(
+            debug_tree_row_color("ts_start", layout(0)),
+            Some(Color::Blue)
+        );
+        assert_eq!(
+            debug_tree_row_color("increment_size", layout(32)),
+            Some(Color::Blue)
+        );
         // Groups, derived rows, and unnamed raw values stay unshaded.
-        assert_eq!(debug_tree_row_color("young_entries (11)", TreeEntryKind::Derived), None);
-        assert_eq!(debug_tree_row_color("version", TreeEntryKind::RawValue { offset: 8 }), None);
+        assert_eq!(
+            debug_tree_row_color("young_entries (11)", TreeEntryKind::Derived),
+            None
+        );
+        assert_eq!(
+            debug_tree_row_color("version", TreeEntryKind::RawValue { offset: 8 }),
+            None
+        );
     }
 }

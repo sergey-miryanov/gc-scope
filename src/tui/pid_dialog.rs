@@ -3,16 +3,16 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::Frame;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::block::{Position, Title};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
-use ratatui::Frame;
-use ratatui::Terminal;
 
-use crate::list_pids::{build_flat_rows, FlatRow, PidInfoMap, ProcessInfo};
+use crate::list_pids::{FlatRow, PidInfoMap, ProcessInfo, build_flat_rows};
 
 fn is_supported(r: &FlatRow) -> bool {
     r.is_python && r.runtime_found && r.supports_stats
@@ -202,8 +202,20 @@ fn render_dialog(
         } else {
             row.name.clone()
         };
-        let r_char = if row.is_python && row.runtime_found { "Y" } else if row.is_python { "N" } else { "-" };
-        let s_char = if row.is_python && row.supports_stats { "Y" } else if row.is_python { "N" } else { "-" };
+        let r_char = if row.is_python && row.runtime_found {
+            "Y"
+        } else if row.is_python {
+            "N"
+        } else {
+            "-"
+        };
+        let s_char = if row.is_python && row.supports_stats {
+            "Y"
+        } else if row.is_python {
+            "N"
+        } else {
+            "-"
+        };
         let indent = "  ".repeat(prefix_depth(&row.prefix));
         let full_name = format!("{}{}", indent, display_name);
 
@@ -234,7 +246,14 @@ fn render_dialog(
     let total = flat_rows.len();
     let up_marker = if top > 0 { "▲ " } else { "" };
     let down_marker = if end < total { " ▼" } else { "" };
-    let status = format!(" {}{}-{} of {}{} ", up_marker, top + 1, end, total, down_marker);
+    let status = format!(
+        " {}{}-{} of {}{} ",
+        up_marker,
+        top + 1,
+        end,
+        total,
+        down_marker
+    );
 
     let text = Text::from(lines);
     let paragraph = Paragraph::new(text).block(
@@ -285,30 +304,40 @@ mod tests {
     #[test]
     fn supported_at_or_after_skips_unsupported_rows() {
         let rows = [
-            row(10, true, true, true),   // 0 supported
-            row(11, true, false, false), // 1
-            row(12, false, false, false),// 2
-            row(13, true, true, true),   // 3 supported
+            row(10, true, true, true),    // 0 supported
+            row(11, true, false, false),  // 1
+            row(12, false, false, false), // 2
+            row(13, true, true, true),    // 3 supported
         ];
         assert_eq!(supported_at_or_after(&rows, 0), Some(0));
         assert_eq!(supported_at_or_after(&rows, 1), Some(3), "skips 1 and 2");
         assert_eq!(supported_at_or_after(&rows, 4), None, "past the end");
-        assert_eq!(supported_at_or_after(&[row(1, false, false, false)], 0), None);
+        assert_eq!(
+            supported_at_or_after(&[row(1, false, false, false)], 0),
+            None
+        );
     }
 
     /// Up-navigation is the mirror: the nearest supported row at or before the cursor.
     #[test]
     fn supported_at_or_before_scans_backwards() {
         let rows = [
-            row(10, true, true, true),   // 0 supported
-            row(11, true, false, false), // 1
-            row(12, false, false, false),// 2
-            row(13, true, true, true),   // 3 supported
+            row(10, true, true, true),    // 0 supported
+            row(11, true, false, false),  // 1
+            row(12, false, false, false), // 2
+            row(13, true, true, true),    // 3 supported
         ];
         assert_eq!(supported_at_or_before(&rows, 3), Some(3));
-        assert_eq!(supported_at_or_before(&rows, 2), Some(0), "skips 2 and 1 back to 0");
+        assert_eq!(
+            supported_at_or_before(&rows, 2),
+            Some(0),
+            "skips 2 and 1 back to 0"
+        );
         assert_eq!(supported_at_or_before(&rows, 0), Some(0));
-        assert_eq!(supported_at_or_before(&[row(1, false, false, false)], 0), None);
+        assert_eq!(
+            supported_at_or_before(&[row(1, false, false, false)], 0),
+            None
+        );
     }
 
     /// The popup is 85% of terminal width, and its height is one row per entry plus 4
@@ -319,7 +348,11 @@ mod tests {
         assert_eq!(popup_dims(100, 40, 5), (85, 12), "few rows floor at 12");
         assert_eq!(popup_dims(100, 40, 50), (85, 30), "many rows cap at 30");
         assert_eq!(popup_dims(100, 20, 50), (85, 16), "shrinks to area_h - 4");
-        assert_eq!(popup_dims(100, 10, 50), (85, 12), "floors at 12 even when taller than the terminal");
+        assert_eq!(
+            popup_dims(100, 10, 50),
+            (85, 12),
+            "floors at 12 even when taller than the terminal"
+        );
     }
 
     /// The visible-row capacity is the popup height minus 4 chrome lines, never below 1.

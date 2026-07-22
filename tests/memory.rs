@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::{pid_alive, python_version, test_python, SpawnedPython};
+use common::{SpawnedPython, pid_alive, python_version, test_python};
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,7 +32,9 @@ use gcscope::memory::{binary, process, reader, regions};
 #[test]
 fn read_cmdline_tracks_liveness_and_names_the_fixture() {
     let Some(python) = test_python() else {
-        eprintln!("SKIP read_cmdline_tracks_liveness_and_names_the_fixture: no Python found (set GCSCOPE_TEST_PYTHON)");
+        eprintln!(
+            "SKIP read_cmdline_tracks_liveness_and_names_the_fixture: no Python found (set GCSCOPE_TEST_PYTHON)"
+        );
         return;
     };
     let proc = SpawnedPython::spawn(&python).expect("spin.py should reach READY");
@@ -71,7 +73,10 @@ fn find_python_modules_lists_the_interpreter() {
     let proc = SpawnedPython::spawn(&python).expect("spin.py should reach READY");
 
     let modules = process_modules(proc.pid());
-    assert!(!modules.is_empty(), "a live interpreter must expose python modules");
+    assert!(
+        !modules.is_empty(),
+        "a live interpreter must expose python modules"
+    );
     for (path, base) in &modules {
         assert!(
             path.to_lowercase().contains("python"),
@@ -98,7 +103,10 @@ fn list_regions_includes_a_python_mapping() {
     let proc = SpawnedPython::spawn(&python).expect("spin.py should reach READY");
 
     let regions = regions::list_regions(proc.pid()).expect("list_regions on a live child");
-    assert!(!regions.is_empty(), "a live process must have mapped regions");
+    assert!(
+        !regions.is_empty(),
+        "a live process must have mapped regions"
+    );
     assert!(
         regions.iter().any(|m| {
             m.filename()

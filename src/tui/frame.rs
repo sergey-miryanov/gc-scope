@@ -6,21 +6,25 @@ use std::io::stdout;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
 use ratatui::text::Text;
 use ratatui::widgets::{Block, BorderType, Paragraph};
-use ratatui::Terminal;
 
-use crate::snapshot::collect::{avg_collection_time_per_gen, collections_rate_from_entries, CollectRequest};
+use crate::snapshot::collect::{
+    CollectRequest, avg_collection_time_per_gen, collections_rate_from_entries,
+};
 use crate::snapshot::poller::SnapshotPoller;
 
 use super::format::fmt_duration_ns;
 use super::gc_view::build_gc_buffer_view;
 use super::glitch::{
-    apply_connection_lost_buildup, apply_glitch, apply_one_glitch, draw_connection_lost_box,
-    rand_range, GlitchState,
+    GlitchState, apply_connection_lost_buildup, apply_glitch, apply_one_glitch,
+    draw_connection_lost_box, rand_range,
 };
 use super::layout::{build_lines, render_snapshot, status_bar};
 
@@ -39,7 +43,12 @@ impl Drop for TerminalGuard {
 }
 
 // ── Entry point ───────────────────────────────────────────────────
-pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitch_enabled: bool) -> Result<()> {
+pub fn run_tui(
+    pid: Option<u32>,
+    rate_ms: u64,
+    duration_secs: Option<u64>,
+    glitch_enabled: bool,
+) -> Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
     stdout().execute(EnterAlternateScreen)?;
@@ -93,7 +102,11 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
                 KeyOutcome::DumpSnapshot => pending_dump = true,
                 KeyOutcome::PickPid => {
                     if let Ok((processes, pid_info_map)) = crate::list_pids::list_python_processes()
-                        && let Ok(Some(new_pid)) = super::pid_dialog::show_pid_dialog(&mut terminal, &processes, &pid_info_map)
+                        && let Ok(Some(new_pid)) = super::pid_dialog::show_pid_dialog(
+                            &mut terminal,
+                            &processes,
+                            &pid_info_map,
+                        )
                         && poller.retarget(new_pid).is_ok()
                     {
                         // `retarget` swaps the session in only on a successful attach, so a
@@ -113,8 +126,8 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
             Err(e) => {
                 terminal.draw(|f| {
                     let area = f.size();
-                    let msg =
-                        Paragraph::new(format!("Error: {}", e)).block(Block::bordered().title(" Error "));
+                    let msg = Paragraph::new(format!("Error: {}", e))
+                        .block(Block::bordered().title(" Error "));
                     f.render_widget(msg, area);
                 })?;
                 std::thread::sleep(Duration::from_secs(2));
@@ -131,7 +144,14 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
         if pending_dump {
             pending_dump = false;
             let path = format!("{}.txt", poller.pid());
-            let frame = render_snapshot(&data, state.selected_entry, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex, state.gc_only);
+            let frame = render_snapshot(
+                &data,
+                state.selected_entry,
+                state.debug_offsets_show_tree,
+                state.debug_offsets_show_hex,
+                state.show_runtime_hex,
+                state.gc_only,
+            );
             dump_note = Some(match std::fs::write(&path, frame) {
                 Ok(()) => format!(" — Saved {path}"),
                 Err(e) => format!(" — Save failed: {e}"),
@@ -162,9 +182,23 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
             avg_collection_time_per_gen(entries, stats.has_duration),
         );
         let styled_lines = if state.gc_only {
-            build_gc_buffer_view(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_entry)
+            build_gc_buffer_view(
+                &data,
+                rate_per_gen,
+                avg_coll_time_per_gen,
+                state.selected_entry,
+            )
         } else {
-            build_lines(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_entry, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex).0
+            build_lines(
+                &data,
+                rate_per_gen,
+                avg_coll_time_per_gen,
+                state.selected_entry,
+                state.debug_offsets_show_tree,
+                state.debug_offsets_show_hex,
+                state.show_runtime_hex,
+            )
+            .0
         };
 
         // Pre-compute glitch draw conditions for this frame.
@@ -213,10 +247,22 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
                 dump_note_str
             );
             let content = Paragraph::new(Text::from(styled_lines))
-                .block(Block::bordered().border_type(BorderType::Plain).title(title))
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Plain)
+                        .title(title),
+                )
                 .scroll((scroll, 0));
 
-            let status = status_bar(scroll, max_scroll, selected_entry, entry_count, glitch_badge_active, cl_active, glitch_enabled);
+            let status = status_bar(
+                scroll,
+                max_scroll,
+                selected_entry,
+                entry_count,
+                glitch_badge_active,
+                cl_active,
+                glitch_enabled,
+            );
             f.render_widget(content, chunks[0]);
             f.render_widget(status, chunks[1]);
             if should_buildup {
@@ -301,8 +347,12 @@ impl TuiState {
     fn handle_key(&mut self, code: KeyCode) -> KeyOutcome {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return KeyOutcome::Quit,
-            KeyCode::Up | KeyCode::Char('k') => self.selected_entry = self.selected_entry.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.selected_entry = self.selected_entry.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.selected_entry = self.selected_entry.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.selected_entry = self.selected_entry.saturating_add(1)
+            }
             KeyCode::Char('t') => self.debug_offsets_show_tree = !self.debug_offsets_show_tree,
             KeyCode::Char('h') => self.debug_offsets_show_hex = !self.debug_offsets_show_hex,
             KeyCode::Char('o') => {
@@ -357,7 +407,10 @@ mod tests {
     #[test]
     fn handle_key_toggles_the_debug_offsets_panels() {
         let mut s = TuiState::new(100, false);
-        assert!(s.debug_offsets_show_tree && s.debug_offsets_show_hex, "both shown by default");
+        assert!(
+            s.debug_offsets_show_tree && s.debug_offsets_show_hex,
+            "both shown by default"
+        );
         s.handle_key(KeyCode::Char('t'));
         assert!(!s.debug_offsets_show_tree);
         s.handle_key(KeyCode::Char('h'));

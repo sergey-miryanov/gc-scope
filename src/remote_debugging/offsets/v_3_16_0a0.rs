@@ -5,7 +5,13 @@
 //   registered at a time, and CI pins this exact commit (read from this line by
 //   .github/workflows/rust.yml). Regenerate and the pin moves with it.
 
-#![allow(non_snake_case, non_camel_case_types, dead_code, non_upper_case_globals, unused_imports)]
+#![allow(
+    non_snake_case,
+    non_camel_case_types,
+    dead_code,
+    non_upper_case_globals,
+    unused_imports
+)]
 
 use crate::impl_display_debug_offsets;
 use crate::impl_validate_debug_offsets;
@@ -700,7 +706,8 @@ const _: () = {
         [::std::mem::offset_of!(gc_generation_stats, heap_size) - 56usize];
 };
 
-impl_display_debug_offsets!(_Py_DebugOffsets,
+impl_display_debug_offsets!(
+    _Py_DebugOffsets,
     _Py_DebugOffsets__runtime_state,
     _Py_DebugOffsets__interpreter_state,
     _Py_DebugOffsets__thread_state,
@@ -724,7 +731,8 @@ impl_display_debug_offsets!(_Py_DebugOffsets,
     _Py_DebugOffsets__debugger_support
 );
 
-impl_validate_debug_offsets!(_Py_DebugOffsets,
+impl_validate_debug_offsets!(
+    _Py_DebugOffsets,
     _Py_DebugOffsets__runtime_state,
     _Py_DebugOffsets__interpreter_state,
     _Py_DebugOffsets__thread_state,
@@ -747,7 +755,6 @@ impl_validate_debug_offsets!(_Py_DebugOffsets,
     _Py_DebugOffsets__llist_node,
     _Py_DebugOffsets__debugger_support
 );
-
 
 // -- GC generation stats field layout --
 // Computed from bindgen-generated #[repr(C)] struct via offset_of! at compile time.
@@ -759,14 +766,38 @@ pub const GC_ITEM_SIZE: usize = std::mem::size_of::<gc_generation_stats>();
 pub static GC_LAYOUT: GcItemLayout = GcItemLayout {
     item_size: GC_ITEM_SIZE,
     fields: &[
-        ("ts_start", std::mem::offset_of!(gc_generation_stats, ts_start)),
-        ("ts_stop", std::mem::offset_of!(gc_generation_stats, ts_stop)),
-        ("collections", std::mem::offset_of!(gc_generation_stats, collections)),
-        ("collected", std::mem::offset_of!(gc_generation_stats, collected)),
-        ("uncollectable", std::mem::offset_of!(gc_generation_stats, uncollectable)),
-        ("candidates", std::mem::offset_of!(gc_generation_stats, candidates)),
-        ("duration", std::mem::offset_of!(gc_generation_stats, duration)),
-        ("heap_size", std::mem::offset_of!(gc_generation_stats, heap_size)),
+        (
+            "ts_start",
+            std::mem::offset_of!(gc_generation_stats, ts_start),
+        ),
+        (
+            "ts_stop",
+            std::mem::offset_of!(gc_generation_stats, ts_stop),
+        ),
+        (
+            "collections",
+            std::mem::offset_of!(gc_generation_stats, collections),
+        ),
+        (
+            "collected",
+            std::mem::offset_of!(gc_generation_stats, collected),
+        ),
+        (
+            "uncollectable",
+            std::mem::offset_of!(gc_generation_stats, uncollectable),
+        ),
+        (
+            "candidates",
+            std::mem::offset_of!(gc_generation_stats, candidates),
+        ),
+        (
+            "duration",
+            std::mem::offset_of!(gc_generation_stats, duration),
+        ),
+        (
+            "heap_size",
+            std::mem::offset_of!(gc_generation_stats, heap_size),
+        ),
     ],
 };
 
@@ -776,11 +807,21 @@ pub fn gc_field_names() -> &'static [(&'static str, usize)] {
 
 // -- DebugOffsetsView: per-version dispatch (see offsets/mod.rs) --
 impl crate::remote_debugging::offsets::DebugOffsetsView for _Py_DebugOffsets {
-    fn layout_version(&self) -> u64 { 0x031000a0 }
-    fn threads_main(&self) -> u64 { self.interpreter_state.threads_main }
-    fn gc_frame(&self) -> u64 { self.gc.frame }
-    fn gc_generation_stats(&self) -> u64 { self.gc.generation_stats }
-    fn gc_generation_stats_size(&self) -> u64 { self.gc.generation_stats_size }
+    fn layout_version(&self) -> u64 {
+        0x031000a0
+    }
+    fn threads_main(&self) -> u64 {
+        self.interpreter_state.threads_main
+    }
+    fn gc_frame(&self) -> u64 {
+        self.gc.frame
+    }
+    fn gc_generation_stats(&self) -> u64 {
+        self.gc.generation_stats
+    }
+    fn gc_generation_stats_size(&self) -> u64 {
+        self.gc.generation_stats_size
+    }
     fn gc_stats_shape(&self) -> crate::remote_debugging::offsets::GcStatsShape {
         crate::remote_debugging::offsets::GcStatsShape {
             kind: crate::remote_debugging::offsets::offset_table::GcStatsKind::RingBuffer,
