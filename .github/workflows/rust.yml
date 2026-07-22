@@ -137,6 +137,31 @@ jobs:
           sudo -E "$PY" tests/live_smoke.py \
             --label ${{ matrix.os }}-py${{ matrix.python }}
 
+      # Rust successor to live_smoke.py, riding alongside it (Python above stays the gate).
+      # Non-blocking trial across the full matrix; gated by GCSCOPE_LIVE_SMOKE. test_python()
+      # picks up setup-python's interpreter from PATH. Works in bash and pwsh (Windows).
+      - name: "Live-smoke (Rust successor, trial)"
+        if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
+        continue-on-error: true
+        env:
+          GCSCOPE_LIVE_SMOKE: '1'
+        run: cargo test --test live_smoke -- --ignored --nocapture
+
+      # macOS pre-3.13 needs root to attach. cargo/rustup live in the user's HOME, not root's,
+      # so build unprivileged, then run the test binary itself under sudo -E (which carries the
+      # GCSCOPE_* vars through; PATH is reset, hence the explicit GCSCOPE_TEST_PYTHON).
+      - name: "Live-smoke (Rust successor, trial, sudo)"
+        if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
+        continue-on-error: true
+        run: |
+          export GCSCOPE_LIVE_SMOKE=1
+          export GCSCOPE_TEST_PYTHON="$(command -v python)"
+          BIN=$(cargo test --test live_smoke --no-run --message-format=json \
+                | jq -r 'select(.executable != null and .target.name == "live_smoke") | .executable' \
+                | head -1)
+          echo "test binary: $BIN"
+          sudo -E "$BIN" --ignored --nocapture
+
   # Build custom interpreters setup-python can't supply, then run the live_smoke driver.
   # Linux-only (version/decode coverage is OS-independent). Blocking gate. Rationale:
   # docs/adr/0006-layout-registration-integrity.md.
@@ -222,6 +247,16 @@ jobs:
           EXTRA=""
           [ "${{ matrix.expect_extended }}" = "yes" ] && EXTRA="--expect-extended"
           python3 tests/live_smoke.py --python "$PY" --label "${{ matrix.label }}" $EXTRA
+
+      # Rust successor trial (non-blocking): same source-built interpreter, and the +inc leg
+      # additionally requires the extended GC columns via GCSCOPE_EXPECT_EXTENDED.
+      - name: "Live-smoke (Rust successor, trial)"
+        continue-on-error: true
+        run: |
+          export GCSCOPE_LIVE_SMOKE=1
+          export GCSCOPE_TEST_PYTHON="$HOME/cpython-build/bin/python3"
+          [ "${{ matrix.expect_extended }}" = "yes" ] && export GCSCOPE_EXPECT_EXTENDED=1
+          cargo test --test live_smoke -- --ignored --nocapture
 
   # The integration suites (lifecycle, memory, monitor, remote_debugging, diagram) are
   # #[ignore]d because they attach to a live interpreter; this leg grants attach
