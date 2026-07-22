@@ -17,7 +17,7 @@ use crate::snapshot::collect::{avg_collection_time_per_gen, collections_rate_fro
 use crate::snapshot::poller::SnapshotPoller;
 
 use super::format::fmt_duration_ns;
-use super::gc_view::build_gc_only_lines;
+use super::gc_view::build_gc_buffer_view;
 use super::glitch::{
     apply_connection_lost_buildup, apply_glitch, apply_one_glitch, draw_connection_lost_box,
     rand_range, GlitchState,
@@ -162,7 +162,7 @@ pub fn run_tui(pid: Option<u32>, rate_ms: u64, duration_secs: Option<u64>, glitc
             avg_collection_time_per_gen(entries, stats.has_duration),
         );
         let styled_lines = if state.gc_only {
-            build_gc_only_lines(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_entry)
+            build_gc_buffer_view(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_entry)
         } else {
             build_lines(&data, rate_per_gen, avg_coll_time_per_gen, state.selected_entry, state.debug_offsets_show_tree, state.debug_offsets_show_hex, state.show_runtime_hex).0
         };

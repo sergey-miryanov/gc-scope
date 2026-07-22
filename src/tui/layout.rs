@@ -8,7 +8,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::snapshot::collect::{avg_collection_time_per_gen, collections_rate_from_entries, CollectedData};
 
-use super::gc_view::{build_gc_only_lines, section_gc_stats};
+use super::gc_view::{build_gc_buffer_view, section_gc_stats};
 use super::sections::{section_debug_offsets, section_interpreter, section_interpreter_legacy};
 
 // ── Layout constants ──────────────────────────────────────────────
@@ -276,7 +276,7 @@ pub fn render_snapshot(
     let rate = collections_rate_from_entries(&stats.entries, stats.has_timestamps);
     let avg = avg_collection_time_per_gen(&stats.entries, stats.has_duration);
     let lines = if gc_only {
-        build_gc_only_lines(data, rate, avg, selected_entry)
+        build_gc_buffer_view(data, rate, avg, selected_entry)
     } else {
         build_lines(data, rate, avg, selected_entry, show_tree, show_hex, show_runtime_hex).0
     };
