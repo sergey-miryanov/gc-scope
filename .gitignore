@@ -13,7 +13,7 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
-# Coverage artifacts (grcov / LLVM source-based instrumentation)
+# Coverage artifacts (cargo-llvm-cov / LLVM source-based instrumentation)
 *.profraw
 lcov*.info
 

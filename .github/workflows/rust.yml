@@ -26,7 +26,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
-          tool: grcov  # pinned SHA: the ref no longer selects the tool
+          tool: cargo-llvm-cov  # pinned action SHA; the `tool` input selects what to install
 
       - name: Build
         run: cargo build --verbose
@@ -239,7 +239,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
-          tool: grcov  # pinned SHA: the ref no longer selects the tool
+          tool: cargo-llvm-cov  # pinned action SHA; the `tool` input selects what to install
       # Guarantees an interpreter, so the tests run rather than skip (a false green).
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
@@ -265,21 +265,18 @@ jobs:
           name: integration-ubuntu-latest
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
 
-  # grcov (not cargo-llvm-cov): `-s .` emits repo-relative paths so Windows uploads merge
-  # with Linux/macOS instead of double-counting under absolute paths.
   # Coverage-only sibling of live-smoke: the gate must assert against an UNINSTRUMENTED
   # binary, and coverage needs only enough legs (3.8/3.12/3.15 × 3 OS) to reach each decode
-  # path. Every step is non-blocking — live-smoke is the gate, not this.
+  # path. Every step is non-blocking — live-smoke is the gate, not this. cargo-llvm-cov's
+  # show-env instruments the gcscope binary in its own target dir; the env is written to a
+  # file and sourced by every build/run/report step (bash on all three OSes, so no per-shell
+  # branching), and Codecov normalizes the absolute paths so the per-OS uploads merge.
   coverage-smoke:
     name: coverage smoke (${{ matrix.os }} py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     # Job-level: an instrumented-build/tool failure can't block a merge. This masks the
     # job's API `conclusion` — judge by whether a report reached Codecov, not GitHub status.
     continue-on-error: true
-    env:
-      # Coverage comes from the gcscope subprocess itself (%p = pid, %m = binary signature).
-      RUSTFLAGS: -Cinstrument-coverage
-      LLVM_PROFILE_FILE: ${{ github.workspace }}/target/profraw/gcscope-%p-%m.profraw
     strategy:
       fail-fast: false
       matrix:
@@ -296,15 +293,29 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
-          tool: grcov  # pinned SHA: the ref no longer selects the tool
+          tool: cargo-llvm-cov  # pinned action SHA; the `tool` input selects what to install
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: ${{ matrix.python }}
           allow-prereleases: true
 
-      # No rust-cache here: RUSTFLAGS forces a full instrumented rebuild anyway.
+      # show-env writes the instrumentation env (its own target dir, LLVM_PROFILE_FILE, the
+      # encoded RUSTFLAGS) to a file that every later step sources. `clean` runs after it.
+      # No rust-cache: the instrumented build is a full rebuild anyway.
+      - name: Prepare coverage env
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo llvm-cov show-env --export-prefix > "$RUNNER_TEMP/llvm-cov-env.sh"
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          cargo llvm-cov clean --workspace
+
       - name: Build instrumented gcscope
-        run: cargo build
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          cargo build
 
       - name: Allow ptrace (best-effort)
         if: runner.os == 'Linux'
@@ -315,28 +326,54 @@ jobs:
         continue-on-error: true
         run: sudo security authorizationdb write system.privilege.taskport is-developer
 
+      # The instrumented binary lives in cargo-llvm-cov's target dir, not target/debug, so
+      # point the driver at it explicitly (+ .exe on Windows).
       - name: Smoke run
         if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
         continue-on-error: true
-        run: python tests/live_smoke.py --label cov-${{ matrix.os }}-py${{ matrix.python }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          BIN="$CARGO_LLVM_COV_TARGET_DIR/debug/gcscope"
+          [ "$RUNNER_OS" = "Windows" ] && BIN="$BIN.exe"
+          python tests/live_smoke.py --gcscope "$BIN" \
+            --label cov-${{ matrix.os }}-py${{ matrix.python }}
 
       - name: Smoke run (sudo)
         if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
         continue-on-error: true
+        shell: bash
         run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          BIN="$CARGO_LLVM_COV_TARGET_DIR/debug/gcscope"
           PY="$(command -v python)"
-          sudo -E "$PY" tests/live_smoke.py \
+          # -E carries LLVM_PROFILE_FILE into the root-run gcscope so it still writes profiles.
+          sudo -E "$PY" tests/live_smoke.py --gcscope "$BIN" \
             --label cov-${{ matrix.os }}-py${{ matrix.python }}
 
-      # The sudo legs write root-owned .profraw that grcov then cannot read.
+      # The sudo legs write root-owned .profraw that report then cannot read.
       - name: Make profiles readable
         if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
         continue-on-error: true
-        run: sudo chown -R "$(whoami)" target/profraw || true
+        shell: bash
+        run: |
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          sudo chown -R "$(whoami)" "$CARGO_LLVM_COV_TARGET_DIR" || true
 
-      # Profraw was already emitted by the smoke run above (job-level RUSTFLAGS), so
-      # no test-cmd here — just grcov + upload.
-      - name: Generate and upload coverage
+      # Profiles were emitted by the smoke run above; produce lcov, then upload (the action
+      # is upload-only when test-cmd is empty).
+      - name: Generate lcov
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          cargo llvm-cov report --lcov --output-path lcov.info
+          echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
+
+      - name: Upload coverage
         continue-on-error: true
         uses: ./.github/actions/coverage-report
         with:
