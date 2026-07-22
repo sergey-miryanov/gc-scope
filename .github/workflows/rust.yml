@@ -125,36 +125,18 @@ jobs:
           done
 
       # Unprivileged where it works, so a target that drops get-task-allow fails here
-      # instead of being masked by blanket sudo.
-      - name: Attach, detect version, assert non-empty GC stats
+      # instead of being masked by blanket sudo. test_python() picks up setup-python's
+      # interpreter from PATH; the command works in bash and pwsh (Windows).
+      - name: Attach, detect version, assert GC-stats shape
         if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
-        run: python tests/live_smoke.py --label ${{ matrix.os }}-py${{ matrix.python }}
-
-      - name: Attach, detect version, assert non-empty GC stats (sudo)
-        if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
-        run: |
-          PY="$(command -v python)"
-          sudo -E "$PY" tests/live_smoke.py \
-            --label ${{ matrix.os }}-py${{ matrix.python }}
-
-      # Rust successor to live_smoke.py, riding alongside it (Python above stays the gate).
-      # Non-blocking trial across the full matrix; gated by GCSCOPE_LIVE_SMOKE. test_python()
-      # picks up setup-python's interpreter from PATH. Works in bash and pwsh (Windows).
-      - name: "Live-smoke (Rust successor, trial)"
-        if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
-        continue-on-error: true
-        env:
-          GCSCOPE_LIVE_SMOKE: '1'
         run: cargo test --test live_smoke -- --ignored --nocapture
 
       # macOS pre-3.13 needs root to attach. cargo/rustup live in the user's HOME, not root's,
-      # so build unprivileged, then run the test binary itself under sudo -E (which carries the
-      # GCSCOPE_* vars through; PATH is reset, hence the explicit GCSCOPE_TEST_PYTHON).
-      - name: "Live-smoke (Rust successor, trial, sudo)"
+      # so build the test binary unprivileged, then run it under sudo -E (which carries
+      # GCSCOPE_TEST_PYTHON through; sudo resets PATH, hence the explicit path).
+      - name: Attach, detect version, assert GC-stats shape (sudo)
         if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
-        continue-on-error: true
         run: |
-          export GCSCOPE_LIVE_SMOKE=1
           export GCSCOPE_TEST_PYTHON="$(command -v python)"
           BIN=$(cargo test --test live_smoke --no-run --message-format=json \
                 | jq -r 'select(.executable != null and .target.name == "live_smoke") | .executable' \
@@ -240,21 +222,13 @@ jobs:
       - name: Allow ptrace (best-effort)
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      - name: Attach, detect version, assert GC stats
+      # GCSCOPE_TEST_PYTHON points the test at the source-built interpreter; the +inc leg
+      # additionally requires the extended GC columns via GCSCOPE_EXPECT_EXTENDED.
+      - name: Attach, detect version, assert GC-stats shape
         run: |
           PY="$HOME/cpython-build/bin/python3"
           "$PY" --version
-          EXTRA=""
-          [ "${{ matrix.expect_extended }}" = "yes" ] && EXTRA="--expect-extended"
-          python3 tests/live_smoke.py --python "$PY" --label "${{ matrix.label }}" $EXTRA
-
-      # Rust successor trial (non-blocking): same source-built interpreter, and the +inc leg
-      # additionally requires the extended GC columns via GCSCOPE_EXPECT_EXTENDED.
-      - name: "Live-smoke (Rust successor, trial)"
-        continue-on-error: true
-        run: |
-          export GCSCOPE_LIVE_SMOKE=1
-          export GCSCOPE_TEST_PYTHON="$HOME/cpython-build/bin/python3"
+          export GCSCOPE_TEST_PYTHON="$PY"
           [ "${{ matrix.expect_extended }}" = "yes" ] && export GCSCOPE_EXPECT_EXTENDED=1
           cargo test --test live_smoke -- --ignored --nocapture
 
@@ -283,18 +257,11 @@ jobs:
       - name: Allow ptrace (best-effort)
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      # Blocking gate, uninstrumented (ADR 0005: assert against a clean binary).
+      # Blocking gate, uninstrumented (ADR 0005: assert against a clean binary). This now also
+      # runs the live-smoke shape test (tests/live_smoke.rs) on Linux/py3.13, since it joined
+      # the --tests set; the full OS × version matrix runs it in the live-smoke job.
       - name: "Run the 'ignored' integration tests"
         run: cargo test --features test-hooks --tests -- --ignored
-
-      # Trial run of the Rust successor to tests/live_smoke.py. Gated by GCSCOPE_LIVE_SMOKE so
-      # the blocking step above skips it; here it runs on this leg's interpreter (py3.13) to
-      # prove it green before the full-matrix cutover. Non-blocking during the trial.
-      - name: "Live-smoke (Rust successor, trial)"
-        continue-on-error: true
-        env:
-          GCSCOPE_LIVE_SMOKE: '1'
-        run: cargo test --test live_smoke -- --ignored --nocapture
 
       # Separate instrumented re-run so the integration suites' live-attach code
       # paths (find_runtime, read_offsets, session reads, collect/render, the monitor
@@ -309,12 +276,10 @@ jobs:
           name: integration-ubuntu-latest
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
 
-  # Coverage-only sibling of live-smoke: the gate must assert against an UNINSTRUMENTED
-  # binary, and coverage needs only enough legs (3.8/3.12/3.15 × 3 OS) to reach each decode
-  # path. Every step is non-blocking — live-smoke is the gate, not this. cargo-llvm-cov's
-  # show-env instruments the gcscope binary in its own target dir; the env is written to a
-  # file and sourced by every build/run/report step (bash on all three OSes, so no per-shell
-  # branching), and Codecov normalizes the absolute paths so the per-OS uploads merge.
+  # Coverage-only sibling of live-smoke — every step is non-blocking; live-smoke is the gate,
+  # not this. Enough legs (3.8/3.12/3.15 × 3 OS) to reach each decode path. cargo-llvm-cov runs
+  # the live_smoke test target natively and captures the gcscope binary it spawns; Codecov
+  # normalizes the absolute paths so the per-OS uploads merge.
   coverage-smoke:
     name: coverage smoke (${{ matrix.os }} py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
@@ -343,24 +308,6 @@ jobs:
           python-version: ${{ matrix.python }}
           allow-prereleases: true
 
-      # show-env writes the instrumentation env (its own target dir, LLVM_PROFILE_FILE, the
-      # encoded RUSTFLAGS) to a file that every later step sources. `clean` runs after it.
-      # No rust-cache: the instrumented build is a full rebuild anyway.
-      - name: Prepare coverage env
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo llvm-cov show-env --export-prefix > "$RUNNER_TEMP/llvm-cov-env.sh"
-          source "$RUNNER_TEMP/llvm-cov-env.sh"
-          cargo llvm-cov clean --workspace
-
-      - name: Build instrumented gcscope
-        shell: bash
-        run: |
-          set -euo pipefail
-          source "$RUNNER_TEMP/llvm-cov-env.sh"
-          cargo build
-
       - name: Allow ptrace (best-effort)
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
@@ -370,50 +317,32 @@ jobs:
         continue-on-error: true
         run: sudo security authorizationdb write system.privilege.taskport is-developer
 
-      # The instrumented binary lives in cargo-llvm-cov's target dir, not target/debug, so
-      # point the driver at it explicitly (+ .exe on Windows).
-      - name: Smoke run
+      # Unprivileged legs: one native invocation builds the instrumented test + gcscope binary,
+      # runs the shape test (which attaches), and captures the spawned binary's coverage.
+      - name: Coverage (unprivileged)
         if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
         continue-on-error: true
         shell: bash
-        run: |
-          set -euo pipefail
-          source "$RUNNER_TEMP/llvm-cov-env.sh"
-          BIN="$CARGO_LLVM_COV_TARGET_DIR/debug/gcscope"
-          [ "$RUNNER_OS" = "Windows" ] && BIN="$BIN.exe"
-          python tests/live_smoke.py --gcscope "$BIN" \
-            --label cov-${{ matrix.os }}-py${{ matrix.python }}
+        run: cargo llvm-cov --test live_smoke --lcov --output-path lcov.info -- --ignored
 
-      - name: Smoke run (sudo)
+      # macOS pre-3.13 needs root to attach: instrument via show-env, build the test binary
+      # unprivileged, run it under sudo -E (LLVM_PROFILE_FILE + GCSCOPE_TEST_PYTHON carried
+      # through), make the root-written profiles readable, then report.
+      - name: Coverage (sudo)
         if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
-          source "$RUNNER_TEMP/llvm-cov-env.sh"
-          BIN="$CARGO_LLVM_COV_TARGET_DIR/debug/gcscope"
-          PY="$(command -v python)"
-          # -E carries LLVM_PROFILE_FILE into the root-run gcscope so it still writes profiles.
-          sudo -E "$PY" tests/live_smoke.py --gcscope "$BIN" \
-            --label cov-${{ matrix.os }}-py${{ matrix.python }}
-
-      # The sudo legs write root-owned .profraw that report then cannot read.
-      - name: Make profiles readable
-        if: runner.os == 'macOS' && matrix.macos_needs_root == 'yes'
-        continue-on-error: true
-        shell: bash
-        run: |
-          source "$RUNNER_TEMP/llvm-cov-env.sh"
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov clean --workspace
+          export GCSCOPE_TEST_PYTHON="$(command -v python)"
+          BIN=$(cargo test --test live_smoke --no-run --message-format=json \
+                | jq -r 'select(.executable != null and .target.name == "live_smoke") | .executable' \
+                | head -1)
+          echo "test binary: $BIN"
+          sudo -E "$BIN" --ignored --nocapture
           sudo chown -R "$(whoami)" "$CARGO_LLVM_COV_TARGET_DIR" || true
-
-      # Profiles were emitted by the smoke run above; produce lcov, then upload (the action
-      # is upload-only when test-cmd is empty).
-      - name: Generate lcov
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euo pipefail
-          source "$RUNNER_TEMP/llvm-cov-env.sh"
           cargo llvm-cov report --lcov --output-path lcov.info
           echo "lcov source files: $(grep -c '^SF:' lcov.info || echo 0)"
 

@@ -1,16 +1,14 @@
 //! Rust live-smoke: spawn a real interpreter, attach with the gcscope *binary*, and assert
-//! the decoded GC-stats **shape** — not merely a clean read. This is the characteristic-bug
-//! gate (a wrong struct offset emits a full table of plausible garbage) that
-//! `tests/live_smoke.py` has held; this is its in-tree successor.
+//! the decoded GC-stats **shape** — not merely a clean read. This is the correctness gate for
+//! the attach+decode path across the CI matrix: a wrong struct offset emits a full table of
+//! plausible garbage that a non-empty check waves through, so the shape is asserted instead.
 //!
 //! It shells out to `CARGO_BIN_EXE_gcscope` rather than calling `PySession`, so it exercises
 //! the shipped CLI end-to-end (output formatting, exit codes) and gets matrix parity for
 //! pre-3.13 and free-threaded builds without per-version library plumbing.
 //!
-//! `#[ignore]`d: it attaches to a live process (ptrace/taskport). It additionally no-ops
-//! unless `GCSCOPE_LIVE_SMOKE=1` — a rollout gate so it stays out of the default integration
-//! gate while the Python driver is still authoritative. Remove that guard at the CI cutover,
-//! when `tests/live_smoke.py` is retired and this runs across the full matrix.
+//! `#[ignore]`d: it attaches to a live process (ptrace/taskport), so it runs only where CI
+//! grants attach permission — `cargo test --test live_smoke -- --ignored`.
 //!
 //! Per-leg knobs (env): `GCSCOPE_TEST_PYTHON` selects the interpreter (see
 //! `common::test_python`); `GCSCOPE_EXPECT_EXTENDED=1` requires the extended `+inc` GC columns
@@ -219,11 +217,6 @@ fn check_stats(rows: &[Row], kind: &str, entries: [usize; 3]) -> Result<(), Stri
 #[test]
 #[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
 fn live_smoke_attaches_and_decodes_shape() {
-    // Rollout gate: authoritative coverage is still tests/live_smoke.py until the CI cutover.
-    if std::env::var("GCSCOPE_LIVE_SMOKE").ok().as_deref() != Some("1") {
-        eprintln!("SKIP live_smoke: set GCSCOPE_LIVE_SMOKE=1 to run (rollout gate)");
-        return;
-    }
     let Some(python) = test_python() else {
         eprintln!("SKIP live_smoke: no Python found (set GCSCOPE_TEST_PYTHON)");
         return;
