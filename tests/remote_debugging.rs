@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{python_version, test_python, SpawnedPython};
+use common::{SpawnedPython, python_version, test_python};
 
 use gcscope::memory::process;
 use gcscope::remote_debugging::offsets::{self, pre_3_13};
@@ -16,9 +16,10 @@ use gcscope::remote_debugging::session::PySession;
 use gcscope::remote_debugging::version;
 
 /// `version::detect` reads the running interpreter's version from memory (the
-/// `Py_Version` symbol on 3.13+, a rodata string scan otherwise). It must agree with
-/// what the interpreter reports for itself. Version-independent — runs on the whole
-/// supported range.
+/// `Py_Version` symbol, added to the C API in 3.11, with a rodata string scan as the
+/// fallback — the only path on 3.8–3.10, and on any build with a stripped symbol
+/// table). It must agree with what the interpreter reports for itself.
+/// Version-independent — runs on the whole supported range.
 #[test]
 #[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
 fn detect_matches_the_interpreter_version() {
@@ -106,14 +107,22 @@ fn session_readers_agree_on_the_runtime_cookie() {
     let addr = session.runtime_addr();
     assert_ne!(addr, 0);
 
-    let bytes = session.read(addr, 8).expect("read the cookie via PySession::read");
-    assert_eq!(&bytes, b"xdebugpy", "the runtime address must start with the debug cookie");
+    let bytes = session
+        .read(addr, 8)
+        .expect("read the cookie via PySession::read");
+    assert_eq!(
+        &bytes, b"xdebugpy",
+        "the runtime address must start with the debug cookie"
+    );
 
     let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
     assert_eq!(session.read_u64(addr).expect("read_u64"), word);
     assert_eq!(session.read_i64(addr).expect("read_i64"), word as i64);
 
-    assert!(session.supports_gc_stats(), "a 3.13+ build must support GC stats");
+    assert!(
+        session.supports_gc_stats(),
+        "a 3.13+ build must support GC stats"
+    );
 }
 
 /// `gc_stats` walks the interpreter's per-generation stats from live memory. It must
@@ -131,7 +140,9 @@ fn gc_stats_reads_cleanly_on_a_supported_build() {
 
     let session = PySession::attach(proc.pid()).expect("attach to the live interpreter");
     if !session.supports_gc_stats() {
-        eprintln!("SKIP gc_stats_reads_cleanly_on_a_supported_build: build reports no GC-stats support");
+        eprintln!(
+            "SKIP gc_stats_reads_cleanly_on_a_supported_build: build reports no GC-stats support"
+        );
         return;
     }
     session

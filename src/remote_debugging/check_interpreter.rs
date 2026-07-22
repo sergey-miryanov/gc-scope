@@ -1,5 +1,5 @@
-use anyhow::{bail, Result};
-use proc_maps::{get_process_maps, MapRange};
+use anyhow::{Result, bail};
+use proc_maps::{MapRange, get_process_maps};
 
 use crate::memory::reader;
 

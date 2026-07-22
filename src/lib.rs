@@ -20,9 +20,9 @@
 //! - [`cli`] — command definitions and handlers; the top layer `main.rs` dispatches to.
 
 pub mod cli;
-pub mod tui;
 pub mod list_pids;
 pub mod memory;
 pub mod monitor;
 pub mod remote_debugging;
 pub mod snapshot;
+pub mod tui;

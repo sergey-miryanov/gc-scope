@@ -57,7 +57,11 @@ pub fn test_python() -> Option<PathBuf> {
 /// rare toolchain that still uses it.
 pub fn python_version(python: &Path) -> Option<(u8, u8)> {
     let out = Command::new(python).arg("--version").output().ok()?;
-    let text = if out.stdout.is_empty() { out.stderr } else { out.stdout };
+    let text = if out.stdout.is_empty() {
+        out.stderr
+    } else {
+        out.stdout
+    };
     let s = String::from_utf8_lossy(&text);
     let ver = s.split_whitespace().nth(1)?; // "Python" "3.13.1"
     let mut parts = ver.split('.');
@@ -74,6 +78,21 @@ fn runs(python: &Path) -> bool {
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// True for a free-threaded (no-GIL) build, whose GC ring holds one entry per generation
+/// instead of the GIL build's 11/3/3 — the live-smoke shape check needs this to pick the
+/// expected entry counts. `false` if it can't be determined (the common GIL case).
+pub fn is_free_threaded(python: &Path) -> bool {
+    Command::new(python)
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_config_var('Py_GIL_DISABLED') or 0)",
+        ])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
         .unwrap_or(false)
 }
 

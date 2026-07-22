@@ -8,6 +8,10 @@ than being rewritten.
 Forward-looking work that hasn't been decided/built yet lives in a `*-plan.md`
 next to this folder, not here (e.g. `docs/venv-launcher-child-retarget.md`).
 
+[`docs/version-support.md`](../version-support.md) documents the resulting
+behaviour in one place: how CPython 3.8–3.16 are detected, located, resolved, and
+decoded. The ADRs below record why each piece is the way it is.
+
 | ADR | Decision |
 |-----|----------|
 | [0001](0001-pysession-resolve-once-facade.md) | `PySession`: resolve a process once, expose it through a tiered `Resolved` enum |

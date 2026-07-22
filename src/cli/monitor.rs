@@ -1,16 +1,16 @@
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use crate::cli::monitor_options::MonitorOptions;
-use crate::monitor::exporters::chrome::ChromeTraceExporter;
 use crate::monitor::exporters::EventsExporter;
-use crate::monitor::{run_loop, MonitorContext, StartupTimeoutPolicy};
+use crate::monitor::exporters::chrome::ChromeTraceExporter;
+use crate::monitor::{MonitorContext, StartupTimeoutPolicy, run_loop};
 
 // ---------------------------------------------------------------------------
 // ProcessRunner — abstracts attach-vs-spawn
@@ -44,13 +44,22 @@ struct ChildProcessRunner {
 }
 
 impl ChildProcessRunner {
-    fn new(python: &str, script: Option<&str>, module: Option<&str>, script_args: &[String]) -> Result<Self> {
+    fn new(
+        python: &str,
+        script: Option<&str>,
+        module: Option<&str>,
+        script_args: &[String],
+    ) -> Result<Self> {
         let mut cmd = Command::new(python);
         cmd.arg("-u");
 
         match (script, module) {
-            (Some(s), None) => { cmd.arg(s); }
-            (None, Some(m)) => { cmd.arg("-m").arg(m); }
+            (Some(s), None) => {
+                cmd.arg(s);
+            }
+            (None, Some(m)) => {
+                cmd.arg("-m").arg(m);
+            }
             _ => anyhow::bail!("Must specify either --script or --module"),
         }
 
@@ -119,10 +128,7 @@ pub fn run(
 // ---------------------------------------------------------------------------
 
 /// Create exporter, set up ctrlc, run monitor loop, close, return exit code.
-fn run_monitoring_loop(
-    runner: &mut impl ProcessRunner,
-    opts: &MonitorOptions,
-) -> Result<i32> {
+fn run_monitoring_loop(runner: &mut impl ProcessRunner, opts: &MonitorOptions) -> Result<i32> {
     let pid = runner.start()?;
     eprintln!("Monitoring PID: {}", pid);
 
@@ -135,13 +141,9 @@ fn run_monitoring_loop(
     ctrlc::set_handler(move || r.store(false, Ordering::SeqCst))?;
 
     let mut ctx = MonitorContext::new(&mut exporter);
-    run_loop(
-        &mut ctx,
-        pid,
-        opts.rate,
-        &running,
-        || StartupTimeoutPolicy::new(Duration::from_secs(2)),
-    )?;
+    run_loop(&mut ctx, pid, opts.rate, &running, || {
+        StartupTimeoutPolicy::new(Duration::from_secs(2))
+    })?;
 
     ctx.close()?;
     eprintln!("Trace written to {}", opts.output);

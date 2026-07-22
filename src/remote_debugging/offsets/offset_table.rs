@@ -80,25 +80,47 @@ pub struct OffsetTable {
 }
 
 impl OffsetTable {
-    pub fn runtime_interpreters_head(&self) -> u64 { self.runtime_interpreters_head }
-    pub fn runtime_gc(&self) -> Option<u64> { self.runtime_gc }
-    pub fn interp_next(&self) -> u64 { self.interp_next }
-    pub fn interp_id(&self) -> u64 { self.interp_id }
-    pub fn interp_threads_head(&self) -> u64 { self.interp_threads_head }
-    pub fn interp_gc(&self) -> Option<u64> { self.interp_gc }
-    pub fn thread_interp(&self) -> u64 { self.thread_interp }
-    pub fn gc_generations(&self) -> u64 { self.gc_generations }
-    pub fn gc_collecting(&self) -> u64 { self.gc_collecting }
-    pub fn gc_frame(&self) -> Option<u64> { self.gc_frame }
+    pub fn runtime_interpreters_head(&self) -> u64 {
+        self.runtime_interpreters_head
+    }
+    pub fn runtime_gc(&self) -> Option<u64> {
+        self.runtime_gc
+    }
+    pub fn interp_next(&self) -> u64 {
+        self.interp_next
+    }
+    pub fn interp_id(&self) -> u64 {
+        self.interp_id
+    }
+    pub fn interp_threads_head(&self) -> u64 {
+        self.interp_threads_head
+    }
+    pub fn interp_gc(&self) -> Option<u64> {
+        self.interp_gc
+    }
+    pub fn thread_interp(&self) -> u64 {
+        self.thread_interp
+    }
+    pub fn gc_generations(&self) -> u64 {
+        self.gc_generations
+    }
+    pub fn gc_collecting(&self) -> u64 {
+        self.gc_collecting
+    }
+    pub fn gc_frame(&self) -> Option<u64> {
+        self.gc_frame
+    }
 
     /// Panics if `interp_gc` is `None` (i.e. on Python 3.8).
     pub fn interp_gc_unwrap(&self) -> u64 {
-        self.interp_gc.expect("interp_gc is not available on Python 3.8")
+        self.interp_gc
+            .expect("interp_gc is not available on Python 3.8")
     }
 
     /// Panics if `runtime_gc` is `None` (i.e. on Python 3.9+).
     pub fn runtime_gc_unwrap(&self) -> u64 {
-        self.runtime_gc.expect("runtime_gc is only available on Python 3.8")
+        self.runtime_gc
+            .expect("runtime_gc is only available on Python 3.8")
     }
 
     /// True for the 3.8 global-GC layout: the GC state lives in `_PyRuntime` (`runtime_gc`),
@@ -184,8 +206,9 @@ impl OffsetTable {
             Some(t) => t,
             None => return Ok(vec![]),
         };
-        let raw = reader::read_memory_h(handle, addr, total)
-            .with_context(|| format!("Failed to read gc_stats buffer at {addr:#x} ({total} bytes)"))?;
+        let raw = reader::read_memory_h(handle, addr, total).with_context(|| {
+            format!("Failed to read gc_stats buffer at {addr:#x} ({total} bytes)")
+        })?;
         Ok(self.decode_gc_stats(&raw, iid))
     }
 
@@ -197,7 +220,11 @@ impl OffsetTable {
     pub fn describe_gc_geometry(&self) -> String {
         let mut s = String::new();
         s.push_str(&format!("  kind             : {:?}\n", self.gc_stats_kind));
-        match (self.gc_item_size, self.gc_entries_per_gen, self.gc_gen_base_offsets) {
+        match (
+            self.gc_item_size,
+            self.gc_entries_per_gen,
+            self.gc_gen_base_offsets,
+        ) {
             (Some(item), Some(entries), Some(bases)) => {
                 s.push_str(&format!("  entry size        : {item} bytes\n"));
                 s.push_str(&format!("  entries/generation : {entries:?}\n"));
@@ -226,8 +253,11 @@ impl OffsetTable {
         }
         match self.gc_layout {
             Some(l) => {
-                s.push_str(&format!("  per-entry fields  : {} in {} bytes\n",
-                                    l.fields.len(), l.item_size));
+                s.push_str(&format!(
+                    "  per-entry fields  : {} in {} bytes\n",
+                    l.fields.len(),
+                    l.item_size
+                ));
                 for (name, off) in l.fields {
                     s.push_str(&format!("      {off:>4}  {name}\n"));
                 }
@@ -246,7 +276,11 @@ impl OffsetTable {
         if self.gc_stats_kind != GcStatsKind::RingBuffer {
             return 0;
         }
-        match (self.gc_item_size, self.gc_entries_per_gen, self.gc_gen_base_offsets) {
+        match (
+            self.gc_item_size,
+            self.gc_entries_per_gen,
+            self.gc_gen_base_offsets,
+        ) {
             (Some(item), Some(entries), Some(bases)) => bases[2] + entries[2] * item + 8,
             _ => 0,
         }
@@ -332,7 +366,10 @@ impl GcItemLayout {
     }
 
     pub fn field_offset(&self, name: &str) -> Option<usize> {
-        self.fields.iter().find(|(n, _)| *n == name).map(|(_, o)| *o)
+        self.fields
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, o)| *o)
     }
 }
 
@@ -344,8 +381,11 @@ impl GcItemLayout {
 /// hand-packed offset table.
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn seq_layout(names: &[&'static str]) -> &'static GcItemLayout {
-    let fields: Vec<(&'static str, usize)> =
-        names.iter().enumerate().map(|(i, &name)| (name, i * 8)).collect();
+    let fields: Vec<(&'static str, usize)> = names
+        .iter()
+        .enumerate()
+        .map(|(i, &name)| (name, i * 8))
+        .collect();
     Box::leak(Box::new(GcItemLayout {
         item_size: names.len() * 8,
         fields: Box::leak(fields.into_boxed_slice()),
@@ -466,7 +506,12 @@ mod tests {
 
     fn ring_table(free_threaded: u64) -> OffsetTable {
         let mut table = pre_3_13::table_for_version(3, 12).unwrap();
-        set_ring(&mut table, RING_LAYOUT.item_size as u64, &RING_LAYOUT, free_threaded);
+        set_ring(
+            &mut table,
+            RING_LAYOUT.item_size as u64,
+            &RING_LAYOUT,
+            free_threaded,
+        );
         table.gc_stats_addr = Some(0x1000);
         table
     }
@@ -497,14 +542,21 @@ mod tests {
                 s.ts_start(),
                 1000 * (s.generation as i64 + 1) + s.index as i64,
                 "generation {} entry {} read from the wrong offset",
-                s.generation, s.index
+                s.generation,
+                s.index
             );
-            assert_eq!(s.get("increment_size"), Some(10 * s.generation as i64 + s.index as i64));
+            assert_eq!(
+                s.get("increment_size"),
+                Some(10 * s.generation as i64 + s.index as i64)
+            );
         }
 
         // Generation 1 starts one 8-byte pad past the end of generation 0's entries;
         // reading it at `11 * item` instead would land inside the pad and return 0.
-        let gen1_first = stats.iter().find(|s| s.generation == 1 && s.index == 0).unwrap();
+        let gen1_first = stats
+            .iter()
+            .find(|s| s.generation == 1 && s.index == 0)
+            .unwrap();
         assert_eq!(gen1_first.ts_start(), 2000);
     }
 
@@ -545,7 +597,10 @@ mod tests {
         let per_interp = pre_3_13::table_for_version(3, 12).unwrap();
         let interp_gc = per_interp.interp_gc.unwrap();
         // Per-interpreter: interp addr + interp_gc; the runtime addr is irrelevant.
-        assert_eq!(per_interp.gc_state_addr(0xdead_0000, 0x1000), 0x1000 + interp_gc);
+        assert_eq!(
+            per_interp.gc_state_addr(0xdead_0000, 0x1000),
+            0x1000 + interp_gc
+        );
 
         let mut global = per_interp.clone();
         global.interp_gc = None;
@@ -606,9 +661,15 @@ mod tests {
         let bases = table.gc_gen_base_offsets.unwrap();
         let item = table.gc_item_size.unwrap() as usize;
         assert_eq!(table.entry_byte_offset(0, 0), Some(bases[0] as usize));
-        assert_eq!(table.entry_byte_offset(0, 5), Some(bases[0] as usize + 5 * item));
+        assert_eq!(
+            table.entry_byte_offset(0, 5),
+            Some(bases[0] as usize + 5 * item)
+        );
         assert_eq!(table.entry_byte_offset(1, 0), Some(bases[1] as usize));
-        assert_eq!(table.entry_byte_offset(2, 2), Some(bases[2] as usize + 2 * item));
+        assert_eq!(
+            table.entry_byte_offset(2, 2),
+            Some(bases[2] as usize + 2 * item)
+        );
     }
 
     /// Out-of-range generation or entry yields `None`, not an offset that spills into the
@@ -616,7 +677,11 @@ mod tests {
     #[test]
     fn entry_byte_offset_rejects_out_of_range() {
         let table = ring_table(0); // entries [11, 3, 3]
-        assert_eq!(table.entry_byte_offset(0, 11), None, "gen0 has entries 0..=10");
+        assert_eq!(
+            table.entry_byte_offset(0, 11),
+            None,
+            "gen0 has entries 0..=10"
+        );
         assert_eq!(table.entry_byte_offset(1, 3), None, "gen1 has 3 entries");
         assert_eq!(table.entry_byte_offset(3, 0), None, "no generation 3");
     }
@@ -638,7 +703,10 @@ mod tests {
         let mut table = pre_3_13::table_for_version(3, 12).unwrap();
         table.gc_stats_addr = Some(0x1000);
         assert!(table.decode_gc_stats(&[], 0).is_empty());
-        assert!(table.decode_gc_stats(&[0u8; 71], 0).is_empty(), "one byte short");
+        assert!(
+            table.decode_gc_stats(&[0u8; 71], 0).is_empty(),
+            "one byte short"
+        );
         assert_eq!(table.decode_gc_stats(&[0u8; 72], 0).len(), 3);
     }
 
@@ -724,11 +792,17 @@ mod tests {
         assert!(out.contains("RingBuffer"), "{out}");
         assert!(out.contains("entry size        : 40 bytes"), "{out}");
         assert!(
-            out.contains(&format!("region size      : {}", table.gc_stats_region_size())),
+            out.contains(&format!(
+                "region size      : {}",
+                table.gc_stats_region_size()
+            )),
             "{out}"
         );
         assert!(
-            out.contains(&format!("bytes read       : {}", table.stats_buffer_len().unwrap())),
+            out.contains(&format!(
+                "bytes read       : {}",
+                table.stats_buffer_len().unwrap()
+            )),
             "{out}"
         );
         // Registered per-entry fields are listed for offset diagnosis.

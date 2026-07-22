@@ -1,8 +1,8 @@
 pub mod chrome;
 pub mod timing;
 
-use std::path::Path;
 use crate::remote_debugging::gc_stats::GcStat;
+use std::path::Path;
 
 pub enum ProcessLifecycle {
     Started,

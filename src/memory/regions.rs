@@ -1,5 +1,5 @@
 use anyhow::Result;
-use proc_maps::{get_process_maps, MapRange};
+use proc_maps::{MapRange, get_process_maps};
 
 pub fn list_regions(pid: u32) -> Result<Vec<MapRange>> {
     let maps = get_process_maps(pid as proc_maps::Pid)?;
@@ -10,7 +10,14 @@ pub fn print_region(m: &MapRange) {
     let path = m.filename().and_then(|p| p.to_str());
     println!(
         "{}",
-        format_region(m.start(), m.size(), m.is_read(), m.is_write(), m.is_exec(), path)
+        format_region(
+            m.start(),
+            m.size(),
+            m.is_read(),
+            m.is_write(),
+            m.is_exec(),
+            path
+        )
     );
 }
 
@@ -65,7 +72,10 @@ mod tests {
     #[test]
     fn end_address_is_start_plus_size() {
         let out = format_region(0x1000, 0x2500, true, false, true, None);
-        assert!(out.starts_with("0x0000000000001000-0x0000000000003500"), "{out}");
+        assert!(
+            out.starts_with("0x0000000000001000-0x0000000000003500"),
+            "{out}"
+        );
     }
 
     /// Each permission bit maps to its letter when set and `-` when clear, in
