@@ -349,8 +349,36 @@ fn parse_gc_entries(raw: &[u8], table: &offsets::offset_table::OffsetTable) -> V
         .collect()
 }
 
+/// Bucket entries by generation, dropping ring positions that were never written.
+///
+/// A ring position CPython has not filled yet decodes as all-zeros, and `collections == 0` is
+/// the reliable marker for it: the counter is incremented before the entry is published, so a
+/// generation's first real entry always carries `collections == 1`. Keeping the zeros would let
+/// `min_by_key` anchor the window at collection 0 and silently turn a ring-window statistic into
+/// a process-lifetime one — plausible-looking output either way, which is exactly why it has to
+/// be excluded here rather than eyeballed downstream.
+///
+/// Out-of-range generations (a layout/geometry mismatch can decode one) are dropped too, so the
+/// caller can index the returned array unconditionally.
+fn entries_by_generation(entries: &[GcEntry]) -> [Vec<&GcEntry>; 3] {
+    let mut gen_entries: [Vec<&GcEntry>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for entry in entries {
+        if entry.collections == 0 {
+            continue;
+        }
+        let g = entry.generation as usize;
+        if g < 3 {
+            gen_entries[g].push(entry);
+        }
+    }
+    gen_entries
+}
+
 /// Compute average collection pause time per generation from a single snapshot.
 /// Uses the full ring range: `(max.duration - min.duration) / (max.collections - min.collections)`.
+/// The min/max are taken **by `collections` value, never by entry index**: a ring wraps, so
+/// within one generation storage order runs e.g. `10, 11, 12, 5, 6, 7` — the oldest entry sits
+/// mid-buffer, and an index-order read would span the wrong pair (or a negative delta).
 /// Returns `[None; 3]` when the entry layout has no `duration` field (e.g. inline 3.13/3.14):
 /// the pause time is unrecoverable externally, so the summary renders "n/a" rather than a
 /// fake 0. Gens with <2 entries stay `Some(0.0)` (formatted like before).
@@ -358,13 +386,7 @@ pub fn avg_collection_time_per_gen(entries: &[GcEntry], has_duration: bool) -> [
     if !has_duration {
         return [None, None, None];
     }
-    let mut gen_entries: [Vec<&GcEntry>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for entry in entries {
-        let g = entry.generation as usize;
-        if g < 3 {
-            gen_entries[g].push(entry);
-        }
-    }
+    let gen_entries = entries_by_generation(entries);
 
     let mut avgs = [Some(0.0f64); 3];
     for (g, gentries) in gen_entries.iter().enumerate() {
@@ -386,6 +408,8 @@ pub fn avg_collection_time_per_gen(entries: &[GcEntry], has_duration: bool) -> [
 
 /// Compute collections rate per second for each generation from a single snapshot.
 /// Uses the full ring range: `(max.collections - min.collections) / ((max.stop_ts - min.start_ts) / 1e9)`.
+/// As in [`avg_collection_time_per_gen`], every min/max is taken **by value, not by entry
+/// index**, so a wrapped ring (`10, 11, 12, 5, 6, 7`) still yields the true window.
 /// Returns `[None; 3]` when the entry layout has no `ts_start`/`ts_stop` fields (e.g. inline
 /// 3.13/3.14): there is no time base in a single snapshot, so the summary renders "n/a"
 /// rather than a fake 0. Gens with <2 entries stay `Some(0.0)` (formatted like before).
@@ -393,13 +417,7 @@ pub fn collections_rate_from_entries(entries: &[GcEntry], has_timestamps: bool) 
     if !has_timestamps {
         return [None, None, None];
     }
-    let mut gen_entries: [Vec<&GcEntry>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for entry in entries {
-        let g = entry.generation as usize;
-        if g < 3 {
-            gen_entries[g].push(entry);
-        }
-    }
+    let gen_entries = entries_by_generation(entries);
 
     let mut rates = [Some(0.0f64); 3];
     for (g, gentries) in gen_entries.iter().enumerate() {
@@ -486,12 +504,174 @@ mod tests {
         assert_eq!(avg[2], Some(0.0));
     }
 
+    /// Generations do not come with equal entry counts: a GIL ring is `[11, 3, 3]`, and a
+    /// young process leaves the older rings only partly written. Each generation must be
+    /// averaged over its own entries alone — a populous gen0 must not leak into gen1/gen2,
+    /// and a gen with a single entry stays 0.0 while its neighbours still compute.
+    #[test]
+    fn avg_collection_time_averages_each_generation_over_its_own_entries() {
+        let entries = vec![
+            // gen0: 4 entries, collections 1..7 (Δ6), duration 2..20 (Δ18) → 3.0.
+            entry(0, 1, 2.0, 0, 0),
+            entry(0, 3, 8.0, 0, 0),
+            entry(0, 5, 14.0, 0, 0),
+            entry(0, 7, 20.0, 0, 0),
+            // gen1: 2 entries, Δcollections 2, Δduration 9.0 → 4.5.
+            entry(1, 4, 1.0, 0, 0),
+            entry(1, 6, 10.0, 0, 0),
+            // gen2: 1 entry — no delta to take.
+            entry(2, 9, 100.0, 0, 0),
+        ];
+        assert_eq!(
+            avg_collection_time_per_gen(&entries, true),
+            [Some(3.0), Some(4.5), Some(0.0)]
+        );
+    }
+
+    /// The decoder emits entries in ring order, not grouped by generation, and the sparse
+    /// generation can be the *young* one (gen0 wrapped to a single live entry while the
+    /// older rings hold several). Bucketing is by the `generation` field, so interleaving
+    /// and an inverted population must not change any result.
+    #[test]
+    fn avg_collection_time_buckets_interleaved_entries_by_generation() {
+        let entries = vec![
+            entry(2, 10, 100.0, 0, 0),
+            entry(1, 2, 4.0, 0, 0),
+            entry(0, 5, 50.0, 0, 0), // gen0: the lone entry → 0.0
+            entry(2, 14, 140.0, 0, 0),
+            entry(1, 5, 13.0, 0, 0),
+            entry(2, 12, 116.0, 0, 0),
+        ];
+        // gen1: Δcollections 3, Δduration 9.0 → 3.0. gen2: Δcollections 4, Δduration 40.0 → 10.0.
+        assert_eq!(
+            avg_collection_time_per_gen(&entries, true),
+            [Some(0.0), Some(3.0), Some(10.0)]
+        );
+    }
+
+    /// `GcEntry::generation` is a raw decoded `u32`; a layout/geometry mismatch can hand us
+    /// an out-of-range generation. Those entries are dropped, never indexed into the
+    /// 3-element array, and the valid generations still compute.
+    #[test]
+    fn avg_collection_time_ignores_out_of_range_generations() {
+        let entries = vec![
+            entry(3, 1, 1.0, 0, 0),
+            entry(7, 9, 9.0, 0, 0),
+            entry(0, 2, 4.0, 0, 0),
+            entry(0, 4, 12.0, 0, 0),
+        ];
+        assert_eq!(
+            avg_collection_time_per_gen(&entries, true),
+            [Some(4.0), Some(0.0), Some(0.0)]
+        );
+    }
+
     /// Two entries but no new collections between them (Δcollections == 0) can't yield a
     /// meaningful average — it stays 0.0 rather than dividing by zero.
     #[test]
     fn avg_collection_time_is_zero_when_no_new_collections() {
         let entries = vec![entry(0, 5, 10.0, 0, 0), entry(0, 5, 30.0, 0, 0)];
         assert_eq!(avg_collection_time_per_gen(&entries, true)[0], Some(0.0));
+    }
+
+    /// A ring wraps, so within one generation `collections` is non-monotonic in storage
+    /// order — position 0 can hold the newest entry while the oldest sits mid-buffer, e.g.
+    /// `[10, 11, 12, 5, 6, 7, 8, 9]`. The window must therefore span the min/max
+    /// *collections values*, not the first/last entries by index. Durations here are
+    /// deliberately uneven so an index-order reading (6.0 / 13.0) would fail.
+    #[test]
+    fn avg_collection_time_spans_the_ring_across_a_wrap() {
+        let entries = vec![
+            // gen0: 8 entries, wrapped after 12 — collections 10,11,12 then 5..9.
+            entry(0, 10, 50.0, 0, 0),
+            entry(0, 11, 56.0, 0, 0),
+            entry(0, 12, 63.0, 0, 0), // newest
+            entry(0, 5, 7.0, 0, 0),   // oldest
+            entry(0, 6, 14.0, 0, 0),
+            entry(0, 7, 26.0, 0, 0),
+            entry(0, 8, 38.0, 0, 0),
+            entry(0, 9, 44.0, 0, 0),
+            // gen1: 3 entries, wrapped after 21 — collections 21 then 19, 20.
+            entry(1, 21, 70.0, 0, 0), // newest
+            entry(1, 19, 51.0, 0, 0), // oldest
+            entry(1, 20, 57.0, 0, 0),
+            // gen2: 1 entry.
+            entry(2, 3, 12.0, 0, 0),
+        ];
+        // gen0: Δcollections 12-5 = 7, Δduration 63.0-7.0 = 56.0 → 8.0.
+        // gen1: Δcollections 21-19 = 2, Δduration 70.0-51.0 = 19.0 → 9.5.
+        assert_eq!(
+            avg_collection_time_per_gen(&entries, true),
+            [Some(8.0), Some(9.5), Some(0.0)]
+        );
+    }
+
+    /// A ring is allocated full-size and filled in over time, so a young process leaves
+    /// trailing positions all-zero. `collections == 0` never occurs for a real entry (the
+    /// first one is always 1), so those positions are unwritten and must not anchor the
+    /// window — otherwise the average silently becomes a process-lifetime one over a
+    /// phantom collection 0. Each generation fills at its own pace, so the counts differ.
+    #[test]
+    fn avg_collection_time_ignores_unwritten_ring_positions() {
+        let entries = vec![
+            // gen0: 3 written of 6 — collections 4..8, duration 20..44 → Δ4/Δ24 → 6.0.
+            entry(0, 4, 20.0, 0, 0),
+            entry(0, 6, 30.0, 0, 0),
+            entry(0, 8, 44.0, 0, 0),
+            entry(0, 0, 0.0, 0, 0),
+            entry(0, 0, 0.0, 0, 0),
+            entry(0, 0, 0.0, 0, 0),
+            // gen1: 2 written of 3 — Δcollections 1, Δduration 7.0 → 7.0.
+            entry(1, 1, 9.0, 0, 0),
+            entry(1, 2, 16.0, 0, 0),
+            entry(1, 0, 0.0, 0, 0),
+            // gen2: never collected — every position unwritten.
+            entry(2, 0, 0.0, 0, 0),
+            entry(2, 0, 0.0, 0, 0),
+            entry(2, 0, 0.0, 0, 0),
+        ];
+        assert_eq!(
+            avg_collection_time_per_gen(&entries, true),
+            [Some(6.0), Some(7.0), Some(0.0)]
+        );
+    }
+
+    /// A single written entry beside unwritten positions is still a single entry — there is
+    /// no second point to take a delta against, so it stays 0.0 rather than pairing with a
+    /// phantom collection 0 at duration 0 (which would report the whole cumulative duration
+    /// as one collection's pause).
+    #[test]
+    fn avg_collection_time_does_not_pair_a_lone_entry_with_an_unwritten_one() {
+        let entries = vec![
+            entry(0, 3, 90.0, 0, 0),
+            entry(0, 0, 0.0, 0, 0),
+            entry(0, 0, 0.0, 0, 0),
+        ];
+        // Anchoring at the zero position would give 90.0/3 = 30.0.
+        assert_eq!(avg_collection_time_per_gen(&entries, true)[0], Some(0.0));
+    }
+
+    /// The zero-Δcollections guard is per generation too. A gen whose entries all report
+    /// the same `collections` has no denominator and stays 0.0 however many entries it
+    /// holds and however far its `duration` spreads, while a sparser gen beside it still
+    /// divides normally.
+    #[test]
+    fn avg_collection_time_is_zero_only_for_the_generation_with_no_new_collections() {
+        let entries = vec![
+            // gen0: 3 entries, duration spread 10..90 but collections pinned at 5 → Δ0.
+            entry(0, 5, 10.0, 0, 0),
+            entry(0, 5, 30.0, 0, 0),
+            entry(0, 5, 90.0, 0, 0),
+            // gen1: 2 entries, Δcollections 4, Δduration 20.0 → 5.0.
+            entry(1, 2, 4.0, 0, 0),
+            entry(1, 6, 24.0, 0, 0),
+            // gen2: 1 entry — no delta to take.
+            entry(2, 9, 100.0, 0, 0),
+        ];
+        assert_eq!(
+            avg_collection_time_per_gen(&entries, true),
+            [Some(0.0), Some(5.0), Some(0.0)]
+        );
     }
 
     // ── collections_rate_from_entries ─────────────────────────────
@@ -508,18 +688,115 @@ mod tests {
     /// the max `stop_ts`. 4 collections over 2s (2e9 ns) → 2.0/s.
     #[test]
     fn collections_rate_is_collections_over_elapsed_seconds() {
-        let entries = vec![entry(0, 0, 0.0, 0, 0), entry(0, 4, 0.0, 0, 2_000_000_000)];
+        let entries = vec![entry(0, 1, 0.0, 0, 0), entry(0, 5, 0.0, 0, 2_000_000_000)];
         let rate = collections_rate_from_entries(&entries, true);
         assert_eq!(rate[0], Some(2.0));
         assert_eq!(rate[1], Some(0.0), "gen1 has <2 entries");
+    }
+
+    /// Same uneven-population rule for the rate: each generation's window is its own
+    /// min `start_ts` → max `stop_ts`, so a gen0 with many entries and a wide window must
+    /// not set the denominator for a gen1 with two entries and a narrow one.
+    #[test]
+    fn collections_rate_uses_each_generations_own_window() {
+        let entries = vec![
+            // gen0: 3 entries, Δcollections 10 over 0..5s → 2.0/s.
+            entry(0, 1, 0.0, 0, 1_000_000_000),
+            entry(0, 7, 0.0, 2_000_000_000, 3_000_000_000),
+            entry(0, 11, 0.0, 4_000_000_000, 5_000_000_000),
+            // gen1: 2 entries, Δcollections 3 over 1s..4s → 1.0/s.
+            entry(1, 1, 0.0, 1_000_000_000, 2_000_000_000),
+            entry(1, 4, 0.0, 3_000_000_000, 4_000_000_000),
+            // gen2: 1 entry — no window.
+            entry(2, 8, 0.0, 0, 9_000_000_000),
+        ];
+        assert_eq!(
+            collections_rate_from_entries(&entries, true),
+            [Some(2.0), Some(1.0), Some(0.0)]
+        );
     }
 
     /// Zero elapsed time (all timestamps equal) can't yield a rate — stays 0.0 rather
     /// than dividing by zero.
     #[test]
     fn collections_rate_is_zero_when_no_time_elapsed() {
-        let entries = vec![entry(0, 0, 0.0, 5, 5), entry(0, 4, 0.0, 5, 5)];
+        let entries = vec![entry(0, 1, 0.0, 5, 5), entry(0, 5, 0.0, 5, 5)];
         assert_eq!(collections_rate_from_entries(&entries, true)[0], Some(0.0));
+    }
+
+    /// Same wrap for the rate: timestamps go backwards mid-buffer along with `collections`,
+    /// so the window is the min `start_ts` → max `stop_ts` *by value*. Reading the first and
+    /// last entries by index would here give a negative span (gen0 starts at 4s and ends at
+    /// 3.2s) and report 0.0.
+    #[test]
+    fn collections_rate_spans_the_ring_across_a_wrap() {
+        let entries = vec![
+            // gen0: 5 entries, wrapped after 9 — collections 8, 9 then 5, 6, 7.
+            entry(0, 8, 0.0, 4_000_000_000, 4_200_000_000),
+            entry(0, 9, 0.0, 4_800_000_000, 5_000_000_000), // newest
+            entry(0, 5, 0.0, 1_000_000_000, 1_200_000_000), // oldest
+            entry(0, 6, 0.0, 2_000_000_000, 2_200_000_000),
+            entry(0, 7, 0.0, 3_000_000_000, 3_200_000_000),
+            // gen1: 2 entries, wrapped — collections 12 then 11.
+            entry(1, 12, 0.0, 1_500_000_000, 2_000_000_000), // newest
+            entry(1, 11, 0.0, 0, 500_000_000),               // oldest
+            // gen2: 1 entry.
+            entry(2, 2, 0.0, 0, 9_000_000_000),
+        ];
+        // gen0: Δcollections 4 over 1s..5s → 1.0/s. gen1: Δcollections 1 over 0..2s → 0.5/s.
+        assert_eq!(
+            collections_rate_from_entries(&entries, true),
+            [Some(1.0), Some(0.5), Some(0.0)]
+        );
+    }
+
+    /// Unwritten positions carry `ts_start == ts_stop == 0` too, so leaving them in would
+    /// stretch every window back to timestamp 0 and crush the rate toward zero. They are
+    /// dropped by the same `collections == 0` marker, per generation.
+    #[test]
+    fn collections_rate_ignores_unwritten_ring_positions() {
+        let entries = vec![
+            // gen0: 3 written of 5 — Δcollections 6 over 4s..7s → 2.0/s.
+            entry(0, 2, 0.0, 4_000_000_000, 4_500_000_000),
+            entry(0, 5, 0.0, 5_000_000_000, 5_500_000_000),
+            entry(0, 8, 0.0, 6_500_000_000, 7_000_000_000),
+            entry(0, 0, 0.0, 0, 0),
+            entry(0, 0, 0.0, 0, 0),
+            // gen1: 2 written of 4 — Δcollections 1 over 4s..6s → 0.5/s.
+            entry(1, 1, 0.0, 4_000_000_000, 4_500_000_000),
+            entry(1, 2, 0.0, 5_500_000_000, 6_000_000_000),
+            entry(1, 0, 0.0, 0, 0),
+            entry(1, 0, 0.0, 0, 0),
+            // gen2: never collected.
+            entry(2, 0, 0.0, 0, 0),
+        ];
+        // With the zeros left in, gen0 would span 0..7s and report 8/7 ≈ 1.14/s.
+        assert_eq!(
+            collections_rate_from_entries(&entries, true),
+            [Some(2.0), Some(0.5), Some(0.0)]
+        );
+    }
+
+    /// The degenerate window is per generation too. A gen with several entries that all
+    /// share one timestamp has no time base and stays 0.0 no matter how many collections
+    /// it counted, while a *less* populated gen alongside it still reports a real rate.
+    #[test]
+    fn collections_rate_is_zero_only_for_the_generation_with_no_time_elapsed() {
+        let entries = vec![
+            // gen0: 2 entries, Δcollections 3 over 0..2s → 1.5/s.
+            entry(0, 1, 0.0, 0, 1_000_000_000),
+            entry(0, 4, 0.0, 1_000_000_000, 2_000_000_000),
+            // gen1: 3 entries, Δcollections 8 but every timestamp identical → no window.
+            entry(1, 1, 0.0, 7, 7),
+            entry(1, 4, 0.0, 7, 7),
+            entry(1, 9, 0.0, 7, 7),
+            // gen2: 1 entry — a wide span, but a single entry is never a delta.
+            entry(2, 5, 0.0, 0, 5_000_000_000),
+        ];
+        assert_eq!(
+            collections_rate_from_entries(&entries, true),
+            [Some(1.5), Some(0.0), Some(0.0)]
+        );
     }
 
     // ── parse_gc_entries / parse_entry ─────────────────────────────
