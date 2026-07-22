@@ -13,11 +13,11 @@ remoteprocess = "0.5.2"
 ctrlc = "3.5.2"
 ratatui = "0.26"
 crossterm = "0.29"
-sysinfo = "0.33"
+sysinfo = "0.39"
 
 [dev-dependencies]
 goblin = "0.10.7"
-sysinfo = "0.33"
+sysinfo = "0.39"
 criterion = { version = "5.0.1", package = "codspeed-criterion-compat" }
 
 [features]
