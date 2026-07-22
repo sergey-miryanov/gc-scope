@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build & test (${{ matrix.os }})
@@ -31,14 +34,10 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
-      # Unit tests only; live-smoke below is the integration gate.
       - name: Test
         run: cargo test --verbose
 
-      # Separate instrumented run so a coverage-tool failure isn't mistaken for a test
-      # failure and the gate keeps running an uninstrumented binary. Non-blocking.
       - name: Coverage (unit tests)
-        continue-on-error: true
         uses: ./.github/actions/coverage-report
         with:
           test-cmd: cargo test --quiet
@@ -55,13 +54,6 @@ jobs:
         continue-on-error: true
         run: cargo fmt --all --check
 
-  # Attach to a real interpreter and decode its GC stats, per (OS, Python minor). Covers
-  # both finding paths across all three binary parsers. See ADR 0004 for the full cross-product.
-  # Runs INSTRUMENTED: this matrix is both the correctness gate and the coverage source, so
-  # there is no separate coverage-smoke job. Instrumentation cannot cause the characteristic
-  # bug (a wrong offset reads the *target's* memory; -Cinstrument-coverage only changes
-  # gcscope's own binary). Only the Codecov upload is non-blocking, so a coverage-service
-  # failure can't redden the gate while a real test/build failure still does.
   live-smoke:
     name: gc-stats smoke (${{ matrix.os }} py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
@@ -92,21 +84,16 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
-          tool: cargo-llvm-cov  # pinned action SHA; the `tool` input selects what to install
+          tool: cargo-llvm-cov
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: ${{ matrix.python }}
-          # Required for the beta-only 3.15.
           allow-prereleases: true
-
-      # No separate `cargo build`: the instrumented run below builds both the test target and
-      # the gcscope binary it spawns, so a second uninstrumented build would be wasted work.
 
       - name: Allow ptrace (best-effort)
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      # macOS gates attach behind task_for_pid. Non-blocking so it can't mask a code failure.
       - name: Configure macOS taskport permissions
         if: runner.os == 'macOS'
         continue-on-error: true
@@ -115,7 +102,6 @@ jobs:
           sudo security authorizationdb write system.privilege.taskport is-developer
           sudo security authorizationdb read system.privilege.taskport
 
-      # Dump image facts so a macOS failure is diagnosable without another CI round-trip.
       - name: Describe the macOS Python image
         if: runner.os == 'macOS'
         continue-on-error: true
@@ -133,10 +119,6 @@ jobs:
               || echo "(unsigned / no signing info)"
           done
 
-      # Unprivileged where it works, so a target that drops get-task-allow fails here
-      # instead of being masked by blanket sudo. One instrumented invocation builds the test +
-      # gcscope binary, asserts the shape (the gate), and captures the spawned binary's
-      # profile. test_python() picks up setup-python's interpreter from PATH.
       - name: Attach, detect version, assert GC-stats shape
         if: runner.os != 'macOS' || matrix.macos_needs_root != 'yes'
         shell: bash
@@ -162,23 +144,13 @@ jobs:
           sudo chown -R "$(whoami)" "$CARGO_LLVM_COV_TARGET_DIR" || true
           cargo llvm-cov report --lcov --output-path lcov.info
 
-      # Upload-only (the action skips generation when test-cmd is empty). Non-blocking: a
-      # Codecov outage must not redden the correctness gate above.
       - name: Upload coverage
-        continue-on-error: true
         uses: ./.github/actions/coverage-report
         with:
           flags: smoke,${{ matrix.os }}
           name: smoke-${{ matrix.os }}-py${{ matrix.python }}
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
 
-  # Build custom interpreters setup-python can't supply, then run the live_smoke driver.
-  # Linux-only (version/decode coverage is OS-independent). Blocking gate. Rationale:
-  # docs/adr/0006-layout-registration-integrity.md.
-  #   - 3.15+inc: shares hex 0x030f00b1 with clean 3.15.0b1; --expect-extended proves the
-  #     +inc candidate (not the clean one) was decoded.
-  #   - 3.16.0a0: pinned commit read from the gcscope-source: line in v_3_16_0a0.rs, so
-  #     regenerating 3.16 moves the pin with no YAML edit.
   custom-build-smoke:
     name: gc-stats smoke (source ${{ matrix.label }})
     runs-on: ubuntu-latest
@@ -186,8 +158,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ref: branch/SHA to build. provenance_file: read the pin from a layout's
-          # gcscope-source: line instead (leave ref empty).
           - label: '3.15+inc'
             repo: sergey-miryanov/cpython
             ref: 'feat/gc-gen-3.15+inc'
@@ -207,10 +177,8 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
-          tool: cargo-llvm-cov  # pinned action SHA; the `tool` input selects what to install
+          tool: cargo-llvm-cov
 
-      # Resolve to an exact commit (empty ref → read the pin from provenance_file). The
-      # cache key is that commit, so a moving branch re-keys and a pinned SHA stays a hit.
       - name: Resolve interpreter commit
         id: rev
         run: |
@@ -233,8 +201,6 @@ jobs:
           path: ~/cpython-build
           key: cpython-${{ matrix.label }}-${{ steps.rev.outputs.sha }}
 
-      # Fetch the resolved SHA (branch or pinned commit both work). Only C build deps
-      # needed; spin.py imports gc/os/sys/time only.
       - name: Build CPython from source
         if: steps.cache-py.outputs.cache-hit != 'true'
         run: |
@@ -248,16 +214,9 @@ jobs:
           make -j"$(nproc)"
           make install
 
-      # No separate `cargo build`: the instrumented run below builds both the test target and
-      # the gcscope binary it spawns.
-
       - name: Allow ptrace (best-effort)
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      # Instrumented, so these two source-built layouts (v_3_15_0b1_*.rs / v_3_16_0a0.rs) get
-      # coverage — they execute nowhere else in the matrix. GCSCOPE_TEST_PYTHON points the test
-      # at the source-built interpreter; the +inc leg additionally requires the extended GC
-      # columns via GCSCOPE_EXPECT_EXTENDED.
       - name: Attach, detect version, assert GC-stats shape
         shell: bash
         run: |
@@ -267,21 +226,13 @@ jobs:
           [ "${{ matrix.expect_extended }}" = "yes" ] && export GCSCOPE_EXPECT_EXTENDED=1
           cargo llvm-cov --test live_smoke --lcov --output-path lcov.info -- --ignored --nocapture
 
-      # Upload-only. Non-blocking: a Codecov outage must not redden the gate above. The label
-      # carries the build identity; it stays out of `flags` because Codecov flag names don't
-      # accept the '+' in "3.15+inc".
       - name: Upload coverage
-        continue-on-error: true
         uses: ./.github/actions/coverage-report
         with:
           flags: smoke,custom-build
           name: smoke-custom-${{ matrix.label }}
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
 
-  # The integration suites (lifecycle, memory, monitor, remote_debugging, diagram) are
-  # #[ignore]d because they attach to a live interpreter; this leg grants attach
-  # permission and runs them all. --features test-hooks is required by tests/monitor.rs
-  # and a no-op elsewhere. Linux/py3.13. Blocking gate.
   integration-tests:
     name: integration tests (attach)
     runs-on: ubuntu-latest
@@ -294,8 +245,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
-          tool: cargo-llvm-cov  # pinned action SHA; the `tool` input selects what to install
-      # Guarantees an interpreter, so the tests run rather than skip (a false green).
+          tool: cargo-llvm-cov
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: '3.13'
@@ -303,18 +253,10 @@ jobs:
       - name: Allow ptrace (best-effort)
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      # Blocking gate, uninstrumented (ADR 0005: assert against a clean binary). This now also
-      # runs the live-smoke shape test (tests/live_smoke.rs) on Linux/py3.13, since it joined
-      # the --tests set; the full OS × version matrix runs it in the live-smoke job.
       - name: "Run the 'ignored' integration tests"
         run: cargo test --features test-hooks --tests -- --ignored
 
-      # Separate instrumented re-run so the integration suites' live-attach code
-      # paths (find_runtime, read_offsets, session reads, collect/render, the monitor
-      # retry) are measured — the unit-coverage leg never runs the #[ignore]d tests.
-      # Non-blocking so a coverage-tool failure can't fail the gate above.
       - name: Coverage (integration tests)
-        continue-on-error: true
         uses: ./.github/actions/coverage-report
         with:
           test-cmd: cargo test --features test-hooks --tests -- --ignored
