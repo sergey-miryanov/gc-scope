@@ -31,6 +31,8 @@ authoritative; this document restates what the code computes and can drift.
 7. [Per-version capabilities](#7-per-version-capabilities)
 8. [Verification and adding a version](#8-verification-and-adding-a-version)
 
+[Appendix — where things live](#appendix--where-things-live)
+
 ---
 
 ## 1. Attach pipeline
@@ -131,7 +133,8 @@ layout registry is indexed by.
 
 release_level:  0xA = alpha   0xB = beta   0xC = rc   0xF = final
 
-0x030f00b4  =  3 . 15 . 0 b4        0x030d01f0  =  3 . 13 . 1  (final)
+0x030f00b4  =  3 . 15 . 0 b4
+0x030d01f0  =  3 . 13 . 1 (final)
 ```
 
 The release-level nibble separates a pre-release from a released build, which is the
@@ -188,36 +191,10 @@ Two backstops:
 `PySession::layout_source()` reports `Parsed` vs `Cached`, which lifecycle tests use
 to observe the fast path.
 
-### 1.6 Reused PIDs — `revalidate`
+*Source:* `src/remote_debugging/session.rs` (`attach`, `layout_still_valid`,
+`layout_source`).
 
-On a failed read the session does not retry; that decision belongs to the caller's
-`WaitPolicy`. It calls `revalidate`, which returns `Fresh` / `Changed` / `Dead`:
-
-```mermaid
-flowchart TD
-    A["read failed → revalidate()"] --> B["process::read_cmdline(pid)"]
-    B --> C{"classify_cmdline"}
-    C -->|"new read is None"| D["Dead"]
-    C -->|"both non-empty AND differ"| E["Changed<br/>(a different program holds this PID)"]
-    C -->|"identical, or either side empty"| F["soft_reattach()"]
-    F --> G{"new handle + runtime addr;<br/>exe_key unchanged?<br/>version word unchanged?"}
-    G -->|yes| H["Fresh — caller may retry"]
-    G -->|no| I["Changed"]
-    G -->|"open/find failed"| J["Dead"]
-```
-
-An empty command line is treated as unknown rather than as a difference, so `Changed`
-requires both sides non-empty and differing. `read_cmdline` returns `Some("")` when
-the OS still has the process but its command line cannot be read — a transient access
-failure, or a process caught mid-teardown, which is the state `revalidate` runs in.
-
-On Windows this also requires asking sysinfo explicitly for `cmd`; `refresh_processes`
-alone leaves it empty there, which made the check compare `""` against `""`.
-
-*Source:* `src/remote_debugging/session.rs` (`attach`, `revalidate`,
-`classify_cmdline`, `soft_reattach`, `layout_still_valid`).
-
-### 1.7 Traces through the same pipeline
+### 1.6 Traces through the same pipeline
 
 **CPython 3.8.18 on macOS, `sudo gcscope gc-stats <pid>`** — the global-GC build
 
@@ -354,20 +331,30 @@ the interpreter/thread pointer graph closing and agreeing with `interpreters.hea
 That description is needed before the search can start and follows from the version
 alone, so a pre-3.13 target has its offsets before it has its runtime address.
 
-```mermaid
-flowchart LR
-    A["version.minor"] -->|">= 13"| B["find_runtime_module"]
-    A -->|"8 – 12"| C["find_runtime_pre_3_13"]
-    B --> B1["locate PyRuntime section on disk"]
-    B1 --> B2["translate file addr → load addr"]
-    B2 --> B3["read 8 bytes at that addr"]
-    B3 --> B4{"== 'xdebugpy'?"}
-    B4 -->|yes| OK["runtime_addr"]
-    B4 -->|no| B5["try next module"]
-    C --> C1["resolve _PyRuntime symbol"]
-    C1 --> C2["check_runtime: structural round-trip"]
-    C2 -->|"round-trip closes"| OK
-    C2 -->|no| C3["try next module, record why"]
+```text
+                            version.minor
+                                  │
+            ┌─────────────────────┴─────────────────────┐
+         >= 13                                        8 – 12
+            │                                            │
+            ▼                                            ▼
+    find_runtime_module                        find_runtime_pre_3_13
+            │                                            │
+            ▼                                            ▼
+ locate PyRuntime section on disk           resolve _PyRuntime symbol
+            │                                            │
+            ▼                                            ▼
+ translate file addr → load addr             check_runtime:
+            │                                structural round-trip
+            ▼                                            │
+ read 8 bytes at that addr                               │
+            │                                            │
+            ▼                                            ▼
+    == "xdebugpy"? ──no──┐                  round-trip closes? ──no──┐
+            │            │                             │             │
+           yes    try next module                     yes    try next module,
+            │                                          │      record why
+            └──────────────► runtime_addr ◄────────────┘
 ```
 
 ### 2.1 3.13+ — cookie path
@@ -493,27 +480,28 @@ mirror ([§4.1](#41-bindgen-generated-structs-313)).
 Pre-3.13 has no registry: `pre_3_13::table_for_version(major, minor)` matches
 `(3, 8) … (3, 12)` and returns `None` otherwise.
 
-```mermaid
-flowchart TD
-    A["read_offsets(pid, detected_version)"] --> B{"major.minor >= 3.13?"}
-    B -->|no| Z["error: no _Py_DebugOffsets<br/>(pre-3.13 goes to pre_3_13.rs)"]
-    B -->|yes| C["find_runtime; read u64 at runtime_addr + 8<br/>→ stored hex (AUTHORITATIVE)"]
-    C --> D{"on-disk version<br/>disagrees?"}
-    D -->|yes| D1["warn; trust the live value"]
-    D -->|no| E
-    D1 --> E{"stored hex in LAYOUTS?"}
-    E -->|yes| F["exact match → Resolved::Full"]
-    E -->|no| G{"FALLBACK_CACHE<br/>hit for (pid, stored)?"}
-    G -->|yes| H["reuse cached fallback hex"]
-    G -->|no| I{"release_level(stored) == 0xF?"}
-    I -->|"no — alpha/beta/rc"| J["REFUSE: 'no other X.Y layout<br/>can stand in for it'"]
-    I -->|yes| K{"any FINAL same-minor<br/>layout compiled in?"}
-    K -->|no| L["REFUSE: 'no released X.Y.x layout<br/>to fall back to'"]
-    K -->|yes| M["pick nearest by hex<br/>(ties prefer lower); warn once;<br/>memoize per (pid, stored)"]
-    M --> N["Resolved::LayoutOnly"]
-    H --> N
-    F --> O["build_variant → read struct bytes<br/>through that version's mirror"]
-    N --> O
+Which row applies is decided by the version hex the process publishes:
+
+```text
+published version hex
+        │
+        ▼
+ exact row in LAYOUTS? ──yes──► Resolved::Full
+        │
+        no
+        │
+        ▼
+ target is a final release? ──no──► REFUSE — an alpha/beta/rc has no stand-in
+        │
+       yes
+        │
+        ▼
+ a final same-minor row registered? ──no──► REFUSE — nothing released to
+        │                                            fall back to
+       yes
+        │
+        ▼
+ nearest by hex, ties prefer lower ──► Resolved::LayoutOnly, with a warning
 ```
 
 ### 3.1 Exact-or-refuse fallback
@@ -552,17 +540,31 @@ Since the navigation struct is identical, one `VersionedOffsets` variant serves
 both, and only the GC shape needs choosing. The single discriminator visible from
 outside the process is the ring byte-size published in `gc.generation_stats_size`.
 
-```mermaid
-flowchart TD
-    A["to_offset_table()"] --> B["default = this variant's own gc_stats_shape()"]
-    B --> C{"reported ring size == 0?"}
-    C -->|"yes (inline / pre-ring)"| D["use default — nothing to disambiguate"]
-    C -->|no| E{"hex in GC_CANDIDATES?"}
-    E -->|"no (single layout)"| D
-    E -->|yes| F["for each candidate:<br/>expected_ring_size(item_size, free_threaded)"]
-    F --> G{"matches reported?"}
-    G -->|yes| H["use that candidate's kind + item size + GC_LAYOUT"]
-    G -->|"no candidate matches"| I["fall through to default —<br/>the gc_stats size guard then fires<br/>with the regenerate hint"]
+```text
+to_offset_table()
+        │
+        ▼
+ default = this variant's own gc_stats_shape()
+        │
+        ▼
+ reported ring size == 0? ──yes (inline / pre-ring)──► use default —
+        │                                              nothing to disambiguate
+        no                                                    ▲
+        │                                                     │
+        ▼                                                     │
+ hex in GC_CANDIDATES? ──no (single layout)───────────────────┘
+        │
+       yes
+        │
+        ▼
+ for each candidate: expected_ring_size(item_size, free_threaded)
+        │
+        ├─ matches reported ──────► use that candidate's kind + item size
+        │                           + GC_LAYOUT
+        │
+        └─ no candidate matches ──► fall through to default — the gc_stats
+                                    size guard then fires with the
+                                    regenerate hint
 ```
 
 Invariant: candidates registered under one hex must have distinct expected ring
@@ -703,16 +705,34 @@ table is clearer for hand-extracted offsets. Revisit if the live coverage narrow
 `VersionedOffsets` is an enum with one variant per registered layout.
 Version-specific behavior lives in exactly two places:
 
-```mermaid
-flowchart TD
-    A["VersionedOffsets enum<br/>(one variant per LAYOUTS row)"] --> B["for_each_variant! macro<br/>— the variant list, enumerated ONCE"]
-    B --> C["uniform accessors<br/>runtime_interpreters_head()<br/>interpreter_state_gc()<br/>gc_collecting() …"]
-    B --> D["trait delegation<br/>DebugOffsetsView"]
-    D --> E["impl in each generated v_*.rs:<br/>layout_version, threads_main, gc_frame,<br/>gc_generation_stats(_size),<br/>gc_stats_shape, gc_inline_off"]
-    A --> F["gc_debug_fields()<br/>— the ONE hand-written per-variant match"]
-    F --> G["needs offset_of!/size_of! on<br/>that variant's OWN struct types;<br/>exhaustive match ⇒ compiler-enforced"]
-    C --> H["to_offset_table() → flat OffsetTable"]
-    E --> H
+```text
+VersionedOffsets enum
+(one variant per LAYOUTS row)
+        │
+        ├──► for_each_variant! macro — the variant list, enumerated ONCE
+        │            │
+        │            ├──► uniform accessors ─────────────────────────┐
+        │            │    runtime_interpreters_head()                │
+        │            │    interpreter_state_gc()                     │
+        │            │    gc_collecting() …                          │
+        │            │                                               │
+        │            └──► trait delegation: DebugOffsetsView         │
+        │                         │                                  │
+        │                         ▼                                  │
+        │                 impl in each generated v_*.rs:             │
+        │                 layout_version, threads_main, gc_frame,    │
+        │                 gc_generation_stats(_size),                │
+        │                 gc_stats_shape, gc_inline_off              │
+        │                         │                                  │
+        │                         └──────────────┬───────────────────┘
+        │                                        ▼
+        │                       to_offset_table() → flat OffsetTable
+        │
+        └──► gc_debug_fields() — the ONE hand-written per-variant match
+                     │
+                     ▼
+             needs offset_of!/size_of! on that variant's OWN struct types;
+             exhaustive match ⇒ compiler-enforced
 ```
 
 - Uniform accessors — fields present on every version — fan out through
@@ -874,19 +894,19 @@ followed by an 8-byte write cursor:
 ```
 *(gc_addr + gc.generation_stats)
 │
-│ ◄─────────────── generation 0 (young): 11 entries ───────────────►│cursor│
-├────────┬────────┬────────┬─────────────────────────┬────────┬─────┬──────┐
-│ entry0 │ entry1 │ entry2 │           …             │entry10 │     │ u64  │
-└────────┴────────┴────────┴─────────────────────────┴────────┴─────┴──────┘
-│                                                                          │
-│ ◄──── generation 1: 3 entries ────►│cursor│                              │
-├────────┬────────┬────────┬──────┐                                        │
-│ entry0 │ entry1 │ entry2 │ u64  │                                        │
-└────────┴────────┴────────┴──────┘                                        │
-│ ◄──── generation 2: 3 entries ────►│cursor│                              │
-├────────┬────────┬────────┬──────┐                                        │
-│ entry0 │ entry1 │ entry2 │ u64  │ ◄── the process counts this trailing   │
-└────────┴────────┴────────┴──────┘     cursor; the decoder never reads it  │
+├── bases[0] ┌──────────────────────────────┐  generation 0 (young)
+│            │ entry 0 … entry n            │  entries_per_gen[0] × item_size
+│            ├──────────────────────────────┤
+│            │ write cursor  (u64)          │  +8
+├── bases[1] ├──────────────────────────────┤  generation 1
+│            │ entry 0 … entry n            │  entries_per_gen[1] × item_size
+│            ├──────────────────────────────┤
+│            │ write cursor  (u64)          │  +8
+├── bases[2] ├──────────────────────────────┤  generation 2 (old)
+│            │ entry 0 … entry n            │  entries_per_gen[2] × item_size
+│            ├──────────────────────────────┤  ◄── end of what the decoder reads
+│            │ write cursor  (u64)          │      counted by the process,
+└──          └──────────────────────────────┘      never read
 
 bases = compute_ring_base_offsets(item_size, entries):
     bases[0] = 0
@@ -1058,8 +1078,7 @@ ignored on ad-hoc signatures. Re-sign after every build.
 
 Unit tests (`#[cfg(test)]`, in-file, no Python needed, under a second) cover the pure
 logic: version hex encoding, the `LAYOUTS` registry's self-consistency, GC-shape
-selection, ring and inline geometry, stat decode, monitor dedup, and the
-`revalidate` classification.
+selection, ring and inline geometry, stat decode, and monitor dedup.
 
 They cannot catch a wrong struct offset. Such an offset executes the same branches,
 the same call graph, and the same covered lines as a correct one, and the difference
@@ -1173,10 +1192,12 @@ in `README.md` ("Adding a new Python version").
 | Generated per-build mirrors | `src/remote_debugging/offsets/v_*.rs` |
 | Flat `OffsetTable`, stats geometry + decode | `src/remote_debugging/offsets/offset_table.rs` |
 | Layout validation reports | `src/remote_debugging/offsets/validation.rs` |
-| `PySession`: attach, cache, revalidate, `gc_stats` | `src/remote_debugging/session.rs` |
+| `PySession`: attach, layout cache, `gc_stats` | `src/remote_debugging/session.rs` |
 | `GcStat` layout-driven view | `src/remote_debugging/gc_stats.rs` |
 | Snapshot collection for the TUI | `src/snapshot/` |
+| TUI frame loop, `_Py_DebugOffsets` tree model | `src/tui/` |
 | Monitor loop, exporters | `src/monitor/` |
+| Offset generation | `scripts/gen-offsets.py` |
 | TUI rendering | `src/tui/` |
 | Offset generator | `scripts/gen-offsets.py` |
 | Decision records | `docs/adr/` |
