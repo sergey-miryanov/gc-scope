@@ -644,7 +644,7 @@ dependencies = [
  "goblin",
  "proc-maps 0.5.0",
  "ratatui",
- "read-process-memory",
+ "read-process-memory 0.2.0",
  "remoteprocess",
  "sysinfo",
 ]
@@ -1245,6 +1245,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "read-process-memory"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98379bd2cb26a9ad7d0af215816348a41279285fd15e40b398af97108207a9d3"
+dependencies = [
+ "libc",
+ "log",
+ "mach2 0.6.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1301,7 +1313,7 @@ dependencies = [
  "nix",
  "object",
  "proc-maps 0.4.0",
- "read-process-memory",
+ "read-process-memory 0.1.6",
  "regex",
  "winapi",
 ]
