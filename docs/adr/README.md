@@ -8,9 +8,10 @@ than being rewritten.
 Forward-looking work that hasn't been decided/built yet lives in a `*-plan.md`
 next to this folder, not here (e.g. `docs/venv-launcher-child-retarget.md`).
 
-[`docs/version-support.md`](../version-support.md) documents the resulting
-behaviour in one place: how CPython 3.8–3.16 are detected, located, resolved, and
-decoded. The ADRs below record why each piece is the way it is.
+[`docs/version-support.md`](../version-support.md) covers the other half of the
+story: what varies across CPython 3.8–3.16 and why each difference makes attaching
+hard — the forces, stated without deciding anything. The ADRs below record what
+gcscope decided in response to them.
 
 | ADR | Decision |
 |-----|----------|

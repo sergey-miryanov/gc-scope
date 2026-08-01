@@ -54,6 +54,9 @@ recursively search children of the target PID.
 
 ## Supported Python versions
 
+For *why* support works this way — what changes across CPython versions, and what
+each change forces — see [`docs/version-support.md`](docs/version-support.md).
+
 Generated offset structs are in `src/remote_debugging/offsets/`. Currently supported:
 
 | Version | Hex | Method |
