@@ -30,7 +30,10 @@ On macOS the split is the target's doing: framework builds are signed with a
 hardened runtime, and only 3.13+ ships `com.apple.security.get-task-allow` (with
 PEP 768), which is what admits a same-user caller. Granting
 `system.privilege.taskport` does not help. If you don't know the target's version,
-use `sudo`.
+use `sudo`. The entitlement arrived with the same change that added the runtime
+marker and the self-published offsets — see
+[PEP 768](docs/version-support.md#pep-768-the-interpreter-starts-describing-itself)
+in the version-support notes.
 
 To avoid `sudo` there, sign gcscope with `com.apple.security.cs.debugger` (the
 `gcscope.entitlements` file in the repo root grants it) — the mechanism LLDB's
@@ -82,12 +85,18 @@ sizes — the only out-of-process discriminator — enforced by a test. Example:
 `0x030f00b1` serves both clean 3.15.0b1 (64-byte stats) and the `gc-gen-3.15+inc` build
 (208-byte stats).
 
+Why the version hex is an incomplete key, and why a colliding pair has to be refused
+rather than guessed between, is in
+[Build configuration varies independently of version](docs/version-support.md#build-configuration-varies-independently-of-version).
+
 ## How offset tables work
 
 gcscope needs to know the byte offsets of fields within `_PyRuntime`,
 `PyInterpreterState`, `PyThreadState`, and the GC state. These offsets
 change between every Python minor version (3.8 → 3.9 → … → 3.16).
-There are two ways to obtain them:
+There are two ways to obtain them — what each mechanism compiles in versus reads
+from the process is laid out in
+[Deciding which layout describes the build](docs/version-support.md#4-deciding-which-layout-describes-the-build):
 
 ### 1. Hardcoded tables (3.8–3.12)
 
@@ -175,6 +184,10 @@ This is a maintainer-only step — building, testing, and running gcscope need n
 since the generated `v_*.rs` are checked in. `gen-offsets.py` shells out to a `bindgen`
 binary on PATH; it is not a crate dependency.
 
+Every pre-release needs its own entry while patch releases do not, and the reason is
+CPython's, not gcscope's:
+[What the ABI freeze does and does not promise](docs/version-support.md#what-the-abi-freeze-does-and-does-not-promise).
+
 ```powershell
 # One-time: install the bindgen CLI (puts `bindgen` on PATH) and point LIBCLANG_PATH
 # at the VS-bundled LLVM.
@@ -232,10 +245,9 @@ discriminator).
 
 ### Version hex reference
 
-The version hex in `patchlevel.h` encodes:
-`(major << 24) | (minor << 16) | (micro << 8) | (level << 4) | serial`
-
-Level: `0xA` = alpha, `0xB` = beta, `0xC` = release candidate, `0xF` = final
+`PY_VERSION_HEX` comes from CPython's `patchlevel.h`. Its bit layout, and why the
+release-level nibble matters for layout selection, are in
+[`docs/version-support.md`](docs/version-support.md#2-knowing-which-version-you-are-looking-at).
 
 To find the hex for any checkout:
 ```powershell
