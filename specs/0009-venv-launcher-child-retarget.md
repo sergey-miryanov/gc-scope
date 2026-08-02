@@ -1,13 +1,13 @@
 # 0009 — Re-target `attach` from a venv launcher to its real interpreter child
 
-**Status:** Not started
-**Kind:** feature — ergonomics
-**Effort:** M
-**Origin:** deferred plan of 2026-07-20, follow-up to
-[ADR 0002](../docs/adr/0002-version-split-runtime-finding.md), which records this as a
-known blind spot.
-**Respects:** [ADR 0001](../docs/adr/0001-pysession-resolve-once-facade.md),
-[ADR 0002](../docs/adr/0002-version-split-runtime-finding.md)
+- **Status:** Not started
+- **Kind:** feature — ergonomics
+- **Effort:** M
+- **Origin:** deferred plan of 2026-07-20, follow-up to
+  [ADR 0002](../docs/adr/0002-version-split-runtime-finding.md), which records this as a
+  known blind spot.
+- **Respects:** [ADR 0001](../docs/adr/0001-pysession-resolve-once-facade.md),
+  [ADR 0002](../docs/adr/0002-version-split-runtime-finding.md)
 
 ## 1. Problem statement
 

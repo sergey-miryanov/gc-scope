@@ -1,12 +1,12 @@
 # 0010 — Emit the last-child connector `tree_prefixes` promises
 
-**Status:** Not started, **pinned**
-(`tree_prefixes_always_use_the_plus_connector_never_the_last_child_form` in `tui::tree`)
-**Kind:** bug — cosmetic
-**Effort:** S, but it changes rendered output
-**Origin:** surfaced 2026-07-21 while adding coverage to the diagram subsystem; recorded
-rather than fixed, and pinned by a characterization test so that fixing it is deliberate.
-**Respects:** [ADR 0005](../docs/adr/0005-testing-strategy.md)
+- **Status:** Not started, **pinned**
+  (`tree_prefixes_always_use_the_plus_connector_never_the_last_child_form` in `tui::tree`)
+- **Kind:** bug — cosmetic
+- **Effort:** S, but it changes rendered output
+- **Origin:** surfaced 2026-07-21 while adding coverage to the diagram subsystem; recorded
+  rather than fixed, and pinned by a characterization test so that fixing it is deliberate.
+- **Respects:** [ADR 0005](../docs/adr/0005-testing-strategy.md)
 
 ## 1. Problem
 

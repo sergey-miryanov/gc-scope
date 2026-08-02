@@ -1,12 +1,12 @@
 # 0005 — Drive the TUI tree's entry geometry from the resolved layout
 
-**Status:** Not started
-**Kind:** bug — correctness (presentation)
-**Effort:** S
-**Origin:** 2026-07-18 review (findings C10 / A2) — four of five copies of the formula
-eliminated; this is the last one.
-**Respects:** [ADR 0003](../docs/adr/0003-layout-driven-gc-stats-decode.md),
-[ADR 0007](../docs/adr/0007-gcstat-layout-driven-view.md)
+- **Status:** Not started
+- **Kind:** bug — correctness (presentation)
+- **Effort:** S
+- **Origin:** 2026-07-18 review (findings C10 / A2) — four of five copies of the formula
+  eliminated; this is the last one.
+- **Respects:** [ADR 0003](../docs/adr/0003-layout-driven-gc-stats-decode.md),
+  [ADR 0007](../docs/adr/0007-gcstat-layout-driven-view.md)
 
 ## 1. Problem
 

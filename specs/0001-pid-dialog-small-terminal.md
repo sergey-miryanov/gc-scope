@@ -1,10 +1,10 @@
 # 0001 — Refuse the PID dialog on a terminal too small to hold it
 
-**Status:** Not started
-**Kind:** bug — crash
-**Effort:** S
-**Origin:** 2026-07-18 review (finding C9), half-fixed; the remaining half is below.
-**Respects:** [ADR 0005](../docs/adr/0005-testing-strategy.md)
+- **Status:** Not started
+- **Kind:** bug — crash
+- **Effort:** S
+- **Origin:** 2026-07-18 review (finding C9), half-fixed; the remaining half is below.
+- **Respects:** [ADR 0005](../docs/adr/0005-testing-strategy.md)
 
 ## 1. Problem
 

@@ -7,11 +7,11 @@
 > Use this template for enhancements, ergonomics and cleanups — anything where the change is
 > *wanted* rather than *broken*. For a defect, use [TEMPLATE-bugfix.md](TEMPLATE-bugfix.md).
 
-**Status:** Not started | In progress | Blocked (`<on what>`)
-**Kind:** feature — enhancement | ergonomics | efficiency | cleanup
-**Effort:** XS | S | M | L
-**Origin:** `<where this came from>`
-**Respects:** `<ADR links whose decisions this must not contradict, or "—">`
+- **Status:** Not started | In progress | Blocked (`<on what>`)
+- **Kind:** feature — enhancement | ergonomics | efficiency | cleanup
+- **Effort:** XS | S | M | L
+- **Origin:** `<where this came from>`
+- **Respects:** `<ADR links whose decisions this must not contradict, or "—">`
 
 ## 1. Problem statement
 

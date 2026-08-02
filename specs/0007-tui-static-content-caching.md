@@ -1,12 +1,12 @@
 # 0007 — Cache the TUI's immutable per-PID content instead of rebuilding it every frame
 
-**Status:** Not started
-**Kind:** feature — efficiency
-**Effort:** M
-**Origin:** 2026-07-18 review (finding E4); the sibling finding E1 landed as
-[ADR 0001](../docs/adr/0001-pysession-resolve-once-facade.md).
-**Respects:** [ADR 0001](../docs/adr/0001-pysession-resolve-once-facade.md),
-[ADR 0009](../docs/adr/0009-performance-guarded-by-shape.md)
+- **Status:** Not started
+- **Kind:** feature — efficiency
+- **Effort:** M
+- **Origin:** 2026-07-18 review (finding E4); the sibling finding E1 landed as
+  [ADR 0001](../docs/adr/0001-pysession-resolve-once-facade.md).
+- **Respects:** [ADR 0001](../docs/adr/0001-pysession-resolve-once-facade.md),
+  [ADR 0009](../docs/adr/0009-performance-guarded-by-shape.md)
 
 ## 1. Problem statement
 

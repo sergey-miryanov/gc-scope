@@ -1,11 +1,11 @@
 # 0008 — One PID-row assembly shared by the CLI table and the TUI picker
 
-**Status:** Not started
-**Kind:** feature — cleanup
-**Effort:** M
-**Origin:** 2026-07-18 review (findings R3 and R4); both partially reduced when the TUI was
-split and the verify column removed.
-**Respects:** [ADR 0008](../docs/adr/0008-reader-consumer-package-layering.md)
+- **Status:** Not started
+- **Kind:** feature — cleanup
+- **Effort:** M
+- **Origin:** 2026-07-18 review (findings R3 and R4); both partially reduced when the TUI was
+  split and the verify column removed.
+- **Respects:** [ADR 0008](../docs/adr/0008-reader-consumer-package-layering.md)
 
 ## 1. Problem statement
 

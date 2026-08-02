@@ -4,11 +4,11 @@
 > fill it in. See [README §Conventions](README.md#conventions) for the rules these
 > sections exist to enforce.
 
-**Status:** Not started | In progress | Blocked (`<on what>`) | **Pinned** (`<test that locks current behavior>`)
-**Kind:** bug — crash | correctness | safety | regression | reporting | cosmetic
-**Effort:** XS | S | M | L
-**Origin:** `<where this came from — a review, a CI failure, an issue, a session>`
-**Respects:** `<ADR links whose decisions this must not contradict, or "—">`
+- **Status:** Not started | In progress | Blocked (`<on what>`) | **Pinned** (`<test that locks current behavior>`)
+- **Kind:** bug — crash | correctness | safety | regression | reporting | cosmetic
+- **Effort:** XS | S | M | L
+- **Origin:** `<where this came from — a review, a CI failure, an issue, a session>`
+- **Respects:** `<ADR links whose decisions this must not contradict, or "—">`
 
 ## 1. Problem
 

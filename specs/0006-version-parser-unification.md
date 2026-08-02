@@ -1,12 +1,12 @@
 # 0006 — One version grammar: make the byte scanner delegate to `from_string`
 
-**Status:** Not started
-**Kind:** bug — drift
-**Effort:** S
-**Origin:** 2026-07-18 review (finding R2). The related C5 defect — the scan aborting on
-its first bad candidate — has since landed; the duplication it rode on has not.
-**Respects:** [ADR 0002](../docs/adr/0002-version-split-runtime-finding.md),
-[ADR 0006](../docs/adr/0006-layout-registration-integrity.md)
+- **Status:** Not started
+- **Kind:** bug — drift
+- **Effort:** S
+- **Origin:** 2026-07-18 review (finding R2). The related C5 defect — the scan aborting on
+  its first bad candidate — has since landed; the duplication it rode on has not.
+- **Respects:** [ADR 0002](../docs/adr/0002-version-split-runtime-finding.md),
+  [ADR 0006](../docs/adr/0006-layout-registration-integrity.md)
 
 ## 1. Problem
 

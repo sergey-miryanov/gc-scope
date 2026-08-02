@@ -1,11 +1,11 @@
 # 0003 — Harden the pre-3.13 word scan and the interpreter walk against hostile remote data
 
-**Status:** Not started
-**Kind:** bug — safety
-**Effort:** S
-**Origin:** 2026-07-18 review (finding C14, and the residue of C1 after the hang fix).
-**Respects:** [ADR 0002](../docs/adr/0002-version-split-runtime-finding.md),
-[ADR 0010](../docs/adr/0010-pre-3-13-offsets-stay-hand-maintained.md)
+- **Status:** Not started
+- **Kind:** bug — safety
+- **Effort:** S
+- **Origin:** 2026-07-18 review (finding C14, and the residue of C1 after the hang fix).
+- **Respects:** [ADR 0002](../docs/adr/0002-version-split-runtime-finding.md),
+  [ADR 0010](../docs/adr/0010-pre-3-13-offsets-stay-hand-maintained.md)
 
 Two independent hardening items against *remote* data — bytes read out of a foreign
 process, which may be stale, torn, or garbage. Grouped because they are the last two places

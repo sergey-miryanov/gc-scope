@@ -1,13 +1,13 @@
 # 0004 — Report `free_threaded` as information, not as a failed check
 
-**Status:** Not started, **pinned** (`a_free_threaded_flag_fails_only_that_check` in
-`offsets::mod`)
-**Kind:** bug — reporting
-**Effort:** S
-**Origin:** deferred plan of 2026-08-02, follow-up to
-[ADR 0006](../docs/adr/0006-layout-registration-integrity.md).
-**Respects:** [ADR 0006](../docs/adr/0006-layout-registration-integrity.md),
-[ADR 0011](../docs/adr/0011-layout-equivalence-sweep.md)
+- **Status:** Not started, **pinned** (`a_free_threaded_flag_fails_only_that_check` in
+  `offsets::mod`)
+- **Kind:** bug — reporting
+- **Effort:** S
+- **Origin:** deferred plan of 2026-08-02, follow-up to
+  [ADR 0006](../docs/adr/0006-layout-registration-integrity.md).
+- **Respects:** [ADR 0006](../docs/adr/0006-layout-registration-integrity.md),
+  [ADR 0011](../docs/adr/0011-layout-equivalence-sweep.md)
 
 Not a correctness blocker — free-threaded builds decode correctly today and are covered by
 a live CI leg. The damage is that `read-runtime` tells the operator a fully supported build

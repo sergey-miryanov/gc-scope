@@ -1,12 +1,12 @@
 # 0002 — Restore the `pyruntime` clause in module discovery
 
-**Status:** Not started
-**Kind:** bug — regression
-**Effort:** XS
-**Origin:** 2026-07-18 review (finding C11); introduced when module discovery was extracted
-into `memory::binary`.
-**Respects:** [ADR 0002](../docs/adr/0002-version-split-runtime-finding.md),
-[ADR 0004](../docs/adr/0004-per-platform-image-layout.md)
+- **Status:** Not started
+- **Kind:** bug — regression
+- **Effort:** XS
+- **Origin:** 2026-07-18 review (finding C11); introduced when module discovery was extracted
+  into `memory::binary`.
+- **Respects:** [ADR 0002](../docs/adr/0002-version-split-runtime-finding.md),
+  [ADR 0004](../docs/adr/0004-per-platform-image-layout.md)
 
 ## 1. Problem
 
