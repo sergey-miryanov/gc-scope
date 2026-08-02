@@ -50,6 +50,7 @@ picks the nearest micro). `check_runtime`'s sole caller is the pre-3.13 finder;
   runs the real interpreter as a child, whose `_PyRuntime` lives in a separate
   address space, so a single-shot `attach` on the launcher PID fails. Target the
   child PID (`list-pids` surfaces it). Plan of record:
-  `docs/venv-launcher-child-retarget.md`. Reconcile at the same time: the recursive
+  [spec 0009](../../specs/0009-venv-launcher-child-retarget.md). Reconcile at the same
+  time: the recursive
   `search_pid_and_children` returns `(addr, path)` but **drops the child PID**, so
   it can locate a runtime it can never read.

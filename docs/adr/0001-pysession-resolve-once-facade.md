@@ -1,8 +1,9 @@
 # 0001 — `PySession`: resolve a process once, tiered `Resolved`
 
 **Status:** Accepted — implemented 2026-07-19. (Supersedes the old
-`docs/pysession-plan.md`. Resolves `docs/fix-plan.md` findings A3, E1, E2, C4,
-C6, C7, R1.)
+`docs/pysession-plan.md`. Resolves the 2026-07-18 review's findings A3, E1, E2, C4,
+C6, C7, R1 — that review has since been retired; its unimplemented remainder is in
+[`specs/`](../../specs/README.md).)
 
 ## Context
 

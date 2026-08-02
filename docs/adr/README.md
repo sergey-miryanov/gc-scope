@@ -5,10 +5,9 @@ decided, and the consequences — not a step-by-step implementation plan. When a
 later decision changes an earlier one, the earlier ADR gets a short note rather
 than being rewritten.
 
-Forward-looking work that hasn't been decided/built yet lives in a `*-plan.md`
-next to this folder, not here — currently
-[`docs/venv-launcher-child-retarget.md`](../venv-launcher-child-retarget.md) and
-[`docs/free-threaded-validation-plan.md`](../free-threaded-validation-plan.md).
+Forward-looking work that hasn't been decided/built yet lives in
+[`specs/`](../../specs/README.md), not here — one file per open item, deleted when it
+lands.
 
 [`docs/version-support.md`](../version-support.md) covers the other half of the
 story: what varies across CPython 3.8–3.16 and why each difference makes attaching
