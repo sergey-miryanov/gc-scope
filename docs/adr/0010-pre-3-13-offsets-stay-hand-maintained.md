@@ -66,6 +66,14 @@ wrong offset at all, since a wrong one executes exactly the same lines as a righ
    until Oct 2027 / Oct 2028) — the residual risk a static table carries. **Pinning an exact
    patch version in the smoke matrix silently disables this guard** and must not be done for
    the pre-3.13 legs without replacing it.
+
+   > **Extended ([ADR 0011](0011-layout-equivalence-sweep.md), 2026-08-03).** This applies to
+   > **every** leg, not just pre-3.13: 3.13 and 3.14 compile in an inline `generation_stats`
+   > offset their targets do not publish, so they carry the same static-table risk. 3.14.5
+   > restructured `_gc_runtime_state` mid-line and proved the concern is not theoretical. The
+   > rule is now enforced by the `matrix-unpinned` CI job rather than by this paragraph, and
+   > 3.13+ additionally gets the weekly source sweep, which is deterministic where the live
+   > matrix is probabilistic.
 3. **Non-goals stated explicitly.** Neither the current design nor a generator handles a
    `--with-pydebug` or 32-bit pre-3.13 interpreter; both fail open. gcscope supports
    release-configuration 64-bit builds before 3.13, and that is a property of the era, not a

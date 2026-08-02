@@ -1,0 +1,117 @@
+name: Offsets sweep
+
+# Watches CPython, not this repo. A new patch release is what invalidates the layout
+# registry, and that happens asynchronously to our PRs — so this is time-driven rather
+# than change-driven, and lives outside CI proper so a weekly tick doesn't drag the whole
+# 27-leg live matrix with it.
+#
+# It covers the gap the live matrix structurally cannot. That matrix tests whichever ONE
+# patch `setup-python` currently offers, and only notices a wrong offset if the garbage it
+# produces happens to trip a range check — a +/-8 shift reads adjacent counters and passes
+# green. This compares EVERY patch release of every shipped minor, from headers alone, and
+# compares computed offsets directly.
+on:
+  schedule:
+    - cron: '0 5 * * 1'   # Mondays, 05:00 UTC
+  workflow_dispatch:
+  # Also on changes to the machinery itself, so a broken sweep is caught by the PR that
+  # breaks it rather than the following Monday.
+  pull_request:
+    paths:
+      - 'scripts/gen-offsets.py'
+      - '.github/workflows/offsets-sweep.yml'
+      - 'src/remote_debugging/offsets/mod.rs'
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    name: Compare every patch release of every shipped minor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install bindgen and libclang
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libclang-dev
+          cargo install bindgen-cli --version 0.72.1 --locked
+
+      # Which minors to sweep is derived from the registry, not hardcoded: any minor with
+      # a registered FINAL layout is a shipped line whose patch releases we claim to
+      # serve. Pre-release cycles are deliberately excluded — a new beta is caught by the
+      # floating 3.15 live-smoke leg going red, and superseded alphas (3.15.0a7/a8) are
+      # unsupported by choice, so sweeping them would keep this job permanently failing.
+      - name: Derive shipped minors from LAYOUTS
+        id: minors
+        run: |
+          MINORS=$(python3 - <<'EOF'
+          import re
+          t = open('src/remote_debugging/offsets/mod.rs', encoding='utf-8').read()
+          hexes = [int(h, 16) for h in re.findall(r'\(\s*0x([0-9a-f]{8})\s*,\s*\|p,\s*a\|', t)]
+          finals = sorted({(h >> 16) & 0xff for h in hexes if (h >> 4) & 0xf == 0xF})
+          print(' '.join(f'3.{m}' for m in finals))
+          EOF
+          )
+          echo "Shipped minors: $MINORS"
+          echo "list=$MINORS" >> "$GITHUB_OUTPUT"
+
+      # A blobless clone keeps this to the object graph plus the Include/ blobs each tag
+      # actually needs; `git archive` then exports just that subtree per tag. The tag
+      # filter is finals-only (`vX.Y.Z`, no a/b/rc suffix) — see the step above for why
+      # pre-release cycles are out of scope here.
+      #
+      # The export leaves no `.git`, so the sweep is told with `--trust-tags` that these
+      # are releases. That is sound by construction: the list comes from `git tag -l`
+      # filtered to final releases, so a branch tip cannot appear among them. Only
+      # immutable trees may be aliased, and this is what establishes it.
+      - name: Export Include/ for every patch release
+        run: |
+          git clone --filter=blob:none --no-checkout --quiet \
+            https://github.com/python/cpython cpython.git
+          mkdir -p trees
+          COUNT=0
+          for MINOR in ${{ steps.minors.outputs.list }}; do
+            for TAG in $(git -C cpython.git tag -l "v${MINOR}.*" \
+                         | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | sort -V); do
+              mkdir -p "trees/$TAG"
+              git -C cpython.git archive --format=tar "$TAG" Include \
+                | tar -x -C "trees/$TAG"
+              [ -f "trees/$TAG/Include/patchlevel.h" ] || {
+                echo "::error::$TAG exported without Include/patchlevel.h"; exit 1; }
+              COUNT=$((COUNT + 1))
+            done
+          done
+          echo "Exported $COUNT release trees"
+          [ "$COUNT" -gt 0 ] || { echo "::error::no tags matched"; exit 1; }
+
+      # Exit code is non-zero when any tree is uncovered.
+      - name: Sweep
+        run: |
+          set +e
+          python3 scripts/gen-offsets.py --sweep trees --trust-tags --emit-aliases \
+            | tee sweep.txt
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::CPython shipped a release this registry does not describe."
+            echo "The sweep output above names it. To fix, locally:"
+            echo "  1. python scripts/gen-offsets.py <path-to-that-tag>   # only if the layout is new"
+            echo "  2. python scripts/gen-offsets.py --sweep <all-trees> --tags-only --emit-aliases"
+            echo "  3. MERGE the emitted rows into ALIASES / VERIFIED_GC_SIZES in offsets/mod.rs"
+            echo "Most releases need only steps 2-3: the layout is usually unchanged and the"
+            echo "release just needs an alias row, not a module of its own."
+            echo
+            echo "NOTE: this job sweeps FINAL releases only, so the tables it printed omit"
+            echo "pre-release rows. Merge, never replace — and prefer regenerating from a"
+            echo "local directory that holds every supported tree."
+          fi
+          if grep -q '^REDUNDANT' sweep.txt; then
+            echo "::warning::Two registered modules encode the same layout (see output)."
+          fi
+          exit "$STATUS"

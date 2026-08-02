@@ -201,9 +201,18 @@ This is a maintainer-only step — building, testing, and running gcscope need n
 since the generated `v_*.rs` are checked in. `gen-offsets.py` shells out to a `bindgen`
 binary on PATH; it is not a crate dependency.
 
-Every pre-release needs its own entry while patch releases do not, and the reason is
-CPython's, not gcscope's:
-[What the ABI freeze does and does not promise](docs/version-support.md#what-the-abi-freeze-does-and-does-not-promise).
+**Check first whether a new module is needed at all.** Most releases share a layout with one
+already registered and need only an alias row. Ask the sweep:
+
+```powershell
+python scripts/gen-offsets.py --sweep X:/path/to/cpython-trees --tags-only --emit-aliases
+```
+
+It groups every tree by layout and prints the `ALIASES` and `VERIFIED_GC_SIZES` tables for
+`offsets/mod.rs` (**merge** them — the rows describe only the trees you swept). Generate a
+module only for a build the sweep reports as a genuinely new layout. Background:
+[What the ABI freeze does and does not promise](docs/version-support.md#what-the-abi-freeze-does-and-does-not-promise)
+and [ADR 0011](docs/adr/0011-layout-equivalence-sweep.md).
 
 ```powershell
 # One-time: install the bindgen CLI (puts `bindgen` on PATH) and point LIBCLANG_PATH
