@@ -177,22 +177,17 @@ typedef struct _PyInterpreterFrame _PyInterpreterFrame;
 def compute_gc_runtime_facts(cpython_path: Path) -> tuple[int | None, int | None]:
     """`(offset of generation_stats, sizeof _gc_runtime_state)` for a GIL build.
 
-    **The offset** is version-specific (3.13 = 128, 3.14 = 120, 3.15.0a7 = 104) because
-    each release reshuffles the fields preceding `generation_stats`: 3.14 dropped the
-    `generation0` pointer, 3.15.0a7 dropped `trash_delete_later`, and so on. Crucially it
-    is NOT exposed by `_Py_DebugOffsets` before 3.15 (their `gc` sub-struct carries only
-    `size`/`collecting`), so gcscope cannot read it from the target — it must be computed
-    here and compiled in. That makes it the one GC quantity with no runtime check on
-    3.13/3.14, which is what the `gc.size` verified set exists to cover.
+    The **offset** is version-specific (3.13 = 128, 3.14 = 120, 3.15.0a7 = 104) — each
+    release reshuffles the fields ahead of `generation_stats` — and is NOT published by
+    `_Py_DebugOffsets` before 3.15, so it must be computed here and compiled in. That makes
+    it the one GC quantity with no runtime check on 3.13/3.14.
 
-    **The size** is `sizeof(struct _gc_runtime_state)`, which every 3.13+ build DOES
-    publish, as `_Py_DebugOffsets.gc.size`. It is a change detector, not a correctness
-    oracle: 3.14.4 → 3.14.5 grew it 240 → 264 while `generation_stats` stayed at 120, and
-    3.13.x → 3.14.0 kept it at 240 while the offset moved 128 → 120. So it can only say
-    "this `_gc_runtime_state` is one the sweep has seen", never "the offset is right".
+    The **size** is what those builds do publish, as `gc.size`. It is a change detector,
+    not a correctness oracle (ADR 0011), so the runtime tests membership of the swept set
+    rather than equality.
 
-    Returns `(None, None)` if the struct can't be reconstructed or bindgen fails; the
-    caller then treats the build as having no readable inline stats (`GcStatsKind::None`).
+    `(None, None)` if the struct can't be reconstructed or bindgen fails; the caller then
+    treats the build as having no readable inline stats (`GcStatsKind::None`).
     """
     wrapper = _gc_runtime_wrapper(cpython_path)
     if wrapper is None:
@@ -454,12 +449,11 @@ def registered_layout_hexes(mod_rs_text: str) -> dict[int, str]:
 def layout_signature(cpython_path: Path, *, trust_tags: bool = False) -> dict | None:
     """Everything the sweep needs to decide whether two builds share a layout.
 
-    An alias requires ALL THREE of `block`, `stats` and `inline_off` to match. Block
-    identity alone is not sufficient — see `_gc_stats_struct`. The block is compared as
-    *generated Rust*, not as raw C: bindgen has already resolved which header the struct
-    lives in (it moved from `pycore_runtime.h` to `pycore_debug_offsets.h` at 3.14) and
-    normalized away comments and no-op attributes like `_Py_NONSTRING`, so a formatting
-    or annotation change cannot masquerade as a layout change.
+    An alias requires ALL THREE of `block`, `stats` and `inline_off` to match; block
+    identity alone is not sufficient (see `_gc_stats_struct`). The block is compared as
+    *generated Rust*, not raw C — bindgen has already resolved which header the struct
+    lives in (it moved at 3.14) and normalized away comments and no-op attributes like
+    `_Py_NONSTRING`, so neither can masquerade as a layout change.
     """
     try:
         v = read_version(cpython_path)
@@ -625,17 +619,10 @@ def run_sweep(trees_dir: Path, *, emit: bool, tags_only: bool = False,
               trust_tags: bool = False) -> int:
     """Group CPython trees by layout and report aliases, duplicates and gaps.
 
-    This is the generation-time half of the fail-closed story. `_Py_DebugOffsets` is
-    *assumed* to be frozen across a minor's patch releases, and CPython bends that: 3.14.5
-    restructured `_gc_runtime_state` inside a released line (`sizeof` 240 -> 264) while
-    holding `generation_stats` at 120 with hand-inserted dummy members. The sweep turns
-    that assumption into a checked fact by comparing every tree it is given, and produces
-    the two things the runtime needs:
-
-      * the **alias table** — hexes that provably share a registered layout, so a
-        pre-release no longer has to be refused merely for lacking its own module;
-      * the **verified `gc.size` sets** — the `sizeof(_gc_runtime_state)` values seen for
-        each layout, which the inline (3.13/3.14) runtime check tests membership against.
+    The generation-time half of the fail-closed story (ADR 0011): it replaces the
+    patch-freeze *assumption* with a comparison of every tree it is given, and emits the
+    two tables `offsets/mod.rs` needs — `ALIASES` (hexes that provably share a registered
+    layout) and `VERIFIED_GC_SIZES` (the sizes the inline runtime check accepts).
 
     Returns a process exit code: non-zero if any tree is uncovered by the registry.
     """

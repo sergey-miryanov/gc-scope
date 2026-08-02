@@ -72,20 +72,17 @@ Generated offset structs are in `src/remote_debugging/offsets/`. One module per 
 | `v_3_15_0b4` | `0x030f00b4` | — |
 | `v_3_16_0a0` | `0x031000a0` | — (ongoing dev build, provenance-pinned) |
 
-A build resolves against these on one of three tiers, strongest evidence first:
+A build resolves on one of three tiers, strongest evidence first:
 
 1. **Exact** — its hex has a module.
-2. **Verified alias** — `scripts/gen-offsets.py --sweep` compared the two source trees and
-   found the `_Py_DebugOffsets` block, the `gc_generation_stats` struct *and* the computed
-   inline `generation_stats` offset all identical. This is proof, so it reports as a full
-   match, and it is the only way a **pre-release** without its own module resolves at all.
-3. **Same-minor fallback** — an unregistered *final* patch release borrows its minor's
-   anchor layout. This is an assumption (CPython's patch-freeze convention), not a proof,
-   and it warns.
+2. **Verified alias** — `gen-offsets.py --sweep` proved its layout identical to a
+   registered one. Proof, so it reports as a full match, and the only way a **pre-release**
+   without its own module resolves. Every shipped 3.13.x/3.14.x release is on this tier.
+3. **Same-minor fallback** — an unregistered *final* borrows its minor's anchor, on
+   CPython's patch-freeze convention. An assumption, so it warns.
 
-Anything else is refused rather than approximated. 3.15.0a7 and 3.15.0a8 are not supported:
-both are superseded alphas with layouts of their own, and an unregistered pre-release fails
-closed.
+Anything else is refused rather than approximated — including 3.15.0a7 and 3.15.0a8, both
+superseded alphas with layouts of their own.
 
 All pre-3.13 versions (3.8–3.12) use hardcoded tables in `pre_3_13.rs`; see
 [ADR 0010](docs/adr/0010-pre-3-13-offsets-stay-hand-maintained.md) for why those are not

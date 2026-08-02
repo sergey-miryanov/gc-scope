@@ -447,20 +447,13 @@ impl PySession {
     }
 
     /// Advisory check for inline builds: is this target's `_gc_runtime_state` one the
-    /// generation-time sweep has actually compared?
+    /// generation-time sweep has compared?
     ///
-    /// Deliberately a **warning**, not the hard error [`Self::verify_ring_stats_size`]
-    /// raises, because the two fire on different evidence. The ring check fires on a
-    /// *contradiction* — the process states a region size that the layout gcscope is
-    /// about to use cannot produce — which is proof of wrongness. This fires on
-    /// *unfamiliarity*, which is not: 3.14.5 grew `sizeof(_gc_runtime_state)` from 240 to
-    /// 264 and still decoded correctly, because `generation_stats` never moved. Refusing
-    /// here would break gcscope on every new patch release for a fact it cannot
-    /// establish. Saying nothing is the status quo, and the status quo is silence on a
-    /// build whose compiled offset nothing has checked.
-    ///
-    /// Once per PID: the monitor loop calls `gc_stats` on every tick, and a warning
-    /// repeated at poll rate is one an operator learns to ignore.
+    /// A **warning**, not the hard error [`Self::verify_ring_stats_size`] raises, because
+    /// the two fire on different evidence: the ring check on a *contradiction* (proof of
+    /// wrongness), this on *unfamiliarity* (3.14.5 was unfamiliar and still correct).
+    /// Refusing would break gcscope on every new patch release over a fact it cannot
+    /// establish. Once per PID — the monitor loop polls `gc_stats` every tick.
     fn warn_if_gc_runtime_unverified(&self) {
         let Some(vo) = self.resolved.offsets() else {
             return; // Legacy (3.8-3.12): no published gc.size to check against.
