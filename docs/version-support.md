@@ -398,7 +398,9 @@ is no published size at all, so an instrumented fork of a 3.13 or 3.14 build has
 nothing to separate it from the clean release. No later check resolves either case,
 so such a pair has to be refused rather than chosen between.
 
-→ gcscope's response: [ADR 0006](adr/0006-layout-registration-integrity.md).
+→ gcscope's response: [ADR 0006](adr/0006-layout-registration-integrity.md) for the 3.13+
+registry, and [ADR 0010](adr/0010-pre-3-13-offsets-stay-hand-maintained.md) for why the
+pre-3.13 half of the table above is not generated from source to match it.
 
 ---
 
