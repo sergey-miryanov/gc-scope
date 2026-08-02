@@ -44,15 +44,18 @@ fn main() -> Result<()> {
             println!("PyRuntime at {:#018x}  (version {})", addr, version);
             println!("(stored version: 0x{:08x})\n", stored);
 
-            // Which compiled layout is actually in play, and how it was chosen. A
+            // Which compiled layout is actually in play, and on what evidence. A
             // fallback silently substituting a differently-shaped struct is the one
-            // failure mode that looks like a decode bug but isn't.
-            let exact = remote_debugging::offsets::has_exact_layout(stored);
+            // failure mode that looks like a decode bug but isn't — so the three tiers
+            // are named rather than collapsed into match/no-match. An alias is proof
+            // (the sweep compared the two source trees); a fallback is an assumption.
+            let selected = offsets.expected_version();
             println!(
-                "layout selected: 0x{:08x} ({})",
-                offsets.expected_version(),
-                if exact {
+                "layout selected: 0x{selected:08x} ({})",
+                if selected == stored {
                     "exact match".to_string()
+                } else if remote_debugging::offsets::has_verified_layout(stored) {
+                    format!("verified alias — 0x{stored:08x} is byte-identical to it")
                 } else {
                     format!("FALLBACK — no compiled layout for 0x{stored:08x}")
                 }
@@ -71,6 +74,23 @@ fn main() -> Result<()> {
                     "  *** MISMATCH: process {reported} vs gcscope {expected} — \
                      gc-stats will refuse to decode this build ***"
                 );
+            }
+
+            // For an inline build the `generation_stats` offset above is compiled in, not
+            // published, so state plainly whether anything has confirmed it for this
+            // build rather than letting the geometry read as equally attested throughout.
+            let grt = offsets.gc_runtime_size();
+            match remote_debugging::offsets::gc_runtime_size_is_verified(selected, grt) {
+                Some(true) => println!(
+                    "  _gc_runtime_state: {grt} bytes — verified for this layout by the \
+                     offsets sweep"
+                ),
+                Some(false) => println!(
+                    "  _gc_runtime_state: {grt} bytes — NOT seen by the offsets sweep for \
+                     layout 0x{selected:08x}; the inline offset above is unverified for \
+                     this build"
+                ),
+                None => {}
             }
 
             println!("\n{}", offsets);

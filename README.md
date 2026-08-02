@@ -60,19 +60,36 @@ recursively search children of the target PID.
 For *why* support works this way — what changes across CPython versions, and what
 each change forces — see [`docs/version-support.md`](docs/version-support.md).
 
-Generated offset structs are in `src/remote_debugging/offsets/`. Currently supported:
+Generated offset structs are in `src/remote_debugging/offsets/`. One module per distinct
+**layout**, not per version — several releases usually share one:
 
-| Version | Hex | Method |
+| Module | Hex | Also describes |
 |---|---|---|
-| 3.13.1 | `0x030d01f0` | bindgen |
-| 3.13.13+ | `0x030d0df0` | bindgen |
-| 3.14.4 | `0x030e04f0` | bindgen |
-| 3.15.0a8 | `0x030f00a8` | bindgen |
-| 3.15.0b1 | `0x030f00b1` | bindgen |
-| 3.15.0b3 | `0x030f00b3` | bindgen |
-| 3.16.0a0 | `0x031000a0` | bindgen |
+| `v_3_13_0` | `0x030d00f0` | 3.13.1 (verified); later 3.13.x by fallback |
+| `v_3_14_0` | `0x030e00f0` | 3.14.4, 3.14.5 (verified); later 3.14.x by fallback |
+| `v_3_15_0b1` | `0x030f00b1` | 3.15.0b2, 3.15.0b3 (verified) |
+| `v_3_15_0b1_gcinc` | `0x030f00b1` | the `+inc` GC layout for that hex (see below) |
+| `v_3_15_0b4` | `0x030f00b4` | — |
+| `v_3_16_0a0` | `0x031000a0` | — (ongoing dev build, provenance-pinned) |
 
-All pre-3.13 versions (3.8–3.12) use hardcoded tables in `pre_3_13.rs`.
+A build resolves against these on one of three tiers, strongest evidence first:
+
+1. **Exact** — its hex has a module.
+2. **Verified alias** — `scripts/gen-offsets.py --sweep` compared the two source trees and
+   found the `_Py_DebugOffsets` block, the `gc_generation_stats` struct *and* the computed
+   inline `generation_stats` offset all identical. This is proof, so it reports as a full
+   match, and it is the only way a **pre-release** without its own module resolves at all.
+3. **Same-minor fallback** — an unregistered *final* patch release borrows its minor's
+   anchor layout. This is an assumption (CPython's patch-freeze convention), not a proof,
+   and it warns.
+
+Anything else is refused rather than approximated. 3.15.0a7 and 3.15.0a8 are not supported:
+both are superseded alphas with layouts of their own, and an unregistered pre-release fails
+closed.
+
+All pre-3.13 versions (3.8–3.12) use hardcoded tables in `pre_3_13.rs`; see
+[ADR 0010](docs/adr/0010-pre-3-13-offsets-stay-hand-maintained.md) for why those are not
+generated.
 
 ### Builds that share a version hex (multi-candidate GC layout)
 
