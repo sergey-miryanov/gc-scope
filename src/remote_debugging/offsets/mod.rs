@@ -108,13 +108,41 @@ const GC_CANDIDATES: &[(u64, &[GcCandidate])] = &[
 /// at one commit and rots silently: 3.16 dev matches 3.15.0b4 exactly today and will stop
 /// doing so without any signal. Ongoing builds keep their own module — see the
 /// single-ongoing rule in `scripts/gen-offsets.py`.
+/// Rows are enumerated one release at a time on purpose. A range rule ("every 3.13.x
+/// final → 3.13.0") would be shorter and would re-encode exactly the assumption 3.14.5
+/// disproved, covering releases before anyone compared them. Each row here is a claim
+/// backed by one source-tree comparison; a release absent from the table has not been
+/// checked and still takes the fallback path, which warns. That is the intended
+/// behaviour, not a gap.
 const ALIASES: &[(u64, u64)] = &[
-    (0x030d01f0, 0x030d00f0), // 3.13.1   -> 3.13.0
-    (0x030e04f0, 0x030e00f0), // 3.14.4   -> 3.14.0
-    (0x030e05f0, 0x030e00f0), // 3.14.5   -> 3.14.0  (sizeof(_gc_runtime_state) 240 -> 264,
-    //                                                generation_stats unmoved at 120)
-    (0x030f00b2, 0x030f00b1), // 3.15.0b2 -> 3.15.0b1
-    (0x030f00b3, 0x030f00b1), // 3.15.0b3 -> 3.15.0b1
+    // 3.13.1 - 3.13.14 -> 3.13.0. Whole shipped line verified identical; sizeof 240
+    // throughout, generation_stats@128.
+    (0x030d01f0, 0x030d00f0),
+    (0x030d02f0, 0x030d00f0),
+    (0x030d03f0, 0x030d00f0),
+    (0x030d04f0, 0x030d00f0),
+    (0x030d05f0, 0x030d00f0),
+    (0x030d06f0, 0x030d00f0),
+    (0x030d07f0, 0x030d00f0),
+    (0x030d08f0, 0x030d00f0),
+    (0x030d09f0, 0x030d00f0),
+    (0x030d0af0, 0x030d00f0),
+    (0x030d0bf0, 0x030d00f0),
+    (0x030d0cf0, 0x030d00f0),
+    (0x030d0df0, 0x030d00f0),
+    (0x030d0ef0, 0x030d00f0),
+    // 3.14.1 - 3.14.6 -> 3.14.0. generation_stats@120 throughout; .5 and .6 carry the
+    // restructured `_gc_runtime_state` (sizeof 264 vs 240) that moved nothing we read.
+    (0x030e01f0, 0x030e00f0),
+    (0x030e02f0, 0x030e00f0),
+    (0x030e03f0, 0x030e00f0),
+    (0x030e04f0, 0x030e00f0),
+    (0x030e05f0, 0x030e00f0),
+    (0x030e06f0, 0x030e00f0),
+    // 3.15.0b2, b3 -> 3.15.0b1. Pre-releases: these resolve ONLY because of this proof —
+    // the fallback refuses a pre-release outright.
+    (0x030f00b2, 0x030f00b1),
+    (0x030f00b3, 0x030f00b1),
 ];
 
 /// The registered layout `stored` is proven equal to, if it is an alias.
@@ -928,10 +956,11 @@ mod registry_tests {
 
     #[test]
     fn has_verified_layout_rejects_an_unregistered_build() {
-        // A plausible 3.13 micro we have never generated offsets for, and which the
-        // sweep has therefore never proven equal to anything.
-        assert!(!has_verified_layout(0x030d02f0));
-        assert!(alias_of(0x030d02f0).is_none());
+        // A 3.13 micro past everything shipped, so the sweep has never compared it and
+        // cannot have proven it equal to anything. (Releases up to 3.13.14 are all in
+        // `ALIASES`, so picking one of those would test the opposite of the intent.)
+        assert!(!has_verified_layout(0x030d14f0), "3.13.20");
+        assert!(alias_of(0x030d14f0).is_none());
     }
 
     /// Every alias must point at a hex that is actually registered, and must not itself
@@ -1027,30 +1056,42 @@ mod registry_tests {
         );
     }
 
-    /// The permitted case: a patch release of a shipped line that the sweep has never
-    /// seen, so there is no alias for it. Each minor is anchored at its `.0`, so the
+    /// The permitted case: a *future* patch release, past everything the sweep has
+    /// compared, so no alias covers it. Each minor is anchored at its `.0`, so the
     /// substitution always resolves *backwards* in time — a layout that predates the
     /// target, never one that postdates it. That direction is the defensible one: 3.13.0
-    /// describes 3.13.2 on the strength of the patch-freeze convention, whereas letting
-    /// 3.13.2 stand in for 3.13.0 would assume a build could be described by its own
-    /// future.
+    /// describes 3.13.20 on the strength of the patch-freeze convention, whereas letting
+    /// 3.13.20 stand in for 3.13.0 would assume a build could be described by its own
+    /// future. Both hexes below are deliberately beyond the newest shipped release; every
+    /// release up to those IS in `ALIASES` and resolves by proof instead.
     #[test]
     fn fallback_substitutes_backwards_from_the_minors_anchor() {
-        assert_eq!(
-            resolve_fallback_layout(0x030d02f0).unwrap(),
-            0x030d00f0,
-            "3.13.2"
-        );
-        assert_eq!(
-            resolve_fallback_layout(0x030d0cf0).unwrap(),
-            0x030d00f0,
-            "3.13.12"
-        );
-        assert_eq!(
-            resolve_fallback_layout(0x030e09f0).unwrap(),
-            0x030e00f0,
-            "3.14.9"
-        );
+        for (hex, anchor, label) in [
+            (0x030d14f0u64, 0x030d00f0u64, "3.13.20"),
+            (0x030e09f0, 0x030e00f0, "3.14.9"),
+        ] {
+            assert!(
+                alias_of(hex).is_none(),
+                "{label} must not be aliased — this test is about the fallback"
+            );
+            assert_eq!(resolve_fallback_layout(hex).unwrap(), anchor, "{label}");
+        }
+    }
+
+    /// Every shipped 3.13.x and 3.14.x release resolves by *proof*, not assumption — the
+    /// sweep compared all 22 against `python/cpython`'s tags. A user on any of them gets
+    /// no fallback warning and the `Full` tier. Guards against a future edit trimming the
+    /// table back to "representative" rows.
+    #[test]
+    fn every_shipped_patch_release_resolves_by_proof() {
+        for micro in 1..=14u64 {
+            let hex = 0x030d00f0 | (micro << 8);
+            assert_eq!(alias_of(hex), Some(0x030d00f0), "3.13.{micro}");
+        }
+        for micro in 1..=6u64 {
+            let hex = 0x030e00f0 | (micro << 8);
+            assert_eq!(alias_of(hex), Some(0x030e00f0), "3.14.{micro}");
+        }
     }
 
     /// 3.14.5 is the counter-example to the patch-freeze premise, and the reason the
