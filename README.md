@@ -60,19 +60,33 @@ recursively search children of the target PID.
 For *why* support works this way — what changes across CPython versions, and what
 each change forces — see [`docs/version-support.md`](docs/version-support.md).
 
-Generated offset structs are in `src/remote_debugging/offsets/`. Currently supported:
+Generated offset structs are in `src/remote_debugging/offsets/`. One module per distinct
+**layout**, not per version — several releases usually share one:
 
-| Version | Hex | Method |
+| Module | Hex | Also describes |
 |---|---|---|
-| 3.13.1 | `0x030d01f0` | bindgen |
-| 3.13.13+ | `0x030d0df0` | bindgen |
-| 3.14.4 | `0x030e04f0` | bindgen |
-| 3.15.0a8 | `0x030f00a8` | bindgen |
-| 3.15.0b1 | `0x030f00b1` | bindgen |
-| 3.15.0b3 | `0x030f00b3` | bindgen |
-| 3.16.0a0 | `0x031000a0` | bindgen |
+| `v_3_13_0` | `0x030d00f0` | 3.13.1 – 3.13.14 (verified); later 3.13.x by fallback |
+| `v_3_14_0` | `0x030e00f0` | 3.14.1 – 3.14.6 (verified); later 3.14.x by fallback |
+| `v_3_15_0b1` | `0x030f00b1` | 3.15.0b2, 3.15.0b3 (verified) |
+| `v_3_15_0b1_gcinc` | `0x030f00b1` | the `+inc` GC layout for that hex (see below) |
+| `v_3_15_0b4` | `0x030f00b4` | — |
+| `v_3_16_0a0` | `0x031000a0` | — (ongoing dev build, provenance-pinned) |
 
-All pre-3.13 versions (3.8–3.12) use hardcoded tables in `pre_3_13.rs`.
+A build resolves on one of three tiers, strongest evidence first:
+
+1. **Exact** — its hex has a module.
+2. **Verified alias** — `gen-offsets.py --sweep` proved its layout identical to a
+   registered one. Proof, so it reports as a full match, and the only way a **pre-release**
+   without its own module resolves. Every shipped 3.13.x/3.14.x release is on this tier.
+3. **Same-minor fallback** — an unregistered *final* borrows its minor's anchor, on
+   CPython's patch-freeze convention. An assumption, so it warns.
+
+Anything else is refused rather than approximated — including 3.15.0a7 and 3.15.0a8, both
+superseded alphas with layouts of their own.
+
+All pre-3.13 versions (3.8–3.12) use hardcoded tables in `pre_3_13.rs`; see
+[ADR 0010](docs/adr/0010-pre-3-13-offsets-stay-hand-maintained.md) for why those are not
+generated.
 
 ### Builds that share a version hex (multi-candidate GC layout)
 
@@ -184,9 +198,18 @@ This is a maintainer-only step — building, testing, and running gcscope need n
 since the generated `v_*.rs` are checked in. `gen-offsets.py` shells out to a `bindgen`
 binary on PATH; it is not a crate dependency.
 
-Every pre-release needs its own entry while patch releases do not, and the reason is
-CPython's, not gcscope's:
-[What the ABI freeze does and does not promise](docs/version-support.md#what-the-abi-freeze-does-and-does-not-promise).
+**Check first whether a new module is needed at all.** Most releases share a layout with one
+already registered and need only an alias row. Ask the sweep:
+
+```powershell
+python scripts/gen-offsets.py --sweep X:/path/to/cpython-trees --tags-only --emit-aliases
+```
+
+It groups every tree by layout and prints the `ALIASES` and `VERIFIED_GC_SIZES` tables for
+`offsets/mod.rs` (**merge** them — the rows describe only the trees you swept). Generate a
+module only for a build the sweep reports as a genuinely new layout. Background:
+[What the ABI freeze does and does not promise](docs/version-support.md#what-the-abi-freeze-does-and-does-not-promise)
+and [ADR 0011](docs/adr/0011-layout-equivalence-sweep.md).
 
 ```powershell
 # One-time: install the bindgen CLI (puts `bindgen` on PATH) and point LIBCLANG_PATH

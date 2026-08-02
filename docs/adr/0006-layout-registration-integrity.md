@@ -1,6 +1,8 @@
 # 0006 — Layout registration and resolution integrity
 
-**Status:** Accepted — implemented 2026-07-20 … 07-21. (Part of the work that supersedes
+**Status:** Accepted — implemented 2026-07-20 … 07-21. **Amended 2026-08-03 by
+[ADR 0011](0011-layout-equivalence-sweep.md)**, which corrects one premise and one
+overstated consequence below; both are marked inline. (Part of the work that supersedes
 `docs/tests-harness-plan.md`; complements [ADR 0005](0005-testing-strategy.md).)
 
 ## Context
@@ -13,6 +15,10 @@ cookie or a shape/ring check. Four forces make this sharp:
 - `_Py_DebugOffsets` is ABI-frozen across a minor's *patch* releases but **not** across its
   pre-release cycle — 3.15.0b1 shrank `gc_generation_stats`, and 3.15.0b4 inserted a field
   that shifted every later field. Approximating a pre-release from a neighbour fails open.
+
+  > **Amended ([ADR 0011](0011-layout-equivalence-sweep.md)).** Both halves are weaker than
+  > stated — 3.14.5 restructured `_gc_runtime_state` inside a shipped line, and b1/b2/b3 are
+  > byte-identical. Both assumptions are now replaced by a generation-time comparison.
 - Two builds can share a version hex: a clean release and a gc-instrumented **`+inc`** build
   (both `0x030f00b1`), told apart only by `generation_stats_size`.
 - An **in-development** version (3.16 dev = `main`) drifts continuously; there is no oracle
@@ -26,6 +32,9 @@ cookie or a shape/ring check. Four forces make this sharp:
 1. **Exact-or-refuse for pre-releases.** `resolve_fallback_layout` substitutes a same-minor
    layout only when both target and candidate are **final** (`level == 0xF`); a pre-release
    with no exact layout is refused, never approximated.
+
+   > **Amended ([ADR 0011](0011-layout-equivalence-sweep.md)):** now *exact, verified alias,
+   > or refuse*. Approximation is still refused; proof is admitted alongside exactness.
 2. **Fail-closed on decode.** `PySession::gc_stats` hard-errors when the process-published
    ring size disagrees with the compiled layout — the durable guard against any future
    mid-cycle struct change, on every OS, with no new test.
@@ -53,6 +62,12 @@ cookie or a shape/ring check. Four forces make this sharp:
 
 - A mis-registration — copy-pasted `LAYOUTS` row, a drifted `+inc`, a second ongoing
   version — is caught at generation time or by a live leg, not by a user reading garbage.
+
+  > **Amended ([ADR 0011](0011-layout-equivalence-sweep.md)):** overstated. The
+  > drifted-`+inc` half — decision 5's byte-identity check — never ran:
+  > `registered_nav_module`'s regex predated `cargo fmt`'s output shape, so it always
+  > returned `None` and the generator silently skipped the check. Now fixed and passing; the
+  > invariant held throughout, but nothing had been confirming it.
 - The provenance pin makes "regenerate the 3.16 offsets" a one-step change that carries CI
   with it; the shape assertions of ADR 0005 are what surface a resolution error live.
 - Retires the previously-planned local, manifest-driven test harness.

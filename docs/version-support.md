@@ -398,7 +398,17 @@ is no published size at all, so an instrumented fork of a 3.13 or 3.14 build has
 nothing to separate it from the clean release. No later check resolves either case,
 so such a pair has to be refused rather than chosen between.
 
-→ gcscope's response: [ADR 0006](adr/0006-layout-registration-integrity.md).
+One assumption this section makes is worth flagging, because it turned out to be false: that
+a minor's patch releases share a layout. 3.14.5 restructured `_gc_runtime_state` inside the
+shipped 3.14 line, holding the offsets gcscope reads only via placeholder members
+(`/* dummy members to preserve other offsets */`). The freeze is a convention honoured on
+purpose, not a rule.
+
+→ gcscope's response: [ADR 0006](adr/0006-layout-registration-integrity.md) for the 3.13+
+registry, [ADR 0011](adr/0011-layout-equivalence-sweep.md) for the source sweep that replaced
+that assumption with a comparison, and
+[ADR 0010](adr/0010-pre-3-13-offsets-stay-hand-maintained.md) for why the pre-3.13 half of the
+table above is not generated to match.
 
 ---
 

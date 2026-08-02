@@ -60,6 +60,28 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
 
 
+  matrix-unpinned:
+    name: Smoke matrix stays unpinned
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # The live matrix only guards against a patch-release struct change because
+      # setup-python floats each entry to the newest patch. Pin one and that guard dies
+      # silently — the leg still passes, it just stops testing anything new. This is the
+      # constraint ADR 0010 section 2 states; nothing enforced it until now.
+      - name: Reject pinned patch versions in the live-smoke matrix
+        run: |
+          LINE=$(grep -oE "^ *python: \[.*\]" .github/workflows/rust.yml | head -1)
+          echo "matrix: $LINE"
+          PINNED=$(printf '%s' "$LINE" | grep -oE "'[0-9]+\.[0-9]+\.[0-9]+t?'" || true)
+          if [ -n "$PINNED" ]; then
+            echo "::error::live-smoke matrix pins a patch version: $PINNED"
+            echo "Entries must be bare '3.x' so setup-python floats to the newest patch."
+            echo "See ADR 0010 section 2 — the float IS the patch-drift guard."
+            exit 1
+          fi
+          echo "All entries are bare minor versions."
+
   live-smoke:
     name: gc-stats smoke (${{ matrix.os }} py${{ matrix.python }})
     runs-on: ${{ matrix.os }}

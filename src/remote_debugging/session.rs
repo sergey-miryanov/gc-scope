@@ -438,11 +438,48 @@ impl PySession {
     /// `_gc_runtime_state`. 3.8 keeps that state global in `_PyRuntime` (no per-interpreter
     /// `gc`); 3.9+ has it per interpreter.
     fn gc_stats_inline(&self, all_interpreters: bool) -> Result<Vec<GcStat>> {
+        self.warn_if_gc_runtime_unverified();
         let head_addr = self.read_interpreters_head()?;
         if self.resolved.table().has_global_gc() {
             return self.gc_stats_global(head_addr);
         }
         self.gc_stats_per_interpreter(head_addr, all_interpreters)
+    }
+
+    /// Advisory check for inline builds: is this target's `_gc_runtime_state` one the
+    /// generation-time sweep has compared?
+    ///
+    /// A **warning**, not the hard error [`Self::verify_ring_stats_size`] raises, because
+    /// the two fire on different evidence: the ring check on a *contradiction* (proof of
+    /// wrongness), this on *unfamiliarity* (3.14.5 was unfamiliar and still correct).
+    /// Refusing would break gcscope on every new patch release over a fact it cannot
+    /// establish. Once per PID — the monitor loop polls `gc_stats` every tick.
+    fn warn_if_gc_runtime_unverified(&self) {
+        let Some(vo) = self.resolved.offsets() else {
+            return; // Legacy (3.8-3.12): no published gc.size to check against.
+        };
+        let reported = vo.gc_runtime_size();
+        let layout_hex = vo.expected_version();
+        if reported == 0 {
+            return;
+        }
+        if offsets::gc_runtime_size_is_verified(layout_hex, reported) != Some(false) {
+            return; // verified, or a layout with no set (ring builds guard themselves)
+        }
+        static WARNED: std::sync::LazyLock<
+            std::sync::Mutex<std::collections::HashSet<(u32, u64)>>,
+        > = std::sync::LazyLock::new(Default::default);
+        if !WARNED.lock().unwrap().insert((self.pid, reported)) {
+            return;
+        }
+        eprintln!(
+            "warning: this build's _gc_runtime_state is {reported} bytes, which the \
+             offsets sweep has not seen for layout {layout_hex:#010x}. gcscope reads the \
+             inline generation_stats at a compiled-in offset that these versions do not \
+             publish, so it cannot confirm the offset for this build — the numbers below \
+             may be wrong. To check it, add this build's source tree and re-run:\n    \
+             python scripts/gen-offsets.py --sweep <trees-dir> --tags-only"
+        );
     }
 
     /// `RingBuffer` builds (3.15+): the stats hang off the `gc.generation_stats` pointer,
@@ -613,7 +650,7 @@ fn resolve_layout(pid: u32, runtime_addr: u64, detected: PythonVersion) -> Resul
         let (_addr, stored, offsets) = offsets::read_offsets(pid, &detected)?;
         let table = offsets.to_offset_table(pid, runtime_addr);
         let version = PythonVersion::from_hex(stored).unwrap_or(detected);
-        let resolved = if offsets::has_exact_layout(stored) {
+        let resolved = if offsets::has_verified_layout(stored) {
             Resolved::Full { offsets, table }
         } else {
             Resolved::LayoutOnly { offsets, table }

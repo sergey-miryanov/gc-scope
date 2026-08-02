@@ -9,6 +9,7 @@ Requires LIBCLANG_PATH set on Windows.
 """
 
 import argparse
+import hashlib
 import re
 import subprocess
 import sys
@@ -27,7 +28,16 @@ def hex_already_registered(version_hex: int) -> bool:
     if not mod_rs.exists():
         return False
     # Match a LAYOUTS row: `(0x030f00b1, |p, a| ...)`.
-    return bool(re.search(rf'\(\s*0x{version_hex:08x}\s*,\s*\|p,\s*a\|', mod_rs.read_text()))
+    return bool(re.search(rf'\(\s*0x{version_hex:08x}\s*,\s*\|p,\s*a\|', mod_rs.read_text(encoding="utf-8")))
+
+
+# A `LAYOUTS` row, as cargo fmt leaves it — the closure body is wrapped in braces and
+# pushed to the next line, so the `{` and the newline are NOT optional whitespace:
+#     (0x030e04f0, |p, a| {
+#         Ok(VersionedOffsets::V3_14_4(read_struct(p, a)?))
+#     }),
+# `{hex}` is filled in by `.format()` with either a literal hex or a capture group.
+LAYOUTS_ROW_RE = r'\(\s*0x{hex}\s*,\s*\|p,\s*a\|\s*\{{?\s*Ok\(VersionedOffsets::(\w+)\('
 
 
 def get_define(lines: list[str], name: str) -> str | None:
@@ -108,24 +118,18 @@ def _find_header_with(inc: Path, anchor: str, names: tuple[str, ...]) -> str | N
     """Text of the first header in `names` whose content contains `anchor`."""
     for n in names:
         h = inc / n
-        if h.exists() and anchor in h.read_text():
-            return h.read_text()
+        if h.exists() and anchor in h.read_text(encoding="utf-8"):
+            return h.read_text(encoding="utf-8")
     return None
 
 
-def compute_inline_stats_off(cpython_path: Path) -> int | None:
-    """Byte offset of the inline `generation_stats[]` array within `_gc_runtime_state`.
+def _gc_runtime_wrapper(cpython_path: Path) -> str | None:
+    """A self-contained compile unit defining `_gc_runtime_state`, or None.
 
-    This offset is version-specific (3.13 = 128, 3.14 = 120, 3.15.0a7 = 104) because
-    each release reshuffles the fields preceding `generation_stats`: 3.14 dropped the
-    `generation0` pointer, 3.15.0a7 dropped `trash_delete_later`, and so on. Crucially
-    it is NOT exposed by `_Py_DebugOffsets` for these versions (their `gc` sub-struct
-    carries only `size`/`collecting`), so gcscope cannot read it from the target — it
-    must be computed at generation time. We reconstruct `_gc_runtime_state` from the
-    real headers and let bindgen compute the offset via `offset_of!`.
-
-    Returns None if the struct can't be reconstructed or bindgen fails; the caller then
-    treats this build as having no readable inline stats (`GcStatsKind::None`).
+    `_gc_runtime_state` refers to its dependencies by *pointer*, so the referents can be
+    forward-declared as opaque and the struct reconstructed without pulling in the rest
+    of `Include/internal`. (This does not generalize: `PyInterpreterState` embeds dozens
+    of types by value, and an embedded struct cannot be forward-declared.)
     """
     inc = cpython_path / "Include" / "internal"
     grt = _extract_struct(
@@ -157,7 +161,7 @@ def compute_inline_stats_off(cpython_path: Path) -> int | None:
     # layout-safe here because `_PyObject_MIN_ALIGNMENT` is 4 <= natural pointer
     # alignment, so it never inserts padding. The `#ifdef Py_GIL_DISABLED` tail
     # (PyMutex etc.) is excluded because we don't define that macro.
-    wrapper = f"""typedef unsigned long long uintptr_t;
+    return f"""typedef unsigned long long uintptr_t;
 typedef long long Py_ssize_t;
 typedef struct _object PyObject;
 typedef struct _PyInterpreterFrame _PyInterpreterFrame;
@@ -168,9 +172,29 @@ typedef struct _PyInterpreterFrame _PyInterpreterFrame;
 {gstat}
 {grt}
 """
+
+
+def compute_gc_runtime_facts(cpython_path: Path) -> tuple[int | None, int | None]:
+    """`(offset of generation_stats, sizeof _gc_runtime_state)` for a GIL build.
+
+    The **offset** is version-specific (3.13 = 128, 3.14 = 120, 3.15.0a7 = 104) — each
+    release reshuffles the fields ahead of `generation_stats` — and is NOT published by
+    `_Py_DebugOffsets` before 3.15, so it must be computed here and compiled in. That makes
+    it the one GC quantity with no runtime check on 3.13/3.14.
+
+    The **size** is what those builds do publish, as `gc.size`. It is a change detector,
+    not a correctness oracle (ADR 0011), so the runtime tests membership of the swept set
+    rather than equality.
+
+    `(None, None)` if the struct can't be reconstructed or bindgen fails; the caller then
+    treats the build as having no readable inline stats (`GcStatsKind::None`).
+    """
+    wrapper = _gc_runtime_wrapper(cpython_path)
+    if wrapper is None:
+        return None, None
     with tempfile.TemporaryDirectory(prefix="gcscope-inlineoff-") as tmpdir:
         wpath = Path(tmpdir) / "gcrt.h"
-        wpath.write_text(wrapper)
+        wpath.write_text(wrapper, encoding="utf-8")
         opath = Path(tmpdir) / "gcrt.rs"
         r = subprocess.run(
             ["bindgen", "--allowlist-type", "_gc_runtime_state",
@@ -181,11 +205,18 @@ typedef struct _PyInterpreterFrame _PyInterpreterFrame;
             print("Note: could not compute the inline generation_stats offset "
                   "(bindgen failed on _gc_runtime_state) — GC stats will be "
                   "unavailable for this build.", file=sys.stderr)
-            return None
-        m = re.search(
-            r'offset_of!\(_gc_runtime_state, generation_stats\)\s*-\s*(\d+)usize',
-            opath.read_text())
-        return int(m.group(1)) if m else None
+            return None, None
+        text = opath.read_text(encoding="utf-8")
+        off = re.search(
+            r'offset_of!\(_gc_runtime_state, generation_stats\)\s*-\s*(\d+)usize', text)
+        size = re.search(r'size_of::<_gc_runtime_state>\(\)\s*-\s*(\d+)usize', text)
+        return (int(off.group(1)) if off else None,
+                int(size.group(1)) if size else None)
+
+
+def compute_inline_stats_off(cpython_path: Path) -> int | None:
+    """Byte offset of the inline `generation_stats[]` array within `_gc_runtime_state`."""
+    return compute_gc_runtime_facts(cpython_path)[0]
 
 
 def print_same_hex_checklist(
@@ -351,11 +382,17 @@ def existing_ongoing(offsets_dir: Path, exclude: Path) -> list[tuple[str, str]]:
     for f in sorted(offsets_dir.glob("v_*.rs")):
         if f.resolve() == exclude.resolve():
             continue
-        text = f.read_text()
+        text = f.read_text(encoding="utf-8")
         if "ONGOING dev build" in text:
             m = re.search(r'gcscope-source: \S+@([0-9a-f]{7,40})', text)
             out.append((f.name, m.group(1) if m else "?"))
     return out
+
+
+def is_ongoing_module(offsets_dir: Path, mod_name: str) -> bool:
+    """Whether a registered `v_*` module was generated off a release tag."""
+    f = offsets_dir / f"{mod_name}.rs"
+    return f.exists() and "ONGOING dev build" in f.read_text(encoding="utf-8")
 
 
 def _debug_offsets_structs(text: str) -> dict[str, str]:
@@ -377,9 +414,7 @@ def _debug_offsets_structs(text: str) -> dict[str, str]:
 
 def registered_nav_module(version_hex: int, mod_rs_text: str) -> str | None:
     """The `v_*` module the LAYOUTS row for `version_hex` navigates through, if any."""
-    m = re.search(
-        rf'\(\s*0x{version_hex:08x}\s*,\s*\|p,\s*a\|\s*Ok\(VersionedOffsets::(\w+)\(',
-        mod_rs_text)
+    m = re.search(LAYOUTS_ROW_RE.format(hex=f'{version_hex:08x}'), mod_rs_text)
     if not m:
         return None
     variant = m.group(1)
@@ -387,11 +422,374 @@ def registered_nav_module(version_hex: int, mod_rs_text: str) -> str | None:
     return m2.group(1) if m2 else None
 
 
+def _gc_stats_struct(generated: str) -> str | None:
+    """The normalized `gc_generation_stats` body from a generated module, or None.
+
+    Deliberately separate from `_debug_offsets_structs`: two builds may share a
+    `_Py_DebugOffsets` and differ here (a clean release vs a gc-instrumented `+inc`),
+    which is exactly the case that must NOT be aliased.
+    """
+    m = re.search(r'pub struct gc_generation_stats\s*\{', generated)
+    if not m:
+        return None
+    o = generated.index('{', m.start())
+    e = _brace_end(generated, o)
+    return re.sub(r'\s+', ' ', generated[o:e + 1]).strip() if e > 0 else None
+
+
+def registered_layout_hexes(mod_rs_text: str) -> dict[int, str]:
+    """`{version_hex: module}` for every layout registered in `LAYOUTS`."""
+    out = {}
+    for hx, variant in re.findall(LAYOUTS_ROW_RE.format(hex=r'([0-9a-f]{8})'), mod_rs_text):
+        m = re.search(rf'\b{variant}\((v_\w+)::_Py_DebugOffsets\)', mod_rs_text)
+        out[int(hx, 16)] = m.group(1) if m else "?"
+    return out
+
+
+def layout_signature(cpython_path: Path, *, trust_tags: bool = False) -> dict | None:
+    """Everything the sweep needs to decide whether two builds share a layout.
+
+    An alias requires ALL THREE of `block`, `stats` and `inline_off` to match; block
+    identity alone is not sufficient (see `_gc_stats_struct`). The block is compared as
+    *generated Rust*, not raw C — bindgen has already resolved which header the struct
+    lives in (it moved at 3.14) and normalized away comments and no-op attributes like
+    `_Py_NONSTRING`, so neither can masquerade as a layout change.
+    """
+    try:
+        v = read_version(cpython_path)
+    except (OSError, TypeError, ValueError):
+        return None
+    if (v["major"], v["minor"]) < (3, 13):
+        return None                      # no _Py_DebugOffsets before 3.13
+    built = build_wrapper(cpython_path, quiet=True)
+    if built is None:
+        return None
+    wrapper, has_gc_stats = built
+    with tempfile.TemporaryDirectory(prefix="gcscope-sweep-") as tmpdir:
+        out = Path(tmpdir) / "m.rs"
+        if run_bindgen(wrapper, cpython_path, out, has_gc_stats) is not None:
+            return None
+        generated = out.read_text(encoding="utf-8")
+    blocks = _debug_offsets_structs(generated)
+    if not blocks:
+        return None
+    inline_off, grt_size = compute_gc_runtime_facts(cpython_path)
+    prov = git_provenance(cpython_path)
+    return {
+        "hex": v["hex"],
+        "version": v["version_str"],
+        # Only a release tag is immutable, and only immutable trees may be aliased: a
+        # branch tip's equivalence to another layout is true at one commit and rots
+        # silently thereafter. `main` currently matches 3.15.0b4 exactly, which is
+        # precisely the tempting-but-wrong alias this flag exists to refuse.
+        #
+        # `trust_tags` is for callers that extracted the sources themselves and so have
+        # no `.git` to interrogate — CI enumerates release tags and exports each one, so
+        # tag-ness is guaranteed by construction rather than discoverable after the fact.
+        "at_tag": trust_tags or bool(prov and prov["at_tag"]),
+        "block": hashlib.sha256(
+            repr(sorted(blocks.items())).encode()).hexdigest()[:12],
+        "stats": hashlib.sha256(
+            (_gc_stats_struct(generated) or "").encode()).hexdigest()[:12],
+        "inline_off": inline_off,
+        "grt_size": grt_size,
+    }
+
+
+def read_version(cpython_path: Path) -> dict:
+    """Version fields from `Include/patchlevel.h`, plus the packed `PY_VERSION_HEX`."""
+    patchlevel = cpython_path / "Include" / "patchlevel.h"
+    lines = patchlevel.read_text(encoding="utf-8").splitlines()
+    major = int(get_define(lines, "PY_MAJOR_VERSION"))
+    minor = int(get_define(lines, "PY_MINOR_VERSION"))
+    micro = int(get_define(lines, "PY_MICRO_VERSION"))
+    serial = int(get_define(lines, "PY_RELEASE_SERIAL"))
+    level = resolve_release_level(lines, get_define(lines, "PY_RELEASE_LEVEL"))
+    return {
+        "major": major, "minor": minor, "micro": micro, "level": level, "serial": serial,
+        "hex": (major << 24) | (minor << 16) | (micro << 8) | (level << 4) | serial,
+        "version_str": get_define(lines, "PY_VERSION").strip('"'),
+    }
+
+
+def build_wrapper(cpython_path: Path, *, quiet: bool = False) -> tuple[str, bool] | None:
+    """The bindgen compile unit for this tree's `_Py_DebugOffsets`, and whether
+    `gc_generation_stats` was found. None if no offsets header exists (pre-3.13).
+
+    `_Py_DebugOffsets` moved headers: it lives inside `pycore_runtime.h` on 3.13 and in
+    its own `pycore_debug_offsets.h` from 3.14. `gc_generation_stats` moved too
+    (`pycore_gc.h` on 3.13, `pycore_interp_structs.h` after), so both are searched for
+    rather than assumed.
+    """
+    include_internal = cpython_path / "Include" / "internal"
+    include_pc = cpython_path / "PC"
+
+    offsets_header = include_internal / "pycore_debug_offsets.h"
+    use_runtime_h = False
+    if not offsets_header.exists():
+        offsets_header = include_internal / "pycore_runtime.h"
+        if not offsets_header.exists():
+            return None
+        use_runtime_h = True
+
+    gc_stats_header = None
+    for _name in ("pycore_interp_structs.h", "pycore_gc.h"):
+        _h = include_internal / _name
+        if _h.exists() and "struct gc_generation_stats {" in _h.read_text(encoding="utf-8"):
+            gc_stats_header = _h
+            break
+    has_gc_stats = gc_stats_header is not None
+    if not has_gc_stats and not quiet:
+        print("Note: `struct gc_generation_stats` not found in pycore_interp_structs.h "
+              "or pycore_gc.h — GC_LAYOUT will NOT be emitted for this build.",
+              file=sys.stderr)
+
+    # For 3.13.x the struct is buried in pycore_runtime.h; extract just its definition so
+    # bindgen doesn't have to parse that header's whole dependency tree. `_Py_NONSTRING`
+    # is defined away in both branches: 3.13 later added it to `char cookie[8]`, and it is
+    # an attribute with no layout effect, so neutralizing it keeps the block comparable
+    # across the patch line.
+    if use_runtime_h:
+        hdr_text = offsets_header.read_text(encoding="utf-8")
+        start = hdr_text.find("typedef struct _Py_DebugOffsets {")
+        if start == -1:
+            start = hdr_text.find("struct _Py_DebugOffsets {")
+        end = hdr_text.find("} _Py_DebugOffsets;", start) + len("} _Py_DebugOffsets;")
+        struct_text = hdr_text[start:end]
+        wrapper = f"""typedef unsigned long long uint64_t;
+#define _Py_NONSTRING
+#define _Py_Debug_Cookie "xdebugpy"
+#pragma pack(push, 8)
+{struct_text}
+#pragma pack(pop)
+"""
+    else:
+        wrapper = f"""typedef unsigned long long uint64_t;
+#define _Py_NONSTRING
+#include "{offsets_header.resolve()}"
+"""
+
+    if has_gc_stats:
+        text = gc_stats_header.read_text(encoding="utf-8")
+        start = text.find("struct gc_generation_stats {")
+        if start >= 0:
+            end = _brace_end(text, text.index('{', start)) + 1
+            if end < len(text) and text[end] == ';':
+                end += 1
+            wrapper += f"""
+// Extracted from {gc_stats_header.name}
+typedef long long Py_ssize_t;
+typedef long long PyTime_t;
+{text[start:end]}"""
+    return wrapper, has_gc_stats
+
+
+def run_bindgen(wrapper: str, cpython_path: Path, out_file: Path,
+                has_gc_stats: bool) -> str | None:
+    """Generate `out_file` from `wrapper`. Returns bindgen's stderr on failure."""
+    include_internal = cpython_path / "Include" / "internal"
+    with tempfile.TemporaryDirectory(prefix="gcscope-bindgen-") as tmpdir:
+        wrapper_path = Path(tmpdir) / "wrapper.h"
+        wrapper_path.write_text(wrapper, encoding="utf-8")
+        bindgen_args = [
+            "bindgen",
+            "--allowlist-type", "_Py_DebugOffsets",
+            "--allowlist-var", "_Py_Debug_Cookie",
+        ]
+        if has_gc_stats:
+            bindgen_args += ["--allowlist-type", "gc_generation_stats"]
+        bindgen_args += [
+            "--raw-line", "#![allow(non_snake_case, non_camel_case_types, dead_code, non_upper_case_globals, unused_imports)]",
+            "--raw-line", "",
+            "--raw-line", "use crate::impl_display_debug_offsets;",
+            "--raw-line", "use crate::impl_validate_debug_offsets;",
+            "--output", str(out_file),
+            str(wrapper_path),
+            "--",
+            "-DPy_BUILD_CORE",
+            f"-I{cpython_path / 'Include'}",
+            f"-I{include_internal}",
+            f"-I{cpython_path / 'PC'}",
+        ]
+        result = subprocess.run(bindgen_args, capture_output=True, text=True)
+        return None if result.returncode == 0 else result.stderr
+
+
+def run_sweep(trees_dir: Path, *, emit: bool, tags_only: bool = False,
+              trust_tags: bool = False) -> int:
+    """Group CPython trees by layout and report aliases, duplicates and gaps.
+
+    The generation-time half of the fail-closed story (ADR 0011): it replaces the
+    patch-freeze *assumption* with a comparison of every tree it is given, and emits the
+    two tables `offsets/mod.rs` needs — `ALIASES` (hexes that provably share a registered
+    layout) and `VERIFIED_GC_SIZES` (the sizes the inline runtime check accepts).
+
+    Returns a process exit code: non-zero if any tree is uncovered by the registry, or
+    could not be analysed at all.
+    """
+    trees = sorted(d for d in trees_dir.iterdir()
+                   if (d / "Include" / "patchlevel.h").exists())
+    if tags_only and not trust_tags:
+        trees = [t for t in trees
+                 if (p := git_provenance(t)) is not None and p["at_tag"]]
+    if not trees:
+        print(f"No CPython trees under {trees_dir} "
+              f"(expected subdirectories with Include/patchlevel.h)", file=sys.stderr)
+        return 1
+
+    offsets_dir = Path("src") / "remote_debugging" / "offsets"
+    mod_rs = offsets_dir / "mod.rs"
+    registered = registered_layout_hexes(mod_rs.read_text(encoding="utf-8")) \
+        if mod_rs.exists() else {}
+
+    sigs = []
+    skipped = []          # tried and failed — a hard error
+    out_of_scope = 0      # pre-3.13, correctly has no block
+    for t in trees:
+        try:
+            v = read_version(t)
+        except (OSError, TypeError, ValueError) as e:
+            skipped.append((t.name, f"cannot read Include/patchlevel.h ({e})"))
+            continue
+        # `_Py_DebugOffsets` does not exist before 3.13; those builds are described by
+        # `pre_3_13.rs` (ADR 0010) and are not this sweep's business.
+        if (v["major"], v["minor"]) < (3, 13):
+            out_of_scope += 1
+            continue
+        print(f"  probing {t.name} …", file=sys.stderr)
+        s = layout_signature(t, trust_tags=trust_tags)
+        if s is None:
+            # Never drop one quietly. A 3.13+ tree that cannot be analysed can never
+            # appear in `uncovered`, so a release the registry does not describe would
+            # produce a GREEN sweep — the outcome this job exists to prevent.
+            skipped.append((t.name, "no _Py_DebugOffsets could be extracted"))
+            continue
+        s["tree"] = t.name
+        sigs.append(s)
+
+    # A layout is the (block, stats struct, inline offset) triple; anything sharing it
+    # decodes identically, and nothing else may be aliased onto it.
+    groups: dict[tuple, list[dict]] = {}
+    for s in sigs:
+        groups.setdefault((s["block"], s["stats"], s["inline_off"]), []).append(s)
+
+    scope = f", {out_of_scope} pre-3.13 skipped" if out_of_scope else ""
+    print(f"\n{len(sigs)} trees with a _Py_DebugOffsets block -> "
+          f"{len(groups)} distinct layouts{scope}\n")
+    header = f"{'tree':24} {'hex':>10} {'block':12} {'stats':12} {'stats@':>7} {'sizeof':>7}"
+    aliases: list[tuple[int, int]] = []
+    verified_sizes: list[tuple[int, list[int]]] = []
+    redundant: list[tuple[str, str]] = []
+    uncovered: list[dict] = []
+
+    for i, (key, members) in enumerate(sorted(groups.items(),
+                                              key=lambda kv: min(m["hex"] for m in kv[1])), 1):
+        anchors = [m for m in members if m["hex"] in registered]
+        mods = sorted({registered[m["hex"]] for m in anchors})
+        label = f"layout {i}: " + (f"registered as {', '.join(mods)}" if mods
+                                   else "NOT REGISTERED")
+        print(label)
+        print("  " + header)
+        for m in sorted(members, key=lambda m: m["hex"]):
+            mark = "*" if m["hex"] in registered else " "
+            dev = "" if m["at_tag"] else "  (dev, not a tag)"
+            print(f" {mark}{m['tree']:24} 0x{m['hex']:08x} {m['block']:12} {m['stats']:12} "
+                  f"{str(m['inline_off']):>7} {str(m['grt_size']):>7}{dev}")
+        # Only tagged trees contribute to the verified set: a dev tree's sizeof describes
+        # a commit nobody can attach to twice.
+        sizes = sorted({m["grt_size"] for m in members
+                        if m["at_tag"] and m["grt_size"] is not None})
+        if key[2] is not None and sizes:
+            print(f"   verified gc.size set: {{{', '.join(str(s) for s in sizes)}}} "
+                  f"-> generation_stats@{key[2]}")
+
+        # Redundancy is about the *modules*, not the trees: two registered modules
+        # encoding one layout means one can go. An ONGOING module is exempt — it must
+        # keep its own file even when it currently matches a release (3.16 dev matches
+        # 3.15.0b4 today and will stop without warning).
+        settled = sorted({mod for m in anchors
+                          if not is_ongoing_module(offsets_dir, (mod := registered[m["hex"]]))})
+        if len(settled) > 1:
+            redundant.append((", ".join(settled), label))
+        tagged_anchors = [a for a in anchors if a["at_tag"]]
+        if tagged_anchors:
+            anchor_hex = min(a["hex"] for a in tagged_anchors)
+            aliases += [(m["hex"], anchor_hex) for m in members
+                        if m["hex"] not in registered and m["at_tag"]]
+            # Only inline builds need this: a ring build publishes its own
+            # `generation_stats` offset and is already guarded by the ring-size check.
+            if key[2] is not None and sizes:
+                verified_sizes.append((anchor_hex, sizes))
+        uncovered += [m for m in members
+                      if m["hex"] not in registered and not tagged_anchors]
+        print()
+
+    if skipped:
+        print("FAILED TO ANALYSE — these 3.13+ trees could not be read:")
+        for name, why in skipped:
+            print(f"  {name:24} {why}")
+        print("\n  A tree that cannot be analysed is not the same as one that is covered:\n"
+              "  it can never show up as UNCOVERED, so leaving it silent would turn a\n"
+              "  missing layout into a green run. Check the checkout, bindgen and\n"
+              "  LIBCLANG_PATH.\n")
+    if redundant:
+        print("REDUNDANT — these modules encode the same layout; keep one:")
+        for mods, _ in redundant:
+            print(f"  {mods}")
+        print()
+    if uncovered:
+        print("UNCOVERED — no registered layout describes these builds:")
+        for m in uncovered:
+            print(f"  {m['tree']:24} 0x{m['hex']:08x}  (CPython {m['version']})")
+        print("\n  A *final* release is still served by the same-minor fallback; a "
+              "pre-release\n  is refused outright. Generate a module for it:\n"
+              f"      python {Path(sys.argv[0]).name} <tree>\n")
+    if emit and (aliases or verified_sizes):
+        print(f"// Generated by --sweep over {len(sigs)} trees under {trees_dir}; "
+              f"do not hand-edit.")
+        print("// SCOPE: these rows describe ONLY the trees swept in this run. A layout "
+              "not\n// represented above has no row here and MERGING is required — "
+              "replacing the\n// tables wholesale would silently drop it. To regenerate "
+              "them in full, sweep a\n// directory holding every supported tree, "
+              "pre-releases included.")
+        print("const ALIASES: &[(u64, u64)] = &[")
+        for a, anchor in sorted(aliases):
+            print(f"    (0x{a:08x}, 0x{anchor:08x}),")
+        print("];\n")
+        print("const VERIFIED_GC_SIZES: &[(u64, &[u64])] = &[")
+        for anchor, sizes in sorted(verified_sizes):
+            print(f"    (0x{anchor:08x}, &{sizes}),".replace("[", "[").replace("'", ""))
+        print("];")
+
+    return 1 if (uncovered or skipped) else 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate Rust _Py_DebugOffsets bindings from a CPython checkout.")
-    parser.add_argument("cpython_path", type=Path,
+    parser.add_argument("cpython_path", type=Path, nargs="?",
                         help="CPython source checkout (must have Include/patchlevel.h).")
+    parser.add_argument(
+        "--sweep", type=Path, metavar="DIR",
+        help="Instead of generating, group every CPython tree under DIR by layout and "
+             "report which hexes can be aliased onto a registered module, which modules "
+             "are redundant, and which builds nothing covers. Needs only headers — no "
+             "build, no interpreter — so it can check every patch release of a minor, "
+             "not just the one CI happens to install.")
+    parser.add_argument(
+        "--emit-aliases", action="store_true",
+        help="With --sweep, also print the ALIASES table for offsets/mod.rs.")
+    parser.add_argument(
+        "--tags-only", action="store_true",
+        help="With --sweep, skip trees whose HEAD is not a release tag. What CI wants: "
+             "a feature branch can share a PY_VERSION_HEX with a release and would "
+             "otherwise be mistaken for it.")
+    parser.add_argument(
+        "--trust-tags", action="store_true",
+        help="With --sweep, treat every tree as a release tag even without a .git to "
+             "check. For callers that exported the sources themselves and so know it by "
+             "construction. Do NOT use on a directory that may contain a branch tip: "
+             "only immutable tags may be aliased.")
     parser.add_argument(
         "--suffix", "-s", default="",
         help="Disambiguating tag for the output filename: --suffix gcinc writes "
@@ -404,22 +802,23 @@ def main() -> None:
              "Without it, an existing output file is a hard error, not a silent clobber.")
     args = parser.parse_args()
 
+    if args.sweep:
+        sys.exit(run_sweep(args.sweep, emit=args.emit_aliases,
+                           tags_only=args.tags_only, trust_tags=args.trust_tags))
+    if args.cpython_path is None:
+        parser.error("give a CPython checkout to generate from, or --sweep DIR")
+
     cpython_path = args.cpython_path
     patchlevel = cpython_path / "Include" / "patchlevel.h"
     if not patchlevel.exists():
         print(f"Error: {patchlevel} not found", file=sys.stderr)
         sys.exit(1)
 
-    lines = patchlevel.read_text().splitlines()
-    major = int(get_define(lines, "PY_MAJOR_VERSION"))
-    minor = int(get_define(lines, "PY_MINOR_VERSION"))
-    micro = int(get_define(lines, "PY_MICRO_VERSION"))
-    serial = int(get_define(lines, "PY_RELEASE_SERIAL"))
-    level_str = get_define(lines, "PY_RELEASE_LEVEL")
-    level = resolve_release_level(lines, level_str)
-
-    version_hex = (major << 24) | (minor << 16) | (micro << 8) | (level << 4) | serial
-    version_str = get_define(lines, "PY_VERSION").strip('"')
+    v = read_version(cpython_path)
+    major, minor, micro = v["major"], v["minor"], v["micro"]
+    level, serial = v["level"], v["serial"]
+    version_hex = v["hex"]
+    version_str = v["version_str"]
 
     commit_suffix = ""
     raw_version = version_str
@@ -494,130 +893,35 @@ def main() -> None:
                   f"{raw_version}, or pass --force.", file=sys.stderr)
             sys.exit(1)
 
-    include_internal = cpython_path / "Include" / "internal"
-    include_pc = cpython_path / "PC"
+    built = build_wrapper(cpython_path)
+    if built is None:
+        print("Error: neither pycore_debug_offsets.h nor pycore_runtime.h found",
+              file=sys.stderr)
+        sys.exit(1)
+    wrapper, has_gc_stats = built
 
-    # Find the header containing _Py_DebugOffsets
-    offsets_header = include_internal / "pycore_debug_offsets.h"
-    use_runtime_h = False
-    if not offsets_header.exists():
-        offsets_header = include_internal / "pycore_runtime.h"
-        if not offsets_header.exists():
-            print(f"Error: neither pycore_debug_offsets.h nor pycore_runtime.h found", file=sys.stderr)
-            sys.exit(1)
-        use_runtime_h = True
-
-    # ── Detect gc_generation_stats support ────────────────────────────
-    # The struct lives in different headers across versions: pycore_interp_structs.h
-    # (3.14+) or pycore_gc.h (3.13.x). Search both so GC_LAYOUT is emitted for every
-    # version that actually defines the struct.
-    gc_stats_header = None
-    for _name in ("pycore_interp_structs.h", "pycore_gc.h"):
-        _h = include_internal / _name
-        if _h.exists() and "struct gc_generation_stats {" in _h.read_text():
-            gc_stats_header = _h
-            break
-    has_gc_stats = gc_stats_header is not None
-    if not has_gc_stats:
-        print("Note: `struct gc_generation_stats` not found in pycore_interp_structs.h "
-              "or pycore_gc.h — GC_LAYOUT will NOT be emitted for this build.", file=sys.stderr)
-
-    # Write a wrapper header that supplies prerequisites for bindgen.
-    # For 3.13.x (_Py_DebugOffsets is inside pycore_runtime.h), extract just
-    # the struct definition so bindgen doesn't need to parse all dependencies.
-    if use_runtime_h:
-        hdr_text = offsets_header.read_text()
-        start = hdr_text.find("typedef struct _Py_DebugOffsets {")
-        if start == -1:
-            # Try without typedef
-            start = hdr_text.find("struct _Py_DebugOffsets {")
-        end = hdr_text.find("} _Py_DebugOffsets;", start) + len("} _Py_DebugOffsets;")
-        struct_text = hdr_text[start:end]
-        # Extract _Py_Debug_Cookie from the header too
-        cookie_match = re.search(r'#define\s+_Py_Debug_Cookie\s+"([^"]+)"', hdr_text)
-        cookie_line = f'#define _Py_Debug_Cookie "{cookie_match.group(1)}"' if cookie_match else ''
-        wrapper = f"""typedef unsigned long long uint64_t;
-#define _Py_NONSTRING
-#define _Py_Debug_Cookie "xdebugpy"
-#pragma pack(push, 8)
-{struct_text}
-#pragma pack(pop)
-"""
-    else:
-        wrapper = f"""typedef unsigned long long uint64_t;
-#define _Py_NONSTRING
-#include "{offsets_header.resolve()}"
-"""
-    # Extract struct gc_generation_stats from its header to avoid pulling in the
-    # full header tree (which has clang-irresolvable deps).
-    if has_gc_stats:
-        text = gc_stats_header.read_text()
-        start = text.find("struct gc_generation_stats {")
-        if start >= 0:
-            depth = 0
-            for i in range(start, len(text)):
-                if text[i] == '{':
-                    depth += 1
-                elif text[i] == '}':
-                    depth -= 1
-                    if depth == 0:
-                        # include the closing } and any trailing semicolon
-                        end = i + 1
-                        if end < len(text) and text[end] == ';':
-                            end += 1
-                        break
-            gc_struct_text = text[start:end]
-            wrapper += f"""
-// Extracted from {gc_stats_header.name}
-typedef long long Py_ssize_t;
-typedef long long PyTime_t;
-{gc_struct_text}"""
-
-    with tempfile.TemporaryDirectory(prefix="gcscope-bindgen-") as tmpdir:
-        wrapper_path = Path(tmpdir) / "wrapper.h"
-        wrapper_path.write_text(wrapper)
-
-        bindgen_args = [
-            "bindgen",
-            "--allowlist-type", "_Py_DebugOffsets",
-            "--allowlist-var", "_Py_Debug_Cookie",
-        ]
-        if has_gc_stats:
-            bindgen_args += ["--allowlist-type", "gc_generation_stats"]
-        bindgen_args += [
-            "--raw-line", "#![allow(non_snake_case, non_camel_case_types, dead_code, non_upper_case_globals, unused_imports)]",
-            "--raw-line", "",
-            "--raw-line", "use crate::impl_display_debug_offsets;",
-            "--raw-line", "use crate::impl_validate_debug_offsets;",
-            "--output", str(out_file),
-            str(wrapper_path),
-            "--",
-            "-DPy_BUILD_CORE",
-            f"-I{cpython_path / 'Include'}",
-            f"-I{include_internal}",
-            f"-I{include_pc}",
-        ]
-        result = subprocess.run(bindgen_args, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            print(result.stderr, file=sys.stderr)
-            print(f"bindgen failed with exit code {result.returncode}", file=sys.stderr)
-            sys.exit(1)
+    err = run_bindgen(wrapper, cpython_path, out_file, has_gc_stats)
+    if err is not None:
+        print(err, file=sys.stderr)
+        print("bindgen failed", file=sys.stderr)
+        sys.exit(1)
 
     # Embed source provenance right after bindgen's autogen header (line 1), so every
     # module records the exact commit it came from; for an ongoing build CI reads the pin
     # from here.
     if prov is not None:
-        text = out_file.read_text()
+        text = out_file.read_text(encoding="utf-8")
         nl = text.index("\n") + 1
+        # newline="" suppresses the write-side \n -> \r\n translation that would otherwise
+        # rewrite every line of a bindgen (LF) module on Windows, churning the whole file.
         out_file.write_text(
             text[:nl]
             + provenance_comment(prov, is_ongoing=is_ongoing,
                                  version_str=version_str, version_hex=version_hex)
-            + text[nl:])
+            + text[nl:], encoding="utf-8", newline="")
 
     # Read bindgen output to discover which sub-structs were generated
-    generated = out_file.read_text()
+    generated = out_file.read_text(encoding="utf-8")
 
     # Same-hex nav-struct guard. A --suffix build shares the registered hex's nav variant
     # (only its GC layout is new), so its `_Py_DebugOffsets` MUST be byte-identical to that
@@ -626,10 +930,10 @@ typedef long long PyTime_t;
     # with the wrong offsets. Verify rather than assume.
     if suffix and hex_already_registered(version_hex):
         mod_rs = Path("src") / "remote_debugging" / "offsets" / "mod.rs"
-        nav_mod = registered_nav_module(version_hex, mod_rs.read_text())
+        nav_mod = registered_nav_module(version_hex, mod_rs.read_text(encoding="utf-8"))
         nav_file = (out_file.parent / f"{nav_mod}.rs") if nav_mod else None
         if nav_file and nav_file.exists():
-            nav = _debug_offsets_structs(nav_file.read_text())
+            nav = _debug_offsets_structs(nav_file.read_text(encoding="utf-8"))
             new = _debug_offsets_structs(generated)
             if nav != new:
                 differing = sorted(n for n in set(nav) | set(new)
@@ -665,7 +969,7 @@ typedef long long PyTime_t;
         args = ",\n".join(f"{indent}{s}" for s in sub_structs)
         macro_call = f"\nimpl_display_debug_offsets!(_Py_DebugOffsets,\n{args}\n);\n"
         validate_call = f"\nimpl_validate_debug_offsets!(_Py_DebugOffsets,\n{args}\n);\n"
-        with open(out_file, "a") as f:
+        with open(out_file, "a", newline="\n") as f:
             f.write(macro_call)
             f.write(validate_call)
 
@@ -709,7 +1013,7 @@ pub fn gc_field_names() -> &'static [(&'static str, usize)] {{
     GC_LAYOUT.fields
 }}
 """
-        with open(out_file, "a") as f:
+        with open(out_file, "a", newline="\n") as f:
             f.write(gc_block)
         wrote_gc_layout = True
 
@@ -748,6 +1052,10 @@ pub fn gc_field_names() -> &'static [(&'static str, usize)] {{
     fr = "self.gc.frame" if has_frame else "0"
     gs = "self.gc.generation_stats" if has_gen_stats else "0"
     gss = "self.gc.generation_stats_size" if has_gen_stats_size else "0"
+    # `gc.size` is `sizeof(struct _gc_runtime_state)`, published by every 3.13+ build.
+    # It is the only quantity an inline build exposes that moves when that struct is
+    # restructured, which is what the VERIFIED_GC_SIZES membership check keys on.
+    grs = "self.gc.size" if "size:" in gc_body else "0"
     if is_ring:
         kind, item, layout = "RingBuffer", "GC_ITEM_SIZE as u64", "Some(&GC_LAYOUT)"
     elif is_inline:
@@ -765,7 +1073,7 @@ pub fn gc_field_names() -> &'static [(&'static str, usize)] {{
             f"build's headers (version-specific).\n"
             f"pub const GC_STATS_INLINE_OFF: u64 = 0x{inline_off:x};\n"
         )
-        with open(out_file, "a") as f:
+        with open(out_file, "a", newline="\n") as f:
             f.write(inline_const)
         inline_off_fn = "\n    fn gc_inline_off(&self) -> u64 { GC_STATS_INLINE_OFF }"
         print(f"  inline generation_stats at 0x{inline_off:x} "
@@ -781,6 +1089,7 @@ impl crate::remote_debugging::offsets::DebugOffsetsView for _Py_DebugOffsets {{
     fn gc_frame(&self) -> u64 {{ {fr} }}
     fn gc_generation_stats(&self) -> u64 {{ {gs} }}
     fn gc_generation_stats_size(&self) -> u64 {{ {gss} }}
+    fn gc_runtime_size(&self) -> u64 {{ {grs} }}
     fn gc_stats_shape(&self) -> crate::remote_debugging::offsets::GcStatsShape {{
         crate::remote_debugging::offsets::GcStatsShape {{
             kind: crate::remote_debugging::offsets::offset_table::GcStatsKind::{kind},
@@ -790,7 +1099,7 @@ impl crate::remote_debugging::offsets::DebugOffsetsView for _Py_DebugOffsets {{
     }}{inline_off_fn}
 }}
 """
-    with open(out_file, "a") as f:
+    with open(out_file, "a", newline="\n") as f:
         f.write(view_impl)
 
     print(f"Generated {out_file}  (version hex: 0x{version_hex:08x})")
