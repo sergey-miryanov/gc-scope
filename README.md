@@ -65,8 +65,8 @@ Generated offset structs are in `src/remote_debugging/offsets/`. One module per 
 
 | Module | Hex | Also describes |
 |---|---|---|
-| `v_3_13_0` | `0x030d00f0` | 3.13.1 (verified); later 3.13.x by fallback |
-| `v_3_14_0` | `0x030e00f0` | 3.14.4, 3.14.5 (verified); later 3.14.x by fallback |
+| `v_3_13_0` | `0x030d00f0` | 3.13.1 – 3.13.14 (verified); later 3.13.x by fallback |
+| `v_3_14_0` | `0x030e00f0` | 3.14.1 – 3.14.6 (verified); later 3.14.x by fallback |
 | `v_3_15_0b1` | `0x030f00b1` | 3.15.0b2, 3.15.0b3 (verified) |
 | `v_3_15_0b1_gcinc` | `0x030f00b1` | the `+inc` GC layout for that hex (see below) |
 | `v_3_15_0b4` | `0x030f00b4` | — |

@@ -152,8 +152,8 @@ fn alias_of(stored: u64) -> Option<u64> {
 /// share 240 with *different* offsets (128 vs 120), so equality would be wrong in both
 /// directions. An unfamiliar size means unverified, not wrong.
 const VERIFIED_GC_SIZES: &[(u64, &[u64])] = &[
-    (0x030d00f0, &[240]),      // 3.13.0, 3.13.1
-    (0x030e00f0, &[240, 264]), // 3.14.0, 3.14.4 | 3.14.5
+    (0x030d00f0, &[240]),      // 3.13.0 - 3.13.14
+    (0x030e00f0, &[240, 264]), // 3.14.0 - 3.14.4 | 3.14.5, 3.14.6
 ];
 
 /// Whether the target's published `gc.size` is one the sweep verified for `layout_hex`.
@@ -387,8 +387,26 @@ impl VersionedOffsets {
         for_each_variant!(self, o => o.layout_version())
     }
 
+    /// The `version` field as read out of the target, which is the build's own hex — not
+    /// [`Self::expected_version`], which is the hex of the layout it decodes through.
+    pub fn stored_version(&self) -> u64 {
+        for_each_variant!(self, o => o.version)
+    }
+
     pub fn validate(&self) -> validation::ValidationReport {
-        let expected = self.expected_version();
+        // The version check asks "did we decode through the right struct?". A build
+        // resolved through a verified alias reports its OWN hex, which differs from the
+        // layout's by construction, and the sweep proved the two describe the same
+        // struct — so comparing against the layout anchor would fail this check on every
+        // shipped 3.13.x/3.14.x target. Accept the stored hex when it aliases to the
+        // layout in play; anything else still has to match the anchor exactly.
+        let layout = self.expected_version();
+        let stored = self.stored_version();
+        let expected = if alias_of(stored) == Some(layout) {
+            stored
+        } else {
+            layout
+        };
         match self {
             // 3.13.x / 3.14.x: no full validate macro, do basic check
             Self::V3_13_0(o) => validate_basic(o, expected),
@@ -469,6 +487,11 @@ impl VersionedOffsets {
     /// [`DebugOffsetsView::gc_runtime_size`] and [`VERIFIED_GC_SIZES`].
     pub fn gc_runtime_size(&self) -> u64 {
         for_each_variant!(self, o => o.gc_runtime_size())
+    }
+
+    /// This build's GC stats-region kind, before any `GC_CANDIDATES` selection.
+    pub fn gc_stats_kind(&self) -> offset_table::GcStatsKind {
+        for_each_variant!(self, o => o.gc_stats_shape().kind)
     }
 
     #[allow(dead_code)]
@@ -956,6 +979,18 @@ mod registry_tests {
                 !ALIASES.iter().any(|(h, _)| h == to),
                 "alias {from:#010x} -> {to:#010x}: target is itself an alias (no chains)"
             );
+            // Catches the one mis-merge nothing else would. The tables are pasted in by
+            // hand from the sweep's output, and a row landing on the wrong minor passes
+            // every other check here, then fails OPEN at runtime: inline builds have no
+            // ring-size guard, and 3.13.x and 3.14.0 both publish gc.size == 240 with
+            // *different* inline offsets, so the gc.size warning stays silent while
+            // `generation_stats` is read 8 bytes off. A genuine cross-minor equivalence
+            // would need an explicit exemption here, and a sweep run to justify it.
+            assert_eq!(
+                from & MAJOR_MINOR_MASK,
+                to & MAJOR_MINOR_MASK,
+                "alias {from:#010x} -> {to:#010x} crosses a minor version"
+            );
         }
     }
 
@@ -980,9 +1015,18 @@ mod registry_tests {
     #[test]
     fn verified_gc_sizes_cover_registered_inline_layouts_only() {
         for (hex, sizes) in VERIFIED_GC_SIZES {
-            assert!(
-                LAYOUTS.iter().any(|(h, _)| h == hex),
-                "{hex:#010x} has a verified gc.size set but is not registered"
+            let (_, vo) = build_all()
+                .into_iter()
+                .find(|(h, _)| h == hex)
+                .unwrap_or_else(|| panic!("{hex:#010x} has a gc.size set but is not registered"));
+            // Ring builds publish `generation_stats` themselves and are guarded by
+            // `verify_ring_stats_size`; `warn_if_gc_runtime_unverified` is reached only
+            // from `gc_stats_inline`, so a row here for a ring layout would imply a check
+            // that never runs.
+            assert_eq!(
+                vo.gc_stats_kind(),
+                offset_table::GcStatsKind::InlineArray,
+                "{hex:#010x} is not an inline layout, so its gc.size set is never consulted"
             );
             assert!(!sizes.is_empty(), "{hex:#010x}: empty verified set");
             assert!(
@@ -1180,7 +1224,7 @@ mod gc_shape_tests {
     #[test]
     fn unknown_hex_or_unmatched_size_falls_through_to_the_default() {
         // A hex with a single compiled layout skips selection entirely.
-        assert!(is_sentinel(&select_gc_shape(0x030e04f0, 4096, 0, SENTINEL)));
+        assert!(is_sentinel(&select_gc_shape(0x030e00f0, 4096, 0, SENTINEL)));
         // A registered hex whose reported size matches no candidate: fall through, so
         // the size guard in `gc_stats.rs` emits the regenerate hint rather than a
         // silently wrong layout being used.
@@ -1189,12 +1233,17 @@ mod gc_shape_tests {
         }
     }
 
+    /// A `GC_CANDIDATES` key must be an EXACT `LAYOUTS` row, not merely a verified alias.
+    /// `select_gc_shape` is called with `expected_version()`, which is always the anchor
+    /// hex, so candidates keyed on an alias could never be reached — the multi-candidate
+    /// build would decode through the nav variant's default layout instead, silently.
     #[test]
     fn every_gc_candidate_hex_is_a_registered_layout() {
         for (hex, _) in GC_CANDIDATES {
             assert!(
-                has_verified_layout(*hex),
-                "{hex:#010x} has GC candidates but no _Py_DebugOffsets layout to reach them"
+                LAYOUTS.iter().any(|(h, _)| h == hex),
+                "{hex:#010x} has GC candidates but no LAYOUTS row; keyed on an alias they \
+                 are unreachable, since select_gc_shape only ever sees an anchor hex"
             );
         }
     }
@@ -1304,7 +1353,9 @@ mod validation_tests {
     #[test]
     fn a_version_mismatch_fails_only_the_version_check() {
         let mut off = valid_full();
-        off.version = 0x030f00b3; // a real hex, but not this layout's
+        // A different registered layout, deliberately not one of b1's aliases — those
+        // now pass the version check by design.
+        off.version = 0x030f00b4;
         let checks = validate_full(off);
         assert!(!find(&checks, "version").passed);
         assert!(
@@ -1410,7 +1461,27 @@ mod validation_tests {
     #[test]
     fn basic_tier_catches_a_version_mismatch() {
         let mut off = valid_basic();
-        off.version = 0x030d0df0; // 3.13.13's hex, not the 3.13.0 layout's
+        off.version = 0x030e00f0; // the 3.14.0 layout's hex, not this one's
         assert!(!find(&validate_basic_checks(off), "version").passed);
+    }
+
+    /// Regression: a build resolved through a verified alias reports its OWN hex, which
+    /// differs from the layout's by construction. Comparing against the layout anchor
+    /// failed the version check on every shipped 3.13.x/3.14.x target and suppressed
+    /// `all checks passed` — on the very command the ring-size error tells users to run.
+    #[test]
+    fn an_aliased_build_passes_the_version_check() {
+        // 3.13.x only: `valid_basic()` is a V3_13_0 struct, so these are the hexes that
+        // alias to the layout actually in play.
+        for stored in [0x030d01f0u64, 0x030d07f0, 0x030d0ef0] {
+            let mut off = valid_basic();
+            off.version = stored;
+            let checks = validate_basic_checks(off);
+            assert!(
+                find(&checks, "version").passed,
+                "{stored:#010x} aliases to this layout and must not be flagged"
+            );
+            assert!(all_pass(&checks), "{stored:#010x}: report should be clean");
+        }
     }
 }

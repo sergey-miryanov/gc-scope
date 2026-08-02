@@ -90,7 +90,7 @@ jobs:
           echo "Exported $COUNT release trees"
           [ "$COUNT" -gt 0 ] || { echo "::error::no tags matched"; exit 1; }
 
-      # Exit code is non-zero when any tree is uncovered.
+      # Exit code is non-zero when any tree is uncovered, or could not be analysed.
       - name: Sweep
         run: |
           set +e

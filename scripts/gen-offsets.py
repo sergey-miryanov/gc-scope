@@ -624,7 +624,8 @@ def run_sweep(trees_dir: Path, *, emit: bool, tags_only: bool = False,
     two tables `offsets/mod.rs` needs — `ALIASES` (hexes that provably share a registered
     layout) and `VERIFIED_GC_SIZES` (the sizes the inline runtime check accepts).
 
-    Returns a process exit code: non-zero if any tree is uncovered by the registry.
+    Returns a process exit code: non-zero if any tree is uncovered by the registry, or
+    could not be analysed at all.
     """
     trees = sorted(d for d in trees_dir.iterdir()
                    if (d / "Include" / "patchlevel.h").exists())
@@ -642,12 +643,29 @@ def run_sweep(trees_dir: Path, *, emit: bool, tags_only: bool = False,
         if mod_rs.exists() else {}
 
     sigs = []
+    skipped = []          # tried and failed — a hard error
+    out_of_scope = 0      # pre-3.13, correctly has no block
     for t in trees:
+        try:
+            v = read_version(t)
+        except (OSError, TypeError, ValueError) as e:
+            skipped.append((t.name, f"cannot read Include/patchlevel.h ({e})"))
+            continue
+        # `_Py_DebugOffsets` does not exist before 3.13; those builds are described by
+        # `pre_3_13.rs` (ADR 0010) and are not this sweep's business.
+        if (v["major"], v["minor"]) < (3, 13):
+            out_of_scope += 1
+            continue
         print(f"  probing {t.name} …", file=sys.stderr)
         s = layout_signature(t, trust_tags=trust_tags)
-        if s is not None:
-            s["tree"] = t.name
-            sigs.append(s)
+        if s is None:
+            # Never drop one quietly. A 3.13+ tree that cannot be analysed can never
+            # appear in `uncovered`, so a release the registry does not describe would
+            # produce a GREEN sweep — the outcome this job exists to prevent.
+            skipped.append((t.name, "no _Py_DebugOffsets could be extracted"))
+            continue
+        s["tree"] = t.name
+        sigs.append(s)
 
     # A layout is the (block, stats struct, inline offset) triple; anything sharing it
     # decodes identically, and nothing else may be aliased onto it.
@@ -655,8 +673,9 @@ def run_sweep(trees_dir: Path, *, emit: bool, tags_only: bool = False,
     for s in sigs:
         groups.setdefault((s["block"], s["stats"], s["inline_off"]), []).append(s)
 
+    scope = f", {out_of_scope} pre-3.13 skipped" if out_of_scope else ""
     print(f"\n{len(sigs)} trees with a _Py_DebugOffsets block -> "
-          f"{len(groups)} distinct layouts\n")
+          f"{len(groups)} distinct layouts{scope}\n")
     header = f"{'tree':24} {'hex':>10} {'block':12} {'stats':12} {'stats@':>7} {'sizeof':>7}"
     aliases: list[tuple[int, int]] = []
     verified_sizes: list[tuple[int, list[int]]] = []
@@ -705,6 +724,14 @@ def run_sweep(trees_dir: Path, *, emit: bool, tags_only: bool = False,
                       if m["hex"] not in registered and not tagged_anchors]
         print()
 
+    if skipped:
+        print("FAILED TO ANALYSE — these 3.13+ trees could not be read:")
+        for name, why in skipped:
+            print(f"  {name:24} {why}")
+        print("\n  A tree that cannot be analysed is not the same as one that is covered:\n"
+              "  it can never show up as UNCOVERED, so leaving it silent would turn a\n"
+              "  missing layout into a green run. Check the checkout, bindgen and\n"
+              "  LIBCLANG_PATH.\n")
     if redundant:
         print("REDUNDANT — these modules encode the same layout; keep one:")
         for mods, _ in redundant:
@@ -734,7 +761,7 @@ def run_sweep(trees_dir: Path, *, emit: bool, tags_only: bool = False,
             print(f"    (0x{anchor:08x}, &{sizes}),".replace("[", "[").replace("'", ""))
         print("];")
 
-    return 1 if uncovered else 0
+    return 1 if (uncovered or skipped) else 0
 
 
 def main() -> None:
