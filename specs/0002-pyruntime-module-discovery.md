@@ -70,7 +70,7 @@ recovers it there; `list-pids` will keep missing embedders regardless of this ch
   coverage of the decision — unusually for this codebase, nothing about it can be wrong in
   a way only a live process would reveal.
 - **Prior art:** the path- and version-string unit tests in `remote_debugging::version`
-  (`from_string_parses_the_shapes_detect_actually_sees`), which cover a parsing rule the
+  (`parse_exact_parses_the_shapes_detect_actually_sees`), which cover a parsing rule the
   same way.
 - **Cases:**
   1. Accepts `libpython3.13.so`, `python.exe`, `Python` (framework path), `pyruntime.dll`,

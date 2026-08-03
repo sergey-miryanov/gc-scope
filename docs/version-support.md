@@ -119,20 +119,36 @@ build provides depends on its version.
   ```
 
   The major is fixed at `3`, and the optional suffix supplies the release level for a
-  pre-release build. Three constraints keep the match honest, each of them answering
+  pre-release build. Four constraints keep the match honest, each of them answering
   a false positive that occurs in that same section:
 
-  - the `3` must not follow a digit, or `lib13.12.0` reads as a version
+  - the `3` must not follow a character the grammar itself can consume — a digit, a
+    dot, or a suffix letter — or `lib13.12.0`, `1.3.12.0` and the `a3` of
+    `3.13.1a3.12.0` each read as a version
+  - the candidate ends where that character set ends, and the whole of it must parse:
+    a partial match like `3.12.0z` is refused rather than truncated to `3.12.0`
   - the micro component is mandatory, so a stray `3.1` cannot shadow the real `3.10.4`
     later in the section
-  - a terminator must follow: NUL, space, `(`, `"`, or whitespace
+  - a terminator must follow: NUL, space, `(`, `"`, whitespace, or the end of the
+    section
 
   The section holds other strings that embed the version. A 3.14 image carries the
   build tag `v3.14.0-dirty` a few bytes from the literal itself; the terminator rule
   is what rejects it, since `-` is not a terminator.
 
+  A candidate that fails any constraint advances the scan by one byte rather than
+  past the candidate, so a real version glued to a bad one — `3.999.0-3.13.1` — is
+  still found.
+
+  One grammar does the parsing, and it is strict: it accepts a bare fully-qualified
+  version and nothing else, with no leading `Python `, no surrounding whitespace and
+  no trailing content. A serial that does not fit the four bits the hex reserves for
+  it (`3.15.0b17`) is refused rather than clamped or truncated — see
+  [ADR 0006](adr/0006-layout-registration-integrity.md); naming a build gcscope
+  cannot represent would resolve some *other* build's layout and decode with it.
+
   When no literal matches, detection fails rather than returning a value. A
-  non-version literal that satisfies all three constraints is accepted.
+  non-version literal that satisfies every constraint is accepted.
 
 - **3.11+: an exported variable.** CPython 3.11 added `Py_Version`, a global holding
   `PY_VERSION_HEX`. The binary's symbol table gives the variable's address, and the

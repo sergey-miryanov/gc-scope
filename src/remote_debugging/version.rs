@@ -40,56 +40,6 @@ impl PythonVersion {
             | (self.release_level as u64) << 4
             | self.serial as u64
     }
-
-    /// Parse from a version string like "3.15.0a8", "3.12.0", or "3.11.0rc1".
-    ///
-    /// Accepts strings that may have trailing content after the version
-    /// (e.g. "3.12.0 (tags/v3.12.0, ...)" or "Python 3.11.0").
-    #[allow(dead_code)]
-    pub fn from_string(s: &str) -> Option<Self> {
-        let s = s.trim();
-        let s = s.strip_prefix("Python ").unwrap_or(s);
-
-        let mut chars = s.char_indices().peekable();
-        let major = parse_digits(&mut chars)?;
-        if chars.next()?.1 != '.' {
-            return None;
-        }
-        let minor = parse_digits(&mut chars)?;
-
-        let micro = if chars.peek().map(|&(_, c)| c) == Some('.') {
-            chars.next();
-            parse_digits(&mut chars)?
-        } else {
-            0
-        };
-
-        let (release_level, serial) = match chars.peek() {
-            Some(&(_, c)) if c == 'a' || c == 'b' => {
-                let level = if c == 'a' { 0xA } else { 0xB };
-                chars.next();
-                let serial = parse_digits(&mut chars)?;
-                (level, serial.min(0xF))
-            }
-            Some(&(_, 'r')) => {
-                chars.next();
-                if chars.next()?.1 != 'c' {
-                    return None;
-                }
-                let serial = parse_digits(&mut chars)?;
-                (0xC, serial.min(0xF))
-            }
-            _ => (0xF, 0),
-        };
-
-        Some(PythonVersion {
-            major,
-            minor,
-            micro,
-            release_level,
-            serial,
-        })
-    }
 }
 
 impl std::fmt::Display for PythonVersion {
@@ -106,7 +56,73 @@ impl std::fmt::Display for PythonVersion {
     }
 }
 
-#[allow(dead_code)]
+/// Characters the version grammar can consume. Doubles as the candidate-boundary
+/// rule in `scan_for_version_string`: a run of these is exactly as far as a version
+/// literal could possibly extend, and it is ASCII, so a `&str` over it always builds.
+const fn is_version_char(b: u8) -> bool {
+    b.is_ascii_digit() || matches!(b, b'.' | b'a' | b'b' | b'c' | b'r')
+}
+
+/// Bytes that may legitimately follow an embedded `PY_VERSION` literal. Anything else
+/// means the match is part of a longer token — the build tag `v3.14.0-dirty` sits a few
+/// bytes from the literal in a 3.14 image, and `-` is what rejects it.
+const fn is_terminator(b: u8) -> bool {
+    matches!(b, 0 | b' ' | b'(' | b'\n' | b'\r' | b'\t' | b'"')
+}
+
+/// The one version grammar: a fully-qualified `X.Y.Z` with an optional `aN` / `bN` /
+/// `rcN` suffix, and nothing else — no surrounding whitespace, no `Python ` prefix, no
+/// trailing content. Callers that locate a candidate in a larger buffer delimit it
+/// first; see `scan_for_version_string`.
+///
+/// A serial past `0xF` is refused rather than clamped. The hex packs it into four bits,
+/// so such a build cannot be named: clamping would report a `b15` that does not exist,
+/// and reproducing `patchlevel.h`'s `(level << 4) | serial` would report `b1` — a real
+/// `LAYOUTS` row, whose offsets would then decode the wrong build silently.
+fn parse_exact(s: &str) -> Option<PythonVersion> {
+    let mut chars = s.char_indices().peekable();
+
+    let major = parse_digits(&mut chars)?;
+    if chars.next()?.1 != '.' {
+        return None;
+    }
+    let minor = parse_digits(&mut chars)?;
+    if chars.next()?.1 != '.' {
+        return None;
+    }
+    let micro = parse_digits(&mut chars)?;
+
+    let (release_level, serial) = match chars.peek() {
+        Some(&(_, c)) if c == 'a' || c == 'b' => {
+            let level = if c == 'a' { 0xA } else { 0xB };
+            chars.next();
+            (level, parse_digits(&mut chars)?)
+        }
+        Some(&(_, 'r')) => {
+            chars.next();
+            if chars.next()?.1 != 'c' {
+                return None;
+            }
+            (0xC, parse_digits(&mut chars)?)
+        }
+        _ => (0xF, 0),
+    };
+
+    // Nothing may remain: this is what rejects `3.12.0z`, which the scanner would
+    // otherwise accept at that position.
+    if chars.next().is_some() || serial > 0xF {
+        return None;
+    }
+
+    Some(PythonVersion {
+        major,
+        minor,
+        micro,
+        release_level,
+        serial,
+    })
+}
+
 fn parse_digits(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>) -> Option<u8> {
     let mut n: u8 = 0;
     let mut started = false;
@@ -259,16 +275,6 @@ fn resolve_symbol_macho(bytes: &[u8], base_addr: usize, sym_name: &str) -> Optio
     None
 }
 
-fn parse_micro_digits(bytes: &[u8], start: usize) -> Option<(u8, usize)> {
-    let mut j = start;
-    let mut val: u8 = 0;
-    while j < bytes.len() && bytes[j].is_ascii_digit() {
-        val = val.checked_mul(10)?.checked_add(bytes[j] - b'0')?;
-        j += 1;
-    }
-    if j == start { None } else { Some((val, j)) }
-}
-
 /// File-offset range of the binary's read-only data section — PE `.rdata`, ELF
 /// `.rodata`, Mach-O `__TEXT,__cstring` — where the `PY_VERSION` string literal is
 /// emitted. `None` if the format isn't recognized or the section isn't present.
@@ -318,101 +324,44 @@ fn read_only_data(bytes: &[u8]) -> Option<&[u8]> {
     (start < end).then(|| &bytes[start..end])
 }
 
+/// Locate an embedded `PY_VERSION` literal in a byte image and decode it.
+///
+/// The fallback in `detect` when the `Py_Version` symbol cannot be resolved — which is
+/// every attach below 3.11, where the symbol does not exist yet, so this is the sole
+/// version source for 3.8/3.9/3.10 rather than a rare path.
+///
+/// The scan locates and delimits candidates; `parse_exact` is the only thing that
+/// parses one. A candidate is a `3.` that is not glued to a longer token, running as
+/// far as the version charset reaches, and it must be followed by a terminator.
 fn scan_for_version_string(bytes: &[u8]) -> Option<PythonVersion> {
     let mut i = 0;
-    while i + 4 < bytes.len() {
-        if bytes[i] != b'3' || bytes[i + 1] != b'.' {
+    while i + 1 < bytes.len() {
+        // A preceding version character means this `3` sits inside something longer —
+        // `lib13.12.0`, `1.3.12.0`, the `a3` of `3.13.1a3.12.0` — not at the start of a
+        // literal.
+        if bytes[i] != b'3' || bytes[i + 1] != b'.' || (i > 0 && is_version_char(bytes[i - 1])) {
             i += 1;
             continue;
         }
-        if i > 0 && bytes[i - 1].is_ascii_digit() {
-            i += 1;
-            continue;
-        }
 
-        // Parse minor. A `"3."` not followed by digits (e.g. `"3.E"` in a float
-        // literal) is not a version string — advance and keep scanning rather than
-        // aborting the whole scan, which would miss the real version further in.
-        let Some((minor, mut j)) = parse_micro_digits(bytes, i + 2) else {
-            i += 1;
-            continue;
-        };
+        // As far as a version could possibly extend. The run is ASCII by construction,
+        // so the `&str` always builds; `parse_exact` then decides whether the whole run
+        // is a version, which is what rejects `3.12.0z` and the `v3.14.0-dirty` tag.
+        let end = bytes[i..]
+            .iter()
+            .position(|&b| !is_version_char(b))
+            .map_or(bytes.len(), |n| i + n);
 
-        // Require a micro component. The embedded `PY_VERSION` is always fully
-        // qualified (`"X.Y.Z"`), so a bare `"3.1"` (e.g. in unrelated text, or a
-        // truncated prefix) is a false positive: skip it and keep scanning for the
-        // real version. Without this, a stray `"3.1 "` shadows the true `"3.10.x"`.
-        if bytes.get(j).copied() != Some(b'.') {
-            i += 1;
-            continue;
-        }
-        let micro = match parse_micro_digits(bytes, j + 1) {
-            Some((m, next)) => {
-                j = next;
-                m
-            }
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-
-        // Parse optional release suffix: aN, bN, rcN
-        let (release_level, serial) = match bytes.get(j).copied() {
-            Some(b'a') => match parse_micro_digits(bytes, j + 1) {
-                Some((s, next)) => {
-                    j = next;
-                    (0xA, s)
-                }
-                None => {
-                    i += 1;
-                    continue;
-                }
-            },
-            Some(b'b') => match parse_micro_digits(bytes, j + 1) {
-                Some((s, next)) => {
-                    j = next;
-                    (0xB, s)
-                }
-                None => {
-                    i += 1;
-                    continue;
-                }
-            },
-            Some(b'r') if bytes.get(j + 1).copied() == Some(b'c') => {
-                match parse_micro_digits(bytes, j + 2) {
-                    Some((s, next)) => {
-                        j = next;
-                        (0xC, s)
-                    }
-                    None => {
-                        i += 1;
-                        continue;
-                    }
-                }
-            }
-            _ => (0xF, 0),
-        };
-
-        // Validate trailing context
-        let next = bytes.get(j).copied().unwrap_or(0);
-        if next == 0
-            || next == b' '
-            || next == b'('
-            || next == b'\n'
-            || next == b'\r'
-            || next == b'\t'
-            || next == b'"'
+        if let Ok(candidate) = std::str::from_utf8(&bytes[i..end])
+            && let Some(ver) = parse_exact(candidate)
+            && is_terminator(bytes.get(end).copied().unwrap_or(0))
         {
-            return Some(PythonVersion {
-                major: 3,
-                minor,
-                micro,
-                release_level,
-                serial,
-            });
+            return Some(ver);
         }
-        i = j;
+
+        // Exactly one byte. A real version can be glued to a failed candidate
+        // (`3.999.0-3.13.1`), so skipping to the candidate's end would miss it.
+        i += 1;
     }
     None
 }
@@ -463,64 +412,83 @@ mod tests {
     }
 
     #[test]
-    fn from_string_parses_the_shapes_detect_actually_sees() {
-        assert_eq!(
-            PythonVersion::from_string("3.15.0a8"),
-            Some(v(3, 15, 0, 0xA, 8))
-        );
-        assert_eq!(
-            PythonVersion::from_string("3.12.0"),
-            Some(v(3, 12, 0, 0xF, 0))
-        );
-        assert_eq!(
-            PythonVersion::from_string("3.11.0rc1"),
-            Some(v(3, 11, 0, 0xC, 1))
-        );
-        assert_eq!(
-            PythonVersion::from_string("Python 3.11.0"),
-            Some(v(3, 11, 0, 0xF, 0))
-        );
-        // Trailing content is allowed: this is what `python --version` and the
-        // binary's embedded version string look like.
-        assert_eq!(
-            PythonVersion::from_string("3.12.0 (tags/v3.12.0, Oct  2 2023)"),
-            Some(v(3, 12, 0, 0xF, 0))
-        );
-        // Micro is optional.
-        assert_eq!(
-            PythonVersion::from_string("3.12"),
-            Some(v(3, 12, 0, 0xF, 0))
-        );
+    fn parse_exact_parses_the_shapes_detect_actually_sees() {
+        for (s, want) in [
+            ("3.15.0a8", v(3, 15, 0, 0xA, 8)),
+            ("3.12.0", v(3, 12, 0, 0xF, 0)),
+            ("3.11.0rc1", v(3, 11, 0, 0xC, 1)),
+            ("3.15.0b1", v(3, 15, 0, 0xB, 1)),
+            ("3.8.19", v(3, 8, 19, 0xF, 0)),
+            // Zero-padded components are accepted, as they were before: the rule is
+            // the grammar, not the canonical rendering.
+            ("3.08.1", v(3, 8, 1, 0xF, 0)),
+        ] {
+            assert_eq!(parse_exact(s), Some(want), "should parse {s:?}");
+        }
     }
 
+    /// The parser is deliberately strict where its predecessor was permissive: it is
+    /// fed a candidate that a scanner already delimited out of arbitrary binary data,
+    /// so anything beyond the bare grammar is a reason to refuse, not to look past.
+    /// The first three of these were *accepted* by the old `from_string`.
     #[test]
-    fn from_string_rejects_non_versions() {
-        for s in ["", "3", "3.x", "x3.12", "..", "3."] {
-            assert_eq!(PythonVersion::from_string(s), None, "should reject {s:?}");
+    fn parse_exact_refuses_anything_but_a_bare_fully_qualified_version() {
+        for s in [
+            "Python 3.11.0",                      // no prefix stripping
+            "3.12.0 (tags/v3.12.0, Oct  2 2023)", // no trailing content
+            "3.12",                               // micro is mandatory
+            " 3.12.0",                            // no trimming
+            "3.12.0 ",
+            "3.12.0z",
+            "3.12.0rx",
+            "3.12.0r",
+            "3.12.0a",
+            "3.12.0.1",
+            "",
+            "3",
+            "3.x",
+            "x3.12",
+            "..",
+            "3.",
+        ] {
+            assert_eq!(parse_exact(s), None, "should reject {s:?}");
         }
     }
 
     #[test]
-    fn from_string_rejects_overflowing_component() {
+    fn parse_exact_rejects_overflowing_component() {
         // parse_digits accumulates into a u8 with checked_mul/checked_add. Without
         // those guards "3.999.0" would wrap to a plausible-looking minor and gcscope
         // would silently resolve the wrong layout.
-        assert_eq!(PythonVersion::from_string("3.999.0"), None);
-        assert_eq!(PythonVersion::from_string("3.12.999"), None);
+        assert_eq!(parse_exact("3.999.0"), None);
+        assert_eq!(parse_exact("3.12.999"), None);
+    }
+
+    /// The serial field is four bits wide. A build naming a serial past 0xF cannot be
+    /// represented, so it is refused — see `scan_refuses_a_serial_that_does_not_fit_the_hex`
+    /// for why neither clamping nor mirroring CPython's own packing is the right answer.
+    #[test]
+    fn parse_exact_refuses_a_serial_that_does_not_fit_the_hex() {
+        assert_eq!(parse_exact("3.15.0b17"), None);
+        assert_eq!(parse_exact("3.15.0a16"), None);
+        assert_eq!(parse_exact("3.15.0rc99"), None);
+        assert_eq!(parse_exact("3.15.0b15"), Some(v(3, 15, 0, 0xB, 15)));
     }
 
     #[test]
-    fn display_round_trips_from_string() {
+    fn display_round_trips_parse_exact() {
         for s in ["3.15.0a8", "3.15.0b1", "3.15.0rc1", "3.12.0", "3.8.19"] {
-            let parsed = PythonVersion::from_string(s).expect(s);
+            let parsed = parse_exact(s).expect(s);
             assert_eq!(parsed.to_string(), s);
         }
     }
 
-    // ── binary version-string scan (the on-disk fallback for `detect`) ──
-    // `scan_for_version_string` is the fallback when the `Py_Version` symbol can't
-    // be read; it walks raw rodata bytes. Feeding it byte slices exercises the whole
-    // scanner (and `parse_micro_digits`) without a real binary.
+    // ── binary version-string scan (the on-disk source for `detect` below 3.11) ──
+    // `scan_for_version_string` runs when the `Py_Version` symbol can't be read, which
+    // is every attach below 3.11 — the symbol arrives in 3.11, so this is the sole
+    // version source for 3.8/3.9/3.10, not a rare path. It walks raw rodata bytes, so
+    // feeding it byte slices exercises the whole locate-delimit-parse chain without a
+    // real binary.
 
     /// A fully-qualified `PY_VERSION` literal embedded in surrounding bytes is found,
     /// with every field decoded — including the release suffix.
@@ -588,13 +556,74 @@ mod tests {
         assert_eq!(scan_for_version_string(b"3."), None);
     }
 
-    /// `parse_micro_digits` accumulates into a `u8` with checked arithmetic, so a
-    /// run that overflows 255 returns `None` rather than wrapping to a bogus value.
+    /// The hex packs `serial` into four bits, so a serial past 0xF names a build that
+    /// cannot be represented. Refuse it rather than inventing a neighbour: clamping
+    /// would report `b15`, and mirroring `patchlevel.h`'s `(level << 4) | serial`
+    /// would report `b1` — a live `LAYOUTS` row, decoded with the wrong offsets.
     #[test]
-    fn parse_micro_digits_reads_a_run_and_guards_overflow() {
-        assert_eq!(parse_micro_digits(b"07x", 0), Some((7, 2)));
-        assert_eq!(parse_micro_digits(b"abc", 0), None); // no digits at start
-        assert_eq!(parse_micro_digits(b"255", 0), Some((255, 3)));
-        assert_eq!(parse_micro_digits(b"256", 0), None); // overflows u8
+    fn scan_refuses_a_serial_that_does_not_fit_the_hex() {
+        assert_eq!(scan_for_version_string(b"3.15.0b17\x00"), None);
+        assert_eq!(scan_for_version_string(b"3.15.0a16\x00"), None);
+        assert_eq!(scan_for_version_string(b"3.15.0rc99\x00"), None);
+        // The boundary itself still parses.
+        assert_eq!(
+            scan_for_version_string(b"3.15.0b15\x00"),
+            Some(v(3, 15, 0, 0xB, 15))
+        );
+    }
+
+    /// An anchor glued to a longer token is not a version start. The `3` must not be
+    /// preceded by any character the grammar itself can consume — a digit (`lib13.12.0`),
+    /// a dot (`1.3.12.0`), or a suffix letter (`3.13.1a3.12.0`) — or the scan reads a
+    /// version out of the middle of something else.
+    #[test]
+    fn scan_rejects_an_anchor_glued_to_a_longer_token() {
+        for bytes in [
+            b"lib13.12.0".as_slice(),
+            b"1.3.12.0\x00".as_slice(),
+            b"3.13.1a3.12.0\x00".as_slice(),
+            b"libpython3.13.so.1.0".as_slice(),
+        ] {
+            assert_eq!(
+                scan_for_version_string(bytes),
+                None,
+                "should reject {:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    /// A failed candidate advances the scan by one byte, so a real version glued to
+    /// the failure is still found (the C5 property). The hyphen and the `zzz` matter:
+    /// with a space the failed candidate is terminated anyway, so those forms pass
+    /// even with a broken advance.
+    #[test]
+    fn scan_advances_one_byte_past_a_failed_candidate() {
+        assert_eq!(
+            scan_for_version_string(b"3.999.0-3.13.1\x00"),
+            Some(v(3, 13, 1, 0xF, 0))
+        );
+        assert_eq!(
+            scan_for_version_string(b"3.12.0zzz3.13.1\x00"),
+            Some(v(3, 13, 1, 0xF, 0))
+        );
+        assert_eq!(
+            scan_for_version_string(b"3.13 then 3.13.4 "),
+            Some(v(3, 13, 4, 0xF, 0))
+        );
+    }
+
+    /// End-of-buffer terminates a candidate as surely as a NUL does: the embedded
+    /// literal can be the last thing in the section handed to the scanner.
+    #[test]
+    fn scan_accepts_a_version_terminated_by_end_of_buffer() {
+        assert_eq!(
+            scan_for_version_string(b"3.12.0"),
+            Some(v(3, 12, 0, 0xF, 0))
+        );
+        assert_eq!(
+            scan_for_version_string(b"junk\x003.15.0b1"),
+            Some(v(3, 15, 0, 0xB, 1))
+        );
     }
 }
