@@ -56,30 +56,27 @@ impl std::fmt::Display for PythonVersion {
     }
 }
 
-/// Characters the version grammar can consume. Doubles as the candidate-boundary
-/// rule in `scan_for_version_string`: a run of these is exactly as far as a version
-/// literal could possibly extend, and it is ASCII, so a `&str` over it always builds.
+/// Characters the version grammar can consume. Doubles as the candidate boundary in
+/// `scan_for_version_string`: a run of these is as far as a literal could extend, and
+/// it is ASCII, so a `&str` over it always builds.
 const fn is_version_char(b: u8) -> bool {
     b.is_ascii_digit() || matches!(b, b'.' | b'a' | b'b' | b'c' | b'r')
 }
 
-/// Bytes that may legitimately follow an embedded `PY_VERSION` literal. Anything else
-/// means the match is part of a longer token — the build tag `v3.14.0-dirty` sits a few
-/// bytes from the literal in a 3.14 image, and `-` is what rejects it.
+/// Bytes that may follow an embedded `PY_VERSION` literal. Anything else means the match
+/// is part of a longer token — `-` is what rejects the `v3.14.0-dirty` build tag sitting
+/// a few bytes from the literal in a 3.14 image.
 const fn is_terminator(b: u8) -> bool {
     matches!(b, 0 | b' ' | b'(' | b'\n' | b'\r' | b'\t' | b'"')
 }
 
-/// The one version grammar: a fully-qualified `X.Y.Z` with an optional `aN` / `bN` /
-/// `rcN` suffix, and nothing else — no surrounding whitespace, no `Python ` prefix, no
-/// trailing content. Callers that locate a candidate in a larger buffer delimit it
-/// first; see `scan_for_version_string`.
+/// The one version grammar: a bare fully-qualified `X.Y.Z` with an optional `aN`/`bN`/
+/// `rcN` suffix and nothing else — no whitespace, no `Python ` prefix, no trailing
+/// content. Callers delimit the candidate first; see `scan_for_version_string`.
 ///
-/// A serial past `0xF` is refused rather than clamped. The hex packs it into four bits,
-/// so such a build cannot be named: clamping would report a `b15` that does not exist,
-/// and reproducing `patchlevel.h`'s `(level << 4) | serial` would report `b1` — a real
-/// `LAYOUTS` row, whose offsets would then decode the wrong build silently. See
-/// `docs/adr/0012-version-detection-fails-closed.md`.
+/// A serial past `0xF` does not fit the hex and is refused rather than clamped or
+/// mirrored — [ADR 0012](../../docs/adr/0012-version-detection-fails-closed.md) has the
+/// reasoning.
 fn parse_exact(s: &str) -> Option<PythonVersion> {
     let mut chars = s.char_indices().peekable();
 
@@ -327,27 +324,21 @@ fn read_only_data(bytes: &[u8]) -> Option<&[u8]> {
 
 /// Locate an embedded `PY_VERSION` literal in a byte image and decode it.
 ///
-/// The fallback in `detect` when the `Py_Version` symbol cannot be resolved — which is
-/// every attach below 3.11, where the symbol does not exist yet, so this is the sole
-/// version source for 3.8/3.9/3.10 rather than a rare path.
-///
-/// The scan locates and delimits candidates; `parse_exact` is the only thing that
-/// parses one. A candidate is a `3.` that is not glued to a longer token, running as
-/// far as the version charset reaches, and it must be followed by a terminator.
+/// `detect` reaches this whenever the `Py_Version` symbol cannot be resolved, which is
+/// every attach below 3.11 — so it is the sole version source for 3.8/3.9/3.10, not a
+/// rare path. It locates and delimits; `parse_exact` is the only thing that parses.
 fn scan_for_version_string(bytes: &[u8]) -> Option<PythonVersion> {
     let mut i = 0;
     while i + 1 < bytes.len() {
-        // A preceding version character means this `3` sits inside something longer —
-        // `lib13.12.0`, `1.3.12.0`, the `a3` of `3.13.1a3.12.0` — not at the start of a
-        // literal.
+        // A preceding version character means this `3` sits inside something longer:
+        // `lib13.12.0`, `1.3.12.0`, the `a3` of `3.13.1a3.12.0`.
         if bytes[i] != b'3' || bytes[i + 1] != b'.' || (i > 0 && is_version_char(bytes[i - 1])) {
             i += 1;
             continue;
         }
 
-        // As far as a version could possibly extend. The run is ASCII by construction,
-        // so the `&str` always builds; `parse_exact` then decides whether the whole run
-        // is a version, which is what rejects `3.12.0z` and the `v3.14.0-dirty` tag.
+        // As far as a version could extend; ASCII by construction, so the `&str` always
+        // builds. Requiring the *whole* run to parse is what rejects `3.12.0z`.
         let end = bytes[i..]
             .iter()
             .position(|&b| !is_version_char(b))
@@ -360,8 +351,8 @@ fn scan_for_version_string(bytes: &[u8]) -> Option<PythonVersion> {
             return Some(ver);
         }
 
-        // Exactly one byte. A real version can be glued to a failed candidate
-        // (`3.999.0-3.13.1`), so skipping to the candidate's end would miss it.
+        // Exactly one byte: a real version can be glued to a failed candidate
+        // (`3.999.0-3.13.1`), so skipping to its end would miss it.
         i += 1;
     }
     None
@@ -428,10 +419,9 @@ mod tests {
         }
     }
 
-    /// The parser is deliberately strict where its predecessor was permissive: it is
-    /// fed a candidate that a scanner already delimited out of arbitrary binary data,
-    /// so anything beyond the bare grammar is a reason to refuse, not to look past.
-    /// The first three of these were *accepted* by the old `from_string`.
+    /// Strict where its predecessor was permissive: the input is a candidate already
+    /// delimited out of arbitrary binary data, so anything beyond the bare grammar is a
+    /// reason to refuse. The first three were *accepted* by the old `from_string`.
     #[test]
     fn parse_exact_refuses_anything_but_a_bare_fully_qualified_version() {
         for s in [
@@ -465,9 +455,8 @@ mod tests {
         assert_eq!(parse_exact("3.12.999"), None);
     }
 
-    /// The serial field is four bits wide. A build naming a serial past 0xF cannot be
-    /// represented, so it is refused — see `scan_refuses_a_serial_that_does_not_fit_the_hex`
-    /// for why neither clamping nor mirroring CPython's own packing is the right answer.
+    /// The serial field is four bits wide, so a build past 0xF cannot be represented and
+    /// is refused. `scan_refuses_a_serial_that_does_not_fit_the_hex` carries the why.
     #[test]
     fn parse_exact_refuses_a_serial_that_does_not_fit_the_hex() {
         assert_eq!(parse_exact("3.15.0b17"), None);
@@ -485,11 +474,9 @@ mod tests {
     }
 
     // ── binary version-string scan (the on-disk source for `detect` below 3.11) ──
-    // `scan_for_version_string` runs when the `Py_Version` symbol can't be read, which
-    // is every attach below 3.11 — the symbol arrives in 3.11, so this is the sole
-    // version source for 3.8/3.9/3.10, not a rare path. It walks raw rodata bytes, so
-    // feeding it byte slices exercises the whole locate-delimit-parse chain without a
-    // real binary.
+    // The `Py_Version` symbol arrives in 3.11, so this is the sole version source for
+    // 3.8/3.9/3.10. Byte slices exercise the whole locate-delimit-parse chain without
+    // a real binary.
 
     /// A fully-qualified `PY_VERSION` literal embedded in surrounding bytes is found,
     /// with every field decoded — including the release suffix.
@@ -557,10 +544,9 @@ mod tests {
         assert_eq!(scan_for_version_string(b"3."), None);
     }
 
-    /// The hex packs `serial` into four bits, so a serial past 0xF names a build that
-    /// cannot be represented. Refuse it rather than inventing a neighbour: clamping
-    /// would report `b15`, and mirroring `patchlevel.h`'s `(level << 4) | serial`
-    /// would report `b1` — a live `LAYOUTS` row, decoded with the wrong offsets.
+    /// A serial past 0xF names a build the hex cannot hold. Refuse rather than invent a
+    /// neighbour: clamping reports `b15`, and mirroring `patchlevel.h`'s
+    /// `(level << 4) | serial` reports `b1` — a live `LAYOUTS` row, wrongly decoded.
     #[test]
     fn scan_refuses_a_serial_that_does_not_fit_the_hex() {
         assert_eq!(scan_for_version_string(b"3.15.0b17\x00"), None);
@@ -573,10 +559,9 @@ mod tests {
         );
     }
 
-    /// An anchor glued to a longer token is not a version start. The `3` must not be
-    /// preceded by any character the grammar itself can consume — a digit (`lib13.12.0`),
-    /// a dot (`1.3.12.0`), or a suffix letter (`3.13.1a3.12.0`) — or the scan reads a
-    /// version out of the middle of something else.
+    /// The `3` must not follow any character the grammar can consume — a digit
+    /// (`lib13.12.0`), a dot (`1.3.12.0`), a suffix letter (`3.13.1a3.12.0`) — or the
+    /// scan reads a version out of the middle of something else.
     #[test]
     fn scan_rejects_an_anchor_glued_to_a_longer_token() {
         for bytes in [
@@ -594,10 +579,9 @@ mod tests {
         }
     }
 
-    /// A failed candidate advances the scan by one byte, so a real version glued to
-    /// the failure is still found (the C5 property). The hyphen and the `zzz` matter:
-    /// with a space the failed candidate is terminated anyway, so those forms pass
-    /// even with a broken advance.
+    /// A failed candidate advances one byte, so a version glued to it is still found
+    /// (the C5 property). The hyphen and `zzz` matter: a space would terminate the
+    /// failed candidate anyway, passing even with a broken advance.
     #[test]
     fn scan_advances_one_byte_past_a_failed_candidate() {
         assert_eq!(
