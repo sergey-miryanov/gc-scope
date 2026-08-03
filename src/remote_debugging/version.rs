@@ -78,7 +78,8 @@ const fn is_terminator(b: u8) -> bool {
 /// A serial past `0xF` is refused rather than clamped. The hex packs it into four bits,
 /// so such a build cannot be named: clamping would report a `b15` that does not exist,
 /// and reproducing `patchlevel.h`'s `(level << 4) | serial` would report `b1` — a real
-/// `LAYOUTS` row, whose offsets would then decode the wrong build silently.
+/// `LAYOUTS` row, whose offsets would then decode the wrong build silently. See
+/// `docs/adr/0012-version-detection-fails-closed.md`.
 fn parse_exact(s: &str) -> Option<PythonVersion> {
     let mut chars = s.char_indices().peekable();
 

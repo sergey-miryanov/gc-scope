@@ -144,7 +144,7 @@ build provides depends on its version.
   version and nothing else, with no leading `Python `, no surrounding whitespace and
   no trailing content. A serial that does not fit the four bits the hex reserves for
   it (`3.15.0b17`) is refused rather than clamped or truncated — see
-  [ADR 0006](adr/0006-layout-registration-integrity.md); naming a build gcscope
+  [ADR 0012](adr/0012-version-detection-fails-closed.md); naming a build gcscope
   cannot represent would resolve some *other* build's layout and decode with it.
 
   When no literal matches, detection fails rather than returning a value. A
