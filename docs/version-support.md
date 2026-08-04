@@ -111,8 +111,10 @@ build provides depends on its version.
 
 - **3.8 – 3.10: a string in the binary.** Nothing exports the version as a readable
   variable, so the only record of it is the `PY_VERSION` literal the compiler put in
-  the image (`3.14.0`, NUL-terminated). You scan the read-only data section for it
-  and parse what matches:
+  the image. A release build spells it `3.14.0`, NUL-terminated; a checkout of a
+  maintenance or dev branch spells it `3.14.0+`, because CPython appends the `+` right
+  after tagging while the numeric fields — and so `PY_VERSION_HEX` — keep the released
+  value. You scan the read-only data section for it and parse what matches:
 
   ```
   3.<minor>.<micro>[ a<serial> | b<serial> | rc<serial> ]<terminator>
@@ -125,20 +127,21 @@ build provides depends on its version.
   - the `3` must not follow a character the grammar itself can consume — a digit, a
     dot, or a suffix letter — or `lib13.12.0`, `1.3.12.0` and the `a3` of
     `3.13.1a3.12.0` each read as a version
-  - the candidate ends where that character set ends, and the whole of it must parse:
-    a partial match like `3.12.0z` is refused rather than truncated to `3.12.0`
+  - the candidate ends where that character set ends, and the whole of it must parse,
+    so `3.12.0c` is refused rather than truncated to `3.12.0`
   - the micro component is mandatory, so a stray `3.1` cannot shadow the real `3.10.4`
     later in the section
-  - a terminator must follow: NUL, space, `(`, `"`, whitespace, or the end of the
-    section
+  - a terminator must follow: NUL, space, `(`, `"`, `+`, whitespace, or the end of the
+    section. This is the rule that refuses `3.12.0z` — `z` is outside the character set,
+    so the candidate ends before it and the parse itself succeeds
 
   The section holds other strings that embed the version. A 3.14 image carries the
   build tag `v3.14.0-dirty` a few bytes from the literal itself; the terminator rule
   is what rejects it, since `-` is not a terminator.
 
-  A candidate that fails any constraint advances the scan by one byte rather than
-  past the candidate, so a real version glued to a bad one — `3.999.0-3.13.1` — is
-  still found.
+  A version glued to a bad candidate — `3.999.0-3.13.1` — is still found: the first
+  constraint already rejects every position inside a failed candidate, so the scan
+  cannot lock onto one and skip past a real literal behind it.
 
   One grammar does the parsing, and it is strict: it accepts a bare fully-qualified
   version and nothing else, with no leading `Python `, no surrounding whitespace and

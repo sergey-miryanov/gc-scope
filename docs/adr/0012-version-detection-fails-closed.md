@@ -46,12 +46,21 @@ states these forces; until this ADR nothing decided against that section.
    the run of characters the grammar can consume, and hands it over. Delimiting by character
    run rather than by grammar is what makes one parser sufficient — finding a candidate's end
    would otherwise walk the grammar a second time, which is how the duplication arose.
-4. **A failed candidate advances exactly one byte**, never past the candidate: a real version
-   can be glued to a bad one (`3.999.0-3.13.1`). Stated as an invariant because the natural
-   optimization — skip to the candidate's end — reintroduces the C5 defect.
-5. **The scanner only ever tightens.** Python 4, `X.Y` without a micro, and non-ASCII
-   encodings are out of scope by policy. Widening needs a build that fails without it, not a
-   shape that seems reasonable to accept.
+4. **A failed candidate never swallows what follows it.** A real version can be glued to a
+   bad one (`3.999.0-3.13.1`), and the scan must still find it. Decision 3's anchor guard is
+   what secures this today: every position inside a candidate run has a version-character
+   predecessor, so skipping to the run's end is provably equivalent to advancing one byte.
+   The one-byte advance is kept as the guard's backstop — it is what preserved the property
+   before the guard widened, and the only thing left if the guard is ever narrowed. The
+   tests pin the *outcome*, which holds under either advance, rather than the mechanism.
+5. **The scanner only ever tightens, with one standing exception.** Python 4, `X.Y` without a
+   micro, and non-ASCII encodings are out of scope by policy: widening needs a build that
+   fails without it, not a shape that seems reasonable to accept. `+` is the exception that
+   met that bar — CPython appends it to `PY_VERSION` immediately after tagging a release
+   while the numeric fields, and so `PY_VERSION_HEX`, keep the released value, so a branch
+   checkout emits `3.10.16+`. Below 3.11 the scanner is the only source, making such a build
+   unattachable; accepting `+` as a terminator also makes the scanner *agree* with the symbol
+   path on that build rather than diverge from it.
 
 ## Consequences
 

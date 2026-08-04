@@ -66,8 +66,13 @@ const fn is_version_char(b: u8) -> bool {
 /// Bytes that may follow an embedded `PY_VERSION` literal. Anything else means the match
 /// is part of a longer token — `-` is what rejects the `v3.14.0-dirty` build tag sitting
 /// a few bytes from the literal in a 3.14 image.
+///
+/// `+` is a terminator, not a rejection: CPython bumps `PY_VERSION` to `"X.Y.Z+"` right
+/// after tagging a release while the numeric fields keep the released value, so a branch
+/// checkout emits `3.10.16+` and its `PY_VERSION_HEX` still reads `3.10.16`. Accepting it
+/// is what makes the scanner agree with the symbol path on the same build.
 const fn is_terminator(b: u8) -> bool {
-    matches!(b, 0 | b' ' | b'(' | b'\n' | b'\r' | b'\t' | b'"')
+    matches!(b, 0 | b' ' | b'(' | b'\n' | b'\r' | b'\t' | b'"' | b'+')
 }
 
 /// The one version grammar: a bare fully-qualified `X.Y.Z` with an optional `aN`/`bN`/
@@ -106,8 +111,9 @@ fn parse_exact(s: &str) -> Option<PythonVersion> {
         _ => (0xF, 0),
     };
 
-    // Nothing may remain: this is what rejects `3.12.0z`, which the scanner would
-    // otherwise accept at that position.
+    // Nothing may remain. In the scanner this is the rule that catches an in-charset but
+    // ungrammatical tail (`3.12.0c`, `3.12.0rc1a`); `3.12.0z` never reaches it, since `z`
+    // is outside the charset, ends the run early, and is refused by the terminator rule.
     if chars.next().is_some() || serial > 0xF {
         return None;
     }
@@ -338,7 +344,8 @@ fn scan_for_version_string(bytes: &[u8]) -> Option<PythonVersion> {
         }
 
         // As far as a version could extend; ASCII by construction, so the `&str` always
-        // builds. Requiring the *whole* run to parse is what rejects `3.12.0z`.
+        // builds. Requiring the *whole* run to parse is what rejects `3.12.0c`, where the
+        // run swallows a charset character the grammar cannot use.
         let end = bytes[i..]
             .iter()
             .position(|&b| !is_version_char(b))
@@ -351,8 +358,9 @@ fn scan_for_version_string(bytes: &[u8]) -> Option<PythonVersion> {
             return Some(ver);
         }
 
-        // Exactly one byte: a real version can be glued to a failed candidate
-        // (`3.999.0-3.13.1`), so skipping to its end would miss it.
+        // One byte. The anchor guard above already rejects every position inside a run,
+        // so `i = end` would behave identically today; this is its backstop, and the only
+        // thing preserving the property if that guard is ever narrowed.
         i += 1;
     }
     None
@@ -592,9 +600,10 @@ mod tests {
         }
     }
 
-    /// A failed candidate advances one byte, so a version glued to it is still found
-    /// (the C5 property). The hyphen and `zzz` matter: a space would terminate the
-    /// failed candidate anyway, passing even with a broken advance.
+    /// A version glued to a failed candidate is still found (the C5 property). What
+    /// secures this is now the anchor guard, not the one-byte advance: every position
+    /// inside a run has a version-character predecessor, so `i = end` behaves identically
+    /// — these cases pin the outcome, which holds under either advance.
     #[test]
     fn scan_advances_one_byte_past_a_failed_candidate() {
         assert_eq!(
@@ -609,6 +618,42 @@ mod tests {
             scan_for_version_string(b"3.13 then 3.13.4 "),
             Some(v(3, 13, 4, 0xF, 0))
         );
+    }
+
+    /// A branch checkout carries `PY_VERSION` as `"X.Y.Z+"` — CPython appends the `+`
+    /// right after tagging, while the numeric fields, and so `PY_VERSION_HEX`, keep the
+    /// released value. Below 3.11 the scanner is the only version source, so treating
+    /// `+` as anything but a terminator makes such an interpreter unattachable. Accepting
+    /// it also matches what the 3.11+ symbol path reports for the very same build.
+    #[test]
+    fn scan_accepts_the_dev_branch_plus_suffix() {
+        assert_eq!(
+            scan_for_version_string(b"3.10.16+\x00"),
+            Some(v(3, 10, 16, 0xF, 0))
+        );
+        assert_eq!(
+            scan_for_version_string(b"3.15.0a8+\x00"),
+            Some(v(3, 15, 0, 0xA, 8))
+        );
+        // The `+` ends the version; it is not part of it.
+        assert_eq!(
+            scan_for_version_string(b"3.10.16+extra"),
+            Some(v(3, 10, 16, 0xF, 0))
+        );
+    }
+
+    /// Two different rules refuse two similar-looking tails, and conflating them invites
+    /// a "simplification" that drops one. `c` is inside the charset, so the run swallows
+    /// it and `parse_exact` refuses the whole run; `z` is outside it, so the run ends
+    /// early, `parse_exact` sees a valid `3.12.0`, and the terminator rule refuses it.
+    #[test]
+    fn scan_refuses_in_charset_and_out_of_charset_tails_by_different_rules() {
+        assert_eq!(scan_for_version_string(b"3.12.0c\x00"), None);
+        assert_eq!(scan_for_version_string(b"3.12.0rc1a\x00"), None);
+        assert_eq!(parse_exact("3.12.0c"), None);
+        // Out-of-charset: `parse_exact` accepts what the run holds, the terminator rejects.
+        assert_eq!(parse_exact("3.12.0"), Some(v(3, 12, 0, 0xF, 0)));
+        assert_eq!(scan_for_version_string(b"3.12.0z"), None);
     }
 
     /// End-of-buffer terminates a candidate as surely as a NUL does: the embedded
