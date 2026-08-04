@@ -8,9 +8,9 @@
 
 mod common;
 
-use common::{SpawnedPython, python_version, test_python};
+use common::{SpawnedPython, full_python_version, python_version, test_python};
 
-use gcscope::memory::process;
+use gcscope::memory::{binary, process};
 use gcscope::remote_debugging::offsets::{self, pre_3_13};
 use gcscope::remote_debugging::session::PySession;
 use gcscope::remote_debugging::version;
@@ -37,6 +37,61 @@ fn detect_matches_the_interpreter_version() {
             "version::detect disagrees with `python --version`"
         );
     }
+}
+
+/// The rodata string scan, against the target's **own** on-disk image.
+///
+/// `detect` returns on the `Py_Version` symbol from 3.11 up, so without this the scan runs
+/// live only on the pre-3.11 legs, a third of the matrix, though the sole version source
+/// there. Asserts the **whole** version: micro, level and serial are what the grammar
+/// decides and what a `(major, minor)` check cannot see.
+/// Version-independent — runs on the whole supported range.
+#[test]
+#[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]
+fn image_scan_matches_the_interpreter_version() {
+    let Some(python) = test_python() else {
+        eprintln!("SKIP image_scan_matches_the_interpreter_version: no Python found");
+        return;
+    };
+    let Some(expected) = full_python_version(&python) else {
+        eprintln!("SKIP image_scan_matches_the_interpreter_version: no sys.version_info");
+        return;
+    };
+    let proc = SpawnedPython::spawn(&python).expect("spin.py should reach READY");
+
+    let modules =
+        binary::find_python_modules(proc.pid()).expect("the target has Python modules mapped");
+    assert!(
+        !modules.is_empty(),
+        "no Python modules found for the target"
+    );
+
+    // In `detect`'s own order: the first module whose image yields a literal is the one
+    // whose answer `detect` would take, so that is the one under test. Modules with no
+    // literal (a launcher stub, the stable-ABI `python3.dll`) are skipped, as there.
+    let scanned = modules.iter().find_map(|(path, _)| {
+        let bytes = std::fs::read(path).ok()?;
+        version::scan_image_for_version(&bytes).map(|v| (path.clone(), v))
+    });
+
+    let Some((path, found)) = scanned else {
+        panic!(
+            "no module image yielded a PY_VERSION literal; modules: {:?}",
+            modules.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+    };
+
+    assert_eq!(
+        (
+            found.major,
+            found.minor,
+            found.micro,
+            found.release_level,
+            found.serial
+        ),
+        expected,
+        "image scan of {path} disagrees with sys.version_info"
+    );
 }
 
 /// `read_offsets` finds `_PyRuntime`, reads the live `_Py_DebugOffsets` version word,

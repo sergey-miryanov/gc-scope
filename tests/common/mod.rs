@@ -70,6 +70,37 @@ pub fn python_version(python: &Path) -> Option<(u8, u8)> {
     Some((major, minor))
 }
 
+/// The interpreter's **full** self-reported version as gcscope encodes it:
+/// `(major, minor, micro, release_level, serial)`, with the level as the hex nibble
+/// `PY_VERSION_HEX` uses (`0xA` alpha, `0xB` beta, `0xC` candidate, `0xF` final).
+///
+/// `python_version` stops at `(major, minor)` because its callers gate on the minor. The
+/// string scan decides micro, level and serial too, and a scan that got the micro wrong
+/// would sail through a `(major, minor)` check.
+pub fn full_python_version(python: &Path) -> Option<(u8, u8, u8, u8, u8)> {
+    let out = Command::new(python)
+        .args([
+            "-c",
+            "import sys;v=sys.version_info;print(v[0],v[1],v[2],v[3],v[4])",
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut f = s.split_whitespace();
+    let major = f.next()?.parse().ok()?;
+    let minor = f.next()?.parse().ok()?;
+    let micro = f.next()?.parse().ok()?;
+    let level = match f.next()? {
+        "alpha" => 0xA,
+        "beta" => 0xB,
+        "candidate" => 0xC,
+        "final" => 0xF,
+        _ => return None,
+    };
+    let serial = f.next()?.parse().ok()?;
+    Some((major, minor, micro, level, serial))
+}
+
 /// Whether `python --version` runs and exits 0 (i.e. the interpreter is usable).
 fn runs(python: &Path) -> bool {
     Command::new(python)

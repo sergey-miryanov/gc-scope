@@ -47,6 +47,24 @@ A layered gate, each layer matched to what it can actually prove:
    `#[cfg(feature = "test-hooks")]` hook so the tested configuration is the shipped one.
 4. **Fail closed.** When the live path cannot confirm what it decoded, hard-error rather
    than emit plausible garbage (the ring-size mismatch guard; see ADR 0006).
+5. **Adversarial input gets its own layer**, because `version::scan_image_for_version` is
+   the one entry point fed bytes gcscope does not control, and below 3.11 the sole version
+   source. Both tiers assert only that it *returns*, and that what it returns is
+   representable; which version is right belongs to the unit sweep and the live image test.
+   - `image_scan_survives_adversarial_bytes` (unit): fixed-seed bytes behind real
+     PE/ELF/Mach-O magics. Sub-second, every platform. Found the `parse_macho` hang, where
+     an unchecked `narches` walked ~4e9 iterator errors.
+   - `fuzz/fuzz_targets/scan_image_for_version.rs` (cargo-fuzz, Linux CI, 120s):
+     coverage-guided, so it reaches shapes a blind generator will not. A smoke gate at that
+     budget; run it longer by hand when touching the scanner or `memory::binary`. Windows
+     MSVC cannot run it: the ASAN runtime there mismatches rustc's LLVM, and
+     `--sanitizer none` fails to link libFuzzer's sancov symbols.
+6. **Mutation testing is a periodic audit, not a gate**, following the ADR 0009 shape. It
+   answers "does any test pin this line?", which a green suite cannot, but needs minutes per
+   run and human triage of unviable mutants, so a red leg would be noise. **Trigger:** a
+   change to `remote_debugging::version` or `memory::binary`, or a review finding a test that
+   asserted less than its name claimed, which is what prompted this entry. A surviving mutant
+   is a missing assertion, not necessarily a bug.
 
 ## Consequences
 
@@ -57,3 +75,6 @@ A layered gate, each layer matched to what it can actually prove:
   permission needed); a dedicated Linux job grants ptrace and runs them as a blocking gate.
 - Closes the open item of [ADR 0001](0001-pysession-resolve-once-facade.md): the cache-hit
   and soft-reattach paths are now observed.
+- The layers above are the *why*. Which kind a given change calls for lives in
+  [`docs/testing-policy.md`](../testing-policy.md), which holds rules and links only, so
+  the two cannot contradict each other.

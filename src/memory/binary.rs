@@ -85,12 +85,26 @@ pub fn parse_macho(bytes: &[u8]) -> Option<(goblin::mach::MachO<'_>, usize)> {
     match Mach::parse(bytes).ok()? {
         Mach::Binary(macho) => Some((macho, 0)),
         Mach::Fat(fat) => {
+            // Latency only: the hang fix is the `break` below. Without this bound a 64 MB
+            // corrupt image still terminates, after walking every entry that fits (~2.4s
+            // debug). Mutation testing reports the bound unpinned for that reason: only a
+            // timing assertion could tell the difference, and that flakes.
+            if fat.narches > bytes.len() / goblin::mach::fat::SIZEOF_FAT_ARCH {
+                return None;
+            }
             let want = if cfg!(target_arch = "aarch64") {
                 goblin::mach::cputype::CPU_TYPE_ARM64
             } else {
                 goblin::mach::cputype::CPU_TYPE_X86_64
             };
-            for arch in fat.iter_arches().flatten() {
+            for arch in fat.iter_arches() {
+                // `narches` is unchecked and the iterator yields one `Err` per unreadable
+                // entry rather than stopping, so a `.flatten()` here walks every one of the
+                // ~4e9 a corrupt header can claim and spins for minutes.
+                // A table that stops parsing cannot be trusted past that point. (Found by
+                // `image_scan_survives_adversarial_bytes`; `0xcafebabe` is also the Java
+                // class-file magic, so a mapped `.class` reaches here.)
+                let Ok(arch) = arch else { break };
                 if arch.cputype != want {
                     continue;
                 }
@@ -163,5 +177,23 @@ mod tests {
         );
         assert!(kind(b"not a binary").is_none());
         assert!(kind(&[0u8; 4]).is_none());
+    }
+
+    /// A fat header claiming more architectures than the file can hold is refused, not
+    /// walked. Unbounded, that spins for minutes and hangs every subcommand through
+    /// `version::detect`. The real assertion is that this returns at all; a regression
+    /// shows up as the test timing out rather than failing.
+    #[test]
+    fn parse_macho_refuses_a_fat_header_claiming_impossible_arch_count() {
+        // FAT_MAGIC, then nfat_arch = 0xffff_ffff (big-endian), then filler.
+        let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe, 0xff, 0xff, 0xff, 0xff];
+        bytes.resize(256, 0x41);
+        assert!(parse_macho(&bytes).is_none());
+
+        // The bound is what the buffer can hold, so a plausible-but-still-too-large
+        // count is refused too: 256 bytes hold at most 12 twenty-byte entries.
+        let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe, 0x00, 0x00, 0x00, 0x40];
+        bytes.resize(256, 0x41);
+        assert!(parse_macho(&bytes).is_none());
     }
 }

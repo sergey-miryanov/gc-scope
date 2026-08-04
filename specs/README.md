@@ -17,7 +17,6 @@ Complements the two backward-looking docs:
 | [0003](0003-remote-walk-and-read-hardening.md) | Bug — safety | S | Unaligned `&[u64]` view over a `Vec<u8>`, and an unbounded interpreter walk |
 | [0004](0004-free-threaded-validation-reporting.md) | Bug — reporting | S | `read-runtime` scores `free_threaded = 1` as a *failed* check on a build gcscope fully supports |
 | [0005](0005-tui-ring-geometry-from-layout.md) | Bug — correctness | S | Last hardcoded ring-geometry copy: the TUI tree's entry subtree is wrong on free-threaded targets |
-| [0006](0006-version-parser-unification.md) | Bug — drift | S | Two version grammars; the byte scanner lacks the serial clamp its twin applies |
 | [0007](0007-tui-static-content-caching.md) | Feature — efficiency | M | Per-frame rebuild of immutable TUI content (offsets tree, hex dump, color maps) |
 | [0008](0008-shared-formatters-and-pid-table.md) | Feature — cleanup | M | Two hex formatters; PID-row assembly duplicated across the CLI table and the TUI picker |
 | [0009](0009-venv-launcher-child-retarget.md) | Feature — ergonomics | M | Windows venv shim PIDs fail single-shot commands; `attach` should re-target to the child |
@@ -95,7 +94,7 @@ two large refactors resolved since:
 | Finding | How it was resolved |
 |---|---|
 | C3 — 3.15.0a7 half-wired | Resolved by removal; the registry is now `v_3_13_0` / `v_3_14_0` / `v_3_15_0b1` (+`_gcinc`) / `v_3_15_0b4` / `v_3_16_0a0` with `ALIASES` + `GC_CANDIDATES` ([ADR 0011](../docs/adr/0011-layout-equivalence-sweep.md)) |
-| C5 — version scan aborted on the first bad candidate | `scan_for_version_string` advances past every failed candidate |
+| C5 — version scan aborted on the first bad candidate | `scan_for_version_string` advances **one byte** past a failed candidate. Advancing past the whole candidate would skip a real version glued to it (`3.999.0-3.13.1`) |
 | C8 — dead `find-runtime --check` fallback | Deleted; the subcommand takes only a PID |
 | E3 — PID picker hardcoded `verify=true` | `list_python_processes` no longer takes a verify flag |
 | R5 — formatting toolkit copy-pasted | Consolidated into `tui::format` |
