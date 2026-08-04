@@ -67,10 +67,9 @@ const fn is_version_char(b: u8) -> bool {
 /// is part of a longer token — `-` is what rejects the `v3.14.0-dirty` build tag sitting
 /// a few bytes from the literal in a 3.14 image.
 ///
-/// `+` is a terminator, not a rejection: CPython bumps `PY_VERSION` to `"X.Y.Z+"` right
-/// after tagging a release while the numeric fields keep the released value, so a branch
-/// checkout emits `3.10.16+` and its `PY_VERSION_HEX` still reads `3.10.16`. Accepting it
-/// is what makes the scanner agree with the symbol path on the same build.
+/// `+` terminates rather than rejects: CPython appends it to `PY_VERSION` after tagging
+/// while `PY_VERSION_HEX` keeps the released value, so a branch checkout emits
+/// `3.10.16+` and must still read as `3.10.16` (ADR 0012).
 const fn is_terminator(b: u8) -> bool {
     matches!(b, 0 | b' ' | b'(' | b'\n' | b'\r' | b'\t' | b'"' | b'+')
 }
@@ -170,14 +169,7 @@ pub fn detect(pid: u32) -> Result<PythonVersion> {
             Ok(b) => b,
             Err(_) => continue,
         };
-        // Scan the read-only data section first (where `PY_VERSION` lives), which
-        // avoids stray `"3.x"` bytes elsewhere in the image; fall back to the whole
-        // image if that section can't be located or holds no match, so no build regresses.
-        let scanned = match read_only_data(&bytes) {
-            Some(ro) => scan_for_version_string(ro).or_else(|| scan_for_version_string(&bytes)),
-            None => scan_for_version_string(&bytes),
-        };
-        if let Some(ver) = scanned
+        if let Some(ver) = scan_image_for_version(&bytes)
             && ver.major == 3
         {
             return Ok(ver);
@@ -188,6 +180,22 @@ pub fn detect(pid: u32) -> Result<PythonVersion> {
 }
 
 // ── Symbol resolution ───────────────────────────────────────
+
+/// Read one already-read module image's embedded `PY_VERSION` literal.
+///
+/// The read-only data section first — where the literal is emitted, and away from stray
+/// `"3.x"` bytes elsewhere in the image — then the whole image if that section cannot be
+/// located or holds no match, so no build regresses.
+///
+/// This is `detect`'s second phase, exposed because `detect` short-circuits on the
+/// `Py_Version` symbol from 3.11 up: without a way in here, the scan is only ever
+/// exercised live on the pre-3.11 legs, which is a third of the matrix.
+pub fn scan_image_for_version(bytes: &[u8]) -> Option<PythonVersion> {
+    match read_only_data(bytes) {
+        Some(ro) => scan_for_version_string(ro).or_else(|| scan_for_version_string(bytes)),
+        None => scan_for_version_string(bytes),
+    }
+}
 
 /// Resolve `name` to an absolute load address within one already-read module image.
 /// Dispatches on the binary format; returns `None` if the symbol is absent.
@@ -620,11 +628,9 @@ mod tests {
         );
     }
 
-    /// A branch checkout carries `PY_VERSION` as `"X.Y.Z+"` — CPython appends the `+`
-    /// right after tagging, while the numeric fields, and so `PY_VERSION_HEX`, keep the
-    /// released value. Below 3.11 the scanner is the only version source, so treating
-    /// `+` as anything but a terminator makes such an interpreter unattachable. Accepting
-    /// it also matches what the 3.11+ symbol path reports for the very same build.
+    /// A branch checkout spells `PY_VERSION` as `"X.Y.Z+"` while `PY_VERSION_HEX` keeps
+    /// the released value. Below 3.11 the scanner is the only source, so rejecting `+`
+    /// makes such an interpreter unattachable.
     #[test]
     fn scan_accepts_the_dev_branch_plus_suffix() {
         assert_eq!(
@@ -642,10 +648,10 @@ mod tests {
         );
     }
 
-    /// Two different rules refuse two similar-looking tails, and conflating them invites
-    /// a "simplification" that drops one. `c` is inside the charset, so the run swallows
-    /// it and `parse_exact` refuses the whole run; `z` is outside it, so the run ends
-    /// early, `parse_exact` sees a valid `3.12.0`, and the terminator rule refuses it.
+    /// Two rules refuse two similar-looking tails, and conflating them invites a
+    /// "simplification" that drops one. `c` is in the charset, so the run swallows it and
+    /// `parse_exact` refuses the whole run; `z` is not, so the run ends early,
+    /// `parse_exact` accepts `3.12.0`, and the terminator rule does the refusing.
     #[test]
     fn scan_refuses_in_charset_and_out_of_charset_tails_by_different_rules() {
         assert_eq!(scan_for_version_string(b"3.12.0c\x00"), None);
@@ -654,6 +660,133 @@ mod tests {
         // Out-of-charset: `parse_exact` accepts what the run holds, the terminator rejects.
         assert_eq!(parse_exact("3.12.0"), Some(v(3, 12, 0, 0xF, 0)));
         assert_eq!(scan_for_version_string(b"3.12.0z"), None);
+    }
+
+    /// Every version the type can represent, rendered and scanned back. `Display` and the
+    /// grammar describe one format, and a table names only a few points on it; sweeping
+    /// catches a rule that is right at the examples someone thought of and wrong
+    /// elsewhere — the gap that hid both the `3.15.0b17` divergence and the `+` suffix.
+    #[test]
+    fn every_representable_version_round_trips_through_the_scanner() {
+        let mut checked = 0usize;
+        for minor in 0..=20u8 {
+            for micro in 0..=99u8 {
+                let mut cases = vec![v(3, minor, micro, 0xF, 0)];
+                for level in [0xA, 0xB, 0xC] {
+                    for serial in 0..=0xFu8 {
+                        cases.push(v(3, minor, micro, level, serial));
+                    }
+                }
+                for want in cases {
+                    // Embedded, not bare, so the anchor guard is exercised too. `junk`
+                    // holds no version character, so it cannot mask the anchor.
+                    let mut buf = b"junk\x00".to_vec();
+                    buf.extend_from_slice(want.to_string().as_bytes());
+                    buf.push(0);
+                    assert_eq!(
+                        scan_for_version_string(&buf),
+                        Some(want),
+                        "round-trip failed for {want}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(
+            checked,
+            21 * 100 * 49,
+            "the sweep must cover the whole space"
+        );
+
+        // Every terminator, against a spread of shapes.
+        for term in [0u8, b' ', b'(', b'\n', b'\r', b'\t', b'"', b'+'] {
+            for want in [
+                v(3, 8, 19, 0xF, 0),
+                v(3, 15, 0, 0xA, 8),
+                v(3, 13, 1, 0xC, 15),
+                v(3, 10, 16, 0xF, 0),
+            ] {
+                let mut buf = want.to_string().into_bytes();
+                buf.push(term);
+                assert_eq!(
+                    scan_for_version_string(&buf),
+                    Some(want),
+                    "terminator {term:#04x} failed for {want}"
+                );
+            }
+        }
+    }
+
+    /// `scan_image_for_version` over adversarial bytes: it must return, and what it
+    /// returns must be representable. The everywhere-it-runs half of the fuzzing story
+    /// (`fuzz/` is coverage-guided but Linux-only); deterministic, so a failure reproduces.
+    ///
+    /// The buffers start with real image magics on purpose. Behind a valid-looking header
+    /// the bytes reach goblin's header parsing, `parse_macho`'s fat-slice arithmetic and
+    /// the section-range clamping — where a hang was in fact found — rather than only the
+    /// string grammar, whose bounds are guarded by construction.
+    #[test]
+    fn image_scan_survives_adversarial_bytes() {
+        // splitmix64: tiny, deterministic, and good enough to shake out structure.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+
+        // Magics `binary::classify` dispatches on, plus a non-image control.
+        const MAGICS: [&[u8]; 6] = [
+            &[0x7f, b'E', b'L', b'F'],
+            &[b'M', b'Z', 0x90, 0x00],
+            &[0xfe, 0xed, 0xfa, 0xce],
+            &[0xcf, 0xfa, 0xed, 0xfe],
+            &[0xca, 0xfe, 0xba, 0xbe],
+            &[0xde, 0xad, 0xbe, 0xef],
+        ];
+        // Fragments that push the generator toward the interesting grammar boundaries
+        // instead of relying on random bytes to spell a version.
+        const SEEDS: [&[u8]; 8] = [
+            b"3.13.1\0",
+            b"3.15.0b17\0",
+            b"3.10.16+",
+            b"3.12.0z",
+            b"3.999.0-3.13.1\0",
+            b"3.",
+            b"3.13.1a3.12.0\0",
+            b"PY_VERSION",
+        ];
+
+        for round in 0..4000u32 {
+            let mut buf = MAGICS[(round as usize) % MAGICS.len()].to_vec();
+            let len = 8 + (next() % 248) as usize;
+            while buf.len() < len {
+                let r = next();
+                if r % 5 == 0 {
+                    buf.extend_from_slice(SEEDS[(r >> 8) as usize % SEEDS.len()]);
+                } else {
+                    buf.extend_from_slice(&r.to_le_bytes());
+                }
+            }
+            buf.truncate(len.max(4));
+
+            // The assertion is mostly that this returns at all.
+            if let Some(found) = scan_image_for_version(&buf) {
+                assert_eq!(found.major, 3, "round {round}: the scan anchors on `3.`");
+                assert!(
+                    found.serial <= 0xF,
+                    "round {round}: serial {} does not fit the hex",
+                    found.serial
+                );
+                assert!(
+                    matches!(found.release_level, 0xA | 0xB | 0xC | 0xF),
+                    "round {round}: release level {:#x} is not one the grammar produces",
+                    found.release_level
+                );
+            }
+        }
     }
 
     /// End-of-buffer terminates a candidate as surely as a NUL does: the embedded

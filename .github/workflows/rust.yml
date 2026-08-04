@@ -60,6 +60,48 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
 
 
+  fuzz:
+    name: Fuzz the image version scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # cargo-fuzz needs nightly for -Z sanitizer; the crate itself builds on stable.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: cargo-fuzz
+
+      # The only entry point fed bytes gcscope does not control, and below 3.11 the sole
+      # version source. Covers goblin's header parsing and the fat-slice arithmetic too,
+      # which is where the hang fixed in `parse_macho` lived. Time-boxed: a smoke gate,
+      # not a campaign — run it longer locally when touching the scanner or memory::binary.
+      - name: Fuzz scan_image_for_version
+        run: cargo fuzz run scan_image_for_version -- -max_total_time=120 -rss_limit_mb=4096
+
+      # A red leg is worthless without the input that caused it, and libFuzzer's own dump
+      # truncates for large inputs. base64 the artifact into the log rather than adding an
+      # upload action to the supply chain.
+      - name: Emit the crashing input
+        if: failure()
+        run: |
+          shopt -s nullglob
+          found=0
+          for f in fuzz/artifacts/*/*; do
+            found=1
+            echo "::group::$f ($(stat -c%s "$f") bytes)"
+            base64 "$f"
+            echo "::endgroup::"
+          done
+          [ "$found" = 1 ] || echo "No artifact written — the failure was not a crash."
+
+
   matrix-unpinned:
     name: Smoke matrix stays unpinned
     runs-on: ubuntu-latest

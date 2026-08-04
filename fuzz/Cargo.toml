@@ -1,0 +1,21 @@
+[package]
+name = "gcscope-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.gcscope]
+path = ".."
+
+[[bin]]
+name = "scan_image_for_version"
+path = "fuzz_targets/scan_image_for_version.rs"
+test = false
+doc = false
+bench = false
