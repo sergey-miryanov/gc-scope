@@ -57,6 +57,11 @@ cargo +nightly fuzz run scan_image_for_version   # Linux only
 cargo mutants -f src/remote_debugging/version.rs # periodic audit, never a gate
 ```
 
+If `cargo fuzz` fails with `sanitizer is incompatible with statically linked libc`, it was
+installed as a musl prebuilt and baked that target in as its default. Pass the host triple
+instead, which is what the CI job does:
+`cargo +nightly fuzz run --target $(rustc -vV | sed -n 's/^host: //p') scan_image_for_version`.
+
 **Before adding a test, read [`docs/testing-policy.md`](docs/testing-policy.md).** It says
 which kind a given change calls for, and which kinds would give false comfort. The short
 version: a wrong struct offset executes the same lines as a right one, so no unit test
