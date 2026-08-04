@@ -82,8 +82,17 @@ jobs:
       # version source. Covers goblin's header parsing and the fat-slice arithmetic too,
       # which is where the hang fixed in `parse_macho` lived. Time-boxed: a smoke gate,
       # not a campaign — run it longer locally when touching the scanner or memory::binary.
+      #
+      # `--target` is not optional: cargo-fuzz bakes its default in at *its own* build
+      # time, and the prebuilt binary install-action fetches is musl-built, so it defaults
+      # to x86_64-unknown-linux-musl — which is not installed here, and is crt-static,
+      # which ASAN refuses outright. Derive the real host triple rather than hardcoding
+      # one, so this survives a runner architecture change.
       - name: Fuzz scan_image_for_version
-        run: cargo fuzz run scan_image_for_version -- -max_total_time=120 -rss_limit_mb=4096
+        run: |
+          HOST=$(rustc -vV | sed -n 's/^host: //p')
+          echo "host triple: $HOST"
+          cargo fuzz run --target "$HOST" scan_image_for_version -- -max_total_time=120 -rss_limit_mb=4096
 
       # A red leg is worthless without the input that caused it, and libFuzzer's own dump
       # truncates for large inputs. base64 the artifact into the log rather than adding an
