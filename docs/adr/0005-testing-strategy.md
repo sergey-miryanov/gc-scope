@@ -75,3 +75,6 @@ A layered gate, each layer matched to what it can actually prove:
   permission needed); a dedicated Linux job grants ptrace and runs them as a blocking gate.
 - Closes the open item of [ADR 0001](0001-pysession-resolve-once-facade.md): the cache-hit
   and soft-reattach paths are now observed.
+- The layers above are the *why*. Which kind a given change calls for lives in
+  [`docs/testing-policy.md`](../testing-policy.md), which holds rules and links only, so
+  the two cannot contradict each other.
