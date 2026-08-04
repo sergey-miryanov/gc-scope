@@ -50,6 +50,20 @@ ad-hoc signatures. Re-sign after every build; `cargo build` replaces the binary.
 
 ## Testing
 
+```powershell
+cargo test                                       # unit + property tests, no Python needed
+cargo test --test live_smoke -- --ignored        # the live matrix; needs attach permission
+cargo +nightly fuzz run scan_image_for_version   # Linux only
+cargo mutants -f src/remote_debugging/version.rs # periodic audit, never a gate
+```
+
+**Before adding a test, read [`docs/testing-policy.md`](docs/testing-policy.md).** It says
+which kind a given change calls for, and which kinds would give false comfort. The short
+version: a wrong struct offset executes the same lines as a right one, so no unit test
+catches this codebase's characteristic bug, and the live matrix (3 OSes × Python 3.8
+through 3.15 plus 3.15t) is the real gate.
+[ADR 0005](docs/adr/0005-testing-strategy.md) carries the reasoning behind the layers.
+
 The `.gc-gen-3.15+inc` venv provides a custom 3.15+rc Python build
 for testing. Since venv launchers are child processes,
 `find-runtime` and `read-runtime` use `remoteprocess` to
