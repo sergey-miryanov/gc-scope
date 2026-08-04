@@ -438,6 +438,11 @@ mod tests {
             "3.12.0r",
             "3.12.0a",
             "3.12.0.1",
+            // A component followed by something that is not the next separator. The
+            // scanner cannot produce these (its charset run stops at `x`), but
+            // `parse_exact` is the grammar's definition and owns the rule.
+            "3x.12.0",
+            "3.12x.0",
             "",
             "3",
             "3.x",
@@ -466,6 +471,21 @@ mod tests {
         assert_eq!(parse_exact("3.15.0a16"), None);
         assert_eq!(parse_exact("3.15.0rc99"), None);
         assert_eq!(parse_exact("3.15.0b15"), Some(v(3, 15, 0, 0xB, 15)));
+    }
+
+    /// `from_hex` decodes the release level from a nibble read out of live process
+    /// memory, so it can yield a level the grammar has no spelling for — a corrupt read,
+    /// or a level CPython has not defined. Rendering that as `-<hex><serial>` keeps it
+    /// diagnosable; rendering it as a final release would state something false. The form
+    /// is deliberately not re-parseable, since no such build can be named.
+    #[test]
+    fn display_marks_an_unrecognized_release_level() {
+        assert_eq!(v(3, 15, 0, 0xD, 2).to_string(), "3.15.0-d2");
+        assert_eq!(v(3, 15, 0, 0x0, 0).to_string(), "3.15.0-00");
+        assert_eq!(parse_exact("3.15.0-d2"), None);
+        // The nibble comes straight off a hex read, which is how such a value arrives.
+        let decoded = PythonVersion::from_hex(0x030f00d2).expect("valid hex");
+        assert_eq!(decoded.to_string(), "3.15.0-d2");
     }
 
     #[test]
@@ -563,11 +583,11 @@ mod tests {
             b"3.13.1a3.12.0\x00".as_slice(),
             b"libpython3.13.so.1.0".as_slice(),
         ] {
+            let label = String::from_utf8_lossy(bytes);
             assert_eq!(
                 scan_for_version_string(bytes),
                 None,
-                "should reject {:?}",
-                String::from_utf8_lossy(bytes)
+                "should reject {label:?}"
             );
         }
     }
