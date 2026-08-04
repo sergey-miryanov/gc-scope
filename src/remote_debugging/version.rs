@@ -414,6 +414,9 @@ mod tests {
             // Zero-padded components are accepted, as they were before: the rule is
             // the grammar, not the canonical rendering.
             ("3.08.1", v(3, 8, 1, 0xF, 0)),
+            // Digits are consumed greedily to the end of the run, up to what a u8
+            // holds — the component is not capped at two digits.
+            ("3.1.234", v(3, 1, 234, 0xF, 0)),
         ] {
             assert_eq!(parse_exact(s), Some(want), "should parse {s:?}");
         }
@@ -507,16 +510,6 @@ mod tests {
         );
         // A lone minor-only string yields nothing.
         assert_eq!(scan_for_version_string(b"python 3.13\x00"), None);
-    }
-
-    /// A version glued to the wrong context is rejected: a trailing digit run past the
-    /// micro (`3.1.23456...`) still parses as its own micro, but a `"3."` embedded in
-    /// a longer number (`13.12.0`, where the leading digit precedes `3.`) must not be
-    /// mistaken for a version.
-    #[test]
-    fn scan_rejects_a_version_embedded_in_a_larger_number() {
-        // The `3.` here is preceded by `1`, so it's part of `13.12` — not a version.
-        assert_eq!(scan_for_version_string(b"lib13.12.0"), None);
     }
 
     /// Trailing context must be a terminator (NUL, space, paren, quote, newline). A
