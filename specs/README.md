@@ -94,7 +94,7 @@ two large refactors resolved since:
 | Finding | How it was resolved |
 |---|---|
 | C3 — 3.15.0a7 half-wired | Resolved by removal; the registry is now `v_3_13_0` / `v_3_14_0` / `v_3_15_0b1` (+`_gcinc`) / `v_3_15_0b4` / `v_3_16_0a0` with `ALIASES` + `GC_CANDIDATES` ([ADR 0011](../docs/adr/0011-layout-equivalence-sweep.md)) |
-| C5 — version scan aborted on the first bad candidate | `scan_for_version_string` advances **one byte** past a failed candidate — not past the candidate, which would skip a real version glued to it (`3.999.0-3.13.1`) |
+| C5 — version scan aborted on the first bad candidate | `scan_for_version_string` advances **one byte** past a failed candidate. Advancing past the whole candidate would skip a real version glued to it (`3.999.0-3.13.1`) |
 | C8 — dead `find-runtime --check` fallback | Deleted; the subcommand takes only a PID |
 | E3 — PID picker hardcoded `verify=true` | `list_python_processes` no longer takes a verify flag |
 | R5 — formatting toolkit copy-pasted | Consolidated into `tui::format` |

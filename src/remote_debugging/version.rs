@@ -64,7 +64,7 @@ const fn is_version_char(b: u8) -> bool {
 }
 
 /// Bytes that may follow an embedded `PY_VERSION` literal. Anything else means the match
-/// is part of a longer token — `-` is what rejects the `v3.14.0-dirty` build tag sitting
+/// is part of a longer token; `-` is what rejects the `v3.14.0-dirty` build tag sitting
 /// a few bytes from the literal in a 3.14 image.
 ///
 /// `+` terminates rather than rejects: CPython appends it to `PY_VERSION` after tagging
@@ -75,12 +75,11 @@ const fn is_terminator(b: u8) -> bool {
 }
 
 /// The one version grammar: a bare fully-qualified `X.Y.Z` with an optional `aN`/`bN`/
-/// `rcN` suffix and nothing else — no whitespace, no `Python ` prefix, no trailing
+/// `rcN` suffix and nothing else: no whitespace, no `Python ` prefix, no trailing
 /// content. Callers delimit the candidate first; see `scan_for_version_string`.
 ///
-/// A serial past `0xF` does not fit the hex and is refused rather than clamped or
-/// mirrored — [ADR 0012](../../docs/adr/0012-version-detection-fails-closed.md) has the
-/// reasoning.
+/// A serial past `0xF` does not fit the hex and is refused rather than clamped or mirrored.
+/// [ADR 0012](../../docs/adr/0012-version-detection-fails-closed.md) has the reasoning.
 fn parse_exact(s: &str) -> Option<PythonVersion> {
     let mut chars = s.char_indices().peekable();
 
@@ -181,15 +180,15 @@ pub fn detect(pid: u32) -> Result<PythonVersion> {
 
 // ── Symbol resolution ───────────────────────────────────────
 
-/// Read one already-read module image's embedded `PY_VERSION` literal.
+/// Read a module image's embedded `PY_VERSION` literal.
 ///
-/// The read-only data section first — where the literal is emitted, and away from stray
-/// `"3.x"` bytes elsewhere in the image — then the whole image if that section cannot be
-/// located or holds no match, so no build regresses.
+/// The read-only data section first, where the literal is emitted and away from the stray
+/// `"3.x"` bytes elsewhere in the image. Then the whole image, if that section is missing
+/// or holds no match, so no build regresses.
 ///
-/// This is `detect`'s second phase, exposed because `detect` short-circuits on the
-/// `Py_Version` symbol from 3.11 up: without a way in here, the scan is only ever
-/// exercised live on the pre-3.11 legs, which is a third of the matrix.
+/// This is `detect`'s second phase, public because `detect` short-circuits on the
+/// `Py_Version` symbol from 3.11 up: without a way in here, the scan runs live only on the
+/// pre-3.11 legs, a third of the matrix.
 pub fn scan_image_for_version(bytes: &[u8]) -> Option<PythonVersion> {
     match read_only_data(bytes) {
         Some(ro) => scan_for_version_string(ro).or_else(|| scan_for_version_string(bytes)),
@@ -338,9 +337,9 @@ fn read_only_data(bytes: &[u8]) -> Option<&[u8]> {
 
 /// Locate an embedded `PY_VERSION` literal in a byte image and decode it.
 ///
-/// `detect` reaches this whenever the `Py_Version` symbol cannot be resolved, which is
-/// every attach below 3.11 — so it is the sole version source for 3.8/3.9/3.10, not a
-/// rare path. It locates and delimits; `parse_exact` is the only thing that parses.
+/// `detect` reaches this whenever the `Py_Version` symbol cannot be resolved, which is every
+/// attach below 3.11: the sole version source for 3.8/3.9/3.10. It locates and delimits;
+/// `parse_exact` does all the parsing.
 fn scan_for_version_string(bytes: &[u8]) -> Option<PythonVersion> {
     let mut i = 0;
     while i + 1 < bytes.len() {
@@ -431,7 +430,7 @@ mod tests {
             // the grammar, not the canonical rendering.
             ("3.08.1", v(3, 8, 1, 0xF, 0)),
             // Digits are consumed greedily to the end of the run, up to what a u8
-            // holds — the component is not capped at two digits.
+            // holds; the component is not capped at two digits.
             ("3.1.234", v(3, 1, 234, 0xF, 0)),
         ] {
             assert_eq!(parse_exact(s), Some(want), "should parse {s:?}");
@@ -490,8 +489,8 @@ mod tests {
     }
 
     /// `from_hex` decodes the release level from a nibble read out of live process
-    /// memory, so it can yield a level the grammar has no spelling for — a corrupt read,
-    /// or a level CPython has not defined. Rendering that as `-<hex><serial>` keeps it
+    /// memory, so it can yield a level the grammar has no spelling for: a corrupt read, or
+    /// a level CPython has not defined. Rendering that as `-<hex><serial>` keeps it
     /// diagnosable; rendering it as a final release would state something false. The form
     /// is deliberately not re-parseable, since no such build can be named.
     #[test]
@@ -512,10 +511,8 @@ mod tests {
         }
     }
 
-    // ── binary version-string scan (the on-disk source for `detect` below 3.11) ──
-    // The `Py_Version` symbol arrives in 3.11, so this is the sole version source for
-    // 3.8/3.9/3.10. Byte slices exercise the whole locate-delimit-parse chain without
-    // a real binary.
+    // ── binary version-string scan (the sole version source for `detect` below 3.11) ──
+    // Byte slices exercise the whole locate-delimit-parse chain without a real binary.
 
     /// A fully-qualified `PY_VERSION` literal embedded in surrounding bytes is found,
     /// with every field decoded — including the release suffix.
@@ -575,7 +572,7 @@ mod tests {
 
     /// A serial past 0xF names a build the hex cannot hold. Refuse rather than invent a
     /// neighbour: clamping reports `b15`, and mirroring `patchlevel.h`'s
-    /// `(level << 4) | serial` reports `b1` — a live `LAYOUTS` row, wrongly decoded.
+    /// `(level << 4) | serial` reports `b1`, a live `LAYOUTS` row, wrongly decoded.
     #[test]
     fn scan_refuses_a_serial_that_does_not_fit_the_hex() {
         assert_eq!(scan_for_version_string(b"3.15.0b17\x00"), None);
@@ -588,8 +585,8 @@ mod tests {
         );
     }
 
-    /// The `3` must not follow any character the grammar can consume — a digit
-    /// (`lib13.12.0`), a dot (`1.3.12.0`), a suffix letter (`3.13.1a3.12.0`) — or the
+    /// The `3` must not follow any character the grammar can consume: a digit
+    /// (`lib13.12.0`), a dot (`1.3.12.0`), a suffix letter (`3.13.1a3.12.0`). Otherwise the
     /// scan reads a version out of the middle of something else.
     #[test]
     fn scan_rejects_an_anchor_glued_to_a_longer_token() {
@@ -608,10 +605,10 @@ mod tests {
         }
     }
 
-    /// A version glued to a failed candidate is still found (the C5 property). What
-    /// secures this is now the anchor guard, not the one-byte advance: every position
-    /// inside a run has a version-character predecessor, so `i = end` behaves identically
-    /// — these cases pin the outcome, which holds under either advance.
+    /// A version glued to a failed candidate is still found (the C5 property). The anchor
+    /// guard secures it rather than the one-byte advance: every position inside a run has a
+    /// version-character predecessor, so `i = end` behaves identically. These cases pin the
+    /// outcome, which holds under either advance.
     #[test]
     fn scan_advances_one_byte_past_a_failed_candidate() {
         assert_eq!(
@@ -665,7 +662,7 @@ mod tests {
     /// Every version the type can represent, rendered and scanned back. `Display` and the
     /// grammar describe one format, and a table names only a few points on it; sweeping
     /// catches a rule that is right at the examples someone thought of and wrong
-    /// elsewhere — the gap that hid both the `3.15.0b17` divergence and the `+` suffix.
+    /// elsewhere. That gap hid both the `3.15.0b17` divergence and the `+` suffix.
     #[test]
     fn every_representable_version_round_trips_through_the_scanner() {
         let mut checked = 0usize;
@@ -717,14 +714,14 @@ mod tests {
         }
     }
 
-    /// `scan_image_for_version` over adversarial bytes: it must return, and what it
-    /// returns must be representable. The everywhere-it-runs half of the fuzzing story
-    /// (`fuzz/` is coverage-guided but Linux-only); deterministic, so a failure reproduces.
+    /// `scan_image_for_version` over adversarial bytes: it must return, and what it returns
+    /// must be representable. Runs everywhere, unlike `fuzz/` (coverage-guided, Linux only),
+    /// and is deterministic, so a failure reproduces.
     ///
     /// The buffers start with real image magics on purpose. Behind a valid-looking header
-    /// the bytes reach goblin's header parsing, `parse_macho`'s fat-slice arithmetic and
-    /// the section-range clamping — where a hang was in fact found — rather than only the
-    /// string grammar, whose bounds are guarded by construction.
+    /// the bytes reach goblin's header parsing, `parse_macho`'s fat-slice arithmetic and the
+    /// section-range clamping (where the hang was found), rather than only the string
+    /// grammar, whose bounds are guarded by construction.
     #[test]
     fn image_scan_survives_adversarial_bytes() {
         // splitmix64: tiny, deterministic, and good enough to shake out structure.

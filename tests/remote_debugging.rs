@@ -42,9 +42,9 @@ fn detect_matches_the_interpreter_version() {
 /// The rodata string scan, against the target's **own** on-disk image.
 ///
 /// `detect` returns on the `Py_Version` symbol from 3.11 up, so without this the scan runs
-/// live only on the pre-3.11 legs — a third of the matrix — though it is the sole version
-/// source there. Asserts the **whole** version: micro, level and serial are what the
-/// grammar decides and what a `(major, minor)` check cannot see.
+/// live only on the pre-3.11 legs, a third of the matrix, though the sole version source
+/// there. Asserts the **whole** version: micro, level and serial are what the grammar
+/// decides and what a `(major, minor)` check cannot see.
 /// Version-independent — runs on the whole supported range.
 #[test]
 #[ignore = "attaches to a live process; needs ptrace/taskport — run with --ignored"]

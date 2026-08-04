@@ -80,14 +80,14 @@ jobs:
 
       # The only entry point fed bytes gcscope does not control, and below 3.11 the sole
       # version source. Covers goblin's header parsing and the fat-slice arithmetic too,
-      # which is where the hang fixed in `parse_macho` lived. Time-boxed: a smoke gate,
-      # not a campaign — run it longer locally when touching the scanner or memory::binary.
+      # which is where the hang fixed in `parse_macho` lived. Time-boxed to a smoke gate;
+      # run it longer locally when touching the scanner or memory::binary.
       #
       # `--target` is not optional: cargo-fuzz bakes its default in at *its own* build
       # time, and the prebuilt binary install-action fetches is musl-built, so it defaults
-      # to x86_64-unknown-linux-musl — which is not installed here, and is crt-static,
-      # which ASAN refuses outright. Derive the real host triple rather than hardcoding
-      # one, so this survives a runner architecture change.
+      # to x86_64-unknown-linux-musl, which is not installed here and is crt-static, which
+      # ASAN refuses. Derive the real host triple rather than hardcoding one, so this
+      # survives a runner architecture change.
       - name: Fuzz scan_image_for_version
         run: |
           HOST=$(rustc -vV | sed -n 's/^host: //p')
@@ -108,7 +108,7 @@ jobs:
             base64 "$f"
             echo "::endgroup::"
           done
-          [ "$found" = 1 ] || echo "No artifact written — the failure was not a crash."
+          [ "$found" = 1 ] || echo "No artifact written; the failure was not a crash."
 
 
   matrix-unpinned:

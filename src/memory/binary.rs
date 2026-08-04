@@ -85,11 +85,10 @@ pub fn parse_macho(bytes: &[u8]) -> Option<(goblin::mach::MachO<'_>, usize)> {
     match Mach::parse(bytes).ok()? {
         Mach::Binary(macho) => Some((macho, 0)),
         Mach::Fat(fat) => {
-            // A fast path, *not* the fix — breaking on the first unreadable entry below
-            // is. Its only observable effect is latency (a 64 MB corrupt image still
-            // terminates without it, after walking every entry that fits, ~2.4s debug),
-            // so mutation testing reports it unpinned: only a timing assertion could
-            // distinguish it, which is not worth the flake.
+            // Latency only: the hang fix is the `break` below. Without this bound a 64 MB
+            // corrupt image still terminates, after walking every entry that fits (~2.4s
+            // debug). Mutation testing reports the bound unpinned for that reason: only a
+            // timing assertion could tell the difference, and that flakes.
             if fat.narches > bytes.len() / goblin::mach::fat::SIZEOF_FAT_ARCH {
                 return None;
             }
@@ -99,9 +98,9 @@ pub fn parse_macho(bytes: &[u8]) -> Option<(goblin::mach::MachO<'_>, usize)> {
                 goblin::mach::cputype::CPU_TYPE_X86_64
             };
             for arch in fat.iter_arches() {
-                // `narches` is unchecked and the iterator yields one `Err` per entry it
-                // cannot read rather than stopping, so the previous `.flatten()` walked
-                // every one of the ~4e9 a corrupt header can claim and spun for minutes.
+                // `narches` is unchecked and the iterator yields one `Err` per unreadable
+                // entry rather than stopping, so a `.flatten()` here walks every one of the
+                // ~4e9 a corrupt header can claim and spins for minutes.
                 // A table that stops parsing cannot be trusted past that point. (Found by
                 // `image_scan_survives_adversarial_bytes`; `0xcafebabe` is also the Java
                 // class-file magic, so a mapped `.class` reaches here.)
@@ -181,8 +180,8 @@ mod tests {
     }
 
     /// A fat header claiming more architectures than the file can hold is refused, not
-    /// walked — unbounded, that spins for minutes and hangs every subcommand through
-    /// `version::detect`. The real assertion is that this returns promptly; a regression
+    /// walked. Unbounded, that spins for minutes and hangs every subcommand through
+    /// `version::detect`. The real assertion is that this returns at all; a regression
     /// shows up as the test timing out rather than failing.
     #[test]
     fn parse_macho_refuses_a_fat_header_claiming_impossible_arch_count() {

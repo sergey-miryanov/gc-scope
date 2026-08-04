@@ -5,9 +5,9 @@
 //! locates the read-only data section first, so this covers PE/ELF/Mach-O header parsing,
 //! `parse_macho`'s fat-slice arithmetic and the section-range clamping.
 //!
-//! The property is that it returns rather than panics — a crash here turns a diagnosable
-//! "could not detect Python version" into a stack trace on every subcommand. Which version
-//! comes back is pinned by the unit sweep and the live image test (ADR 0005).
+//! The property is that it returns rather than panics. A crash here turns a diagnosable
+//! "could not detect Python version" into a stack trace on every subcommand. The unit sweep
+//! and the live image test pin which version comes back (ADR 0005).
 //!
 //! Run: `cargo +nightly fuzz run scan_image_for_version`.
 
