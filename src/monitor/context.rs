@@ -155,12 +155,10 @@ impl<'a> MonitorContext<'a> {
 /// `ts_start == 0` means an untouched entry (never collected) and is never selected —
 /// the initial mark is 0 and selection is strictly greater-than.
 ///
-/// An entry caught mid-collection ([`GcStat::is_complete`] false: `ts_start` published,
-/// `ts_stop` still zero or holding the stale value of the entry's previous occupant) is
-/// skipped **without advancing its mark**. Both halves matter: emitting it would write a
-/// Chrome slice whose `E` precedes its `B`, and advancing the mark past its `ts_start` would
-/// reject the very same entry once it completes — the finished record would be lost silently,
-/// since a completed collection reuses the `ts_start` it published when it began.
+/// An entry caught mid-collection ([`GcStat::is_complete`] false) is skipped *without
+/// advancing its mark*. Both halves matter: emitting it writes a Chrome slice whose `E`
+/// precedes its `B`, and advancing the mark past its `ts_start` rejects the same entry once
+/// it finishes, since the finished record republishes that `ts_start`.
 fn select_fresh<'s>(stats: &'s [GcStat], seen: &mut HashMap<(u32, usize), i64>) -> Vec<&'s GcStat> {
     let mut fresh: Vec<&GcStat> = Vec::new();
     for stat in stats {
@@ -288,24 +286,24 @@ mod tests {
         assert_eq!(fresh_ts(&stats, &mut seen), vec![100, 200, 300, 400]);
     }
 
-    /// An entry read while its collection is still running has `ts_start` published and
-    /// `ts_stop` not yet written. Emitting it would produce a Chrome slice ending before it
-    /// begins — but the worse failure is silent: the finished record reuses that same
-    /// `ts_start`, so advancing the mark on the in-flight read would reject it forever.
+    /// An entry read mid-collection has `ts_start` published and `ts_stop` not yet written.
+    /// Emitting it writes a Chrome slice that ends before it begins; the worse failure is
+    /// silent, because the finished record republishes that same `ts_start` and a mark
+    /// advanced on the in-flight read rejects it forever.
     #[test]
     fn an_in_flight_entry_is_held_back_until_its_collection_completes() {
         let mut seen = HashMap::new();
         assert!(fresh_ts(&[timed_stat(0, 0, 100, 0)], &mut seen).is_empty());
         assert_eq!(mark(&seen, 0, 0), 0, "a skipped entry must not move its mark");
 
-        // The same collection, now finished: same ts_start, real ts_stop. It is selected.
+        // The same collection, finished: same ts_start, real ts_stop.
         assert_eq!(fresh_ts(&[timed_stat(0, 0, 100, 150)], &mut seen), vec![100]);
-        // And exactly once — the mark advanced this time.
+        // Once only; this time the mark advanced.
         assert!(fresh_ts(&[timed_stat(0, 0, 100, 150)], &mut seen).is_empty());
     }
 
-    /// The ring-wrap flavor of the same hazard: the entry's `ts_stop` is not zero but the
-    /// stale value left by its previous occupant, so it sits *before* the new `ts_start`.
+    /// The ring-wrap flavor: `ts_stop` is not zero but the previous occupant's value, so it
+    /// sits before the new `ts_start`.
     #[test]
     fn an_entry_holding_a_previous_occupants_ts_stop_is_held_back() {
         let mut seen = HashMap::new();
@@ -314,9 +312,8 @@ mod tests {
         assert_eq!(fresh_ts(&[timed_stat(1, 2, 900, 950)], &mut seen), vec![900]);
     }
 
-    /// Completeness is `ts_start < ts_stop`, not `<=`: a zero-width entry is treated as
-    /// unfinished. This is the predicate `snapshot::collect` and gcmon's `_is_complete`
-    /// both use, and the one the Loss arithmetic assumes.
+    /// Completeness is `ts_start < ts_stop`, not `<=`, so a zero-width entry counts as
+    /// unfinished. `snapshot::collect` and gcmon's `_is_complete` use the same form.
     #[test]
     fn a_zero_width_entry_is_not_treated_as_complete() {
         let mut seen = HashMap::new();
@@ -324,9 +321,9 @@ mod tests {
         assert_eq!(mark(&seen, 0, 0), 0);
     }
 
-    /// The gate is on the LAYOUT, not the values. A build whose entries carry no `ts_stop`
-    /// reads it back as 0 through the zero-fallback accessor, which would look permanently
-    /// in-flight and filter every one of its entries out.
+    /// The gate is on the layout, not the values. A build with no `ts_stop` field reads it
+    /// back as 0 through the zero-fallback accessor, so a value-only gate would call every
+    /// one of its entries in-flight and emit nothing at all.
     #[test]
     fn a_layout_without_a_stop_timestamp_is_not_gated_on_completeness() {
         let mut seen = HashMap::new();

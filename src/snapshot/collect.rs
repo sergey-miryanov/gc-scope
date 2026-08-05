@@ -380,14 +380,12 @@ impl CollectedData {
 /// ([`OffsetTable::decode_gc_stats`]) — the exact path the monitor uses — then projects
 /// each [`GcStat`](crate::remote_debugging::gc_stats::GcStat) onto the display-oriented
 /// [`GcEntry`], recovering the raw-region `byte_offset` (for the hexdump highlight) from the
-/// table geometry. Entries that are not complete — torn or still-running, i.e. `stop_ts <=
-/// start_ts` — are dropped so the view never renders a half-written entry; that is
+/// table geometry. Torn and still-running entries are dropped here, so a half-written entry
+/// never reaches the renderer; the test is
 /// [`GcStat::is_complete`](crate::remote_debugging::gc_stats::GcStat::is_complete), the same
-/// predicate the monitor holds entries back on, so the two paths agree on what counts as a
-/// finished collection. They differ only in *where* it applies: here at parse, so nothing
-/// unfinished reaches the renderer; in the monitor at `select_fresh`, so the entry is still
-/// selectable once it completes. Inline layouts (3.13/3.14) carry no timestamps, so the
-/// predicate can't fire and every entry is kept.
+/// predicate `select_fresh` holds entries back on. The monitor applies it later, at dedup,
+/// where the entry stays selectable once it finishes. Inline layouts (3.13/3.14) carry no
+/// timestamps, so the predicate can't fire and every entry is kept.
 fn parse_gc_entries(raw: &[u8], table: &offsets::offset_table::OffsetTable) -> Vec<GcEntry> {
     table
         .decode_gc_stats(raw, 0)
@@ -930,10 +928,9 @@ mod tests {
         assert_eq!((g1.start_ts, g1.stop_ts), (100, 200));
     }
 
-    /// The predicate is `start_ts < stop_ts` — the same one the monitor's `select_fresh`
-    /// holds entries back on, so the two paths agree on what a finished collection is. It
-    /// rejects zero-width entries too: both a ring position nothing has written yet (all-zero
-    /// bytes) and one whose timestamps landed on the same tick.
+    /// The predicate is `start_ts < stop_ts`, the same form `select_fresh` uses, so it also
+    /// rejects zero-width entries: a ring position nothing has written yet (all-zero bytes),
+    /// and one whose two timestamps landed on the same tick.
     #[test]
     fn parse_drops_zero_width_and_untouched_ring_entries() {
         let table = ts_ring_table();
