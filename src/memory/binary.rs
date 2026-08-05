@@ -82,6 +82,10 @@ pub fn find_python_modules(pid: u32) -> Result<Vec<(String, usize)>> {
 pub fn parse_macho(bytes: &[u8]) -> Option<(goblin::mach::MachO<'_>, usize)> {
     use goblin::mach::{Mach, MachO};
 
+    // `Mach::parse` parses a thin image eagerly, so the guard has to run first.
+    if !macho_entry_point_math_is_safe(bytes) {
+        return None;
+    }
     match Mach::parse(bytes).ok()? {
         Mach::Binary(macho) => Some((macho, 0)),
         Mach::Fat(fat) => {
@@ -120,11 +124,107 @@ pub fn parse_macho(bytes: &[u8]) -> Option<(goblin::mach::MachO<'_>, usize)> {
                 // symbols**, which is invisible to anything that only touches
                 // virtual addresses (`vmaddr`, `n_value`) and breaks everything
                 // that reads the symbol table.
+                //
+                // A slice is a thin image in its own right, so it needs the guard too.
+                if !macho_entry_point_math_is_safe(slice) {
+                    return None;
+                }
                 return MachO::parse(slice, 0).ok().map(|m| (m, start));
             }
             None
         }
     }
+}
+
+/// Whether `MachO::parse` can be handed `bytes` without panicking on its own arithmetic.
+///
+/// While parsing, goblin computes the entry point as
+/// `__TEXT.vmaddr - __TEXT.fileoff + LC_MAIN.entryoff` with **unchecked** `u64` arithmetic
+/// (`goblin-0.10.7`, `src/mach/mod.rs:280`), so a `__TEXT` whose `fileoff` exceeds its
+/// `vmaddr` panics from inside `parse`, where `.ok()?` cannot see it. Debug builds and the
+/// fuzz target have overflow checks on; release wraps instead, into a `MachO::entry` gcscope
+/// never reads. `catch_unwind` is no answer — `libfuzzer-sys` aborts from its panic hook
+/// before unwinding — so the arithmetic must not run at all. Hence the pre-walk, through
+/// goblin's own `LoadCommand` parser to keep the layouts and endianness goblin's.
+///
+/// Conservative: answers "safe" wherever goblin would bail out first, so a divergent walk
+/// can only reject an image goblin would have parsed. Real Mach-Os are unaffected — `__TEXT`
+/// maps the head of the file, so its `vmaddr` is never below its `fileoff`.
+///
+/// Found by the `scan_image_for_version` fuzz target.
+fn macho_entry_point_math_is_safe(bytes: &[u8]) -> bool {
+    use goblin::mach::header::{SIZEOF_HEADER_32, SIZEOF_HEADER_64};
+    use goblin::mach::load_command::{CommandVariant, LoadCommand};
+
+    // No thin Mach-O header here — a fat header, or not Mach-O at all. Either way goblin
+    // errors out before the arithmetic, so there is nothing to refuse.
+    let Ok((_, Some(ctx))) = goblin::mach::parse_magic_and_ctx(bytes, 0) else {
+        return true;
+    };
+
+    // `ncmds` and `sizeofcmds` are the 5th and 6th `u32` of the header, at the same offsets
+    // in both forms — the 64-bit header differs only by a trailing `reserved` word.
+    let word = |at: usize| -> Option<u32> {
+        let raw: [u8; 4] = bytes.get(at..at.checked_add(4)?)?.try_into().ok()?;
+        Some(if ctx.le.is_little() {
+            u32::from_le_bytes(raw)
+        } else {
+            u32::from_be_bytes(raw)
+        })
+    };
+    let (Some(ncmds), Some(sizeofcmds)) = (word(16), word(20)) else {
+        return true;
+    };
+    let (ncmds, sizeofcmds) = (ncmds as usize, sizeofcmds as usize);
+    // goblin's own bound, restated so this walk sees the commands goblin will see: past it
+    // goblin returns `BufferTooShort` without parsing any of them.
+    if ncmds > sizeofcmds / 8 || sizeofcmds > bytes.len() {
+        return true;
+    }
+
+    let mut offset = if ctx.container.is_big() {
+        SIZEOF_HEADER_64
+    } else {
+        SIZEOF_HEADER_32
+    };
+    let mut text: Option<(u64, u64)> = None; // (vmaddr, fileoff) of the first __TEXT
+    let mut entryoff: Option<u64> = None; // first LC_MAIN, the only one dyld honors
+
+    for _ in 0..ncmds {
+        // A command goblin cannot parse aborts its loop with an `Err` too.
+        let Ok(cmd) = LoadCommand::parse(bytes, &mut offset, ctx.le) else {
+            return true;
+        };
+        let seg = match cmd.command {
+            CommandVariant::Segment32(c) => {
+                Some((c.segname, u64::from(c.vmaddr), u64::from(c.fileoff)))
+            }
+            CommandVariant::Segment64(c) => Some((c.segname, c.vmaddr, c.fileoff)),
+            CommandVariant::Main(c) => {
+                entryoff.get_or_insert(c.entryoff);
+                None
+            }
+            _ => None,
+        };
+        // goblin compares the raw leading bytes rather than the trimmed name, and takes the
+        // first `__TEXT` in load-command order. Match that, or the wrong segment is checked.
+        if let Some((segname, vmaddr, fileoff)) = seg
+            && segname[..7] == b"__TEXT\0"[..]
+            && text.is_none()
+        {
+            text = Some((vmaddr, fileoff));
+        }
+    }
+
+    // Without an LC_MAIN goblin takes the LC_UNIXTHREAD address (or 0) verbatim and does no
+    // arithmetic; without a `__TEXT` segment it returns `Malformed` instead.
+    let (Some(entryoff), Some((vmaddr, fileoff))) = (entryoff, text) else {
+        return true;
+    };
+    vmaddr
+        .checked_sub(fileoff)
+        .and_then(|base| base.checked_add(entryoff))
+        .is_some()
 }
 
 /// Calculate the load bias for an ELF binary.
@@ -195,5 +295,78 @@ mod tests {
         let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe, 0x00, 0x00, 0x00, 0x40];
         bytes.resize(256, 0x41);
         assert!(parse_macho(&bytes).is_none());
+    }
+
+    /// A thin 64-bit LE Mach-O holding one `__TEXT` segment and one LC_MAIN — the three
+    /// fields goblin combines into the entry point, and nothing else. Padded past `fileoff`
+    /// so the segment's data range stays in bounds; a short buffer fails earlier, for an
+    /// unrelated reason.
+    fn thin_macho_with_entry_point(vmaddr: u64, fileoff: u64, entryoff: u64) -> Vec<u8> {
+        const LC_SEGMENT_64: u32 = 0x19;
+        const LC_MAIN: u32 = 0x8000_0028;
+        const SEG_CMD_SIZE: u32 = 72;
+        const MAIN_CMD_SIZE: u32 = 24;
+
+        let mut b = Vec::new();
+        // mach_header_64
+        b.extend(0xfeed_facfu32.to_le_bytes()); // magic MH_MAGIC_64
+        b.extend(0x0100_0007u32.to_le_bytes()); // cputype CPU_TYPE_X86_64
+        b.extend(3u32.to_le_bytes()); // cpusubtype
+        b.extend(2u32.to_le_bytes()); // filetype MH_EXECUTE
+        b.extend(2u32.to_le_bytes()); // ncmds
+        b.extend((SEG_CMD_SIZE + MAIN_CMD_SIZE).to_le_bytes()); // sizeofcmds
+        b.extend(0u32.to_le_bytes()); // flags
+        b.extend(0u32.to_le_bytes()); // reserved
+
+        // segment_command_64
+        b.extend(LC_SEGMENT_64.to_le_bytes());
+        b.extend(SEG_CMD_SIZE.to_le_bytes());
+        b.extend(b"__TEXT\0\0\0\0\0\0\0\0\0\0"); // segname, 16 bytes
+        b.extend(vmaddr.to_le_bytes());
+        b.extend(0u64.to_le_bytes()); // vmsize
+        b.extend(fileoff.to_le_bytes());
+        b.extend(0u64.to_le_bytes()); // filesize — keeps the data range empty
+        b.extend(0u32.to_le_bytes()); // maxprot
+        b.extend(0u32.to_le_bytes()); // initprot
+        b.extend(0u32.to_le_bytes()); // nsects
+        b.extend(0u32.to_le_bytes()); // flags
+
+        // entry_point_command
+        b.extend(LC_MAIN.to_le_bytes());
+        b.extend(MAIN_CMD_SIZE.to_le_bytes());
+        b.extend(entryoff.to_le_bytes());
+        b.extend(0u64.to_le_bytes()); // stacksize
+
+        // `fileoff` indexes into the buffer during the segment parse, so it has to fit.
+        if let Some(needed) = usize::try_from(fileoff).ok().filter(|n| *n > b.len()) {
+            b.resize(needed, 0);
+        }
+        b
+    }
+
+    /// goblin resolves the entry point with unchecked arithmetic while parsing, so a `__TEXT`
+    /// whose `fileoff` is above its `vmaddr` panics it from the inside (see
+    /// `macho_entry_point_math_is_safe`). The assertion that matters is that these return at
+    /// all — a regression is a panic, not a wrong answer.
+    #[test]
+    fn parse_macho_refuses_an_image_that_would_overflow_goblins_entry_point_math() {
+        // Underflow: __TEXT starts below its own file offset.
+        assert!(parse_macho(&thin_macho_with_entry_point(0, 0x20, 0)).is_none());
+        // Overflow on the other side: the base is valid, adding `entryoff` wraps.
+        assert!(parse_macho(&thin_macho_with_entry_point(u64::MAX, 0, u64::MAX)).is_none());
+    }
+
+    /// The guard rejects only the impossible arithmetic, not every image with an entry point.
+    /// A real `__TEXT` maps the head of the file — `vmaddr` 0x1_0000_0000 over `fileoff` 0 —
+    /// and must still parse, or the guard has silently disabled macOS.
+    #[test]
+    fn parse_macho_still_accepts_a_well_formed_entry_point() {
+        let bytes = thin_macho_with_entry_point(0x1_0000_0000, 0, 0x4000);
+        let (macho, slice_at) = parse_macho(&bytes).expect("a well-formed thin image parses");
+        assert_eq!(slice_at, 0, "a thin image is not a fat slice");
+        assert_eq!(
+            macho.entry, 0x1_0000_4000,
+            "vmaddr - fileoff + entryoff, the value the guard proved safe to compute"
+        );
     }
 }
