@@ -174,16 +174,17 @@ impl EventsExporter for ChromeTraceExporter {
     fn mark_process_lifecycle(&mut self, _pid: u32, _kind: ProcessLifecycle, _ts_ns: i64) {}
 
     fn close(&mut self) -> std::io::Result<()> {
-        if let Some(file) = self.file.take() {
-            let mut file = file;
-            if self.has_written {
-                write!(file, "\n]")?;
-            } else {
-                writeln!(file, "[]")?;
-            }
-            file.flush()?;
+        // A never-opened (or already-closed) exporter closes cleanly: `run_loop` unwinds
+        // through `close` on paths where `open` never ran.
+        let Some(mut file) = self.file.take() else {
+            return Ok(());
+        };
+        if self.has_written {
+            write!(file, "\n]")?;
+        } else {
+            writeln!(file, "[]")?;
         }
-        Ok(())
+        file.flush()
     }
 }
 
@@ -492,6 +493,26 @@ mod tests {
         stack.is_empty() && !in_str
     }
 
+    /// The scan has to honour JSON escapes: an escaped quote read as the end of its string
+    /// would leave every brace after it counted from the wrong state, and the scan would
+    /// then wave through the malformed traces it exists to catch. No trace gcscope writes
+    /// carries an escape today, which is what makes this worth pinning rather than assuming.
+    #[test]
+    fn brackets_balanced_honours_escapes_inside_strings() {
+        assert!(brackets_balanced(r#"[{"name":"a \" b"}]"#), "escaped quote");
+        assert!(
+            brackets_balanced(r#"[{"name":"c:\\dir"}]"#),
+            "escaped backslash"
+        );
+        // A brace after an escaped quote is still inside the string, so it is text.
+        assert!(
+            brackets_balanced(r#"[{"name":"\"}"}]"#),
+            "escape then brace"
+        );
+        // The scan still fails what it is for.
+        assert!(!brackets_balanced(r#"[{"name":"x"}"#), "unclosed array");
+    }
+
     /// Events handed to an exporter that was never opened are dropped, and the metadata
     /// dedup sets stay untouched so a later `open` still writes them. The monitor holds the
     /// exporter across a whole run, so a spurious poll before `open` must not swallow the
@@ -510,6 +531,44 @@ mod tests {
 
         assert_eq!(count(&out, r#""name":"process_name""#), 1, "output: {out}");
         assert_eq!(count(&out, r#""ph":"B""#), 1, "output: {out}");
+    }
+
+    /// `run_loop` unwinds through `close` on paths where `open` never ran: a target that
+    /// never attached, or a Ctrl-C during startup. Closing twice has to be as harmless,
+    /// since `close` is what takes the file out.
+    #[test]
+    fn closing_an_unopened_exporter_is_a_clean_no_op() {
+        ChromeTraceExporter::new().close().unwrap();
+
+        let path = temp_path();
+        let mut ex = ChromeTraceExporter::new();
+        ex.open(&path).unwrap();
+        ex.add_events(&convert_record(1, &bare_stat()));
+        ex.close().unwrap();
+        ex.close().unwrap();
+        let out = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        // One terminator, not two: the second close wrote nothing.
+        assert_eq!(count(&out, "]"), 1, "output: {out}");
+        assert!(brackets_balanced(&out), "output: {out}");
+    }
+
+    /// Chrome has no liveness track gcscope fills, so `mark_process_lifecycle` is swallowed.
+    /// Pinned rather than assumed: stray events appearing on process start would shift every
+    /// saved analysis, and the byte-identity gate never calls this method.
+    #[test]
+    fn process_lifecycle_marks_are_not_written_to_a_chrome_trace() {
+        let path = temp_path();
+        let mut ex = ChromeTraceExporter::new();
+        ex.open(&path).unwrap();
+        ex.mark_process_lifecycle(7, ProcessLifecycle::Started, 1_000);
+        ex.mark_process_lifecycle(7, ProcessLifecycle::Died, 2_000);
+        ex.close().unwrap();
+        let out = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(out.trim(), "[]", "output: {out}");
     }
 
     /// With no events, the trace must still be a valid, empty JSON array — an
