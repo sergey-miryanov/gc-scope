@@ -76,6 +76,28 @@ impl GcStat {
         self.layout.has_field(name)
     }
 
+    /// Whether this entry describes a **finished** collection.
+    ///
+    /// CPython writes a ring entry in two steps — `ts_start` when the collection begins,
+    /// `ts_stop` last, when it ends — so an entry read mid-collection carries a fresh
+    /// `ts_start` beside a `ts_stop` that is either still zero or the stale value left by the
+    /// entry's previous occupant. Both read back as `ts_stop <= ts_start`, which is the single
+    /// completeness predicate every consumer shares: the monitor holds such an entry back (and
+    /// keeps its dedup mark unadvanced) so the finished record is still emitted on a later
+    /// poll; the TUI drops it so it never renders a half-written entry. Zero-width is treated
+    /// as incomplete too — an untouched entry reads as all-zero, and a real collection whose
+    /// two timestamps land on the same tick carries no information the next poll won't repeat.
+    ///
+    /// Gated on the **layout**, not the values: builds whose entry layout has no timestamps
+    /// (inline, 3.8–3.14) cannot answer the question, so every one of their entries is
+    /// complete rather than filtered out wholesale.
+    pub fn is_complete(&self) -> bool {
+        if !(self.has("ts_start") && self.has("ts_stop")) {
+            return true;
+        }
+        self.ts_start() < self.ts_stop()
+    }
+
     /// Every field the layout defines, in layout order, as `(name, offset-within-entry, raw u64
     /// bits)`. The offset feeds the TUI's hex-highlight; the caller formats the bits by
     /// name (`duration` via `f64::from_bits`, `ts_*` as timestamps, large values as hex).
@@ -382,6 +404,39 @@ mod tests {
         assert_eq!(s.collected(), 0);
         assert_eq!(s.uncollectable(), 0);
         assert_eq!(s.heap_size(), 0);
+    }
+
+    /// `is_complete` is the one predicate the monitor and the TUI both filter on, so it is
+    /// pinned here rather than in either consumer: `ts_start < ts_stop` when the layout has
+    /// both timestamps, and unconditionally true when it doesn't.
+    #[test]
+    fn is_complete_reads_ts_start_lt_ts_stop_when_the_layout_has_both() {
+        let timed = seq_layout(&["ts_start", "ts_stop"]);
+        let complete = |ts_start, ts_stop| {
+            GcStat::from_fields(
+                0,
+                0,
+                1,
+                timed,
+                &[("ts_start", ts_start), ("ts_stop", ts_stop)],
+            )
+            .is_complete()
+        };
+
+        assert!(complete(100, 150), "a finished collection");
+        assert!(!complete(100, 0), "in flight — ts_stop not written yet");
+        assert!(!complete(900, 400), "a previous occupant's stale ts_stop");
+        assert!(!complete(100, 100), "zero-width counts as unfinished");
+        assert!(!complete(0, 0), "an untouched entry");
+
+        // No timestamps in the layout (3.8–3.14 inline builds): both accessors fall back to
+        // zero, which must NOT read as permanently in-flight.
+        let s = GcStat::from_fields(0, 0, 1, *REGULAR, &[("collections", 5)]);
+        assert!(!s.has("ts_stop"));
+        assert!(s.is_complete());
+        // Same when only the start timestamp exists.
+        let start_only = seq_layout(&["ts_start"]);
+        assert!(GcStat::from_fields(0, 0, 1, start_only, &[("ts_start", 100)]).is_complete());
     }
 
     /// The extended print path reads each `+inc` field by name via `get`. A view over an

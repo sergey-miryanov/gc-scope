@@ -380,19 +380,19 @@ impl CollectedData {
 /// ([`OffsetTable::decode_gc_stats`]) — the exact path the monitor uses — then projects
 /// each [`GcStat`](crate::remote_debugging::gc_stats::GcStat) onto the display-oriented
 /// [`GcEntry`], recovering the raw-region `byte_offset` (for the hexdump highlight) from the
-/// table geometry. The one TUI-only policy lives here: torn ring entries
-/// (`stop_ts < start_ts`, a half-written concurrent update) are dropped, whereas the
-/// monitor keeps every entry and dedups downstream. Inline layouts (3.13/3.14) carry no
-/// timestamps, so `has_ts` is false and every entry is kept.
+/// table geometry. Entries that are not complete — torn or still-running, i.e. `stop_ts <=
+/// start_ts` — are dropped so the view never renders a half-written entry; that is
+/// [`GcStat::is_complete`](crate::remote_debugging::gc_stats::GcStat::is_complete), the same
+/// predicate the monitor holds entries back on, so the two paths agree on what counts as a
+/// finished collection. They differ only in *where* it applies: here at parse, so nothing
+/// unfinished reaches the renderer; in the monitor at `select_fresh`, so the entry is still
+/// selectable once it completes. Inline layouts (3.13/3.14) carry no timestamps, so the
+/// predicate can't fire and every entry is kept.
 fn parse_gc_entries(raw: &[u8], table: &offsets::offset_table::OffsetTable) -> Vec<GcEntry> {
-    let has_ts = table
-        .gc_layout
-        .is_some_and(|l| l.has_field("ts_start") && l.has_field("ts_stop"));
-
     table
         .decode_gc_stats(raw, 0)
         .into_iter()
-        .filter(|s| !(has_ts && s.ts_stop() < s.ts_start()))
+        .filter(|s| s.is_complete())
         .map(|s| GcEntry {
             generation: s.generation,
             index: s.index,
@@ -930,6 +930,29 @@ mod tests {
         assert_eq!((g1.start_ts, g1.stop_ts), (100, 200));
     }
 
+    /// The predicate is `start_ts < stop_ts` — the same one the monitor's `select_fresh`
+    /// holds entries back on, so the two paths agree on what a finished collection is. It
+    /// rejects zero-width entries too: both a ring position nothing has written yet (all-zero
+    /// bytes) and one whose timestamps landed on the same tick.
+    #[test]
+    fn parse_drops_zero_width_and_untouched_ring_entries() {
+        let table = ts_ring_table();
+        let bases = table.gc_gen_base_offsets.unwrap();
+        let mut raw = vec![0u8; bases[2] as usize + 40];
+
+        // gen0: never written — start_ts == stop_ts == 0.
+        // gen1: zero-width — both timestamps on the same tick.
+        put_i64(&mut raw, bases[1] as usize, 100);
+        put_i64(&mut raw, bases[1] as usize + 8, 100);
+        // gen2: a finished collection.
+        put_i64(&mut raw, bases[2] as usize, 300);
+        put_i64(&mut raw, bases[2] as usize + 8, 400);
+
+        let entries = parse_gc_entries(&raw, &table);
+        assert_eq!(entries.len(), 1, "only the finished entry survives");
+        assert_eq!(entries[0].generation, 2);
+    }
+
     /// Inline layouts (3.8–3.14) carry no timestamps, so the torn guard is a no-op and
     /// every generation's entry is kept even from an all-zero buffer.
     #[test]
@@ -961,9 +984,10 @@ mod tests {
 
     /// One source of truth: the diagram and the monitor decode the same bytes into the
     /// same numbers because they share one decoder (`OffsetTable::decode_gc_stats`). The
-    /// only sanctioned divergence is the diagram's torn-entry drop; everything else agrees
-    /// field-for-field, and the diagram's `byte_offset` matches the table geometry the
-    /// decoder walked.
+    /// decoder itself filters nothing — the diagram drops incomplete entries here at parse,
+    /// the monitor holds them back later in `select_fresh`, on the same predicate. Everything
+    /// else agrees field-for-field, and the diagram's `byte_offset` matches the table geometry
+    /// the decoder walked.
     #[test]
     fn diagram_and_monitor_decode_agree_except_for_torn_entries() {
         let table = ts_ring_table();
@@ -997,15 +1021,16 @@ mod tests {
             );
         }
 
-        // Tear gen0's entry (stop_ts < start_ts). The monitor keeps every entry (it dedups
-        // downstream); the diagram drops the torn one so it never renders garbage.
+        // Tear gen0's entry (stop_ts < start_ts). The decoder keeps every entry — the
+        // monitor filters downstream, in `select_fresh`; the diagram drops the torn one here
+        // so it never renders garbage.
         put_i64(&mut raw, bases[0] as usize + 8, 0);
         let monitor_torn = table.decode_gc_stats(&raw, 0);
         let diagram_torn = parse_gc_entries(&raw, &table);
         assert_eq!(
             monitor_torn.len(),
             monitor.len(),
-            "monitor keeps torn entries"
+            "the decoder keeps torn entries"
         );
         assert_eq!(
             diagram_torn.len(),

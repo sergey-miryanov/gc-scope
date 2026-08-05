@@ -21,10 +21,17 @@ Complements the two backward-looking docs:
 | [0008](0008-shared-formatters-and-pid-table.md) | Feature — cleanup | M | Two hex formatters; PID-row assembly duplicated across the CLI table and the TUI picker |
 | [0009](0009-venv-launcher-child-retarget.md) | Feature — ergonomics | M | Windows venv shim PIDs fail single-shot commands; `attach` should re-target to the child |
 | [0010](0010-tree-last-child-connector.md) | Bug — cosmetic | S | `tree_prefixes` never emits the last-child connector its doc comment promises |
+| [0011](0011-loss-reconstruction-and-gc-statistics.md) | Feature — enhancement | L | `monitor` writes an empty trace below 3.15 and silently under-reports above it; reconstruct Loss from CPython's cumulative counters and report Coverage |
 
 **Suggested order:** 0001 (the only crash) → 0002 (one line, unblocks embedders) → 0003 →
 0004 (smallest user-visible wrongness) → then the cosmetic and efficiency tail in any
 order.
+
+0011 is a larger, independent track rather than a step in that queue: it is the first
+increment of porting gcmon's consumer stack, and it carries its own increments behind it
+(Perfetto, then the control plane and pyperf hook, then `convert` and the option surface).
+It is blocked by one local issue, `.scratch/monitor-inflight-entries/issues/01-…`, which
+ships on its own first.
 
 ## Templates
 
