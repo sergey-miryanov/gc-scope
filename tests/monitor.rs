@@ -24,12 +24,11 @@ use std::time::Duration;
 use common::{SpawnedPython, pid_alive, test_python};
 
 use gcscope::monitor::exporters::{EventsExporter, ProcessLifecycle};
-use gcscope::monitor::{MonitorContext, PollStatus, StartupTimeoutPolicy, run_loop};
-use gcscope::remote_debugging::gc_stats::GcStat;
+use gcscope::monitor::{MonitorContext, PollStatus, StartupTimeoutPolicy, TraceEvent, run_loop};
 use gcscope::remote_debugging::session::PySession;
 
 /// Counts the exporter callbacks so a test can assert what the poll emitted:
-/// GC events, and the process Started/Died lifecycle marks.
+/// trace events, and the process Started/Died lifecycle marks.
 #[derive(Default)]
 struct RecordingExporter {
     events: usize,
@@ -41,8 +40,8 @@ impl EventsExporter for RecordingExporter {
     fn open(&mut self, _path: &Path) -> std::io::Result<()> {
         Ok(())
     }
-    fn add_event(&mut self, _pid: u32, _event: &GcStat) {
-        self.events += 1;
+    fn add_events(&mut self, events: &[TraceEvent]) {
+        self.events += events.len();
     }
     fn mark_process_lifecycle(&mut self, _pid: u32, kind: ProcessLifecycle, _ts_ns: i64) {
         match kind {

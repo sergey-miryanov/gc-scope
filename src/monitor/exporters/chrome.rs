@@ -1,3 +1,14 @@
+//! The Chrome Trace encoder: [`TraceEvent`]s in, `chrome://tracing` JSON out.
+//!
+//! Nothing here decides what a Collection looks like in a trace — that is
+//! [`crate::monitor::convert`], shared by every format. This file knows only how the Chrome
+//! format spells an event: which `ph` letter each kind takes, in which key order, and that
+//! its timestamps are microseconds while the model's are nanoseconds.
+//!
+//! The JSON is written by hand rather than through a serializer. The shapes are fixed and
+//! tiny, the crate has no serde dependency, and the output is pinned byte-for-byte by the
+//! regression gate at the bottom of this file.
+
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -5,7 +16,7 @@ use std::path::Path;
 
 use super::timing::ts_us;
 use super::{EventsExporter, ProcessLifecycle};
-use crate::remote_debugging::gc_stats::GcStat;
+use crate::monitor::trace_event::{Arg, TraceEvent};
 
 fn write_event(f: &mut File, first: &mut bool, json: &str) -> std::io::Result<()> {
     if *first {
@@ -16,288 +27,83 @@ fn write_event(f: &mut File, first: &mut bool, json: &str) -> std::io::Result<()
     }
 }
 
-fn write_process_meta(f: &mut File, first: &mut bool, pid: u32) -> std::io::Result<()> {
-    write_event(
-        f,
-        first,
-        &format!(
-            r#"{{"ph":"M","pid":{},"name":"process_name","args":{{"name":"python {}"}}}}"#,
-            pid, pid
-        ),
-    )
+/// The inside of an `args` object: `"key":value` pairs, comma-separated. Values are bare
+/// numbers, so nothing here needs escaping.
+fn args_json(args: &[Arg]) -> String {
+    args.iter()
+        .map(|(key, value)| format!(r#""{}":{}"#, key, value))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
-fn write_thread_meta(f: &mut File, first: &mut bool, pid: u32, tid: i64) -> std::io::Result<()> {
-    write_event(
-        f,
-        first,
-        &format!(
-            r#"{{"ph":"M","pid":{},"tid":{},"name":"thread_name","args":{{"name":"{}:{}"}}}}"#,
-            pid, tid, pid, tid
+/// One event as its Chrome Trace JSON object.
+///
+/// Key order differs between the span events and the counter/instant events. That is not
+/// tidiness — it is what the existing encoder emitted, and the traces operators have already
+/// saved were written that way, so it is preserved deliberately.
+fn encode(event: &TraceEvent) -> String {
+    match event {
+        TraceEvent::ProcessMeta { pid, name } => format!(
+            r#"{{"ph":"M","pid":{},"name":"process_name","args":{{"name":"{}"}}}}"#,
+            pid, name
         ),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_begin(
-    f: &mut File,
-    first: &mut bool,
-    pid: u32,
-    tid: i64,
-    ts: i64,
-    name: &str,
-    cat: &str,
-    args_json: &str,
-) -> std::io::Result<()> {
-    write_event(
-        f,
-        first,
-        &format!(
+        TraceEvent::ThreadMeta { pid, tid, name } => format!(
+            r#"{{"ph":"M","pid":{},"tid":{},"name":"thread_name","args":{{"name":"{}"}}}}"#,
+            pid, tid, name
+        ),
+        TraceEvent::Begin {
+            pid,
+            tid,
+            ts_ns,
+            name,
+            cat,
+            args,
+        } => format!(
             r#"{{"ph":"B","pid":{},"tid":{},"ts":{},"name":"{}","cat":"{}","args":{{{}}}}}"#,
-            pid, tid, ts, name, cat, args_json
+            pid,
+            tid,
+            ts_us(*ts_ns),
+            name,
+            cat,
+            args_json(args)
         ),
-    )
-}
-
-fn write_end(
-    f: &mut File,
-    first: &mut bool,
-    pid: u32,
-    tid: i64,
-    ts: i64,
-    name: &str,
-    cat: &str,
-) -> std::io::Result<()> {
-    write_event(
-        f,
-        first,
-        &format!(
+        TraceEvent::End {
+            pid,
+            tid,
+            ts_ns,
+            name,
+            cat,
+        } => format!(
             r#"{{"ph":"E","pid":{},"tid":{},"ts":{},"name":"{}","cat":"{}"}}"#,
-            pid, tid, ts, name, cat
+            pid,
+            tid,
+            ts_us(*ts_ns),
+            name,
+            cat
         ),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_sub_step(
-    f: &mut File,
-    first: &mut bool,
-    pid: u32,
-    tid: i64,
-    name: &str,
-    cat: &str,
-    ts_start: i64,
-    ts_stop: i64,
-    args_json: &str,
-) -> std::io::Result<()> {
-    if ts_stop <= ts_start {
-        return Ok(());
+        // `"s":"p"` scopes the marker to the whole process rather than to one track: an
+        // instant message is the Observed talking about itself, not about an interpreter.
+        TraceEvent::Instant { pid, ts_ns, name } => format!(
+            r#"{{"name":"{}","ph":"I","s":"p","ts":{},"pid":{}}}"#,
+            name,
+            ts_us(*ts_ns),
+            pid
+        ),
+        TraceEvent::Counter {
+            pid,
+            tid,
+            ts_ns,
+            name,
+            args,
+        } => format!(
+            r#"{{"name":"{}","ph":"C","ts":{},"pid":{},"tid":{},"args":{{{}}}}}"#,
+            name,
+            ts_us(*ts_ns),
+            pid,
+            tid,
+            args_json(args)
+        ),
     }
-    write_begin(f, first, pid, tid, ts_us(ts_start), name, cat, args_json)?;
-    write_end(f, first, pid, tid, ts_us(ts_stop), name, cat)
-}
-
-/// How a GC sub-step's start timestamp is found.
-enum Start {
-    /// An explicit start field; the phase emits only if both this and `stop` are present.
-    Explicit(&'static str),
-    /// No own start field — begin where a previous phase ended: the first present candidate
-    /// (else the pause start). Emits whenever `stop` is present. Mirrors how CPython's later
-    /// GC phases chain onto the preceding one.
-    Chained(&'static [&'static str]),
-}
-
-/// One intra-pause GC sub-step, keyed entirely by layout field names so a build's presence or
-/// absence of a phase falls out of whether its fields exist.
-struct Phase {
-    label: &'static str,
-    cat: &'static str,
-    start: Start,
-    stop: &'static str,
-    /// Extra JSON args beyond the always-present `generation`/`iid`: `(json_key, field_name)`.
-    args: &'static [(&'static str, &'static str)],
-}
-
-/// The sub-steps in emission order. Adding a well-behaved phase (own start+stop) is a data-only
-/// change; the irregular chained-start phases are expressed as [`Start::Chained`].
-static PHASES: &[Phase] = &[
-    Phase {
-        label: "Mark Alive",
-        cat: "gc.mark.alive",
-        start: Start::Explicit("ts_mark_alive_start"),
-        stop: "ts_mark_alive_stop",
-        args: &[("alive_size", "alive_size")],
-    },
-    Phase {
-        label: "Fill increment",
-        cat: "gc.increment",
-        start: Start::Explicit("ts_fill_increment_start"),
-        stop: "ts_fill_increment_stop",
-        args: &[("increment_size", "increment_size")],
-    },
-    Phase {
-        label: "Deduce Unreachable",
-        cat: "gc.deduce",
-        start: Start::Explicit("ts_deduce_unreachable_start"),
-        stop: "ts_deduce_unreachable_stop",
-        args: &[("candidates", "candidates")],
-    },
-    Phase {
-        label: "Handle Weakrefs Callbacks",
-        cat: "gc.weakrefs",
-        start: Start::Explicit("ts_handle_weakref_callbacks_start"),
-        stop: "ts_handle_weakref_callbacks_stop",
-        args: &[],
-    },
-    Phase {
-        label: "Finalize Garbage",
-        cat: "gc.finalize",
-        start: Start::Chained(&[
-            "ts_handle_weakref_callbacks_stop",
-            "ts_deduce_unreachable_stop",
-        ]),
-        stop: "ts_finalize_garbage_stop",
-        args: &[("finalized_garbage_count", "finalized_garbage_count")],
-    },
-    Phase {
-        label: "Handle Resurrected",
-        cat: "gc.resurrect",
-        start: Start::Chained(&["ts_finalize_garbage_stop"]),
-        stop: "ts_handle_resurrected_stop",
-        args: &[],
-    },
-    Phase {
-        label: "Clear Weakrefs",
-        cat: "gc.clear_weakrefs",
-        start: Start::Chained(&["ts_handle_resurrected_stop"]),
-        stop: "ts_clear_weakrefs_stop",
-        args: &[("clear_weakrefs_count", "clear_weakrefs_count")],
-    },
-    Phase {
-        label: "Delete Garbage",
-        cat: "gc.delete",
-        start: Start::Explicit("ts_delete_garbage_start"),
-        stop: "ts_delete_garbage_stop",
-        args: &[("deleted_garbage_count", "deleted_garbage_count")],
-    },
-];
-
-fn write_gc_stat_events(
-    f: &mut File,
-    first: &mut bool,
-    pid: u32,
-    s: &GcStat,
-) -> std::io::Result<()> {
-    let tid = s.interpreter_id;
-    let ts_s = s.ts_start();
-    let ts_e = s.ts_stop();
-    let g = s.generation;
-
-    let pause_name = format!("GC Pause (gen={})", g);
-    let pause_cat = format!("gc.pause(gen={})", g);
-
-    // Helper to build JSON args string
-    let a = |pairs: &[(&str, String)]| -> String {
-        pairs
-            .iter()
-            .map(|(k, v)| format!(r#""{}":{}"#, k, v))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-
-    // Begin GC Pause
-    write_begin(
-        f,
-        first,
-        pid,
-        tid,
-        ts_us(ts_s),
-        &pause_name,
-        &pause_cat,
-        &a(&[
-            ("generation", g.to_string()),
-            ("iid", s.interpreter_id.to_string()),
-            ("collections", s.collections().to_string()),
-            ("heap_size", s.heap_size().to_string()),
-            ("collected", s.collected().to_string()),
-            ("uncollectable", s.uncollectable().to_string()),
-            ("candidates", s.candidates().to_string()),
-        ]),
-    )?;
-
-    // Intra-pause sub-steps, driven by the phase table. A phase whose fields this build lacks
-    // resolves to `None` and is skipped; a zero-width span is dropped by `write_sub_step`.
-    for ph in PHASES {
-        let stop = match s.get(ph.stop) {
-            Some(v) => v,
-            None => continue,
-        };
-        let start = match &ph.start {
-            Start::Explicit(field) => match s.get(field) {
-                Some(v) => v,
-                None => continue,
-            },
-            Start::Chained(cands) => cands.iter().find_map(|&c| s.get(c)).unwrap_or(ts_s),
-        };
-        let mut arg_pairs = vec![
-            ("generation", g.to_string()),
-            ("iid", s.interpreter_id.to_string()),
-        ];
-        for &(key, field) in ph.args {
-            arg_pairs.push((key, s.get(field).unwrap_or(0).to_string()));
-        }
-        write_sub_step(
-            f,
-            first,
-            pid,
-            tid,
-            &format!("{} (gen={})", ph.label, g),
-            &format!("{}(gen={})", ph.cat, g),
-            start,
-            stop,
-            &a(&arg_pairs),
-        )?;
-    }
-
-    // End GC Pause
-    write_end(f, first, pid, tid, ts_us(ts_e), &pause_name, &pause_cat)?;
-
-    // Counter event for generation metrics
-    let other = if s.uncollectable() > 0 {
-        format!(r#","uncollectable":{}"#, s.uncollectable())
-    } else {
-        String::new()
-    };
-    write_event(
-        f,
-        first,
-        &format!(
-            r#"{{"name":"G{}","ph":"C","ts":{},"pid":{},"tid":{},"args":{{"collected":{},"candidates":{},"duration":{}{}}}}}"#,
-            g,
-            ts_us(ts_s),
-            pid,
-            tid,
-            s.collected(),
-            s.candidates(),
-            s.duration(),
-            other
-        ),
-    )?;
-
-    // Counter event for heap_size (single arg → encoder sets name to "")
-    write_event(
-        f,
-        first,
-        &format!(
-            r#"{{"name":"","ph":"C","ts":{},"pid":{},"tid":{},"args":{{"heap_size":{}}}}}"#,
-            ts_us(ts_s),
-            pid,
-            tid,
-            s.heap_size()
-        ),
-    )?;
-
-    Ok(())
 }
 
 /// `Default` is derived rather than just `new()`-provided because the split to a
@@ -308,6 +114,10 @@ fn write_gc_stat_events(
 pub struct ChromeTraceExporter {
     file: Option<File>,
     has_written: bool,
+    /// Metadata already written into *this* stream. Deduplication lives here rather than in
+    /// the conversion because it is a property of an output file: two formats fanned out
+    /// from one conversion each need their own copy, and reopening starts a new file that
+    /// needs metadata again.
     pid_meta_done: HashSet<u32>,
     tid_meta_done: HashSet<i64>,
 }
@@ -332,25 +142,34 @@ impl EventsExporter for ChromeTraceExporter {
         Ok(())
     }
 
-    fn add_event(&mut self, pid: u32, event: &GcStat) {
-        let file = match self.file.as_mut() {
-            Some(f) => f,
-            None => return,
+    fn add_events(&mut self, events: &[TraceEvent]) {
+        let Self {
+            file,
+            has_written,
+            pid_meta_done,
+            tid_meta_done,
+        } = self;
+        let Some(file) = file.as_mut() else {
+            return;
         };
 
-        let mut first = !self.has_written;
-        self.has_written = true;
-
-        if self.pid_meta_done.insert(pid) {
-            write_process_meta(file, &mut first, pid).ok();
+        let mut first = !*has_written;
+        for event in events {
+            // Repeated metadata is dropped, not rewritten. Note the thread set is keyed on
+            // the interpreter id alone, so two processes whose interpreter ids collide share
+            // one `thread_name` line — preserved as-is; the monitor reads one interpreter
+            // per process today.
+            let skip = match event {
+                TraceEvent::ProcessMeta { pid, .. } => !pid_meta_done.insert(*pid),
+                TraceEvent::ThreadMeta { tid, .. } => !tid_meta_done.insert(*tid),
+                _ => false,
+            };
+            if skip {
+                continue;
+            }
+            write_event(file, &mut first, &encode(event)).ok();
+            *has_written = true;
         }
-
-        let tid = event.interpreter_id;
-        if self.tid_meta_done.insert(tid) {
-            write_thread_meta(file, &mut first, pid, tid).ok();
-        }
-
-        write_gc_stat_events(file, &mut first, pid, event).ok();
         file.flush().ok();
     }
 
@@ -373,16 +192,18 @@ impl EventsExporter for ChromeTraceExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::convert::convert_record;
+    use crate::remote_debugging::gc_stats::GcStat;
     use crate::remote_debugging::offsets::offset_table::{GcItemLayout, seq_layout};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::LazyLock;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A layout carrying every field the exporter knows about — so a test stat can set any
-    /// phase's timestamps. Only the field *names* matter here (the exporter reads by name), so
-    /// offsets are assigned sequentially. A real regular build's layout has only a subset; the
-    /// exporter skips phases whose fields are absent (see `Start`/`PHASES`).
+    /// A layout carrying every field the conversion knows about — so a test Record can set
+    /// any phase's timestamps. Only the field *names* matter here (fields are read by name),
+    /// so offsets are assigned sequentially. A real regular build's layout has only a subset;
+    /// the conversion skips phases whose fields are absent (see `convert::PHASES`).
     static FULL_LAYOUT: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
         seq_layout(&[
             "ts_start",
@@ -415,9 +236,9 @@ mod tests {
     });
 
     /// A standard build's layout: the core counters + timestamps, but **none** of the `+inc`
-    /// phase fields. A stat over this layout must make the exporter read every phase field as
-    /// genuinely absent (`get(..) == None`), not as a zero-width span — the real regular-build
-    /// path that `FULL_LAYOUT`-based stats never exercise.
+    /// phase fields. A Record over this layout must make the conversion read every phase field
+    /// as genuinely absent (`get(..) == None`), not as a zero-width span — the real
+    /// regular-build path that `FULL_LAYOUT`-based Records never exercise.
     static REGULAR_LAYOUT: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
         seq_layout(&[
             "ts_start",
@@ -431,7 +252,76 @@ mod tests {
         ])
     });
 
+    /// A build carrying a chained phase's *stop* field but none of the fields that phase
+    /// chains onto. Only such a layout reaches `Start::Chained`'s `unwrap_or(ts_start)`
+    /// fallback: with `FULL_LAYOUT` every candidate field exists, so the chain resolves to
+    /// `Some(0)` and the fallback is unreachable.
+    static CHAINED_ONLY_LAYOUT: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
+        seq_layout(&[
+            "ts_start",
+            "ts_stop",
+            "collections",
+            "heap_size",
+            "ts_finalize_garbage_stop",
+            "ts_handle_resurrected_stop",
+        ])
+    });
+
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// The exact bytes `golden_matrix` produced before the `TraceEvent` extraction.
+    const GOLDEN_MATRIX_TRACE: &str = r#"[
+{"ph":"M","pid":100,"name":"process_name","args":{"name":"python 100"}},
+{"ph":"M","pid":100,"tid":3,"name":"thread_name","args":{"name":"100:3"}},
+{"ph":"B","pid":100,"tid":3,"ts":1,"name":"GC Pause (gen=1)","cat":"gc.pause(gen=1)","args":{"generation":1,"iid":3,"collections":5,"heap_size":4096,"collected":42,"uncollectable":7,"candidates":100}},
+{"ph":"B","pid":100,"tid":3,"ts":2,"name":"Mark Alive (gen=1)","cat":"gc.mark.alive(gen=1)","args":{"generation":1,"iid":3,"alive_size":22}},
+{"ph":"E","pid":100,"tid":3,"ts":3,"name":"Mark Alive (gen=1)","cat":"gc.mark.alive(gen=1)"},
+{"ph":"B","pid":100,"tid":3,"ts":3,"name":"Fill increment (gen=1)","cat":"gc.increment(gen=1)","args":{"generation":1,"iid":3,"increment_size":11}},
+{"ph":"E","pid":100,"tid":3,"ts":4,"name":"Fill increment (gen=1)","cat":"gc.increment(gen=1)"},
+{"ph":"B","pid":100,"tid":3,"ts":4,"name":"Deduce Unreachable (gen=1)","cat":"gc.deduce(gen=1)","args":{"generation":1,"iid":3,"candidates":100}},
+{"ph":"E","pid":100,"tid":3,"ts":5,"name":"Deduce Unreachable (gen=1)","cat":"gc.deduce(gen=1)"},
+{"ph":"B","pid":100,"tid":3,"ts":5,"name":"Handle Weakrefs Callbacks (gen=1)","cat":"gc.weakrefs(gen=1)","args":{"generation":1,"iid":3}},
+{"ph":"E","pid":100,"tid":3,"ts":6,"name":"Handle Weakrefs Callbacks (gen=1)","cat":"gc.weakrefs(gen=1)"},
+{"ph":"B","pid":100,"tid":3,"ts":6,"name":"Finalize Garbage (gen=1)","cat":"gc.finalize(gen=1)","args":{"generation":1,"iid":3,"finalized_garbage_count":3}},
+{"ph":"E","pid":100,"tid":3,"ts":7,"name":"Finalize Garbage (gen=1)","cat":"gc.finalize(gen=1)"},
+{"ph":"B","pid":100,"tid":3,"ts":7,"name":"Handle Resurrected (gen=1)","cat":"gc.resurrect(gen=1)","args":{"generation":1,"iid":3}},
+{"ph":"E","pid":100,"tid":3,"ts":8,"name":"Handle Resurrected (gen=1)","cat":"gc.resurrect(gen=1)"},
+{"ph":"B","pid":100,"tid":3,"ts":8,"name":"Clear Weakrefs (gen=1)","cat":"gc.clear_weakrefs(gen=1)","args":{"generation":1,"iid":3,"clear_weakrefs_count":4}},
+{"ph":"E","pid":100,"tid":3,"ts":9,"name":"Clear Weakrefs (gen=1)","cat":"gc.clear_weakrefs(gen=1)"},
+{"ph":"B","pid":100,"tid":3,"ts":9,"name":"Delete Garbage (gen=1)","cat":"gc.delete(gen=1)","args":{"generation":1,"iid":3,"deleted_garbage_count":9}},
+{"ph":"E","pid":100,"tid":3,"ts":10,"name":"Delete Garbage (gen=1)","cat":"gc.delete(gen=1)"},
+{"ph":"E","pid":100,"tid":3,"ts":11,"name":"GC Pause (gen=1)","cat":"gc.pause(gen=1)"},
+{"name":"G1","ph":"C","ts":1,"pid":100,"tid":3,"args":{"collected":42,"candidates":100,"duration":0.00125,"uncollectable":7}},
+{"name":"","ph":"C","ts":1,"pid":100,"tid":3,"args":{"heap_size":4096}},
+{"ph":"B","pid":100,"tid":3,"ts":20,"name":"GC Pause (gen=0)","cat":"gc.pause(gen=0)","args":{"generation":0,"iid":3,"collections":6,"heap_size":0,"collected":1,"uncollectable":0,"candidates":2}},
+{"ph":"E","pid":100,"tid":3,"ts":20,"name":"GC Pause (gen=0)","cat":"gc.pause(gen=0)"},
+{"name":"G0","ph":"C","ts":20,"pid":100,"tid":3,"args":{"collected":1,"candidates":2,"duration":0}},
+{"name":"","ph":"C","ts":20,"pid":100,"tid":3,"args":{"heap_size":0}},
+{"ph":"M","pid":100,"tid":4,"name":"thread_name","args":{"name":"100:4"}},
+{"ph":"B","pid":100,"tid":4,"ts":30,"name":"GC Pause (gen=2)","cat":"gc.pause(gen=2)","args":{"generation":2,"iid":4,"collections":2,"heap_size":0,"collected":0,"uncollectable":1,"candidates":0}},
+{"ph":"B","pid":100,"tid":4,"ts":0,"name":"Finalize Garbage (gen=2)","cat":"gc.finalize(gen=2)","args":{"generation":2,"iid":4,"finalized_garbage_count":0}},
+{"ph":"E","pid":100,"tid":4,"ts":32,"name":"Finalize Garbage (gen=2)","cat":"gc.finalize(gen=2)"},
+{"ph":"E","pid":100,"tid":4,"ts":40,"name":"GC Pause (gen=2)","cat":"gc.pause(gen=2)"},
+{"name":"G2","ph":"C","ts":30,"pid":100,"tid":4,"args":{"collected":0,"candidates":0,"duration":0,"uncollectable":1}},
+{"name":"","ph":"C","ts":30,"pid":100,"tid":4,"args":{"heap_size":0}},
+{"ph":"B","pid":100,"tid":3,"ts":60,"name":"GC Pause (gen=0)","cat":"gc.pause(gen=0)","args":{"generation":0,"iid":3,"collections":8,"heap_size":2048,"collected":0,"uncollectable":0,"candidates":0}},
+{"ph":"B","pid":100,"tid":3,"ts":60,"name":"Finalize Garbage (gen=0)","cat":"gc.finalize(gen=0)","args":{"generation":0,"iid":3,"finalized_garbage_count":0}},
+{"ph":"E","pid":100,"tid":3,"ts":65,"name":"Finalize Garbage (gen=0)","cat":"gc.finalize(gen=0)"},
+{"ph":"B","pid":100,"tid":3,"ts":65,"name":"Handle Resurrected (gen=0)","cat":"gc.resurrect(gen=0)","args":{"generation":0,"iid":3}},
+{"ph":"E","pid":100,"tid":3,"ts":66,"name":"Handle Resurrected (gen=0)","cat":"gc.resurrect(gen=0)"},
+{"ph":"E","pid":100,"tid":3,"ts":70,"name":"GC Pause (gen=0)","cat":"gc.pause(gen=0)"},
+{"name":"G0","ph":"C","ts":60,"pid":100,"tid":3,"args":{"collected":0,"candidates":0,"duration":0}},
+{"name":"","ph":"C","ts":60,"pid":100,"tid":3,"args":{"heap_size":2048}},
+{"ph":"M","pid":200,"name":"process_name","args":{"name":"python 200"}},
+{"ph":"M","pid":200,"tid":9,"name":"thread_name","args":{"name":"200:9"}},
+{"ph":"B","pid":200,"tid":9,"ts":50,"name":"GC Pause (gen=2)","cat":"gc.pause(gen=2)","args":{"generation":2,"iid":9,"collections":11,"heap_size":1048576,"collected":3,"uncollectable":0,"candidates":12}},
+{"ph":"E","pid":200,"tid":9,"ts":55,"name":"GC Pause (gen=2)","cat":"gc.pause(gen=2)"},
+{"name":"G2","ph":"C","ts":50,"pid":200,"tid":9,"args":{"collected":3,"candidates":12,"duration":0}},
+{"name":"","ph":"C","ts":50,"pid":200,"tid":9,"args":{"heap_size":1048576}}
+]"#;
+
+    /// The digest of the bytes `random_matrix` produced before the same change.
+    const RANDOM_MATRIX_DIGEST: u64 = 0x691ac7286d6f515d;
 
     /// A unique scratch path per test invocation. `Date.now()`-style entropy is
     /// avoided; a process-id + monotonic counter is enough for isolation within
@@ -443,16 +333,30 @@ mod tests {
         p
     }
 
-    /// Drive the public exporter API end-to-end and return the file it produced.
-    /// This deliberately exercises `open`/`add_event`/`close` — the same path the
-    /// monitor loop uses — rather than the private `write_*` helpers.
-    fn export(events: &[(u32, GcStat)]) -> String {
+    /// Drive the whole producing-to-encoding path end-to-end and return the file it
+    /// produced: Records through `convert_record`, events through `open`/`add_events`/
+    /// `close` — the same path the monitor loop takes. Deliberately not the private
+    /// `encode`, so the ordering and metadata behaviour are exercised too.
+    fn export(records: &[(u32, GcStat)]) -> String {
         let path = temp_path();
         let mut ex = ChromeTraceExporter::new();
         ex.open(&path).unwrap();
-        for (pid, ev) in events {
-            ex.add_event(*pid, ev);
+        for (pid, record) in records {
+            ex.add_events(&convert_record(*pid, record));
         }
+        ex.close().unwrap();
+        let s = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).ok();
+        s
+    }
+
+    /// The encoder seam on its own: events in, bytes out, with no Record anywhere. Anything
+    /// no producer emits yet has to be reached this way.
+    fn export_events(events: &[TraceEvent]) -> String {
+        let path = temp_path();
+        let mut ex = ChromeTraceExporter::new();
+        ex.open(&path).unwrap();
+        ex.add_events(events);
         ex.close().unwrap();
         let s = fs::read_to_string(&path).unwrap();
         fs::remove_file(&path).ok();
@@ -461,6 +365,55 @@ mod tests {
 
     fn count(hay: &str, needle: &str) -> usize {
         hay.matches(needle).count()
+    }
+
+    /// An instant message is scoped to the process (`"s":"p"`) and carries no `tid`: it is
+    /// the Observed talking about itself, not about one of its interpreters. Nothing
+    /// produces one yet, so this is its only coverage — and its timestamp still has to make
+    /// the nanosecond-to-microsecond trip every other event makes.
+    #[test]
+    fn an_instant_message_encodes_as_a_process_scoped_marker() {
+        let out = export_events(&[TraceEvent::Instant {
+            pid: 7,
+            ts_ns: 4_500,
+            name: "checkpoint".to_string(),
+        }]);
+        assert_eq!(
+            out,
+            "[\n{\"name\":\"checkpoint\",\"ph\":\"I\",\"s\":\"p\",\"ts\":4,\"pid\":7}\n]"
+        );
+    }
+
+    /// The encoder writes what it is handed, in the order it is handed it — no reordering,
+    /// no repair. A sub-span whose timestamp precedes its parent's is a real shape (a build
+    /// that publishes a phase's stop but not its start chains it onto a field reading zero),
+    /// and sorting it "back into place" would move a slice the target never placed there.
+    #[test]
+    fn events_are_written_in_the_order_given_even_when_timestamps_are_not() {
+        let out = export_events(&[
+            TraceEvent::Begin {
+                pid: 1,
+                tid: 0,
+                ts_ns: 9_000,
+                name: "late".to_string(),
+                cat: "c".to_string(),
+                args: vec![],
+            },
+            TraceEvent::End {
+                pid: 1,
+                tid: 0,
+                ts_ns: 1_000,
+                name: "late".to_string(),
+                cat: "c".to_string(),
+            },
+        ]);
+        let ts: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.split("\"ts\":").nth(1))
+            .collect();
+        assert_eq!(ts.len(), 2, "output: {out}");
+        assert!(ts[0].starts_with('9'), "output: {out}");
+        assert!(ts[1].starts_with('1'), "output: {out}");
     }
 
     /// A minimally-populated GC pause: no sub-step timestamps set (all phase fields zero, so
@@ -605,7 +558,7 @@ mod tests {
         }
     }
 
-    /// `write_sub_step` skips any range whose stop is not strictly after its
+    /// The conversion skips any range whose stop is not strictly after its
     /// start. A zero-width sub-step (start == stop) must not appear at all —
     /// emitting it would push a begin without a meaningful end into the trace.
     #[test]
@@ -629,7 +582,7 @@ mod tests {
     }
 
     /// A stat from a **standard** build — whose layout lacks every `+inc` phase field — must
-    /// emit only the outer GC Pause: the exporter reads each phase field as absent (`None`) and
+    /// emit only the outer GC Pause: the conversion reads each phase field as absent (`None`) and
     /// fabricates no sub-step. This exercises the `get(..) == None → skip` branch (both the
     /// Explicit and Chained phases), which the `FULL_LAYOUT` stats can't reach — there the
     /// fields exist and are merely zero-width. A regression that made a missing field decode to
@@ -771,6 +724,213 @@ mod tests {
         assert_eq!(count(&out, r#""ph":"C""#), 2, "output: {out}");
     }
 
+    // ---------------------------------------------------------------------------------
+    // Byte-for-byte regression gate.
+    //
+    // The `TraceEvent` extraction (`.scratch/loss-reconstruction/issues/01`) moved every
+    // decision about *what* a Collection is in a trace out of this file and left only the
+    // encoding behind. Nothing an operator can see was supposed to change, and "supposed
+    // to" is not an oracle — these two tests are. Both expectations were captured from the
+    // encoder as it stood immediately **before** the extraction; neither may be
+    // regenerated to make a failing build pass. A deliberate format change rewrites them
+    // in the same commit that changes the format, and never on its own.
+    // ---------------------------------------------------------------------------------
+
+    /// The curated half of the gate: inputs chosen so that every branch of the conversion
+    /// is reached at least once, and small enough that the expected bytes stay readable.
+    fn golden_matrix() -> Vec<(u32, GcStat)> {
+        vec![
+            // Every phase fires, every pause and counter argument is non-zero, and
+            // `duration` carries real float bits — so float formatting is pinned too.
+            (
+                100,
+                GcStat::from_fields(
+                    1,
+                    0,
+                    3,
+                    *FULL_LAYOUT,
+                    &[
+                        ("ts_start", 1_000),
+                        ("ts_stop", 11_000),
+                        ("collections", 5),
+                        ("collected", 42),
+                        ("uncollectable", 7),
+                        ("candidates", 100),
+                        ("duration", f64::to_bits(0.001_25) as i64),
+                        ("heap_size", 4096),
+                        ("increment_size", 11),
+                        ("alive_size", 22),
+                        ("finalized_garbage_count", 3),
+                        ("clear_weakrefs_count", 4),
+                        ("deleted_garbage_count", 9),
+                        ("ts_mark_alive_start", 2_000),
+                        ("ts_mark_alive_stop", 3_000),
+                        ("ts_fill_increment_start", 3_000),
+                        ("ts_fill_increment_stop", 4_000),
+                        ("ts_deduce_unreachable_start", 4_000),
+                        ("ts_deduce_unreachable_stop", 5_000),
+                        ("ts_handle_weakref_callbacks_start", 5_000),
+                        ("ts_handle_weakref_callbacks_stop", 6_000),
+                        ("ts_finalize_garbage_stop", 7_000),
+                        ("ts_handle_resurrected_stop", 8_000),
+                        ("ts_clear_weakrefs_stop", 9_000),
+                        ("ts_delete_garbage_start", 9_000),
+                        ("ts_delete_garbage_stop", 10_000),
+                    ],
+                ),
+            ),
+            // Same PID and interpreter, so neither metadata line repeats. A sub-µs pause,
+            // `uncollectable` zero so the counter argument is omitted, and a zero-width
+            // `Mark Alive` that must be dropped.
+            (
+                100,
+                GcStat::from_fields(
+                    0,
+                    1,
+                    3,
+                    *FULL_LAYOUT,
+                    &[
+                        ("ts_start", 20_100),
+                        ("ts_stop", 20_900),
+                        ("collections", 6),
+                        ("collected", 1),
+                        ("candidates", 2),
+                        ("ts_mark_alive_start", 20_200),
+                        ("ts_mark_alive_stop", 20_200),
+                    ],
+                ),
+            ),
+            // A chained phase whose candidates all exist in the layout but read zero: the
+            // chain resolves to `Some(0)`, so the span starts at the epoch rather than at
+            // the pause. Ugly, and exactly what today's encoder does.
+            (
+                100,
+                GcStat::from_fields(
+                    2,
+                    0,
+                    4,
+                    *FULL_LAYOUT,
+                    &[
+                        ("ts_start", 30_000),
+                        ("ts_stop", 40_000),
+                        ("collections", 2),
+                        ("uncollectable", 1),
+                        ("ts_finalize_garbage_stop", 32_000),
+                    ],
+                ),
+            ),
+            // The other chained shape: the candidate fields are absent from the build, so
+            // the phase begins at the pause start instead.
+            (
+                100,
+                GcStat::from_fields(
+                    0,
+                    2,
+                    3,
+                    *CHAINED_ONLY_LAYOUT,
+                    &[
+                        ("ts_start", 60_000),
+                        ("ts_stop", 70_000),
+                        ("collections", 8),
+                        ("heap_size", 2048),
+                        ("ts_finalize_garbage_stop", 65_000),
+                        ("ts_handle_resurrected_stop", 66_000),
+                    ],
+                ),
+            ),
+            // A second process on a standard build's layout: new process and thread
+            // metadata, and every phase field genuinely absent rather than zero.
+            (
+                200,
+                GcStat::from_fields(
+                    2,
+                    2,
+                    9,
+                    *REGULAR_LAYOUT,
+                    &[
+                        ("ts_start", 50_000),
+                        ("ts_stop", 55_000),
+                        ("collections", 11),
+                        ("collected", 3),
+                        ("candidates", 12),
+                        ("heap_size", 1_048_576),
+                    ],
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn golden_matrix_bytes_are_unchanged() {
+        assert_eq!(export(&golden_matrix()), GOLDEN_MATRIX_TRACE);
+    }
+
+    /// FNV-1a, 64-bit. Any byte difference anywhere in the trace moves it, which is all
+    /// this needs to do — it stands in for an expected string too large to read.
+    fn digest(s: &str) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    fn xorshift64(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// The randomized half of the gate: many more shapes than a curated matrix can hold,
+    /// pinned by digest rather than by an unreadable expected string. Values are drawn
+    /// from a table of awkward ones — the extremes, the sign boundary, and float bits that
+    /// print as `inf`/`NaN` — because those are where two encoders diverge, not the middle
+    /// of the range. Fixed seed, per `docs/testing-policy.md`.
+    fn random_matrix() -> Vec<(u32, GcStat)> {
+        const VALUES: [i64; 10] = [
+            0,
+            1,
+            -1,
+            7,
+            1_000,
+            1_000_000,
+            i64::MAX,
+            i64::MIN,
+            0x7ff0_0000_0000_0000, // f64::INFINITY bits
+            0x7ff8_0000_0000_0000, // f64::NAN bits
+        ];
+        let layouts = [*FULL_LAYOUT, *REGULAR_LAYOUT, *CHAINED_ONLY_LAYOUT];
+
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut out = Vec::new();
+        for _ in 0..96 {
+            let layout = layouts[(xorshift64(&mut rng) % layouts.len() as u64) as usize];
+            let fields: Vec<(&str, i64)> = layout
+                .fields
+                .iter()
+                .map(|&(name, _)| (name, VALUES[(xorshift64(&mut rng) % 10) as usize]))
+                .collect();
+            let generation = (xorshift64(&mut rng) % 3) as u32;
+            let index = (xorshift64(&mut rng) % 11) as usize;
+            let interpreter_id = (xorshift64(&mut rng) % 4) as i64;
+            let pid = 1000 + (xorshift64(&mut rng) % 3) as u32;
+            out.push((
+                pid,
+                GcStat::from_fields(generation, index, interpreter_id, layout, &fields),
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn randomized_matrix_digest_is_unchanged() {
+        assert_eq!(digest(&export(&random_matrix())), RANDOM_MATRIX_DIGEST);
+    }
+
     /// Reusing an exporter across `open` calls must reset the dedup sets, or the
     /// second capture would silently omit metadata for a PID seen in the first.
     #[test]
@@ -779,13 +939,13 @@ mod tests {
 
         let path1 = temp_path();
         ex.open(&path1).unwrap();
-        ex.add_event(100, &bare_stat());
+        ex.add_events(&convert_record(100, &bare_stat()));
         ex.close().unwrap();
         fs::remove_file(&path1).ok();
 
         let path2 = temp_path();
         ex.open(&path2).unwrap();
-        ex.add_event(100, &bare_stat());
+        ex.add_events(&convert_record(100, &bare_stat()));
         ex.close().unwrap();
         let out = fs::read_to_string(&path2).unwrap();
         fs::remove_file(&path2).ok();
