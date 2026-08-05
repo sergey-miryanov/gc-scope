@@ -294,10 +294,17 @@ mod tests {
     fn an_in_flight_entry_is_held_back_until_its_collection_completes() {
         let mut seen = HashMap::new();
         assert!(fresh_ts(&[timed_stat(0, 0, 100, 0)], &mut seen).is_empty());
-        assert_eq!(mark(&seen, 0, 0), 0, "a skipped entry must not move its mark");
+        assert_eq!(
+            mark(&seen, 0, 0),
+            0,
+            "a skipped entry must not move its mark"
+        );
 
         // The same collection, finished: same ts_start, real ts_stop.
-        assert_eq!(fresh_ts(&[timed_stat(0, 0, 100, 150)], &mut seen), vec![100]);
+        assert_eq!(
+            fresh_ts(&[timed_stat(0, 0, 100, 150)], &mut seen),
+            vec![100]
+        );
         // Once only; this time the mark advanced.
         assert!(fresh_ts(&[timed_stat(0, 0, 100, 150)], &mut seen).is_empty());
     }
@@ -309,7 +316,10 @@ mod tests {
         let mut seen = HashMap::new();
         assert!(fresh_ts(&[timed_stat(1, 2, 900, 400)], &mut seen).is_empty());
         assert_eq!(mark(&seen, 1, 2), 0);
-        assert_eq!(fresh_ts(&[timed_stat(1, 2, 900, 950)], &mut seen), vec![900]);
+        assert_eq!(
+            fresh_ts(&[timed_stat(1, 2, 900, 950)], &mut seen),
+            vec![900]
+        );
     }
 
     /// Completeness is `ts_start < ts_stop`, not `<=`, so a zero-width entry counts as
