@@ -149,8 +149,8 @@ regressions per-PR; `fuzz-nightly.yml` spends 10 minutes at 04:00 UTC building t
 that gate restores. Caches written on the default branch are readable from every branch, so
 each night's exploration deepens every later PR run. They share the `fuzz-corpus-` cache
 prefix — diverge it and neither feeds the other. Mondays the nightly minimizes with
-`cargo fuzz cmin`, without which the corpus grows until the gate spends its budget
-replaying rather than exploring.
+`cargo fuzz cmin`: every run that restores the corpus pays to transfer it, and
+near-duplicate inputs dilute mutation effort for no new coverage.
 
 **Cost:** a nightly toolchain, a corpus, CI minutes, and Linux only. Windows MSVC cannot
 run it: the ASAN runtime mismatches rustc's LLVM, and `--sanitizer none` fails to link
