@@ -144,10 +144,17 @@ The seed keeps the fuzzer from forgetting; the test says what "fixed" means.
 **Watch the test fail before the fix.** A crash reproduces on its own, but a *test* for one
 can assert something that passes either way. Stub the fix out and check.
 
+**Two legs, and the slow one is why the fast one works.** CI's 120s gate catches
+regressions per-PR; `fuzz-nightly.yml` spends 10 minutes at 04:00 UTC building the corpus
+that gate restores. Caches written on the default branch are readable from every branch, so
+each night's exploration deepens every later PR run. They share the `fuzz-corpus-` cache
+prefix — diverge it and neither feeds the other. Mondays the nightly minimizes with
+`cargo fuzz cmin`, without which the corpus grows until the gate spends its budget
+replaying rather than exploring.
+
 **Cost:** a nightly toolchain, a corpus, CI minutes, and Linux only. Windows MSVC cannot
 run it: the ASAN runtime mismatches rustc's LLVM, and `--sanitizer none` fails to link
-libFuzzer's sancov symbols. The CI leg is a 120s smoke gate; run longer by hand when
-touching the code it covers.
+libFuzzer's sancov symbols.
 
 ## Mutation audits
 
