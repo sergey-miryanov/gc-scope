@@ -297,13 +297,12 @@ mod tests {
         assert!(parse_macho(&bytes).is_none());
     }
 
-    /// How a fixture image should be shaped. Defaults to the 64-bit executable that
-    /// [`thin_macho`] documents; the other fields select the guard's remaining exits.
+    /// Which fixture shape to build. Each field selects one of the guard's exits.
     #[derive(Clone, Copy)]
     struct Shape {
         /// 64-bit (`LC_SEGMENT_64`) or 32-bit (`LC_SEGMENT`, half-width address fields).
         bits64: bool,
-        /// `None` emits no LC_MAIN — what every dylib looks like, `libpython` included.
+        /// `None` emits no LC_MAIN — what a dylib looks like, `libpython` included.
         entryoff: Option<u64>,
         /// Append an LC_UUID: a command the walk must step over without misreading.
         extra_cmd: bool,
@@ -319,10 +318,9 @@ mod tests {
         }
     }
 
-    /// A thin little-endian Mach-O holding one `__TEXT` segment and, per `shape`, an LC_MAIN
-    /// — the fields goblin combines into the entry point, and nothing else. Padded past
-    /// `fileoff` so the segment's data range stays in bounds; a short buffer fails earlier,
-    /// for an unrelated reason.
+    /// A thin little-endian Mach-O: one `__TEXT` segment, plus whatever `shape` asks for.
+    /// Padded past `fileoff` so the segment's data range stays in bounds; a short buffer
+    /// fails earlier, for an unrelated reason.
     fn thin_macho(vmaddr: u64, fileoff: u64, shape: Shape) -> Vec<u8> {
         const LC_SEGMENT: u32 = 0x1;
         const LC_SEGMENT_64: u32 = 0x19;
@@ -331,7 +329,11 @@ mod tests {
         const MAIN_CMD_SIZE: u32 = 24;
         const UUID_CMD_SIZE: u32 = 24;
 
-        let seg_cmd_size: u32 = if shape.bits64 { 72 } else { 56 };
+        let (magic, cputype, seg_cmd, seg_cmd_size) = if shape.bits64 {
+            (0xfeed_facfu32, 0x0100_0007u32, LC_SEGMENT_64, 72u32)
+        } else {
+            (0xfeed_face, 0x0000_0007, LC_SEGMENT, 56)
+        };
         let ncmds = 1 + u32::from(shape.entryoff.is_some()) + u32::from(shape.extra_cmd);
         let sizeofcmds = seg_cmd_size
             + shape.entryoff.map_or(0, |_| MAIN_CMD_SIZE)
@@ -339,22 +341,8 @@ mod tests {
 
         let mut b = Vec::new();
         // mach_header / mach_header_64 — identical but for the trailing `reserved`.
-        b.extend(
-            if shape.bits64 {
-                0xfeed_facfu32
-            } else {
-                0xfeed_faceu32
-            }
-            .to_le_bytes(),
-        );
-        b.extend(
-            if shape.bits64 {
-                0x0100_0007u32
-            } else {
-                0x0000_0007
-            }
-            .to_le_bytes(),
-        ); // cputype
+        b.extend(magic.to_le_bytes());
+        b.extend(cputype.to_le_bytes());
         b.extend(3u32.to_le_bytes()); // cpusubtype
         b.extend(2u32.to_le_bytes()); // filetype MH_EXECUTE
         b.extend(ncmds.to_le_bytes());
@@ -365,14 +353,7 @@ mod tests {
         }
 
         // segment_command / segment_command_64
-        b.extend(
-            if shape.bits64 {
-                LC_SEGMENT_64
-            } else {
-                LC_SEGMENT
-            }
-            .to_le_bytes(),
-        );
+        b.extend(seg_cmd.to_le_bytes());
         b.extend(seg_cmd_size.to_le_bytes());
         b.extend(b"__TEXT\0\0\0\0\0\0\0\0\0\0"); // segname, 16 bytes
         if shape.bits64 {
@@ -450,19 +431,17 @@ mod tests {
         );
     }
 
-    /// The case gcscope actually meets on macOS: `libpython3.x.dylib` has no LC_MAIN, so
-    /// goblin never computes a base address and the arithmetic cannot run. Such an image
-    /// must pass the guard untouched — rejecting it would disable the platform, and every
-    /// `__TEXT` here is deliberately the shape that *would* underflow if the guard looked
-    /// at the segment without checking for an entry point first.
+    /// `libpython3.x.dylib` has no LC_MAIN, so goblin computes no base address and the
+    /// arithmetic never runs. Rejecting such an image would disable macOS. Both `__TEXT`
+    /// shapes below *would* underflow if the guard skipped the entry-point check.
     #[test]
     fn parse_macho_accepts_an_image_with_no_entry_point() {
         let shape = Shape {
             entryoff: None,
             ..Shape::default()
         };
-        // The second pair also pushes `fileoff` past the built commands, so the segment's
-        // data range has to be padded into existence.
+        // The second pair pushes `fileoff` past the built commands, so the fixture pads the
+        // segment's data range into existence.
         for (vmaddr, fileoff) in [(0x1_0000_0000u64, 0u64), (0, 0x100)] {
             let bytes = thin_macho(vmaddr, fileoff, shape);
             let (macho, _) = parse_macho(&bytes)
@@ -471,9 +450,9 @@ mod tests {
         }
     }
 
-    /// 32-bit images take the other segment-command form, where `vmaddr`/`fileoff` are
-    /// `u32`. goblin widens them before subtracting, so the same underflow is reachable and
-    /// the guard has to read the narrow fields to see it.
+    /// 32-bit images use `LC_SEGMENT`, whose `vmaddr`/`fileoff` are `u32`. goblin widens
+    /// them before subtracting, so the same underflow is reachable — but only a guard that
+    /// reads the narrow fields sees it.
     #[test]
     fn parse_macho_guards_the_32_bit_segment_form_too() {
         let shape = Shape {
@@ -495,9 +474,9 @@ mod tests {
         assert_eq!(macho.entry, 0x1040);
     }
 
-    /// The walk must step over load commands it does not care about rather than
-    /// misinterpreting one as a segment, and must stop cleanly when a command cannot be
-    /// parsed at all — goblin aborts there too, so the guard only has to not panic or spin.
+    /// The walk steps over commands it does not care about rather than misreading one as a
+    /// segment, and stops when a command will not parse. goblin aborts there too, so the
+    /// guard need only avoid panicking or spinning.
     #[test]
     fn parse_macho_walks_past_unrelated_and_unparseable_load_commands() {
         // An LC_UUID between the segment and LC_MAIN changes nothing.
@@ -510,17 +489,17 @@ mod tests {
         let (macho, _) = parse_macho(&bytes).expect("an unrelated command is skipped");
         assert_eq!(macho.entry, 0x1_0000_4000);
 
-        // Claim one more load command than the buffer holds: the walk hits the end mid-command.
+        // Claim one more load command than the buffer holds, so the walk runs off the end.
         let mut truncated = thin_macho_with_entry_point(0x1_0000_0000, 0, 0x4000);
         let ncmds = u32::from_le_bytes(truncated[16..20].try_into().unwrap());
         truncated[16..20].copy_from_slice(&(ncmds + 1).to_le_bytes());
-        // goblin rejects it for the same reason; the point is that neither of us panics.
+        // goblin rejects it for the same reason; what matters is that neither side panics.
         assert!(parse_macho(&truncated).is_none());
     }
 
     /// Wraps `thin` in a one-architecture universal binary at `slice_at`, tagged with the
-    /// host cputype so `parse_macho` selects it. Every field of the fat header and the
-    /// `fat_arch` table is **big-endian** regardless of the slice's own byte order.
+    /// host cputype so `parse_macho` selects it. The fat header and `fat_arch` table are
+    /// **big-endian** whatever the slice's own byte order.
     fn fat_macho(thin: &[u8], slice_at: usize) -> Vec<u8> {
         let want = if cfg!(target_arch = "aarch64") {
             goblin::mach::cputype::CPU_TYPE_ARM64
@@ -544,10 +523,9 @@ mod tests {
         b
     }
 
-    /// macOS ships Python as a `universal2` framework, so the fat path — not the thin one —
-    /// is what a real macOS attach walks, and until now only the live CI leg exercised it.
-    /// The slice offset is the subtle part: it is returned so callers can rebase *file*
-    /// offsets, and a slice must be parsed standalone rather than in place.
+    /// macOS ships Python as a `universal2` framework, so a real attach walks the fat path;
+    /// before this, only the live CI leg covered it. The slice offset is the subtle part —
+    /// callers rebase *file* offsets onto it, and the slice parses standalone, not in place.
     #[test]
     fn parse_macho_unwraps_a_universal_binary_and_reports_the_slice_offset() {
         const SLICE_AT: usize = 0x40;
@@ -562,10 +540,9 @@ mod tests {
         );
     }
 
-    /// The guard covers a fat slice as much as a thin image: the same goblin arithmetic runs
-    /// on whatever buffer reaches `MachO::parse`, and a universal binary is the shape macOS
-    /// actually hands over. Without the slice-side check this panics where the thin-side
-    /// check would have caught it.
+    /// The same goblin arithmetic runs on whatever buffer reaches `MachO::parse`, so a fat
+    /// slice needs the guard as much as a thin image does. Drop the slice-side check and
+    /// this panics.
     #[test]
     fn parse_macho_guards_the_slice_of_a_universal_binary() {
         let thin = thin_macho_with_entry_point(0, 0x20, 0); // __TEXT below its file offset
