@@ -1,25 +1,20 @@
 name: Fuzz (nightly)
 
-# The long-run counterpart to CI's 120s smoke gate. Time-driven and outside CI proper so a
-# nightly tick does not drag the 27-leg live matrix with it — same reasoning as
-# offsets-sweep.yml.
+# The long-run counterpart to CI's 120s smoke gate. Separate from rust.yml so a nightly tick
+# does not drag its 27-leg live matrix along — same reasoning as offsets-sweep.yml.
 #
-# What this is for is the corpus it leaves behind, not the findings of any one run. Caches
-# written on the default branch are restorable from every branch, so each night's
-# exploration lands in the corpus that later PRs restore, and CI's gate starts deeper than
-# it otherwise could. On its own that gate only grows the shared corpus by 120s per merge.
+# The corpus outlives any one run's findings: caches written on the default branch are
+# readable from every branch, so each night deepens what later PRs restore. CI's gate alone
+# grows it 120s per merge.
 #
-# Nightly rather than weekly for three reasons: GitHub drops cache entries untouched for 7
-# days, so a weekly tick sits on the eviction boundary and can silently lose everything
-# during a quiet stretch; a regression surfaces the next morning instead of the next
-# Monday; and six independent searches resample a heavy-tailed distribution that one long
-# search can get stuck in.
+# Nightly, not weekly: GitHub drops caches untouched for 7 days, so a weekly tick sits on
+# the eviction boundary; a regression surfaces next morning rather than next Monday; and
+# repeated short searches resample a heavy-tailed distribution one long run can stall in.
 on:
   schedule:
     - cron: '0 4 * * *'   # nightly, 04:00 UTC
   workflow_dispatch:
-  # Also on changes to the machinery itself, so a broken job is caught by the PR that
-  # breaks it rather than at 04:00 the next morning.
+  # Also on machinery changes, so a broken job fails the PR that breaks it.
   pull_request:
     paths:
       - 'fuzz/**'
@@ -28,8 +23,8 @@ on:
 permissions:
   contents: read
 
-# A manual dispatch during a scheduled run would have both writing the corpus cache, and
-# the loser's exploration would be discarded. Queue instead.
+# A dispatch overlapping the schedule would have both writing the corpus cache, and the
+# loser's exploration discarded. Queue instead.
 concurrency:
   group: fuzz-nightly
   cancel-in-progress: false
@@ -39,7 +34,7 @@ jobs:
     name: Explore and grow the corpus
     runs-on: ubuntu-latest
     env:
-      # A PR here is only proving the job still works; it should not cost ten minutes.
+      # A PR here only proves the job still runs; it should not cost ten minutes.
       FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && 60 || 600 }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -56,12 +51,11 @@ jobs:
         with:
           tool: cargo-fuzz
 
-      # The `fuzz-corpus-` prefix MUST match the one in rust.yml. Diverge it and the two
-      # jobs stop feeding each other, which is the entire point of running this one.
+      # The `fuzz-corpus-` prefix MUST match rust.yml. Diverge it and the two jobs stop
+      # feeding each other, which is the point of running this one.
       #
-      # Restore and save are split rather than using the combined action because a run that
-      # finds a crash fails, and the combined action skips its save on failure — throwing
-      # away the exploration of exactly the run that proved most productive.
+      # Restore and save are split because the combined action skips its save on failure,
+      # discarding the corpus of the run that found a crash — the one that explored most.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus
@@ -76,9 +70,9 @@ jobs:
             cp "$dir"* "fuzz/corpus/$target/" 2>/dev/null || true
           done
 
-      # `--target` is not optional here for the same reason as in rust.yml: the prebuilt
-      # cargo-fuzz is musl-built, so it defaults to a target that is not installed and is
-      # crt-static, which ASAN refuses.
+      # `--target` is not optional, for rust.yml's reason: the prebuilt cargo-fuzz is
+      # musl-built, so it defaults to a target that is absent here and is crt-static, which
+      # ASAN refuses.
       - name: Fuzz scan_image_for_version
         run: |
           HOST=$(rustc -vV | sed -n 's/^host: //p')
@@ -90,9 +84,8 @@ jobs:
           echo "corpus out: $after inputs (+$((after - before)))"
 
       # libFuzzer re-executes the whole corpus at startup, so an unminimized corpus grows
-      # until CI's 120s gate spends its budget replaying instead of exploring — the long
-      # run slowly poisons the thing it exists to improve. Minimizing costs a chunk of a
-      # run's budget, so it gets its own night rather than every night.
+      # until the 120s gate spends its budget replaying rather than exploring. Minimizing
+      # costs a chunk of a run, so it gets its own night.
       - name: Minimize the corpus (Mondays)
         if: github.event_name != 'pull_request'
         run: |
@@ -106,8 +99,8 @@ jobs:
           after=$(find fuzz/corpus/scan_image_for_version -type f 2>/dev/null | wc -l)
           echo "minimized: $before -> $after inputs"
 
-      # No PR to attach a failure to, so the input has to reach the log. libFuzzer's own
-      # dump truncates; base64 rather than adding an upload action to the supply chain.
+      # No PR to attach a failure to, so the input has to reach the log. libFuzzer's dump
+      # truncates; base64 rather than adding an upload action to the supply chain.
       - name: Emit the crashing input
         if: failure()
         run: |
@@ -122,7 +115,7 @@ jobs:
           [ "$found" = 1 ] || echo "No artifact written; the failure was not a crash."
 
       # `always()` so a crash-finding run still contributes its corpus. Not on pull_request:
-      # that cache would be scoped to the PR branch, where nothing else would ever read it.
+      # that cache is scoped to the PR branch, where nothing reads it.
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: always() && github.event_name != 'pull_request'
         with:
