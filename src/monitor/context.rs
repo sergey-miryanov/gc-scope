@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::monitor::convert::convert_record;
 use crate::monitor::exporters::{EventsExporter, ProcessLifecycle};
 use crate::monitor::run_loop::PollStatus;
 use crate::remote_debugging::gc_stats::GcStat;
@@ -9,7 +10,7 @@ use crate::remote_debugging::session::{PySession, Revalidated};
 ///
 /// The multi-PID sibling of [`crate::snapshot::poller::SnapshotPoller`]: where that owns one
 /// session and *returns* a full snapshot, this owns a `HashMap<u32, PySession>` and *emits*
-/// deduped event deltas into an `EventsExporter`. Both share the same `Fresh/Changed/Dead`
+/// deduped trace events into an `EventsExporter`. Both share the same `Fresh/Changed/Dead`
 /// revalidate ladder (see [`poll`](Self::poll)).
 ///
 /// Owns the exporter and, per PID, an attached [`PySession`] (resolved once and
@@ -108,8 +109,10 @@ impl<'a> MonitorContext<'a> {
                 .mark_process_lifecycle(pid, ProcessLifecycle::Started, 0);
         }
 
+        // Convert once here, so every output format is handed the same events instead of
+        // deriving its own from the raw Record.
         for stat in select_fresh(&stats, self.seen.entry(pid).or_default()) {
-            self.exporter.add_event(pid, stat);
+            self.exporter.add_events(&convert_record(pid, stat));
         }
         PollStatus::Ok
     }

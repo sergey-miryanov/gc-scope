@@ -8,7 +8,7 @@ use crate::snapshot::collect::{CollectRequest, CollectedData, collect_data};
 /// revalidate ladder.
 ///
 /// This is the single-PID sibling of [`crate::monitor::MonitorContext`]. Where that owns
-/// a `HashMap<u32, PySession>` and emits deduped *event deltas* into an `EventsExporter`,
+/// a `HashMap<u32, PySession>` and emits deduped *trace events* into an `EventsExporter`,
 /// this owns one session and returns a *full snapshot* to its caller. The `Fresh/Changed/
 /// Dead` arms of [`poll`](Self::poll) deliberately mirror `MonitorContext::poll` so the
 /// kinship is visible on sight. A future multi-PID snapshot mode would wrap
