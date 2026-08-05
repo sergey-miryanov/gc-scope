@@ -718,10 +718,19 @@ mod tests {
     /// must be representable. Runs everywhere, unlike `fuzz/` (coverage-guided, Linux only),
     /// and is deterministic, so a failure reproduces.
     ///
-    /// The buffers start with real image magics on purpose. Behind a valid-looking header
-    /// the bytes reach goblin's header parsing, `parse_macho`'s fat-slice arithmetic and the
-    /// section-range clamping (where the hang was found), rather than only the string
-    /// grammar, whose bounds are guarded by construction.
+    /// The buffers start with real image magics on purpose, so the bytes reach goblin's
+    /// header parsing, `parse_macho`'s fat-arch table walk (where the hang was found) and
+    /// the section-range clamping, rather than only the string grammar, whose bounds are
+    /// guarded by construction.
+    ///
+    /// **Know what this cannot reach.** goblin *rejects* random bytes rather than parsing
+    /// them. Over 4M rounds — 1000x what runs here — this generator produced 2M Mach-O
+    /// magics, 666k parseable *fat* headers (the table walk is lenient) and **zero**
+    /// parseable thin images, so nothing downstream of a successful `MachO::parse` is
+    /// tested here. That is how the `goblin` entry-point underflow reached CI: it needs a
+    /// valid header, a well-formed `LC_SEGMENT_64`, a segname starting `__TEXT\0` and an
+    /// `LC_MAIN`, which splitmix64 will not assemble at any round count. Reach for a
+    /// builder (`memory::binary`'s `thin_macho`/`fat_macho`) or the fuzzer instead.
     #[test]
     fn image_scan_survives_adversarial_bytes() {
         // splitmix64: tiny, deterministic, and good enough to shake out structure.

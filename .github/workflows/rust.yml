@@ -78,6 +78,27 @@ jobs:
         with:
           tool: cargo-fuzz
 
+      # Without this the leg starts empty every run and throws away its 120s of
+      # coverage-guided search, so a bug it once caught may not be caught again.
+      # `github.run_id` never repeats, so the key always misses and the grown corpus always
+      # saves; `restore-keys` pulls the newest previous one back in.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      # Tracked inputs that must never stop being tested — every one is a past crash. The
+      # cache expires and a cold fork has none, so it cannot be what carries them.
+      - name: Seed the corpus
+        run: |
+          for dir in fuzz/seeds/*/; do
+            target=$(basename "$dir")
+            mkdir -p "fuzz/corpus/$target"
+            cp -v "$dir"* "fuzz/corpus/$target/" 2>/dev/null || true
+          done
+          ls -l fuzz/corpus/* || true
+
       # The only entry point fed bytes gcscope does not control, and below 3.11 the sole
       # version source. Covers goblin's header parsing and the fat-slice arithmetic too,
       # which is where the hang fixed in `parse_macho` lived. Time-boxed to a smoke gate;
