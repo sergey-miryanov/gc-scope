@@ -13,8 +13,9 @@
   by layout, not version), [ADR 0005](../docs/adr/0005-testing-strategy.md),
   [ADR 0007](../docs/adr/0007-gcstat-layout-driven-view.md) (`GcStat` is a layout-driven
   view), [ADR 0008](../docs/adr/0008-reader-consumer-package-layering.md)
-- **Blocked by:** `.scratch/monitor-inflight-entries/issues/01-select-fresh-admits-incomplete-entries.md`
-  — the in-flight-entry fix ships first and standalone.
+- **Blocked by:** nothing. The in-flight-entry fix shipped first and standalone in `ce747cb`,
+  as `GcStat::is_complete` (`ts_start < ts_stop`, gated on the layout) filtering both
+  `select_fresh` and `parse_gc_entries`. §4 below still replaces that cursor outright.
 
 ## 1. Problem statement
 
@@ -268,8 +269,8 @@ that future.
   it can wait.
 - **RSS sampling**, `--duration`, and the environment-variable option surface.
 - **Duty-cycle pause estimation for pre-3.15 builds**, per §4.
-- **The in-flight-entry fix itself**, which ships first as its own change so that a live
-  correctness bug is not held hostage to this work.
+- **The in-flight-entry fix itself**, which shipped first as its own change (`ce747cb`) so
+  that a live correctness bug was not held hostage to this work.
 
 ## 7. Further notes
 
