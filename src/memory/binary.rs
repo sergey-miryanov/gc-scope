@@ -506,6 +506,39 @@ mod tests {
         assert!(parse_macho(&truncated).is_none());
     }
 
+    /// The guard restates goblin's `ncmds > sizeofcmds / 8 || sizeofcmds > bytes.len()`
+    /// bound so that it walks exactly the commands goblin will. Loosening either comparison
+    /// in the direction that *skips* the walk makes the guard call a malformed image safe,
+    /// and goblin then panics on it — so both boundaries need an image sitting on them.
+    ///
+    /// goblin treats `sizeofcmds` as advisory (it loops on `ncmds` and reads the real
+    /// bytes), which is what lets the fixture sit on each boundary without changing what
+    /// goblin itself does with the image.
+    ///
+    /// The two mutations this cannot kill — `/` to `*` and `||` to `&&` — both make the
+    /// condition *harder* to satisfy, so the guard only ever walks more than it must. Same
+    /// category as the `narches` bound in `parse_macho`: conservative, and unobservable.
+    #[test]
+    fn the_guard_does_not_skip_its_walk_at_goblins_bound() {
+        for on_the_bound in [
+            // `ncmds == sizeofcmds / 8`: `>` walks, `>=` would not.
+            |b: &mut Vec<u8>| {
+                let ncmds = u32::from_le_bytes(b[16..20].try_into().unwrap());
+                b[20..24].copy_from_slice(&(ncmds * 8).to_le_bytes());
+            },
+            // `sizeofcmds == bytes.len()`: same boundary on the other comparison.
+            |b: &mut Vec<u8>| {
+                let len = b.len() as u32;
+                b[20..24].copy_from_slice(&len.to_le_bytes());
+            },
+        ] {
+            // __TEXT below its own file offset, so skipping the walk means a panic.
+            let mut bytes = thin_macho_with_entry_point(0, 0x20, 0);
+            on_the_bound(&mut bytes);
+            assert!(parse_macho(&bytes).is_none());
+        }
+    }
+
     /// Wraps `thin` in a one-architecture universal binary at `slice_at`, tagged with the
     /// host cputype so `parse_macho` selects it. The fat header and `fat_arch` table are
     /// **big-endian** whatever the slice's own byte order.
