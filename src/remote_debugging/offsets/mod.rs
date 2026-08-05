@@ -131,6 +131,11 @@ const ALIASES: &[(u64, u64)] = &[
     // the fallback refuses a pre-release outright.
     (0x030f00b2, 0x030f00b1),
     (0x030f00b3, 0x030f00b1),
+    // 3.15.0rc1 -> 3.15.0b4. b4's `_thread_state` change (`last_profiled_frame_seq`) is
+    // already in b4's module and rc1 adds nothing: the sweep reports both at block
+    // ff906fd0a8fc / stats 22a24c6795b7. The CI 3.15 leg floats to the newest pre-release,
+    // so this row is what keeps it green — an rc is refused without it.
+    (0x030f00c1, 0x030f00b4),
 ];
 
 /// The registered layout `stored` is proven equal to, if it is an alias.
@@ -1059,16 +1064,23 @@ mod registry_tests {
     }
 
     /// A verified alias outranks the same-minor fallback, and applies to pre-releases —
-    /// which the fallback refuses outright. 3.15.0b2 is byte-identical to b1, so it
-    /// resolves rather than being turned away for lacking a module of its own.
+    /// which the fallback refuses outright. 3.15.0b2 is byte-identical to b1, and 3.15.0rc1
+    /// to b4, so both resolve rather than being turned away for lacking a module of their
+    /// own. rc1 is the live case: the CI 3.15 leg floats to the newest pre-release, and went
+    /// red the day rc1 shipped.
     #[test]
     fn an_aliased_prerelease_resolves_where_fallback_would_refuse() {
-        assert_eq!(alias_of(0x030f00b2), Some(0x030f00b1));
-        assert!(has_verified_layout(0x030f00b2));
-        assert!(
-            resolve_fallback_layout(0x030f00b2).is_err(),
-            "fallback must still refuse it; only the proof lets it through"
-        );
+        for (hex, anchor, label) in [
+            (0x030f00b2u64, 0x030f00b1u64, "3.15.0b2 -> b1"),
+            (0x030f00c1, 0x030f00b4, "3.15.0rc1 -> b4"),
+        ] {
+            assert_eq!(alias_of(hex), Some(anchor), "{label}");
+            assert!(has_verified_layout(hex), "{label}");
+            assert!(
+                resolve_fallback_layout(hex).is_err(),
+                "{label}: fallback must still refuse it; only the proof lets it through"
+            );
+        }
     }
 
     /// The permitted case: a *future* patch release, past everything the sweep has
