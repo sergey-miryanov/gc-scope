@@ -78,19 +78,18 @@ jobs:
         with:
           tool: cargo-fuzz
 
-      # Without this the leg starts from an empty corpus every run and gets 120s to
-      # rediscover everything from scratch — so a bug it once caught is not guaranteed to
-      # be caught again, and 120s of coverage-guided search is thrown away each time.
-      # `github.run_id` never repeats, so the key always misses and the grown corpus is
-      # always saved; `restore-keys` pulls the newest previous one back in.
+      # Without this the leg starts empty every run and throws away its 120s of
+      # coverage-guided search, so a bug it once caught may not be caught again.
+      # `github.run_id` never repeats, so the key always misses and the grown corpus always
+      # saves; `restore-keys` pulls the newest previous one back in.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
           restore-keys: fuzz-corpus-
 
-      # Tracked inputs that must never stop being tested — every one is a past crash.
-      # The cache is best-effort (it expires, and a cold fork has none); these are not.
+      # Tracked inputs that must never stop being tested — every one is a past crash. The
+      # cache expires and a cold fork has none, so it cannot be what carries them.
       - name: Seed the corpus
         run: |
           for dir in fuzz/seeds/*/; do

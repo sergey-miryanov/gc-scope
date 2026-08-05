@@ -96,19 +96,18 @@ a rule already handles.
 found the `parse_macho` hang.
 
 **Random bytes stop at the first validating parser.** They reach the code that *rejects*
-malformed input, never the code that runs once input is accepted, so a defect past that
-point is invisible however many rounds you add. Measured on
-`image_scan_survives_adversarial_bytes` at 1000x its usual rounds: 2M Mach-O magics, 666k
-parseable fat headers, and zero parseable thin images — which is why the `goblin`
-entry-point underflow got past it to CI. Reaching that line needs a valid header, a
-well-formed `LC_SEGMENT_64`, a segname whose first 7 bytes are exactly `__TEXT\0` and an
-`LC_MAIN`; splitmix64 does not assemble that, and neither does more of it.
+malformed input, never the code that runs once it is accepted, so a defect past that point
+stays invisible however many rounds you add. `image_scan_survives_adversarial_bytes` at
+1000x its usual rounds produced 2M Mach-O magics, 666k parseable fat headers and zero
+parseable thin images, which is how the `goblin` entry-point underflow reached CI. That
+line needs a valid header, a well-formed `LC_SEGMENT_64`, a segname whose first 7 bytes are
+`__TEXT\0`, and an `LC_MAIN`. splitmix64 does not assemble that, and more of it will not.
 
-**So build the structure instead.** For anything behind a header, length field or offset
-table, write a fixture builder that emits a *valid* image and parameterise the one field
-under test — `memory::binary`'s `thin_macho`/`fat_macho` do this for Mach-O. That is what
-covers the accept path; randomization covers the reject path. Coverage-guided fuzzing is
-the third option, and the only one that discovers structure it was not told about.
+**So build the structure instead.** Behind a header, length field or offset table, write a
+builder that emits a *valid* image and parameterise the one field under test —
+`memory::binary`'s `thin_macho`/`fat_macho` do this for Mach-O. Builders cover the accept
+path, randomization the reject path, and coverage-guided fuzzing finds structure nobody
+described.
 
 **Cost:** milliseconds to seconds, in the normal suite.
 
@@ -127,25 +126,23 @@ code did not panic. State the property in the target, as
 `fuzz/fuzz_targets/scan_image_for_version.rs` does for serial and release level, or use a
 different layer.
 
-**When a target crashes, produce two artifacts, not one.**
+**A crash produces two artifacts, not one.**
 
 1. **A seed** in `fuzz/seeds/<target>/`, named for the defect. CI copies these into the
-   corpus before every run. `fuzz/corpus/` is gitignored and restored from cache, so it is
-   best-effort — it expires, and a fork starts cold. A 120s leg starting empty is not
-   guaranteed to rediscover a bug it once found, so without the seed a reintroduction can
-   sit green indefinitely.
-2. **A unit test** stating the correct behaviour, with a fixture built in-repo rather than
+   corpus before every run. `fuzz/corpus/` is gitignored and restored from cache, so it
+   expires and a fork starts cold; a 120s leg starting empty may not rediscover a bug it
+   once found, and a reintroduction then sits green.
+2. **A unit test** stating the correct behaviour, over a fixture built in-repo rather than
    the raw crashing bytes. It runs on all three platforms instead of the Linux fuzz leg,
-   fails with a message instead of a stack trace, and reviews as an assertion about the
-   code rather than 457 opaque bytes.
+   fails with a message instead of a stack trace, and reviews as an assertion rather than
+   457 opaque bytes.
 
-Neither replaces the other: the seed keeps the fuzzer from forgetting, the test says what
-"fixed" means. `goblin-entry-point-underflow` and
+The seed keeps the fuzzer from forgetting; the test says what "fixed" means.
+`goblin-entry-point-underflow` and
 `parse_macho_refuses_an_image_that_would_overflow_goblins_entry_point_math` are the pair.
 
-**Verify the test is red before the fix.** A crash reproduces trivially; a *test* for that
-crash can easily assert something that passes either way. Stub out the fix and watch it
-fail before believing it.
+**Watch the test fail before the fix.** A crash reproduces on its own, but a *test* for one
+can assert something that passes either way. Stub the fix out and check.
 
 **Cost:** a nightly toolchain, a corpus, CI minutes, and Linux only. Windows MSVC cannot
 run it: the ASAN runtime mismatches rustc's LLVM, and `--sanitizer none` fails to link

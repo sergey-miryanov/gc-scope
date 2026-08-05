@@ -723,15 +723,14 @@ mod tests {
     /// the section-range clamping, rather than only the string grammar, whose bounds are
     /// guarded by construction.
     ///
-    /// **Know what this cannot reach.** Random bytes get *rejected* by goblin, they do not
-    /// get parsed by it. Measured over 4M rounds — 1000x what runs here — this generator
-    /// produced 2M Mach-O magics, 666k parseable *fat* headers (the table walk is lenient)
-    /// and **zero** parseable thin images. Anything downstream of a successful
-    /// `MachO::parse` is therefore untested by this, which is how the `goblin` entry-point
-    /// underflow reached CI: it needs a valid header, a well-formed `LC_SEGMENT_64`, a
-    /// segname whose first 7 bytes are exactly `__TEXT\0` and an `LC_MAIN`, and splitmix64
-    /// will not assemble that. Raising the round count buys nothing. Use a structured
-    /// fixture (`memory::binary`'s `thin_macho`/`fat_macho`) or the coverage-guided fuzzer.
+    /// **Know what this cannot reach.** goblin *rejects* random bytes rather than parsing
+    /// them. Over 4M rounds — 1000x what runs here — this generator produced 2M Mach-O
+    /// magics, 666k parseable *fat* headers (the table walk is lenient) and **zero**
+    /// parseable thin images, so nothing downstream of a successful `MachO::parse` is
+    /// tested here. That is how the `goblin` entry-point underflow reached CI: it needs a
+    /// valid header, a well-formed `LC_SEGMENT_64`, a segname starting `__TEXT\0` and an
+    /// `LC_MAIN`, which splitmix64 will not assemble at any round count. Reach for a
+    /// builder (`memory::binary`'s `thin_macho`/`fat_macho`) or the fuzzer instead.
     #[test]
     fn image_scan_survives_adversarial_bytes() {
         // splitmix64: tiny, deterministic, and good enough to shake out structure.
