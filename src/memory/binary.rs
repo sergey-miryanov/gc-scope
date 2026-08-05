@@ -319,8 +319,8 @@ mod tests {
     }
 
     /// A thin little-endian Mach-O: one `__TEXT` segment, plus whatever `shape` asks for.
-    /// Padded past `fileoff` so the segment's data range stays in bounds; a short buffer
-    /// fails earlier, for an unrelated reason.
+    /// `filesize` is always 0, so goblin never reads the bytes at `fileoff` and the buffer
+    /// need not extend that far.
     fn thin_macho(vmaddr: u64, fileoff: u64, shape: Shape) -> Vec<u8> {
         const LC_SEGMENT: u32 = 0x1;
         const LC_SEGMENT_64: u32 = 0x19;
@@ -352,6 +352,16 @@ mod tests {
             b.extend(0u32.to_le_bytes()); // reserved
         }
 
+        // Emitted FIRST, ahead of both commands the walk cares about: a walk that mis-steps
+        // over an unrecognized command then decodes the segment and LC_MAIN from the wrong
+        // offsets. Last, it would be stepped over after everything had already been read.
+        if shape.extra_cmd {
+            // uuid_command
+            b.extend(LC_UUID.to_le_bytes());
+            b.extend(UUID_CMD_SIZE.to_le_bytes());
+            b.extend([0xab; 16]);
+        }
+
         // segment_command / segment_command_64
         b.extend(seg_cmd.to_le_bytes());
         b.extend(seg_cmd_size.to_le_bytes());
@@ -378,17 +388,6 @@ mod tests {
             b.extend(MAIN_CMD_SIZE.to_le_bytes());
             b.extend(entryoff.to_le_bytes());
             b.extend(0u64.to_le_bytes()); // stacksize
-        }
-        if shape.extra_cmd {
-            // uuid_command
-            b.extend(LC_UUID.to_le_bytes());
-            b.extend(UUID_CMD_SIZE.to_le_bytes());
-            b.extend([0xab; 16]);
-        }
-
-        // `fileoff` indexes into the buffer during the segment parse, so it has to fit.
-        if let Some(needed) = usize::try_from(fileoff).ok().filter(|n| *n > b.len()) {
-            b.resize(needed, 0);
         }
         b
     }
@@ -432,16 +431,17 @@ mod tests {
     }
 
     /// `libpython3.x.dylib` has no LC_MAIN, so goblin computes no base address and the
-    /// arithmetic never runs. Rejecting such an image would disable macOS. Both `__TEXT`
-    /// shapes below *would* underflow if the guard skipped the entry-point check.
+    /// arithmetic never runs. Rejecting such an image would disable macOS. The second
+    /// `__TEXT` below *would* underflow if the guard skipped the entry-point check; the
+    /// first is the ordinary shape, there to show nothing else turns it away.
     #[test]
     fn parse_macho_accepts_an_image_with_no_entry_point() {
         let shape = Shape {
             entryoff: None,
             ..Shape::default()
         };
-        // The second pair pushes `fileoff` past the built commands, so the fixture pads the
-        // segment's data range into existence.
+        // The second pair puts `fileoff` past the end of the buffer, which is legal with
+        // `filesize` 0 and keeps the underflow the only thing under test.
         for (vmaddr, fileoff) in [(0x1_0000_0000u64, 0u64), (0, 0x100)] {
             let bytes = thin_macho(vmaddr, fileoff, shape);
             let (macho, _) = parse_macho(&bytes)
@@ -479,7 +479,7 @@ mod tests {
     /// guard need only avoid panicking or spinning.
     #[test]
     fn parse_macho_walks_past_unrelated_and_unparseable_load_commands() {
-        // An LC_UUID between the segment and LC_MAIN changes nothing.
+        // An LC_UUID ahead of the segment and LC_MAIN changes nothing about either.
         let shape = Shape {
             extra_cmd: true,
             entryoff: Some(0x4000),
@@ -488,6 +488,15 @@ mod tests {
         let bytes = thin_macho(0x1_0000_0000, 0, shape);
         let (macho, _) = parse_macho(&bytes).expect("an unrelated command is skipped");
         assert_eq!(macho.entry, 0x1_0000_4000);
+
+        // The assertion with teeth: the same LC_UUID sits ahead of an *underflowing*
+        // `__TEXT`. A walk that gave up on the command it did not recognize would never
+        // reach the segment, would call the image safe, and goblin would panic.
+        let hidden = Shape {
+            entryoff: Some(0),
+            ..shape
+        };
+        assert!(parse_macho(&thin_macho(0, 0x20, hidden)).is_none());
 
         // Claim one more load command than the buffer holds, so the walk runs off the end.
         let mut truncated = thin_macho_with_entry_point(0x1_0000_0000, 0, 0x4000);
