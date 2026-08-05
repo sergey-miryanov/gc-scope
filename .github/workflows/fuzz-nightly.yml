@@ -9,7 +9,7 @@ name: Fuzz (nightly)
 #
 # Nightly, not weekly: GitHub drops caches untouched for 7 days, so a weekly tick sits on
 # the eviction boundary; a regression surfaces next morning rather than next Monday; and
-# repeated short searches resample a heavy-tailed distribution one long run can stall in.
+# short repeated searches resample a heavy-tailed distribution where one long run stalls.
 on:
   schedule:
     - cron: '0 4 * * *'   # nightly, 04:00 UTC
@@ -55,7 +55,7 @@ jobs:
       # feeding each other, which is the point of running this one.
       #
       # Restore and save are split because the combined action skips its save on failure,
-      # discarding the corpus of the run that found a crash — the one that explored most.
+      # discarding the corpus of the run that found a crash.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus
@@ -83,9 +83,9 @@ jobs:
           after=$(find fuzz/corpus/scan_image_for_version -type f 2>/dev/null | wc -l)
           echo "corpus out: $after inputs (+$((after - before)))"
 
-      # libFuzzer re-executes the whole corpus at startup, so an unminimized corpus grows
-      # until the 120s gate spends its budget replaying rather than exploring. Minimizing
-      # costs a chunk of a run, so it gets its own night.
+      # Every run that restores the corpus pays to transfer it, and near-duplicate inputs
+      # dilute the fuzzer's mutation effort for no new coverage. Minimizing costs a chunk of
+      # a run's budget, so it gets its own night.
       - name: Minimize the corpus (Mondays)
         if: github.event_name != 'pull_request'
         run: |
