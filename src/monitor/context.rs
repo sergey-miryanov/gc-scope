@@ -109,8 +109,8 @@ impl<'a> MonitorContext<'a> {
                 .mark_process_lifecycle(pid, ProcessLifecycle::Started, 0);
         }
 
-        // Conversion happens here, once, so every output format is handed the same events
-        // rather than deriving its own from the raw Record.
+        // Convert once here, so every output format is handed the same events instead of
+        // deriving its own from the raw Record.
         for stat in select_fresh(&stats, self.seen.entry(pid).or_default()) {
             self.exporter.add_events(&convert_record(pid, stat));
         }

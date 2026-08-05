@@ -6,9 +6,8 @@
 //! CLI wiring lives in `crate::cli`, not here, so this stays a plain library with no
 //! argument-parsing knowledge.
 //!
-//! Between the poll and an output file sit two modules that keep the formats interchangeable:
-//! [`trace_event`] is the format-independent event model, and [`convert`] is the single
-//! conversion from a decoded Record into it.
+//! Between the poll and an output file, [`trace_event`] holds the format-independent event
+//! model and [`convert`] the single conversion from a decoded Record into it.
 
 pub mod context;
 pub mod convert;

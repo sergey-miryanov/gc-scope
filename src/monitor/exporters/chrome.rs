@@ -1,13 +1,12 @@
 //! The Chrome Trace encoder: [`TraceEvent`]s in, `chrome://tracing` JSON out.
 //!
-//! Nothing here decides what a Collection looks like in a trace — that is
-//! [`crate::monitor::convert`], shared by every format. This file knows only how the Chrome
-//! format spells an event: which `ph` letter each kind takes, in which key order, and that
-//! its timestamps are microseconds while the model's are nanoseconds.
+//! What a Collection looks like in a trace is decided in [`crate::monitor::convert`]. This
+//! file knows only how Chrome spells an event: which `ph` letter each kind takes, in which
+//! key order, and that its timestamps are microseconds where the model's are nanoseconds.
 //!
-//! The JSON is written by hand rather than through a serializer. The shapes are fixed and
-//! tiny, the crate has no serde dependency, and the output is pinned byte-for-byte by the
-//! regression gate at the bottom of this file.
+//! The JSON is hand-written rather than serialized. The shapes are fixed and tiny, the crate
+//! has no serde dependency, and the regression gate at the bottom of this file pins the
+//! output byte for byte.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -38,9 +37,9 @@ fn args_json(args: &[Arg]) -> String {
 
 /// One event as its Chrome Trace JSON object.
 ///
-/// Key order differs between the span events and the counter/instant events. That is not
-/// tidiness — it is what the existing encoder emitted, and the traces operators have already
-/// saved were written that way, so it is preserved deliberately.
+/// Key order differs between the span events and the counter/instant events. That is what
+/// the encoder emitted before this file was split, and operators have saved traces written
+/// that way, so it stays.
 fn encode(event: &TraceEvent) -> String {
     match event {
         TraceEvent::ProcessMeta { pid, name } => format!(
@@ -81,8 +80,8 @@ fn encode(event: &TraceEvent) -> String {
             name,
             cat
         ),
-        // `"s":"p"` scopes the marker to the whole process rather than to one track: an
-        // instant message is the Observed talking about itself, not about an interpreter.
+        // `"s":"p"` scopes the marker to the process: an instant message is the Observed
+        // talking about itself, not about one interpreter.
         TraceEvent::Instant { pid, ts_ns, name } => format!(
             r#"{{"name":"{}","ph":"I","s":"p","ts":{},"pid":{}}}"#,
             name,
@@ -114,10 +113,10 @@ fn encode(event: &TraceEvent) -> String {
 pub struct ChromeTraceExporter {
     file: Option<File>,
     has_written: bool,
-    /// Metadata already written into *this* stream. Deduplication lives here rather than in
-    /// the conversion because it is a property of an output file: two formats fanned out
-    /// from one conversion each need their own copy, and reopening starts a new file that
-    /// needs metadata again.
+    /// Metadata already written into *this* stream. Dedup lives here, not in the conversion,
+    /// because it is a property of one output file: two formats fanned out from one
+    /// conversion each need their own copy, and reopening starts a file that needs metadata
+    /// again.
     pid_meta_done: HashSet<u32>,
     tid_meta_done: HashSet<i64>,
 }
@@ -155,10 +154,9 @@ impl EventsExporter for ChromeTraceExporter {
 
         let mut first = !*has_written;
         for event in events {
-            // Repeated metadata is dropped, not rewritten. Note the thread set is keyed on
-            // the interpreter id alone, so two processes whose interpreter ids collide share
-            // one `thread_name` line — preserved as-is; the monitor reads one interpreter
-            // per process today.
+            // Repeated metadata is dropped. The thread set is keyed on the interpreter id
+            // alone, so two processes whose interpreter ids collide share one `thread_name`
+            // line; kept as-is, since the monitor reads one interpreter per process today.
             let skip = match event {
                 TraceEvent::ProcessMeta { pid, .. } => !pid_meta_done.insert(*pid),
                 TraceEvent::ThreadMeta { tid, .. } => !tid_meta_done.insert(*tid),
@@ -252,10 +250,9 @@ mod tests {
         ])
     });
 
-    /// A build carrying a chained phase's *stop* field but none of the fields that phase
-    /// chains onto. Only such a layout reaches `Start::Chained`'s `unwrap_or(ts_start)`
-    /// fallback: with `FULL_LAYOUT` every candidate field exists, so the chain resolves to
-    /// `Some(0)` and the fallback is unreachable.
+    /// A build carrying a chained phase's *stop* field but none of the fields it chains
+    /// onto. Only such a layout reaches the `unwrap_or(ts_start)` fallback: with
+    /// `FULL_LAYOUT` every candidate field exists, so the chain resolves to `Some(0)`.
     static CHAINED_ONLY_LAYOUT: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
         seq_layout(&[
             "ts_start",
@@ -333,10 +330,10 @@ mod tests {
         p
     }
 
-    /// Drive the whole producing-to-encoding path end-to-end and return the file it
-    /// produced: Records through `convert_record`, events through `open`/`add_events`/
-    /// `close` — the same path the monitor loop takes. Deliberately not the private
-    /// `encode`, so the ordering and metadata behaviour are exercised too.
+    /// Drive the whole path and return the file it produced: Records through
+    /// `convert_record`, events through `open`/`add_events`/`close`, the same route the
+    /// monitor loop takes. Not the private `encode`, so ordering and metadata are exercised
+    /// too.
     fn export(records: &[(u32, GcStat)]) -> String {
         let path = temp_path();
         let mut ex = ChromeTraceExporter::new();
@@ -367,10 +364,9 @@ mod tests {
         hay.matches(needle).count()
     }
 
-    /// An instant message is scoped to the process (`"s":"p"`) and carries no `tid`: it is
-    /// the Observed talking about itself, not about one of its interpreters. Nothing
-    /// produces one yet, so this is its only coverage — and its timestamp still has to make
-    /// the nanosecond-to-microsecond trip every other event makes.
+    /// An instant message is scoped to the process (`"s":"p"`) and carries no `tid`. Nothing
+    /// produces one yet, so this is its only coverage, and its timestamp still makes the
+    /// nanosecond-to-microsecond trip.
     #[test]
     fn an_instant_message_encodes_as_a_process_scoped_marker() {
         let out = export_events(&[TraceEvent::Instant {
@@ -384,10 +380,10 @@ mod tests {
         );
     }
 
-    /// The encoder writes what it is handed, in the order it is handed it — no reordering,
-    /// no repair. A sub-span whose timestamp precedes its parent's is a real shape (a build
-    /// that publishes a phase's stop but not its start chains it onto a field reading zero),
-    /// and sorting it "back into place" would move a slice the target never placed there.
+    /// The encoder writes what it is handed, in the order it is handed it. A sub-span whose
+    /// timestamp precedes its parent's is a real shape (a build publishing a phase's stop
+    /// but not its start chains it onto a field reading zero), and sorting it back into
+    /// place would move a slice the target never put there.
     #[test]
     fn events_are_written_in_the_order_given_even_when_timestamps_are_not() {
         let out = export_events(&[
@@ -727,21 +723,20 @@ mod tests {
     // ---------------------------------------------------------------------------------
     // Byte-for-byte regression gate.
     //
-    // The `TraceEvent` extraction (`.scratch/loss-reconstruction/issues/01`) moved every
-    // decision about *what* a Collection is in a trace out of this file and left only the
-    // encoding behind. Nothing an operator can see was supposed to change, and "supposed
-    // to" is not an oracle — these two tests are. Both expectations were captured from the
-    // encoder as it stood immediately **before** the extraction; neither may be
-    // regenerated to make a failing build pass. A deliberate format change rewrites them
-    // in the same commit that changes the format, and never on its own.
+    // The `TraceEvent` extraction moved every decision about what a Collection is in a
+    // trace out of this file, leaving the encoding. Nothing an operator sees was meant to
+    // change, and these two tests are what checks that. Both expectations came from the
+    // encoder as it stood before the extraction. Do not regenerate either one to make a
+    // failing build pass: a format change rewrites them in the commit that changes the
+    // format, never on its own.
     // ---------------------------------------------------------------------------------
 
     /// The curated half of the gate: inputs chosen so that every branch of the conversion
     /// is reached at least once, and small enough that the expected bytes stay readable.
     fn golden_matrix() -> Vec<(u32, GcStat)> {
         vec![
-            // Every phase fires, every pause and counter argument is non-zero, and
-            // `duration` carries real float bits — so float formatting is pinned too.
+            // Every phase fires, every argument is non-zero, and `duration` carries real
+            // float bits, so float formatting is pinned too.
             (
                 100,
                 GcStat::from_fields(
@@ -800,9 +795,9 @@ mod tests {
                     ],
                 ),
             ),
-            // A chained phase whose candidates all exist in the layout but read zero: the
-            // chain resolves to `Some(0)`, so the span starts at the epoch rather than at
-            // the pause. Ugly, and exactly what today's encoder does.
+            // A chained phase whose candidates exist in the layout but read zero: the chain
+            // resolves to `Some(0)`, so the span starts at the epoch rather than at the
+            // pause. Ugly, and what the encoder does.
             (
                 100,
                 GcStat::from_fields(
@@ -839,7 +834,7 @@ mod tests {
                 ),
             ),
             // A second process on a standard build's layout: new process and thread
-            // metadata, and every phase field genuinely absent rather than zero.
+            // metadata, with the phase fields absent rather than zero.
             (
                 200,
                 GcStat::from_fields(
@@ -865,8 +860,8 @@ mod tests {
         assert_eq!(export(&golden_matrix()), GOLDEN_MATRIX_TRACE);
     }
 
-    /// FNV-1a, 64-bit. Any byte difference anywhere in the trace moves it, which is all
-    /// this needs to do — it stands in for an expected string too large to read.
+    /// FNV-1a, 64-bit. It stands in for an expected string too large to read: any byte
+    /// difference moves it, which is all it has to do.
     fn digest(s: &str) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in s.as_bytes() {
@@ -885,11 +880,10 @@ mod tests {
         x
     }
 
-    /// The randomized half of the gate: many more shapes than a curated matrix can hold,
-    /// pinned by digest rather than by an unreadable expected string. Values are drawn
-    /// from a table of awkward ones — the extremes, the sign boundary, and float bits that
-    /// print as `inf`/`NaN` — because those are where two encoders diverge, not the middle
-    /// of the range. Fixed seed, per `docs/testing-policy.md`.
+    /// The randomized half of the gate: more shapes than a curated matrix can hold, pinned
+    /// by digest. Values come from a table of awkward ones (the extremes, the sign boundary,
+    /// float bits printing as `inf`/`NaN`), since that is where two encoders diverge rather
+    /// than in the middle of the range. Fixed seed, per `docs/testing-policy.md`.
     fn random_matrix() -> Vec<(u32, GcStat)> {
         const VALUES: [i64; 10] = [
             0,

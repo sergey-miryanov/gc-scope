@@ -1,14 +1,10 @@
-//! Records to trace events: the one conversion every output format shares.
+//! Records to trace events: the one conversion every output format shares. A Collection
+//! acquires its slice name, category, arguments and sub-phases here and nowhere else. See
+//! [`super::trace_event`] for why the split exists and what ordering the events carry.
 //!
-//! This is where a decoded [`GcStat`] becomes a trace — where a Collection acquires a slice
-//! name, a category, the arguments it reports and the sub-phases it is broken into. No
-//! output format repeats any of it; each one encodes the [`TraceEvent`]s it is handed. See
-//! [`super::trace_event`] for why that split exists and for the ordering the events carry.
-//!
-//! Everything here is keyed on **field presence**, never on a version: a build's sub-phases
-//! are exactly the ones whose fields its Entry layout defines (see
-//! `docs/adr/0007-gcstat-layout-driven-view.md`). Adding a version adds a layout and nothing
-//! else.
+//! Sub-phases are keyed on field presence, never on a version: a build has the phases whose
+//! fields its Entry layout defines (`docs/adr/0007-gcstat-layout-driven-view.md`). Adding a
+//! version adds a layout and nothing else.
 
 use crate::monitor::trace_event::{Arg, TraceEvent};
 use crate::remote_debugging::gc_stats::GcStat;
@@ -98,22 +94,21 @@ static PHASES: &[Phase] = &[
     },
 ];
 
-/// Turn one decoded Record into the events that describe it, in the order a format must
-/// write them:
+/// Turn one decoded Record into the events that describe it, in the order a format writes
+/// them:
 ///
-/// 1. process and thread metadata — **every time**, because deduplication is per output
-///    stream and therefore the encoder's job, not this function's;
+/// 1. process and thread metadata, on every call: deduplication is per output stream, so it
+///    belongs to the encoder;
 /// 2. the `Begin` of the GC pause;
-/// 3. each intra-pause sub-phase the build carries, as a `Begin`/`End` pair;
+/// 3. each sub-phase the build carries, as a `Begin`/`End` pair;
 /// 4. the `End` of the GC pause;
-/// 5. the two counter samples: the per-generation metrics and the heap-size series.
+/// 5. two counter samples, the per-generation metrics and the heap-size series.
 ///
-/// A phase whose fields this build's layout lacks is skipped, and so is one that resolves to
-/// a span no wider than a point — a zero-width slice is noise in every viewer. Both are the
-/// producer's decisions; nothing downstream repeats them.
+/// A phase is skipped when this build's layout lacks its fields, and when it resolves to a
+/// span no wider than a point. Nothing downstream repeats either decision.
 ///
-/// This function is pure and holds no state between calls, so a fan-out to two formats
-/// converts once and hands both the same events.
+/// Pure and stateless, so a fan-out to two formats converts once and hands both the same
+/// events.
 pub fn convert_record(pid: u32, record: &GcStat) -> Vec<TraceEvent> {
     let tid = record.interpreter_id;
     let ts_start = record.ts_start();
@@ -123,8 +118,8 @@ pub fn convert_record(pid: u32, record: &GcStat) -> Vec<TraceEvent> {
     let pause_name = format!("GC Pause (gen={})", generation);
     let pause_cat = format!("gc.pause(gen={})", generation);
 
-    // Every event a Record produces carries these two, so a viewer can tell tracks apart
-    // after a filter has thrown the track names away.
+    // Carried by every event, so a viewer can tell tracks apart once a filter has thrown
+    // the track names away.
     let identity: [Arg; 2] = [
         ("generation", i64::from(generation).into()),
         ("iid", tid.into()),
@@ -216,9 +211,8 @@ pub fn convert_record(pid: u32, record: &GcStat) -> Vec<TraceEvent> {
         cat: pause_cat,
     });
 
-    // The per-generation series. `uncollectable` is carried only when non-zero: it is
-    // almost always zero, and a series that is present only when it has something to say
-    // is one an operator notices.
+    // The per-generation series. `uncollectable` rides along only when non-zero, so an
+    // operator notices it when it appears.
     let mut metrics: Vec<Arg> = vec![
         ("collected", record.collected().into()),
         ("candidates", record.candidates().into()),
@@ -360,9 +354,8 @@ mod tests {
             .collect()
     }
 
-    /// The whole emission order for the simplest Record, pinned as one sequence: metadata,
-    /// the pause, then its counters. This is the contract [`TraceEvent`] documents, and it
-    /// is the part every format depends on.
+    /// The emission order for the simplest Record, pinned as one sequence. This is the
+    /// contract [`TraceEvent`] documents and what every format depends on.
     #[test]
     fn a_pause_converts_to_metadata_then_a_span_then_its_counters() {
         let events = convert_record(42, &bare());
@@ -380,8 +373,8 @@ mod tests {
         assert_eq!(kinds(&events), ["M", "M", "B", "E", "C", "C"]);
     }
 
-    /// Sub-phases nest inside the pause in emission order — each pair complete, and all of
-    /// them between the pause's own `Begin` and `End`.
+    /// Sub-phases nest inside the pause in emission order: each pair complete, all of them
+    /// between the pause's own `Begin` and `End`.
     #[test]
     fn sub_phases_are_emitted_as_nested_pairs_inside_the_pause() {
         let events = convert_record(1, &full());
@@ -421,9 +414,8 @@ mod tests {
         );
     }
 
-    /// Metadata is emitted on every call, deliberately: two formats writing two streams each
-    /// need their own copy, so only an encoder knows what it has already written. A
-    /// conversion that deduplicated would starve the second stream.
+    /// Metadata goes out on every call: two formats writing two streams each need their own
+    /// copy, and only an encoder knows what it has already written.
     #[test]
     fn metadata_is_emitted_for_every_record_not_deduplicated_here() {
         for _ in 0..3 {
@@ -433,9 +425,8 @@ mod tests {
         }
     }
 
-    /// The tier is the build's field set, not its version: a layout without the phase fields
-    /// produces the pause and its counters and nothing else. `GcStat::get` returning `None`
-    /// (rather than `Some(0)`) is what carries that.
+    /// A layout without the phase fields produces the pause and its counters, nothing else.
+    /// `GcStat::get` returning `None` rather than `Some(0)` is what carries the distinction.
     #[test]
     fn a_build_without_phase_fields_produces_no_sub_phases() {
         let record = GcStat::from_fields(
@@ -451,8 +442,8 @@ mod tests {
         );
     }
 
-    /// A phase whose start and stop coincide is dropped by the producer, so no format has to
-    /// decide what a zero-width slice means.
+    /// The producer drops a phase whose start and stop coincide, so no format has to decide
+    /// what a zero-width slice means.
     #[test]
     fn a_zero_width_phase_is_dropped() {
         let record = GcStat::from_fields(
@@ -472,8 +463,8 @@ mod tests {
         assert_eq!(kinds(&events), ["M", "M", "B", "E", "C", "C"]);
     }
 
-    /// `duration` is the one float a Record carries, and it must reach the counter as a
-    /// float — `Int` would print the same for whole seconds and differently everywhere else.
+    /// `duration` must reach the counter as a float. `Int` prints the same for whole seconds
+    /// and differently everywhere else.
     #[test]
     fn the_metrics_counter_carries_duration_as_a_float() {
         let record = GcStat::from_fields(
@@ -526,9 +517,9 @@ mod tests {
         );
     }
 
-    /// A chained phase begins where the previous one ended. When the build defines none of
-    /// the fields it chains onto, it falls back to the pause start rather than being
-    /// dropped — the phase ran, and only its start is unknown.
+    /// A chained phase begins where the previous one ended. With none of those fields in the
+    /// build it falls back to the pause start rather than being dropped: the phase ran, only
+    /// its start is unknown.
     #[test]
     fn a_chained_phase_falls_back_to_the_pause_start_when_its_predecessors_are_absent() {
         let layout = seq_layout(&["ts_start", "ts_stop", "ts_finalize_garbage_stop"]);
@@ -551,8 +542,8 @@ mod tests {
         assert_eq!(*ts_ns, 60_000, "chained onto the pause start");
     }
 
-    /// Timestamps stay in the nanoseconds CPython published. Converting to a format's own
-    /// unit is the encoder's job, and doing it twice is how a trace ends up 1000× off.
+    /// Timestamps stay in the nanoseconds CPython published. Converting is the encoder's
+    /// job; doing it twice puts a trace 1000× off.
     #[test]
     fn timestamps_are_carried_in_nanoseconds() {
         let events = convert_record(1, &bare());
