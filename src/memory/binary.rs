@@ -297,51 +297,131 @@ mod tests {
         assert!(parse_macho(&bytes).is_none());
     }
 
-    /// A thin 64-bit LE Mach-O holding one `__TEXT` segment and one LC_MAIN — the three
-    /// fields goblin combines into the entry point, and nothing else. Padded past `fileoff`
-    /// so the segment's data range stays in bounds; a short buffer fails earlier, for an
-    /// unrelated reason.
-    fn thin_macho_with_entry_point(vmaddr: u64, fileoff: u64, entryoff: u64) -> Vec<u8> {
+    /// How a fixture image should be shaped. Defaults to the 64-bit executable that
+    /// [`thin_macho`] documents; the other fields select the guard's remaining exits.
+    #[derive(Clone, Copy)]
+    struct Shape {
+        /// 64-bit (`LC_SEGMENT_64`) or 32-bit (`LC_SEGMENT`, half-width address fields).
+        bits64: bool,
+        /// `None` emits no LC_MAIN — what every dylib looks like, `libpython` included.
+        entryoff: Option<u64>,
+        /// Append an LC_UUID: a command the walk must step over without misreading.
+        extra_cmd: bool,
+    }
+
+    impl Default for Shape {
+        fn default() -> Self {
+            Self {
+                bits64: true,
+                entryoff: Some(0),
+                extra_cmd: false,
+            }
+        }
+    }
+
+    /// A thin little-endian Mach-O holding one `__TEXT` segment and, per `shape`, an LC_MAIN
+    /// — the fields goblin combines into the entry point, and nothing else. Padded past
+    /// `fileoff` so the segment's data range stays in bounds; a short buffer fails earlier,
+    /// for an unrelated reason.
+    fn thin_macho(vmaddr: u64, fileoff: u64, shape: Shape) -> Vec<u8> {
+        const LC_SEGMENT: u32 = 0x1;
         const LC_SEGMENT_64: u32 = 0x19;
         const LC_MAIN: u32 = 0x8000_0028;
-        const SEG_CMD_SIZE: u32 = 72;
+        const LC_UUID: u32 = 0x1b;
         const MAIN_CMD_SIZE: u32 = 24;
+        const UUID_CMD_SIZE: u32 = 24;
+
+        let seg_cmd_size: u32 = if shape.bits64 { 72 } else { 56 };
+        let ncmds = 1 + u32::from(shape.entryoff.is_some()) + u32::from(shape.extra_cmd);
+        let sizeofcmds = seg_cmd_size
+            + shape.entryoff.map_or(0, |_| MAIN_CMD_SIZE)
+            + if shape.extra_cmd { UUID_CMD_SIZE } else { 0 };
 
         let mut b = Vec::new();
-        // mach_header_64
-        b.extend(0xfeed_facfu32.to_le_bytes()); // magic MH_MAGIC_64
-        b.extend(0x0100_0007u32.to_le_bytes()); // cputype CPU_TYPE_X86_64
+        // mach_header / mach_header_64 — identical but for the trailing `reserved`.
+        b.extend(
+            if shape.bits64 {
+                0xfeed_facfu32
+            } else {
+                0xfeed_faceu32
+            }
+            .to_le_bytes(),
+        );
+        b.extend(
+            if shape.bits64 {
+                0x0100_0007u32
+            } else {
+                0x0000_0007
+            }
+            .to_le_bytes(),
+        ); // cputype
         b.extend(3u32.to_le_bytes()); // cpusubtype
         b.extend(2u32.to_le_bytes()); // filetype MH_EXECUTE
-        b.extend(2u32.to_le_bytes()); // ncmds
-        b.extend((SEG_CMD_SIZE + MAIN_CMD_SIZE).to_le_bytes()); // sizeofcmds
+        b.extend(ncmds.to_le_bytes());
+        b.extend(sizeofcmds.to_le_bytes());
         b.extend(0u32.to_le_bytes()); // flags
-        b.extend(0u32.to_le_bytes()); // reserved
+        if shape.bits64 {
+            b.extend(0u32.to_le_bytes()); // reserved
+        }
 
-        // segment_command_64
-        b.extend(LC_SEGMENT_64.to_le_bytes());
-        b.extend(SEG_CMD_SIZE.to_le_bytes());
+        // segment_command / segment_command_64
+        b.extend(
+            if shape.bits64 {
+                LC_SEGMENT_64
+            } else {
+                LC_SEGMENT
+            }
+            .to_le_bytes(),
+        );
+        b.extend(seg_cmd_size.to_le_bytes());
         b.extend(b"__TEXT\0\0\0\0\0\0\0\0\0\0"); // segname, 16 bytes
-        b.extend(vmaddr.to_le_bytes());
-        b.extend(0u64.to_le_bytes()); // vmsize
-        b.extend(fileoff.to_le_bytes());
-        b.extend(0u64.to_le_bytes()); // filesize — keeps the data range empty
+        if shape.bits64 {
+            b.extend(vmaddr.to_le_bytes());
+            b.extend(0u64.to_le_bytes()); // vmsize
+            b.extend(fileoff.to_le_bytes());
+            b.extend(0u64.to_le_bytes()); // filesize — keeps the data range empty
+        } else {
+            b.extend((vmaddr as u32).to_le_bytes());
+            b.extend(0u32.to_le_bytes()); // vmsize
+            b.extend((fileoff as u32).to_le_bytes());
+            b.extend(0u32.to_le_bytes()); // filesize
+        }
         b.extend(0u32.to_le_bytes()); // maxprot
         b.extend(0u32.to_le_bytes()); // initprot
         b.extend(0u32.to_le_bytes()); // nsects
         b.extend(0u32.to_le_bytes()); // flags
 
-        // entry_point_command
-        b.extend(LC_MAIN.to_le_bytes());
-        b.extend(MAIN_CMD_SIZE.to_le_bytes());
-        b.extend(entryoff.to_le_bytes());
-        b.extend(0u64.to_le_bytes()); // stacksize
+        if let Some(entryoff) = shape.entryoff {
+            // entry_point_command
+            b.extend(LC_MAIN.to_le_bytes());
+            b.extend(MAIN_CMD_SIZE.to_le_bytes());
+            b.extend(entryoff.to_le_bytes());
+            b.extend(0u64.to_le_bytes()); // stacksize
+        }
+        if shape.extra_cmd {
+            // uuid_command
+            b.extend(LC_UUID.to_le_bytes());
+            b.extend(UUID_CMD_SIZE.to_le_bytes());
+            b.extend([0xab; 16]);
+        }
 
         // `fileoff` indexes into the buffer during the segment parse, so it has to fit.
         if let Some(needed) = usize::try_from(fileoff).ok().filter(|n| *n > b.len()) {
             b.resize(needed, 0);
         }
         b
+    }
+
+    /// The 64-bit executable shape, which most of these tests want.
+    fn thin_macho_with_entry_point(vmaddr: u64, fileoff: u64, entryoff: u64) -> Vec<u8> {
+        thin_macho(
+            vmaddr,
+            fileoff,
+            Shape {
+                entryoff: Some(entryoff),
+                ..Shape::default()
+            },
+        )
     }
 
     /// goblin resolves the entry point with unchecked arithmetic while parsing, so a `__TEXT`
@@ -368,5 +448,128 @@ mod tests {
             macho.entry, 0x1_0000_4000,
             "vmaddr - fileoff + entryoff, the value the guard proved safe to compute"
         );
+    }
+
+    /// The case gcscope actually meets on macOS: `libpython3.x.dylib` has no LC_MAIN, so
+    /// goblin never computes a base address and the arithmetic cannot run. Such an image
+    /// must pass the guard untouched — rejecting it would disable the platform, and every
+    /// `__TEXT` here is deliberately the shape that *would* underflow if the guard looked
+    /// at the segment without checking for an entry point first.
+    #[test]
+    fn parse_macho_accepts_an_image_with_no_entry_point() {
+        let shape = Shape {
+            entryoff: None,
+            ..Shape::default()
+        };
+        // The second pair also pushes `fileoff` past the built commands, so the segment's
+        // data range has to be padded into existence.
+        for (vmaddr, fileoff) in [(0x1_0000_0000u64, 0u64), (0, 0x100)] {
+            let bytes = thin_macho(vmaddr, fileoff, shape);
+            let (macho, _) = parse_macho(&bytes)
+                .unwrap_or_else(|| panic!("no LC_MAIN means no arithmetic: {vmaddr:#x}"));
+            assert_eq!(macho.entry, 0, "no LC_MAIN and no LC_UNIXTHREAD");
+        }
+    }
+
+    /// 32-bit images take the other segment-command form, where `vmaddr`/`fileoff` are
+    /// `u32`. goblin widens them before subtracting, so the same underflow is reachable and
+    /// the guard has to read the narrow fields to see it.
+    #[test]
+    fn parse_macho_guards_the_32_bit_segment_form_too() {
+        let shape = Shape {
+            bits64: false,
+            entryoff: Some(0),
+            extra_cmd: false,
+        };
+        assert!(
+            parse_macho(&thin_macho(0, 0x20, shape)).is_none(),
+            "32-bit __TEXT below its own file offset"
+        );
+
+        let ok = Shape {
+            entryoff: Some(0x40),
+            ..shape
+        };
+        let bytes = thin_macho(0x1000, 0, ok);
+        let (macho, _) = parse_macho(&bytes).expect("a well-formed 32-bit image parses");
+        assert_eq!(macho.entry, 0x1040);
+    }
+
+    /// The walk must step over load commands it does not care about rather than
+    /// misinterpreting one as a segment, and must stop cleanly when a command cannot be
+    /// parsed at all — goblin aborts there too, so the guard only has to not panic or spin.
+    #[test]
+    fn parse_macho_walks_past_unrelated_and_unparseable_load_commands() {
+        // An LC_UUID between the segment and LC_MAIN changes nothing.
+        let shape = Shape {
+            extra_cmd: true,
+            entryoff: Some(0x4000),
+            ..Shape::default()
+        };
+        let bytes = thin_macho(0x1_0000_0000, 0, shape);
+        let (macho, _) = parse_macho(&bytes).expect("an unrelated command is skipped");
+        assert_eq!(macho.entry, 0x1_0000_4000);
+
+        // Claim one more load command than the buffer holds: the walk hits the end mid-command.
+        let mut truncated = thin_macho_with_entry_point(0x1_0000_0000, 0, 0x4000);
+        let ncmds = u32::from_le_bytes(truncated[16..20].try_into().unwrap());
+        truncated[16..20].copy_from_slice(&(ncmds + 1).to_le_bytes());
+        // goblin rejects it for the same reason; the point is that neither of us panics.
+        assert!(parse_macho(&truncated).is_none());
+    }
+
+    /// Wraps `thin` in a one-architecture universal binary at `slice_at`, tagged with the
+    /// host cputype so `parse_macho` selects it. Every field of the fat header and the
+    /// `fat_arch` table is **big-endian** regardless of the slice's own byte order.
+    fn fat_macho(thin: &[u8], slice_at: usize) -> Vec<u8> {
+        let want = if cfg!(target_arch = "aarch64") {
+            goblin::mach::cputype::CPU_TYPE_ARM64
+        } else {
+            goblin::mach::cputype::CPU_TYPE_X86_64
+        };
+
+        let mut b = Vec::new();
+        b.extend(0xcafe_babeu32.to_be_bytes()); // FAT_MAGIC
+        b.extend(1u32.to_be_bytes()); // nfat_arch
+        // fat_arch
+        b.extend(want.to_be_bytes()); // cputype
+        b.extend(3u32.to_be_bytes()); // cpusubtype
+        b.extend((slice_at as u32).to_be_bytes()); // offset
+        b.extend((thin.len() as u32).to_be_bytes()); // size
+        b.extend(12u32.to_be_bytes()); // align (2^12)
+
+        assert!(slice_at >= b.len(), "slice would overlap the fat header");
+        b.resize(slice_at, 0);
+        b.extend(thin);
+        b
+    }
+
+    /// macOS ships Python as a `universal2` framework, so the fat path — not the thin one —
+    /// is what a real macOS attach walks, and until now only the live CI leg exercised it.
+    /// The slice offset is the subtle part: it is returned so callers can rebase *file*
+    /// offsets, and a slice must be parsed standalone rather than in place.
+    #[test]
+    fn parse_macho_unwraps_a_universal_binary_and_reports_the_slice_offset() {
+        const SLICE_AT: usize = 0x40;
+        let thin = thin_macho_with_entry_point(0x1_0000_0000, 0, 0x4000);
+        let bytes = fat_macho(&thin, SLICE_AT);
+
+        let (macho, slice_at) = parse_macho(&bytes).expect("the host slice is selected");
+        assert_eq!(slice_at, SLICE_AT, "callers rebase file offsets onto this");
+        assert_eq!(
+            macho.entry, 0x1_0000_4000,
+            "the slice parsed as a standalone image"
+        );
+    }
+
+    /// The guard covers a fat slice as much as a thin image: the same goblin arithmetic runs
+    /// on whatever buffer reaches `MachO::parse`, and a universal binary is the shape macOS
+    /// actually hands over. Without the slice-side check this panics where the thin-side
+    /// check would have caught it.
+    #[test]
+    fn parse_macho_guards_the_slice_of_a_universal_binary() {
+        let thin = thin_macho_with_entry_point(0, 0x20, 0); // __TEXT below its file offset
+        let bytes = fat_macho(&thin, 0x40);
+        assert!(parse_macho(&bytes).is_none());
     }
 }
