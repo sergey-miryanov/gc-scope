@@ -332,10 +332,10 @@ mod tests {
             .map(|e| match e {
                 TraceEvent::ProcessMeta { .. } => "process_meta",
                 TraceEvent::ThreadMeta { .. } => "thread_meta",
-                TraceEvent::Begin { name, .. } => name,
-                TraceEvent::End { name, .. } => name,
-                TraceEvent::Instant { name, .. } => name,
-                TraceEvent::Counter { name, .. } => name,
+                TraceEvent::Begin { name, .. }
+                | TraceEvent::End { name, .. }
+                | TraceEvent::Instant { name, .. }
+                | TraceEvent::Counter { name, .. } => name,
             })
             .collect()
     }
@@ -344,14 +344,94 @@ mod tests {
         events
             .iter()
             .map(|e| match e {
-                TraceEvent::ProcessMeta { .. } => "M",
-                TraceEvent::ThreadMeta { .. } => "M",
+                TraceEvent::ProcessMeta { .. } | TraceEvent::ThreadMeta { .. } => "M",
                 TraceEvent::Begin { .. } => "B",
                 TraceEvent::End { .. } => "E",
                 TraceEvent::Instant { .. } => "I",
                 TraceEvent::Counter { .. } => "C",
             })
             .collect()
+    }
+
+    /// Every `Begin` as `(name, ts_ns)`, so a test can name the span it means instead of
+    /// indexing the sequence.
+    fn begins(events: &[TraceEvent]) -> Vec<(&str, i64)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::Begin { name, ts_ns, .. } => Some((name.as_str(), *ts_ns)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `Counter` as `(name, args)`.
+    fn counters(events: &[TraceEvent]) -> Vec<(&str, &[Arg])> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::Counter { name, args, .. } => Some((name.as_str(), args.as_slice())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `names` and `kinds` are the lens every test below reads events through, so a wrong
+    /// label here would let an assertion pass against the wrong sequence. `Instant` has no
+    /// producer yet, which makes this the only place it gets classified.
+    #[test]
+    fn the_event_lens_labels_every_variant() {
+        let events = [
+            TraceEvent::ProcessMeta {
+                pid: 1,
+                name: "python 1".to_string(),
+            },
+            TraceEvent::ThreadMeta {
+                pid: 1,
+                tid: 0,
+                name: "1:0".to_string(),
+            },
+            TraceEvent::Begin {
+                pid: 1,
+                tid: 0,
+                ts_ns: 0,
+                name: "begin".to_string(),
+                cat: "cat".to_string(),
+                args: vec![],
+            },
+            TraceEvent::End {
+                pid: 1,
+                tid: 0,
+                ts_ns: 1,
+                name: "end".to_string(),
+                cat: "cat".to_string(),
+            },
+            TraceEvent::Instant {
+                pid: 1,
+                ts_ns: 2,
+                name: "instant".to_string(),
+            },
+            TraceEvent::Counter {
+                pid: 1,
+                tid: 0,
+                ts_ns: 3,
+                name: "counter".to_string(),
+                args: vec![],
+            },
+        ];
+
+        assert_eq!(kinds(&events), ["M", "M", "B", "E", "I", "C"]);
+        assert_eq!(
+            names(&events),
+            [
+                "process_meta",
+                "thread_meta",
+                "begin",
+                "end",
+                "instant",
+                "counter"
+            ]
+        );
     }
 
     /// The emission order for the simplest Record, pinned as one sequence. This is the
@@ -479,9 +559,8 @@ mod tests {
             ],
         );
         let events = convert_record(1, &record);
-        let TraceEvent::Counter { args, .. } = &events[events.len() - 2] else {
-            panic!("expected the metrics counter: {events:?}");
-        };
+        let (name, args) = counters(&events)[0];
+        assert_eq!(name, "G0");
         assert!(
             args.contains(&("duration", ArgValue::Float(0.00125))),
             "{args:?}"
@@ -504,10 +583,7 @@ mod tests {
                 ],
             );
             let events = convert_record(1, &record);
-            let TraceEvent::Counter { args, .. } = &events[events.len() - 2] else {
-                panic!("expected the metrics counter: {events:?}");
-            };
-            args.iter().map(|&(k, _)| k).collect()
+            counters(&events)[0].1.iter().map(|&(k, _)| k).collect()
         };
 
         assert_eq!(metrics_keys(0), ["collected", "candidates", "duration"]);
@@ -535,11 +611,34 @@ mod tests {
             ],
         );
         let events = convert_record(1, &record);
-        let TraceEvent::Begin { ts_ns, name, .. } = &events[3] else {
-            panic!("expected the phase begin: {events:?}");
-        };
-        assert_eq!(name, "Finalize Garbage (gen=0)");
-        assert_eq!(*ts_ns, 60_000, "chained onto the pause start");
+        assert_eq!(
+            begins(&events),
+            [
+                ("GC Pause (gen=0)", 60_000),
+                ("Finalize Garbage (gen=0)", 60_000), // chained onto the pause start
+            ]
+        );
+    }
+
+    /// The other half of that branch: a phase carrying its own start field is skipped when
+    /// the build lacks it, rather than chaining. Only an `Explicit` phase can be in that
+    /// state, and only on a build that publishes the stop without the start.
+    #[test]
+    fn an_explicit_phase_is_skipped_when_the_build_lacks_its_start_field() {
+        let layout = seq_layout(&["ts_start", "ts_stop", "ts_mark_alive_stop"]);
+        let record = GcStat::from_fields(
+            0,
+            0,
+            1,
+            layout,
+            &[
+                ("ts_start", 60_000),
+                ("ts_stop", 70_000),
+                ("ts_mark_alive_stop", 65_000),
+            ],
+        );
+        let events = convert_record(1, &record);
+        assert_eq!(begins(&events), [("GC Pause (gen=0)", 60_000)]);
     }
 
     /// Timestamps stay in the nanoseconds CPython published. Converting is the encoder's
@@ -547,9 +646,7 @@ mod tests {
     #[test]
     fn timestamps_are_carried_in_nanoseconds() {
         let events = convert_record(1, &bare());
-        let TraceEvent::Begin { ts_ns, .. } = &events[2] else {
-            panic!("expected the pause begin: {events:?}");
-        };
-        assert_eq!(*ts_ns, 1_000);
+        assert_eq!(begins(&events), [("GC Pause (gen=0)", 1_000)]);
+        assert_eq!(counters(&events)[1], ("", &[("heap_size", 0.into())][..]));
     }
 }

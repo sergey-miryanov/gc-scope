@@ -492,6 +492,26 @@ mod tests {
         stack.is_empty() && !in_str
     }
 
+    /// Events handed to an exporter that was never opened are dropped, and the metadata
+    /// dedup sets stay untouched so a later `open` still writes them. The monitor holds the
+    /// exporter across a whole run, so a spurious poll before `open` must not swallow the
+    /// process's `process_name` line for the rest of the capture.
+    #[test]
+    fn events_before_open_are_dropped_without_consuming_the_metadata() {
+        let mut ex = ChromeTraceExporter::new();
+        ex.add_events(&convert_record(100, &bare_stat()));
+
+        let path = temp_path();
+        ex.open(&path).unwrap();
+        ex.add_events(&convert_record(100, &bare_stat()));
+        ex.close().unwrap();
+        let out = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(count(&out, r#""name":"process_name""#), 1, "output: {out}");
+        assert_eq!(count(&out, r#""ph":"B""#), 1, "output: {out}");
+    }
+
     /// With no events, the trace must still be a valid, empty JSON array — an
     /// empty file or a lone `[` would make Perfetto reject the whole capture.
     #[test]
@@ -697,18 +717,13 @@ mod tests {
                 .to_string()
         };
 
-        let zero = export(&[(1, bare_stat())]); // uncollectable defaults to 0
-        assert!(
-            !counter_line(&zero).contains("uncollectable"),
-            "counter line: {}",
-            counter_line(&zero)
-        );
+        let zero = counter_line(&export(&[(1, bare_stat())])); // uncollectable defaults to 0
+        assert!(!zero.contains("uncollectable"), "counter line: {zero}");
 
-        let nonzero = export(&[(1, full_stat())]); // uncollectable = 7
+        let nonzero = counter_line(&export(&[(1, full_stat())])); // uncollectable = 7
         assert!(
-            counter_line(&nonzero).contains(r#""uncollectable":7"#),
-            "counter line: {}",
-            counter_line(&nonzero)
+            nonzero.contains(r#""uncollectable":7"#),
+            "counter line: {nonzero}"
         );
     }
 
