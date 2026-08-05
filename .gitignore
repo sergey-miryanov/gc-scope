@@ -18,6 +18,7 @@ target
 lcov*.info
 
 .temp
+.scratch
 .venv
 .gc-gen-3.15+inc
 
