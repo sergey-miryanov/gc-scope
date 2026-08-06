@@ -81,7 +81,7 @@ impl GcStat {
     /// CPython publishes `ts_start` when a collection begins and `ts_stop` when it ends, so an
     /// entry read in between carries a fresh `ts_start` beside a `ts_stop` that is either zero
     /// or the stale value of the entry's previous occupant. Both read back as `ts_stop <=
-    /// ts_start`, and so does a zero-width entry. The monitor's `select_fresh` and the TUI's
+    /// ts_start`, and so does a zero-width entry. The monitor's cursor and the TUI's
     /// `parse_gc_entries` share this one predicate.
     ///
     /// Gated on the layout, not the values: builds with no timestamp fields (inline, 3.8–3.14)

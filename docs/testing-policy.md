@@ -35,7 +35,7 @@ adding an expensive kind to a property a cheaper one already pins.
 selection, formatting, dedup.
 
 **Extract a seam rather than skip the layer.** `OffsetTable::decode_gc_stats` takes
-`&[u8]` and `monitor::context::select_fresh` takes a `&[GcStat]` for this reason. Logic
+`&[u8]` and `monitor::cursor::Cursor::admit` takes a `&[GcStat]` for this reason. Logic
 that only runs against a live target gets tested against one interpreter, once.
 
 **Do not count it as coverage** when correctness rests on a fact this crate does not
