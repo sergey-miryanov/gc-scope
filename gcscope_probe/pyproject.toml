@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gcscope-probe"
+version = "0.1.0"
+description = "Publish per-Collection GC timing from inside CPython, for gcscope to read"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Sergey Miryanov", email = "sergey.miryanov@gmail.com" }]
+keywords = ["gc", "garbage-collection", "profiling", "gcscope"]
+
+# 3.14 only, and the load gate in PyInit says so again at import: a wheel tag is a hint,
+# not an enforcement, and the transcribed interpreter offsets are correct for exactly the
+# builds someone checked. `specs/0013-probe-portable-core.md` widens this to 3.13.
+requires-python = ">=3.14,<3.15"
+
+# No license classifier: PEP 639 supersedes it with the `license` field above, and
+# setuptools now refuses a project that carries both.
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: C",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Topic :: Software Development :: Debuggers",
+]
+
+[project.urls]
+Homepage = "https://github.com/sergey-miryanov/gc-scope"
+Source = "https://github.com/sergey-miryanov/gc-scope"
+
+# No [tool.setuptools] packages: this distribution is one extension module and nothing else.
+# The extension itself is declared in setup.py, since ext-modules in pyproject.toml is still
+# experimental in setuptools and a build that fails at packaging time is indistinguishable,
+# from a CI leg, from one that failed to compile.

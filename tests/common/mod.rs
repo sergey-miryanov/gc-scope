@@ -24,12 +24,12 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// races it.
 const SPIN_LIFETIME_SECS: &str = "120";
 
-/// Path to the checked-in fixture, resolved against the crate root.
-fn spin_fixture() -> PathBuf {
+/// Path to a checked-in fixture by filename, resolved against the crate root.
+fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
-        .join("spin.py")
+        .join(name)
 }
 
 /// A Python interpreter to test against, or `None` if none is available — callers then
@@ -112,6 +112,31 @@ fn runs(python: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// A Python that can `import gcscope_probe`, or `None` — callers then **skip with a log**,
+/// since a checkout where nobody ran `pip install ./gcscope_probe` has no Probe to read and
+/// that is the normal state of a developer's machine.
+///
+/// Selected the same way as [`test_python`], then filtered: an interpreter with no Probe is
+/// not a different interpreter, it is the same one missing a package.
+pub fn probe_python() -> Option<PathBuf> {
+    let python = test_python()?;
+    let ok = Command::new(&python)
+        .args(["-c", "import gcscope_probe"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    ok.then_some(python)
+}
+
+/// Whether a missing Probe must **fail** rather than skip. A skip is right on a laptop and
+/// wrong in CI, where it would turn a Probe that failed to compile into a green leg — so the
+/// leg that builds one sets `GCSCOPE_REQUIRE_PROBE=1` and gets a failure instead.
+pub fn probe_required() -> bool {
+    std::env::var("GCSCOPE_REQUIRE_PROBE").ok().as_deref() == Some("1")
+}
+
 /// True for a free-threaded (no-GIL) build, whose GC ring holds one entry per generation
 /// instead of the GIL build's 11/3/3 — the live-smoke shape check needs this to pick the
 /// expected entry counts. `false` if it can't be determined (the common GIL case).
@@ -140,8 +165,15 @@ impl SpawnedPython {
     /// it stays correct even if a launcher/shim sits in between. Errors if the fixture dies
     /// on startup or never reports `READY` within [`READY_TIMEOUT`].
     pub fn spawn(python: &Path) -> io::Result<Self> {
+        Self::spawn_fixture(python, "spin.py")
+    }
+
+    /// As [`Self::spawn`], for a fixture other than `spin.py` — currently `probe_spin.py`,
+    /// which installs the Probe before collecting. Every fixture takes the same lifetime
+    /// argument and prints the same `READY <pid>` marker, so the wait is shared.
+    pub fn spawn_fixture(python: &Path, fixture_name: &str) -> io::Result<Self> {
         let mut child = Command::new(python)
-            .arg(spin_fixture())
+            .arg(fixture(fixture_name))
             .arg(SPIN_LIFETIME_SECS)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -149,7 +181,7 @@ impl SpawnedPython {
 
         // Drain the fixture's stdout on a worker thread so the wait is bounded: an
         // interpreter that fails to start closes stdout (EOF → sender dropped) and a hung
-        // one trips the recv timeout — neither blocks the test forever. spin.py writes
+        // one trips the recv timeout — neither blocks the test forever. The fixtures write
         // nothing to stdout after READY, so we can stop reading once we have it.
         let stdout = child.stdout.take().expect("stdout was piped");
         let (tx, rx) = mpsc::channel();
@@ -172,7 +204,7 @@ impl SpawnedPython {
                 let _ = child.wait();
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "spin.py exited or never reported READY",
+                    format!("{fixture_name} exited or never reported READY"),
                 ))
             }
         }

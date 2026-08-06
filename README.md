@@ -16,6 +16,16 @@ Cross-platform CLI tool for reading and analyzing CPython process memory.
 
 `-1` can be used as PID to target the current process.
 
+## The Probe (`gcscope_probe/`)
+
+Below 3.15 CPython records no GC timestamps at all, so gcscope can say how *often* the
+collector ran but not what any Collection cost. [`gcscope_probe/`](gcscope_probe/README.md) is
+a CPython C extension you install into your **own** process to publish that timing, in the
+shape gcscope's ring decoder already reads. It is a separate distribution on its own release
+train — [ADR 0016](docs/adr/0016-probe-ships-from-this-repo.md) explains why a C extension
+lives in a Rust repository. Today it builds on 3.14 for Windows only;
+[`specs/0013`](specs/0013-probe-portable-core.md) carries it to Linux, macOS and 3.13.
+
 ## Attaching: per-platform permissions
 
 gcscope reads another process's memory, which every OS gates differently.
@@ -53,6 +63,7 @@ ad-hoc signatures. Re-sign after every build; `cargo build` replaces the binary.
 ```powershell
 cargo test                                       # unit + property tests, no Python needed
 cargo test --test live_smoke -- --ignored        # the live matrix; needs attach permission
+cargo test --test probe -- --ignored             # the Probe; skips unless one is installed
 cargo +nightly fuzz run scan_image_for_version   # Linux only
 cargo mutants -f src/remote_debugging/version.rs # periodic audit, never a gate
 ```

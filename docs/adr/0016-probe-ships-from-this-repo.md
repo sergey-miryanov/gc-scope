@@ -16,6 +16,16 @@ between publishing gcscope to crates.io as a library — a public contract maint
 indefinitely for exactly one internal consumer — and abandoning the verifier. A workspace
 member dissolves the problem instead of solving it.
 
+> **Amended 2026-08-07, implementing the move.** The verifier did not become a workspace
+> member; it stopped being a program. Its whole reason to exist was that a *separate
+> repository* needed a way to reach gcscope's decoder, and the move removes that reason —
+> `tests/probe.rs` reaches the decoder directly, on the live-attach harness this repo already
+> has, and its four invariants are assertions rather than printed output. A test that fails
+> is a better instrument than a binary someone has to run and read. The force above is
+> answered more completely by there being no second crate at all than it would have been by a
+> workspace, so the workspace conversion was dropped and the root `Cargo.toml` stays a single
+> package. The decision below is untouched: the Probe ships from this repo.
+
 **The layout contract is bidirectional and silent.** The Probe writes a region this repo's
 decoder reads. Its compile-time assertions encode the reader's expectations. Split across
 repos, the assertion and the truth it protects live in different places, and drift surfaces as
@@ -39,8 +49,9 @@ at the moment it was decided.
 
 ## Decision
 
-1. **One repo.** The Probe lives here as `gcscope_probe/`; its verifier becomes a Cargo
-   workspace member, which is what removes the path dependency.
+1. **One repo.** The Probe lives here as `gcscope_probe/`; its verifier becomes a gcscope
+   integration test (`tests/probe.rs`), which is what removes the path dependency. *(As
+   decided this was "a Cargo workspace member" — see the amendment above.)*
 2. **Two release trains.** The Probe is versioned and tagged independently and published to
    PyPI on its own tag; gcscope's tags do not trigger a wheel, and vice versa. Merging the
    repos is not merging the products.
@@ -53,7 +64,7 @@ at the moment it was decided.
    it, path filters would leave the shared contract breakable from the reader's side with no
    leg going red on the pull request that broke it. That leg is the price of the filters and
    is not optional.
-5. **gcscope is not published as a library** to satisfy this. The workspace removed the only
+5. **gcscope is not published as a library** to satisfy this. The move removed the only
    forcing reason; whether gcscope wants library consumers is a separate decision that should
    be made on its own merits.
 6. **Rejected: vendoring the constants with a scheduled drift job.** It detects, late and out
