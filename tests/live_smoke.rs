@@ -107,12 +107,12 @@ fn expected_shape(
 }
 
 /// Whether this interpreter publishes the pause timestamps a span needs, and so which tier
-/// `monitor` should produce. Derived from the target's own reported version rather than
-/// hardcoded, and it tracks [`expected_shape`]: the ring builds that brought the timestamps
-/// are the same ones that brought the ring. `None` if the version is unknown.
+/// `monitor` should produce. Read from the target's own version, and it tracks
+/// [`expected_shape`]: the builds that brought the timestamps brought the ring. `None` if the
+/// version is unknown.
 ///
-/// The monitor itself compares no version — it reads the fields off the Entry layout. This is
-/// the outside view of that decision, which is the only place a version may appear.
+/// The monitor compares no version; it reads the fields off the Entry layout. This is the
+/// outside view of that decision, and the only place a version belongs.
 fn expects_spans(version: Option<(u8, u8)>) -> Option<bool> {
     Some(version? >= (3, 15))
 }
@@ -314,14 +314,10 @@ fn live_smoke_attaches_and_decodes_shape() {
 }
 
 /// The monitoring counterpart of the shape check above: `gcscope run` against a real
-/// interpreter must write the tier that interpreter's Entry layout supports, and write
-/// *something* either way. A build below the ring builds published no timestamps, so it used
-/// to produce an empty trace against a process collecting constantly; the fix must not swap
-/// that for a trace reporting pause figures it does not have.
-///
-/// The expectation comes from the target's own version, never from a constant. gcscope itself
-/// compares no version — it reads the fields off the layout — so this is the outside check
-/// that the two agree.
+/// interpreter writes the tier that interpreter's Entry layout supports, and writes
+/// *something* either way. A build below the ring builds used to produce an empty trace
+/// against a process collecting constantly, and the fix must not swap that for a trace
+/// reporting pause figures it does not have.
 #[test]
 #[ignore = "spawns and attaches to a live interpreter; needs ptrace/taskport — run with --ignored"]
 fn live_monitor_writes_the_tier_the_build_supports() {
@@ -385,15 +381,15 @@ fn live_monitor_writes_the_tier_the_build_supports() {
     );
     assert!(
         !written.contains("duration"),
-        "a pause figure this build never published must be absent, not zero\n{head}"
+        "a pause figure this build never published belongs absent, not at zero\n{head}"
     );
     assert!(
         written.contains(r#""collections""#),
         "the cumulative count is what this tier reports\n{head}"
     );
 
-    // The counts are a rate only if they are spread over the timeline — every sample stamped
-    // alike would draw one point for the whole run.
+    // The counts read as a rate only when spread over the timeline; samples stamped alike
+    // draw one point for the whole run.
     let stamps: HashSet<&str> = written
         .lines()
         .filter(|l| l.contains(r#""ph":"C""#))

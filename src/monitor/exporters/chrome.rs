@@ -265,9 +265,9 @@ mod tests {
         ])
     });
 
-    /// A build that publishes no timing at all: the cumulative counts and nothing else,
-    /// which is every interpreter below the ring builds. Its Records carry no pause, so the
-    /// conversion hands this encoder counter samples and no spans.
+    /// A build that publishes no timing: the cumulative counts and nothing else, as every
+    /// interpreter below the ring builds does. Its Records carry no pause, so the conversion
+    /// hands this encoder counter samples.
     static COUNTS_ONLY_LAYOUT: LazyLock<&'static GcItemLayout> =
         LazyLock::new(|| seq_layout(&["collections", "collected", "uncollectable"]));
 
@@ -715,11 +715,10 @@ mod tests {
         }
     }
 
-    /// What an operator on a build with no timing actually gets: a counter track per
-    /// generation, carrying the cumulative counts, and no span anywhere. The whole trace is
-    /// pinned rather than probed, because the absences are the point — a `duration` or a
-    /// zero-width `GC Pause` here would report a pause figure the interpreter never
-    /// published.
+    /// What an operator on a build with no timing gets: a counter track per generation
+    /// carrying the cumulative counts, and no span. The whole trace is pinned rather than
+    /// probed, since the absences are the point. A `duration` key or a zero-width `GC Pause`
+    /// here reports a pause the interpreter never published.
     #[test]
     fn a_build_without_timing_writes_counter_tracks_and_no_spans() {
         let sample = |counter: i64, collected: i64, observed_at_ns: i64| {

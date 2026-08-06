@@ -2,9 +2,9 @@
 //! acquires its slice name, category, arguments and sub-phases here and nowhere else. See
 //! [`super::trace_event`] for why the split exists and what ordering the events carry.
 //!
-//! Everything version-dependent here is keyed on field presence, never on a version
+//! Everything version-dependent here keys on field presence
 //! (`docs/adr/0007-gcstat-layout-driven-view.md`): a build has the sub-phases whose fields its
-//! Entry layout defines, and it is in the tier its timestamps put it in — spans where they
+//! Entry layout defines, and sits in the tier its timestamps put it in — spans where they
 //! exist, counter samples where they do not
 //! (`docs/adr/0017-monitoring-tiers-follow-the-entry-layout.md`). Adding a version adds a
 //! layout and nothing else.
@@ -99,19 +99,16 @@ static PHASES: &[Phase] = &[
 
 /// Turn one decoded Record into the events that describe it.
 ///
-/// What a build produces is a property of its Entry layout, never of its version: one that
-/// publishes the pause timestamps describes each Collection as a span
-/// ([`pause_events`]), one that does not has only exact cumulative counts to report and
-/// produces counter samples ([`count_events`]). Neither is a mode — a new build lands in a
-/// tier by what its Entry carries, and no version is compared here or anywhere downstream.
+/// What a build produces follows from its Entry layout, not its version: one publishing the
+/// pause timestamps describes each Collection as a span ([`pause_events`]), one without them
+/// has only cumulative counts to report ([`count_events`]). No version is compared here or
+/// downstream.
 ///
 /// `observed_at_ns` is the Observer's clock at the poll that read this Record. Only a build
-/// with no timestamps of its own consults it, that being the only timeline such a trace has;
-/// a build with timing places every event on the target's own clock and ignores it.
+/// with no timestamps of its own uses it, having no other timeline.
 ///
-/// Pure and stateless, so a fan-out to two formats converts once and hands both the same
-/// events. Metadata leads every call — deduplication is per output stream, so it belongs to
-/// the encoder.
+/// Pure and stateless, so a fan-out to two formats converts once. Metadata leads every call:
+/// deduplication is per output stream, so it belongs to the encoder.
 pub fn convert_record(pid: u32, record: &GcStat, observed_at_ns: i64) -> Vec<TraceEvent> {
     let tid = record.interpreter_id;
     let body = if record.has_timing() {
@@ -140,13 +137,11 @@ pub fn convert_record(pid: u32, record: &GcStat, observed_at_ns: i64) -> Vec<Tra
 
 /// The events for a Record from a build that publishes no timestamps: one counter sample per
 /// generation, carrying the Lifetime totals CPython does publish. Their rise over a run is the
-/// GC rate, which is all such a build can show — and, since they are exact, it is a rate no
-/// consumer of CPython's own remote-debugging API can show at all.
+/// GC rate, which is what such a build can show.
 ///
-/// Nothing pause-derived appears — no duration, no span, not even a zero-width one. A `0`
-/// there reads as "this process spends no time in GC" rather than "this build cannot say",
-/// and the second is the truth (spec 0011 §2). The sample sits on the Observer's clock, the
-/// only timeline available.
+/// Nothing pause-derived appears, down to the zero-width span. A `duration` of `0` reads as
+/// "this process spends no time in GC" when the truth is that the build cannot say (spec 0011
+/// §2). The sample sits on the Observer's clock, the only timeline available.
 fn count_events(pid: u32, record: &GcStat, observed_at_ns: i64) -> Vec<TraceEvent> {
     let mut counts: Vec<Arg> = Vec::new();
     for name in ["collections", "collected"] {
@@ -160,8 +155,8 @@ fn count_events(pid: u32, record: &GcStat, observed_at_ns: i64) -> Vec<TraceEven
         counts.push(("uncollectable", record.uncollectable().into()));
     }
     if counts.is_empty() {
-        // A layout carrying none of the counts has nothing to draw a track from, so no track
-        // is named. Nothing reaches here from a registered build.
+        // A layout carrying none of the counts has nothing to draw a track from. No
+        // registered build reaches here.
         return Vec::new();
     }
 
@@ -741,9 +736,9 @@ mod tests {
 
     // ── the tier a build's layout puts it in ──────────────────────────────────────────
 
-    /// A build whose layout has no timestamps has no pause to draw. Its Records are exact
-    /// cumulative counts, so they become counter samples and nothing else — a span there
-    /// would be zero-width at the epoch, which is a pause figure the build never reported.
+    /// A build whose layout has no timestamps has no pause to draw. Its Records are
+    /// cumulative counts, so they become counter samples: a span here would be zero-width at
+    /// the epoch, reporting a pause the build never measured.
     #[test]
     fn a_build_without_timing_produces_counter_samples_and_no_spans() {
         let events = convert_record(9, &counted(1, 40, 900, 0), OBSERVER_CLOCK);
@@ -755,9 +750,9 @@ mod tests {
         );
     }
 
-    /// The counts are what the build has; everything a pause would have supplied is absent
-    /// from the output rather than reported as zero. An operator reading `duration: 0` off
-    /// such a trace would conclude the process spends no time in GC (spec 0011 §2).
+    /// Everything a pause would have supplied is absent rather than zero. An operator reading
+    /// `duration: 0` off such a trace concludes the process spends no time in GC (spec 0011
+    /// §2).
     #[test]
     fn a_build_without_timing_reports_no_pause_derived_value() {
         let events = convert_record(9, &counted(0, 3, 4, 5), OBSERVER_CLOCK);
@@ -778,9 +773,9 @@ mod tests {
         }
     }
 
-    /// Such a build publishes no clock of its own, so its samples are placed on the
-    /// Observer's — the only timeline the trace has. Every sample from one poll shares it,
-    /// which is what makes the counts read as a rate.
+    /// Such a build publishes no clock, so its samples take the Observer's, the only timeline
+    /// the trace has. Every sample from one poll shares it, which is what makes the counts
+    /// read as a rate.
     #[test]
     fn counters_from_a_build_without_timing_take_the_observers_clock() {
         let events = convert_record(9, &counted(2, 7, 8, 0), 4_200_000);
@@ -806,8 +801,8 @@ mod tests {
         assert_eq!(keys(6), ["collections", "collected", "uncollectable"]);
     }
 
-    /// The other tier is untouched: a build that publishes its own timestamps places every
-    /// event on them and never consults the Observer's clock.
+    /// The other tier is untouched: a build with its own timestamps places every event on
+    /// them and never reads the Observer's clock.
     #[test]
     fn a_build_with_timing_never_consults_the_observers_clock() {
         let events = convert_record(1, &bare(), 4_200_000);

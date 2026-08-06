@@ -30,8 +30,8 @@ pub struct MonitorContext<'a> {
     /// did against what was read of it, which is what makes Loss recoverable.
     cursor: Cursor,
     alive_pids: HashSet<u32>,
-    /// When monitoring began, the origin of the Observer's clock. Read only for builds that
-    /// publish no timestamps of their own — see [`observed_at_ns`](Self::observed_at_ns).
+    /// When monitoring began: the origin of the Observer's clock, read only for builds that
+    /// publish no timestamps of their own. See [`observed_at_ns`](Self::observed_at_ns).
     started: Instant,
 }
 
@@ -120,16 +120,14 @@ impl<'a> MonitorContext<'a> {
 
     /// The poll seam: one read's Records in, the events an exporter receives out.
     ///
-    /// Everything between the memory read and the output file happens here — which Records
-    /// are new (the cursor) and what each one looks like in a trace (the conversion) — so
-    /// both are reachable from a test with scripted Records and no live interpreter
-    /// (`docs/adr/0005-testing-strategy.md`). Converting here rather than per format also
-    /// means a fan-out to two formats is handed the same events instead of each deriving its
-    /// own from the raw Record.
+    /// Which Records are new (the cursor) and what each looks like in a trace (the
+    /// conversion) both happen here, so a test drives them with scripted Records and no live
+    /// interpreter (`docs/adr/0005-testing-strategy.md`). Converting here rather than per
+    /// format also hands a fan-out to two formats the same events.
     ///
     /// `observed_at_ns` is the Observer's clock for this poll, shared by every Record it
-    /// returned. A build that publishes no timestamps of its own has nothing else to place a
-    /// sample on the timeline with; one that does ignores it.
+    /// returns. A build publishing no timestamps has nothing else to place a sample on the
+    /// timeline with; one that does ignores it.
     fn events_for(&mut self, pid: u32, stats: &[GcStat], observed_at_ns: i64) -> Vec<TraceEvent> {
         self.cursor
             .admit(pid, stats)
@@ -138,9 +136,9 @@ impl<'a> MonitorContext<'a> {
             .collect()
     }
 
-    /// The Observer's own clock, in nanoseconds since monitoring began. Deliberately not the
-    /// wall clock: a trace that starts near zero reads more easily, and nothing correlates
-    /// these samples with anything outside the run.
+    /// The Observer's own clock, in nanoseconds since monitoring began. Not the wall clock: a
+    /// trace starting near zero reads more easily, and nothing correlates these samples with
+    /// anything outside the run.
     fn observed_at_ns(&self) -> i64 {
         self.started
             .elapsed()
@@ -238,7 +236,7 @@ mod tests {
         )
     }
 
-    /// Run one poll's Records through the seam, against an inert exporter — the events an
+    /// Run one poll's Records through the seam against an inert exporter: the events an
     /// output format would be handed.
     fn poll_events(records: &[GcStat], observed_at_ns: i64) -> Vec<TraceEvent> {
         let mut exporter = ChromeTraceExporter::new();
@@ -259,9 +257,9 @@ mod tests {
             .collect()
     }
 
-    /// A build with no timing monitors as counter tracks: one sample per generation per
-    /// poll, and not a single span. Before this, such a target produced either an empty
-    /// trace or a zero-width pause at the epoch — a pause figure it never published.
+    /// A build with no timing monitors as counter tracks: one sample per generation per poll,
+    /// no spans. Such a target used to yield an empty trace, then a zero-width pause at the
+    /// epoch reporting a pause it never published.
     #[test]
     fn a_build_without_timing_polls_to_counter_samples_only() {
         let poll = [counted(0, 40, 900), counted(1, 7, 30), counted(2, 2, 4)];

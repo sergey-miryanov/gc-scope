@@ -78,11 +78,10 @@ impl GcStat {
 
     /// Whether this build publishes the timestamps that bound a collection.
     ///
-    /// The tier selector, and the one place it is decided: a build with these fields
-    /// describes each collection as a span and can report a pause; one without publishes
-    /// exact cumulative counts and nothing else, so a pause figure from it would be
-    /// fabricated. Keyed on the layout, never on a version — a new build lands in a tier by
-    /// what its entry carries (ADR 0003, ADR 0007).
+    /// The tier selector, decided here and nowhere else: a build with these fields describes
+    /// each collection as a span and can report a pause; one without publishes cumulative
+    /// counts, so any pause figure from it would be fabricated. Keyed on the layout, never on
+    /// a version (ADR 0003, ADR 0007, ADR 0017).
     pub fn has_timing(&self) -> bool {
         self.has("ts_start") && self.has("ts_stop")
     }
