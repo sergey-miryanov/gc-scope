@@ -112,6 +112,10 @@ mod tests {
     /// The Chrome encoder writes argument values through `Display`, so the awkward ones are
     /// pinned here rather than inside a JSON assertion. `Float` must print `0` for `0.0`:
     /// that is what the hand-built JSON did, and the trace bytes depend on it.
+    ///
+    /// The last two cases record a defect, not a requirement. `inf` and `NaN` are not JSON,
+    /// so one non-finite `duration` (a torn read can supply one) makes a viewer reject the
+    /// whole capture. See `.scratch/chrome-encoder-defects/issues/03`.
     #[test]
     fn arg_values_display_as_bare_numbers() {
         assert_eq!(ArgValue::Int(0).to_string(), "0");

@@ -154,9 +154,13 @@ impl EventsExporter for ChromeTraceExporter {
 
         let mut first = !*has_written;
         for event in events {
-            // Repeated metadata is dropped. The thread set is keyed on the interpreter id
-            // alone, so two processes whose interpreter ids collide share one `thread_name`
-            // line; kept as-is, since the monitor reads one interpreter per process today.
+            // Repeated metadata is dropped.
+            //
+            // BUG, preserved on purpose: the thread set is keyed on the interpreter id, not
+            // on `(pid, tid)`. Every process's main interpreter is id 0, so in a
+            // multiprocessing capture the first worker claims 0 and every later worker's
+            // track renders unnamed. The fix moves bytes, which the gate below forbids here.
+            // See `.scratch/chrome-encoder-defects/issues/01`.
             let skip = match event {
                 TraceEvent::ProcessMeta { pid, .. } => !pid_meta_done.insert(*pid),
                 TraceEvent::ThreadMeta { tid, .. } => !tid_meta_done.insert(*tid),
@@ -493,10 +497,10 @@ mod tests {
         stack.is_empty() && !in_str
     }
 
-    /// The scan has to honour JSON escapes: an escaped quote read as the end of its string
-    /// would leave every brace after it counted from the wrong state, and the scan would
-    /// then wave through the malformed traces it exists to catch. No trace gcscope writes
-    /// carries an escape today, which is what makes this worth pinning rather than assuming.
+    /// The scan has to honour JSON escapes. An escaped quote read as the end of its string
+    /// leaves every brace after it counted from the wrong state, so the scan would pass the
+    /// malformed traces it exists to catch. No trace gcscope writes carries an escape today,
+    /// so this pins the handling rather than assuming it.
     #[test]
     fn brackets_balanced_honours_escapes_inside_strings() {
         assert!(brackets_balanced(r#"[{"name":"a \" b"}]"#), "escaped quote");
@@ -514,9 +518,9 @@ mod tests {
     }
 
     /// Events handed to an exporter that was never opened are dropped, and the metadata
-    /// dedup sets stay untouched so a later `open` still writes them. The monitor holds the
-    /// exporter across a whole run, so a spurious poll before `open` must not swallow the
-    /// process's `process_name` line for the rest of the capture.
+    /// dedup sets stay untouched so a later `open` still writes them. The monitor holds one
+    /// exporter for a whole run, so a poll before `open` must not swallow the process's
+    /// `process_name` line for the rest of the capture.
     #[test]
     fn events_before_open_are_dropped_without_consuming_the_metadata() {
         let mut ex = ChromeTraceExporter::new();
@@ -869,9 +873,11 @@ mod tests {
                     ],
                 ),
             ),
-            // A chained phase whose candidates exist in the layout but read zero: the chain
-            // resolves to `Some(0)`, so the span starts at the epoch rather than at the
-            // pause. Ugly, and what the encoder does.
+            // A chained phase whose candidates exist in the layout but read zero, so the
+            // chain resolves to `Some(0)` and the span runs from the epoch to the pause's
+            // real stop. A BUG the gate pins rather than blesses: `record.get` answers "is
+            // this field in the layout", not "did the target publish it".
+            // See `.scratch/chrome-encoder-defects/issues/02`.
             (
                 100,
                 GcStat::from_fields(
@@ -958,6 +964,11 @@ mod tests {
     /// by digest. Values come from a table of awkward ones (the extremes, the sign boundary,
     /// float bits printing as `inf`/`NaN`), since that is where two encoders diverge rather
     /// than in the middle of the range. Fixed seed, per `docs/testing-policy.md`.
+    ///
+    /// The digest asserts the bytes are *unchanged*, never that they are *valid*: the
+    /// non-finite `duration` bits render as bare `inf`/`NaN`, which no JSON parser accepts.
+    /// That defect predates the extraction, and the digest moves when it is fixed. See
+    /// `.scratch/chrome-encoder-defects/issues/03`.
     fn random_matrix() -> Vec<(u32, GcStat)> {
         const VALUES: [i64; 10] = [
             0,
