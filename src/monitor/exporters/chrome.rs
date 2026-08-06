@@ -265,7 +265,18 @@ mod tests {
         ])
     });
 
+    /// A build that publishes no timing at all: the cumulative counts and nothing else,
+    /// which is every interpreter below the ring builds. Its Records carry no pause, so the
+    /// conversion hands this encoder counter samples and no spans.
+    static COUNTS_ONLY_LAYOUT: LazyLock<&'static GcItemLayout> =
+        LazyLock::new(|| seq_layout(&["collections", "collected", "uncollectable"]));
+
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// The Observer's clock reading handed to the conversion. Every layout in this file
+    /// except [`COUNTS_ONLY_LAYOUT`] publishes timestamps of its own, so those Records ignore
+    /// it entirely — which is what lets the byte-identity gate below stay a gate.
+    const OBSERVER_CLOCK: i64 = 0;
 
     /// The exact bytes `golden_matrix` produced before the `TraceEvent` extraction.
     const GOLDEN_MATRIX_TRACE: &str = r#"[
@@ -340,7 +351,7 @@ mod tests {
         let mut ex = ChromeTraceExporter::new();
         ex.open(&path).unwrap();
         for (pid, record) in records {
-            ex.add_events(&convert_record(*pid, record));
+            ex.add_events(&convert_record(*pid, record, OBSERVER_CLOCK));
         }
         ex.close().unwrap();
         let s = fs::read_to_string(&path).unwrap();
@@ -520,11 +531,11 @@ mod tests {
     #[test]
     fn events_before_open_are_dropped_without_consuming_the_metadata() {
         let mut ex = ChromeTraceExporter::new();
-        ex.add_events(&convert_record(100, &bare_stat()));
+        ex.add_events(&convert_record(100, &bare_stat(), OBSERVER_CLOCK));
 
         let path = temp_path();
         ex.open(&path).unwrap();
-        ex.add_events(&convert_record(100, &bare_stat()));
+        ex.add_events(&convert_record(100, &bare_stat(), OBSERVER_CLOCK));
         ex.close().unwrap();
         let out = fs::read_to_string(&path).unwrap();
         fs::remove_file(&path).ok();
@@ -543,7 +554,7 @@ mod tests {
         let path = temp_path();
         let mut ex = ChromeTraceExporter::new();
         ex.open(&path).unwrap();
-        ex.add_events(&convert_record(1, &bare_stat()));
+        ex.add_events(&convert_record(1, &bare_stat(), OBSERVER_CLOCK));
         ex.close().unwrap();
         ex.close().unwrap();
         let out = fs::read_to_string(&path).unwrap();
@@ -702,6 +713,40 @@ mod tests {
                 "no {phase:?} span for a standard-set stat: {out}"
             );
         }
+    }
+
+    /// What an operator on a build with no timing actually gets: a counter track per
+    /// generation, carrying the cumulative counts, and no span anywhere. The whole trace is
+    /// pinned rather than probed, because the absences are the point — a `duration` or a
+    /// zero-width `GC Pause` here would report a pause figure the interpreter never
+    /// published.
+    #[test]
+    fn a_build_without_timing_writes_counter_tracks_and_no_spans() {
+        let sample = |counter: i64, collected: i64, observed_at_ns: i64| {
+            convert_record(
+                300,
+                &GcStat::from_fields(
+                    0,
+                    0,
+                    5,
+                    *COUNTS_ONLY_LAYOUT,
+                    &[("collections", counter), ("collected", collected)],
+                ),
+                observed_at_ns,
+            )
+        };
+        let mut events = sample(40, 900, 1_000_000);
+        events.extend(sample(41, 950, 2_000_000));
+
+        assert_eq!(
+            export_events(&events),
+            r#"[
+{"ph":"M","pid":300,"name":"process_name","args":{"name":"python 300"}},
+{"ph":"M","pid":300,"tid":5,"name":"thread_name","args":{"name":"300:5"}},
+{"name":"G0","ph":"C","ts":1000,"pid":300,"tid":5,"args":{"collections":40,"collected":900}},
+{"name":"G0","ph":"C","ts":2000,"pid":300,"tid":5,"args":{"collections":41,"collected":950}}
+]"#
+        );
     }
 
     /// CPython hands us nanoseconds; the trace format is microseconds. The pause
@@ -1007,13 +1052,13 @@ mod tests {
 
         let path1 = temp_path();
         ex.open(&path1).unwrap();
-        ex.add_events(&convert_record(100, &bare_stat()));
+        ex.add_events(&convert_record(100, &bare_stat(), OBSERVER_CLOCK));
         ex.close().unwrap();
         fs::remove_file(&path1).ok();
 
         let path2 = temp_path();
         ex.open(&path2).unwrap();
-        ex.add_events(&convert_record(100, &bare_stat()));
+        ex.add_events(&convert_record(100, &bare_stat(), OBSERVER_CLOCK));
         ex.close().unwrap();
         let out = fs::read_to_string(&path2).unwrap();
         fs::remove_file(&path2).ok();
