@@ -105,10 +105,9 @@ pub struct Cursor {
     /// reached: the newest `ts_start` of a Collection caught running, and the newest `ts_stop`
     /// of one read finished.
     ///
-    /// Within a single poll the in-flight start is the stronger of the two, since Collections
-    /// serialize and one that had started is later evidence than one that had ended. Across
-    /// polls both apply: learning where a later Collection ended raises the bound again, and
-    /// a bound left at an old in-flight start would widen every Loss window opened after it.
+    /// Within one poll the in-flight start is the stronger, since Collections serialize and
+    /// one that had started is later evidence than one that had ended. Across polls both
+    /// apply: a bound left at an old start would widen every Loss window opened after it.
     last_certainty: HashMap<(u32, i64), i64>,
 }
 
@@ -170,9 +169,9 @@ impl Cursor {
         fresh
     }
 
-    /// Raise this interpreter's certainty bound to `moment`, if `moment` is later. A
-    /// non-positive moment is no evidence: a build with no timestamps reports zero at both
-    /// ends of every Entry, and so does an Entry that never held a Collection.
+    /// Raise this interpreter's certainty bound to `moment` when `moment` is later. A
+    /// non-positive one is no evidence: a build with no timestamps reads zero at both ends of
+    /// every Entry, and so does an Entry that never held a Collection.
     fn raise_certainty(&mut self, pid: u32, interpreter: i64, moment: i64) {
         if moment <= 0 {
             return;
@@ -396,19 +395,16 @@ mod tests {
         c.admit(1, &[running(5, 500)]);
         assert_eq!(c.last_certainty(1, 0), Some(900));
 
-        // And it survives the Record never coming back: the Entry is overwritten, nothing
-        // newer is observed, and the bound stands.
+        // And it survives the Record never coming back: nothing newer is observed, so the
+        // bound stands.
         c.admit(1, &[running(9, 900)]);
         assert_eq!(c.last_certainty(1, 0), Some(900));
     }
 
-    /// Certainty is a high-water mark of proof, so a finished Record raises it too: its stop
-    /// is a moment the Observer knows the interpreter reached. An in-flight start is the
-    /// stronger bound only within one poll, where a Collection that had started is later
-    /// evidence than one that had ended. Across polls, learning where a later Collection
-    /// ended raises the bound further, and both apply. gcmon's `_ingest` carries the same
-    /// rule; without it a stale start from the first poll bounds every Loss window for the
-    /// rest of the run, making each one orders of magnitude too wide.
+    /// A finished Record raises the bound too: its stop is a moment the Observer knows the
+    /// interpreter reached. Without it a stale in-flight start from the first poll bounds
+    /// every Loss window for the rest of the run, each one orders of magnitude too wide.
+    /// gcmon's `_ingest` carries the same rule.
     #[test]
     fn a_finished_record_raises_certainty_past_a_stale_in_flight_start() {
         let mut c = Cursor::new();
