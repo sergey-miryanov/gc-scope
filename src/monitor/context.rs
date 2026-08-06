@@ -160,10 +160,10 @@ mod tests {
     /// read its predecessor's `collections` counters as already-seen and swallow the new
     /// process's first Collections.
     ///
-    /// `poll` is what fills the cursor in a real run, and it needs a live target — see
-    /// `tests/monitor.rs`. The eviction rule itself does not, so it is pinned here. An
-    /// unopened `ChromeTraceExporter` stands in as an inert sink rather than a bespoke double
-    /// whose methods this test would never call.
+    /// `poll` fills the cursor in a real run and needs a live target (`tests/monitor.rs`).
+    /// The eviction rule does not, so it is pinned here, with an unopened
+    /// `ChromeTraceExporter` as an inert sink rather than a double whose methods this test
+    /// would never call.
     #[test]
     fn marking_a_pid_dead_clears_its_cursor() {
         let mut exporter = ChromeTraceExporter::new();

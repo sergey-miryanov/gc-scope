@@ -8,8 +8,7 @@ use std::collections::HashMap;
 
 use crate::remote_debugging::gc_stats::GcStat;
 
-/// One ring: the sequence of Entries through which one generation of one interpreter of one
-/// process publishes its Records.
+/// One ring: the Entries one generation of one interpreter publishes its Records through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RingKey {
     pub pid: u32,
@@ -19,9 +18,9 @@ pub struct RingKey {
 
 /// What one ring did, against what the Observer saw of it.
 ///
-/// The two `_counter` fields come from CPython and describe the ring; the rest describe the
+/// The `_counter` fields come from CPython and describe the ring; the rest describe the
 /// reading. Every Loss figure is the difference between the two, so nothing derived is stored
-/// here — ticket 06 computes exact count, exact pause, Coverage and scale factor from these.
+/// here. Ticket 06 computes exact count, exact pause, Coverage and scale factor from these.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RingObservation {
     first_counter: i64,
@@ -33,8 +32,8 @@ pub struct RingObservation {
 }
 
 impl RingObservation {
-    /// Whether any Record from this ring has been read. An empty one is not the same as a
-    /// ring that collected nothing: it is one nothing is known about.
+    /// Whether any Record from this ring has been read. An empty one means nothing is known
+    /// about the ring, rather than that the ring collected nothing.
     pub fn is_empty(&self) -> bool {
         self.sampled == 0
     }
@@ -59,13 +58,13 @@ impl RingObservation {
         self.last_duration
     }
 
-    /// How many Records were actually read. Against the counter span, this is Coverage.
+    /// How many Records were read. Against the counter span, this is Coverage.
     pub fn sampled(&self) -> u64 {
         self.sampled
     }
 
-    /// Pause time summed over the Records actually read, in nanoseconds. Builds with no
-    /// timestamps contribute nothing, so this stays zero there.
+    /// Pause time summed over the Records read, in nanoseconds. Builds with no timestamps
+    /// contribute nothing, so it stays zero there.
     pub fn measured_pause_ns(&self) -> i64 {
         self.measured_pause_ns
     }
@@ -97,15 +96,15 @@ fn pause_ns(record: &GcStat) -> i64 {
 /// Which Records of a process tree have already been reported, and what their rings did.
 ///
 /// Replaces a per-`(generation, Entry)` high-water mark on `ts_start`, which could not work
-/// below 3.15 (no timestamps are published there) and could not detect a *gap* at all: a mark
-/// on one Entry says nothing about how many Collections passed through it between two polls.
+/// below 3.15 (no timestamps are published there) and could not detect a gap: a mark on one
+/// Entry says nothing about how many Collections passed through it between two polls.
 #[derive(Debug, Default)]
 pub struct Cursor {
     rings: HashMap<RingKey, RingObservation>,
-    /// Per `(pid, interpreter)`, the latest `ts_start` seen on a Collection that was still
-    /// running. Collections serialize within an interpreter, so a started one is later news
-    /// than the newest finished one, which makes this the strongest available bound on when
-    /// the Observer last had certainty.
+    /// Per `(pid, interpreter)`, the latest `ts_start` on a Collection still running.
+    /// Collections serialize within an interpreter, so one that had started is later evidence
+    /// than the newest finished Record, and so the strongest bound on when the Observer last
+    /// had certainty.
     last_certainty: HashMap<(u32, i64), i64>,
 }
 
@@ -117,17 +116,16 @@ impl Cursor {
     /// Fold one poll's Records in and return the ones not yet reported, in the order an
     /// exporter should receive them.
     ///
-    /// A poll hands over whole rings, so most of what arrives has been seen. Records are
-    /// folded in `(interpreter, generation, counter)` order, which is the order their rings
-    /// produced them, and returned in `ts_start` order, which is the order a trace wants.
-    /// Within one ring the two agree, since a later Collection carries both a higher counter
-    /// and a later start.
+    /// A poll hands over whole rings, so most of what arrives has been seen. Records fold in
+    /// `(interpreter, generation, counter)` order, the order their rings produced them, and
+    /// return in `ts_start` order, the order a trace wants. Within one ring the two agree,
+    /// since a later Collection carries both a higher counter and a later start.
     ///
-    /// Three kinds of Entry are refused. One still running is not a Record at all and is held
-    /// for a later poll, without advancing anything. One whose counter is not past its ring's
-    /// cursor was already reported — including CPython's own copy of a Record into the next
-    /// Entry ahead of overwriting it, which carries the same counter and which no timestamp
-    /// could distinguish. And one whose counter is zero has never held a Collection.
+    /// Three kinds of Entry are refused: one still running, held for a later poll without
+    /// advancing anything; one whose counter is not past its ring's cursor, already reported,
+    /// which also covers CPython's copy of a Record into the next Entry ahead of overwriting
+    /// it (same counter, and no timestamp tells the two apart); and one whose counter is
+    /// zero, which has never held a Collection.
     pub fn admit<'r>(&mut self, pid: u32, records: &'r [GcStat]) -> Vec<&'r GcStat> {
         let mut candidates: Vec<&GcStat> = records.iter().collect();
         candidates.sort_by_key(|r| (r.interpreter_id, r.generation, r.collections()));
@@ -136,8 +134,8 @@ impl Cursor {
         for record in candidates {
             if !record.is_complete() {
                 // An Entry that never held a Collection reads zero at both ends and so fails
-                // the completeness test too. A start it never published is no evidence of
-                // anything, and a fresh attach reads a ring that is mostly these.
+                // the completeness test too. A start it never published is no evidence, and a
+                // fresh attach reads a ring that is mostly these.
                 if record.ts_start() > 0 {
                     let bound = self
                         .last_certainty
@@ -166,8 +164,8 @@ impl Cursor {
             fresh.push(record);
         }
 
-        // Stable, so Records sharing a timestamp — every Record on a build that publishes
-        // none — keep the ring order they were folded in.
+        // Stable, so Records sharing a timestamp (every Record on a build that publishes
+        // none) keep the ring order they were folded in.
         fresh.sort_by_key(|r| r.ts_start());
         fresh
     }
@@ -268,8 +266,8 @@ mod tests {
             .collect()
     }
 
-    /// The base case. A Record is admitted once, and re-reading the same Entry on the next
-    /// poll admits nothing — the ring is unchanged, so there is nothing new in it.
+    /// A Record is admitted once. Re-reading the same Entry on the next poll admits nothing,
+    /// since the ring has not changed.
     #[test]
     fn a_record_is_admitted_once() {
         let mut c = Cursor::new();
@@ -277,24 +275,22 @@ mod tests {
         assert_eq!(admitted(&mut c, 1, &[done(1, 100, 150)]), []);
     }
 
-    /// The key is the counter, not the timestamp. A Record that ran *later* but reports an
-    /// earlier `ts_start` than one already admitted is still new, and a timestamp high-water
-    /// mark would silently drop it. Nothing but the counter can tell them apart.
+    /// The key is the counter. A Record that ran later but reports an earlier `ts_start` than
+    /// one already admitted is still new, and a timestamp high-water mark drops it.
     #[test]
     fn selection_follows_the_counter_not_the_timestamp() {
         let mut c = Cursor::new();
         assert_eq!(admitted(&mut c, 1, &[done(7, 9_000, 9_500)]), [7]);
-        // A newer Collection whose clock reading is lower — a target whose monotonic clock
-        // was read across a suspend, or simply a test pinning that ts plays no part.
+        // A newer Collection whose clock reading is lower: a monotonic clock read across a
+        // suspend, or just a test pinning that the timestamp plays no part.
         assert_eq!(admitted(&mut c, 1, &[done(8, 100, 150)]), [8]);
         // And an older counter is refused however high its timestamp.
         assert_eq!(admitted(&mut c, 1, &[done(6, 99_000, 99_500)]), []);
     }
 
-    /// The key is the counter, not the Entry position. CPython copies a Record into the next
-    /// Entry before overwriting the old one, so the same Collection can appear at two
-    /// positions in one poll. Both carry the same counter, which is the only thing that
-    /// identifies them as one Collection; a per-Entry mark admits both and doubles it.
+    /// CPython copies a Record into the next Entry before overwriting the old one, so one
+    /// Collection can appear at two positions in a single poll. The counter is the only thing
+    /// identifying them as one Collection; a per-Entry mark admits both and doubles it.
     #[test]
     fn the_same_collection_at_two_entries_is_admitted_once() {
         let mut c = Cursor::new();
@@ -321,9 +317,8 @@ mod tests {
         assert_eq!(admitted(&mut c, 1, &second), [3, 4]);
     }
 
-    /// An Entry that has never held a Collection reads a counter of zero. The initial cursor
-    /// is empty, so nothing but an explicit floor keeps those out of the trace — and a fresh
-    /// attach reads a mostly-empty ring.
+    /// An Entry that has never held a Collection reads a counter of zero, and a fresh attach
+    /// reads a mostly-empty ring. Only an explicit floor keeps those out of the trace.
     #[test]
     fn untouched_entries_are_never_admitted() {
         let mut c = Cursor::new();
@@ -331,10 +326,10 @@ mod tests {
         assert_eq!(admitted(&mut c, 1, &poll), [1]);
     }
 
-    /// An Entry that never held a Collection reads zero at both ends, which is exactly what
-    /// one caught mid-Collection looks like. It is not one, and a fresh attach reads a ring
-    /// that is mostly these — so mistaking them fabricates a certainty bound at the epoch for
-    /// every interpreter, which ticket 06 would then bound a Loss window with.
+    /// An Entry that never held a Collection reads zero at both ends, the same as one caught
+    /// mid-Collection. A fresh attach reads a ring that is mostly these, so mistaking them
+    /// fabricates a certainty bound at the epoch for every interpreter, which is the value
+    /// ticket 06 would bound a Loss window with.
     #[test]
     fn untouched_entries_are_not_mistaken_for_a_running_collection() {
         let mut c = Cursor::new();
@@ -342,8 +337,8 @@ mod tests {
         assert_eq!(c.last_certainty(1, 0), None);
     }
 
-    /// An Entry whose timestamps landed but whose counter did not — a torn read of a ring
-    /// being overwritten — has nothing to key on, so it is refused rather than admitted as
+    /// An Entry whose timestamps landed but whose counter did not (a torn read of a ring
+    /// being overwritten) has nothing to key on, so it is refused rather than admitted as
     /// collection zero.
     #[test]
     fn a_complete_entry_carrying_no_counter_is_refused() {
@@ -353,8 +348,8 @@ mod tests {
     }
 
     /// A Collection still running is not a Record. It must not reach an exporter, and it must
-    /// not advance the cursor — advancing past it would reject the finished Record, which
-    /// republishes the same counter, and lose it permanently and silently.
+    /// not advance the cursor: advancing past it rejects the finished Record, which
+    /// republishes the same counter, and loses it for good.
     #[test]
     fn a_running_collection_is_held_back_until_it_finishes() {
         let mut c = Cursor::new();
@@ -363,10 +358,10 @@ mod tests {
         assert_eq!(admitted(&mut c, 1, &[done(4, 100, 150)]), []);
     }
 
-    /// A running Collection is evidence, not noise: its start is the latest moment the
-    /// Observer had certainty about that interpreter, which is stronger than the newest
-    /// *finished* Record, because a Collection that had started is later news than one that
-    /// had ended. Ticket 06 bounds Loss windows with it.
+    /// A running Collection is evidence. Its start is the latest moment the Observer had
+    /// certainty about that interpreter, stronger than the newest finished Record, since a
+    /// Collection that had started is later news than one that had ended. Ticket 06 bounds
+    /// Loss windows with it.
     #[test]
     fn a_running_collection_records_when_certainty_was_last_held() {
         let mut c = Cursor::new();
@@ -385,8 +380,8 @@ mod tests {
         assert_eq!(c.last_certainty(1, 0), Some(900));
     }
 
-    /// Each interpreter's certainty is its own — Collections serialize within an interpreter
-    /// and not across them, so one interpreter's in-flight Entry says nothing about another.
+    /// Collections serialize within an interpreter and not across them, so one interpreter's
+    /// in-flight Entry says nothing about another's.
     #[test]
     fn certainty_is_tracked_per_interpreter() {
         let mut c = Cursor::new();
@@ -426,9 +421,9 @@ mod tests {
         assert_eq!(admitted(&mut c, 200, &[done(4, 200, 210)]), [4]);
     }
 
-    /// A PID is reused the moment the OS wants to reuse it. State kept past a process's death
-    /// would make the new occupant's first Collections read as already-seen, so a dead PID's
-    /// state goes when it does — and its siblings' stays.
+    /// A PID is reused the moment the OS wants it back. State kept past a process's death
+    /// makes the new occupant's first Collections read as already-seen, so a dead PID's state
+    /// goes when it does. Its siblings' stays.
     #[test]
     fn forgetting_a_pid_drops_its_state_and_leaves_its_siblings_alone() {
         let mut c = Cursor::new();
@@ -447,10 +442,9 @@ mod tests {
         assert_eq!(admitted(&mut c, 200, &[done(50, 100, 110)]), []);
     }
 
-    /// The accumulator holds what its ring did against what was read of it: the cumulative
-    /// counter and cumulative pause at the first and last Record seen, how many were sampled,
-    /// and the pause measured across them. Every Loss figure ticket 06 reports is derived
-    /// from these six numbers, so what lands in them is this ticket's deliverable.
+    /// The accumulator holds what its ring did against what was read of it: cumulative counter
+    /// and cumulative pause at the first and last Record seen, how many were sampled, and the
+    /// pause measured across them. Every Loss figure comes from these six numbers.
     #[test]
     fn an_accumulator_records_the_span_it_observed() {
         let mut c = Cursor::new();
@@ -483,18 +477,17 @@ mod tests {
         assert_eq!(obs.measured_pause_ns(), 800);
     }
 
-    /// A ring nobody has read yet has no accumulator at all, which is what lets ticket 06
-    /// distinguish "covered nothing" from "covered everything".
+    /// A ring nobody has read has no accumulator, which is what lets ticket 06 tell "covered
+    /// nothing" from "covered everything".
     #[test]
     fn an_unobserved_ring_has_no_accumulator() {
         let c = Cursor::new();
         assert_eq!(c.observation(key(1, 0, 0)), None);
     }
 
-    /// The whole point of the change. A build with no timestamp fields publishes nothing a
-    /// timestamp key could order, so the old cursor admitted nothing and the trace came out
-    /// empty against a process collecting constantly. The counter is all these builds have,
-    /// and it is enough.
+    /// A build with no timestamp fields publishes nothing a timestamp key could order, so the
+    /// old cursor admitted nothing and the trace came out empty against a process collecting
+    /// constantly. The counter is all these builds have.
     #[test]
     fn a_build_without_timestamps_still_advances() {
         let mut c = Cursor::new();
@@ -516,8 +509,7 @@ mod tests {
 
     /// The cursor this replaced, frozen as a test oracle: a `ts_start` high-water mark per
     /// `(generation, Entry)`, skipping an incomplete Entry without advancing its mark. The
-    /// equivalence claim below has no other way to be checked, so the old implementation
-    /// lives on here and nowhere else.
+    /// equivalence claim below cannot be checked any other way.
     fn select_fresh_by_timestamp<'s>(
         stats: &'s [GcStat],
         seen: &mut HashMap<(u32, usize), i64>,
@@ -556,8 +548,8 @@ mod tests {
 
     /// A ring build polled fast enough that nothing is overwritten unread: one Collection
     /// runs per tick, in a generation the seed picks, and the poll returns every Entry of
-    /// every generation. Entry counts and generation-major ordering match a real read. The
-    /// ring still wraps, so the equivalence covers Entry reuse rather than dodging it.
+    /// every generation. Entry counts and generation-major ordering match a real read, and
+    /// the ring wraps, so the equivalence covers Entry reuse.
     fn no_loss_polls(seed: u64, ticks: usize) -> Vec<Vec<GcStat>> {
         const ENTRIES: [usize; 3] = [11, 3, 3];
         let mut rng = seed | 1;
@@ -596,10 +588,10 @@ mod tests {
     }
 
     /// The equivalence this change has to preserve: against a ring polled fast enough that
-    /// nothing was overwritten unread, the counter cursor admits exactly what the timestamp
-    /// cursor admitted, tick for tick. Beyond that point the two are *meant* to disagree —
-    /// the timestamp cursor cannot see a gap, which is the whole reason for the change — so
-    /// the simulation stays inside the case where agreement is the requirement.
+    /// nothing was overwritten unread, the counter cursor admits what the timestamp cursor
+    /// admitted, tick for tick. Past that the two are meant to disagree, since the timestamp
+    /// cursor cannot see a gap, so the simulation stays inside the case where agreement is
+    /// the requirement.
     #[test]
     fn a_no_loss_ring_admits_exactly_what_the_timestamp_cursor_did() {
         for seed in [0x9e37_79b9_7f4a_7c15u64, 0x0123_4567_89ab_cdef, 7] {
