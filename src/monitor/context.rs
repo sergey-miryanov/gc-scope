@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::monitor::convert::convert_record;
+use crate::monitor::cursor::Cursor;
 use crate::monitor::exporters::{EventsExporter, ProcessLifecycle};
 use crate::monitor::run_loop::PollStatus;
-use crate::remote_debugging::gc_stats::GcStat;
 use crate::remote_debugging::session::{PySession, Revalidated};
 
 /// Per-process polling context.
@@ -22,13 +22,10 @@ pub struct MonitorContext<'a> {
     /// Resolved session per PID. Attached lazily on first `poll`; a failed attach
     /// is NOT cached (so a not-yet-ready process is retried per the `WaitPolicy`).
     sessions: HashMap<u32, PySession>,
-    /// Per-PID, per-(generation, entry) timestamp high-water mark for event dedup
-    /// (C4). `read_gc_stats` yields entries in generation-major order, not timestamp
-    /// order, so a single per-PID mark would drop a fresh event in one entry after
-    /// a higher timestamp was seen in another (across generations, or across a ring
-    /// wrap within a generation). Tracking freshness per entry fixes that; each ring
-    /// entry's `ts_start` only ever increases as it is overwritten.
-    seen: HashMap<u32, HashMap<(u32, usize), i64>>,
+    /// Which Records have already been reported, keyed on CPython's cumulative
+    /// `collections` per `(pid, interpreter, generation)`. It also carries what each ring
+    /// did against what was read of it, which is what makes Loss recoverable.
+    cursor: Cursor,
     alive_pids: HashSet<u32>,
 }
 
@@ -37,7 +34,7 @@ impl<'a> MonitorContext<'a> {
         MonitorContext {
             exporter,
             sessions: HashMap::new(),
-            seen: HashMap::new(),
+            cursor: Cursor::new(),
             alive_pids: HashSet::new(),
         }
     }
@@ -89,14 +86,14 @@ impl<'a> MonitorContext<'a> {
                     }
                     Revalidated::Changed => {
                         // A different program holds this PID now: drop the stale
-                        // session AND its freshness marks so the next tick
-                        // re-attaches from scratch and dedups against a clean slate.
+                        // session AND its cursor so the next tick re-attaches from
+                        // scratch and reads the new occupant's counters as new.
                         // NOTE: this is the one poll branch with no automated test — it
                         // needs a *different* program to reuse the exact same PID between
                         // ticks, which can't be reproduced deterministically. The Fresh,
                         // Dead, and give-up paths are covered in tests/monitor.rs.
                         self.sessions.remove(&pid);
-                        self.seen.remove(&pid);
+                        self.cursor.forget(pid);
                         return self.on_invalid(pid);
                     }
                     Revalidated::Dead => return self.on_invalid(pid),
@@ -111,8 +108,8 @@ impl<'a> MonitorContext<'a> {
 
         // Convert once here, so every output format is handed the same events instead of
         // deriving its own from the raw Record.
-        for stat in select_fresh(&stats, self.seen.entry(pid).or_default()) {
-            self.exporter.add_events(&convert_record(pid, stat));
+        for record in self.cursor.admit(pid, &stats) {
+            self.exporter.add_events(&convert_record(pid, record));
         }
         PollStatus::Ok
     }
@@ -133,12 +130,12 @@ impl<'a> MonitorContext<'a> {
     ///
     /// This is the single eviction point (C7): `run_loop` routes every give-up
     /// (vanished PID, policy-says-stop, shutdown) through here, so dropping the
-    /// session + timestamp cache here means no per-PID state can leak or go stale
+    /// session + cursor here means no per-PID state can leak or go stale
     /// across a reused PID. No lifecycle event if the PID was never reported as
     /// started or was already marked dead.
     pub fn mark_died(&mut self, pid: u32) {
         self.sessions.remove(&pid);
-        self.seen.remove(&pid);
+        self.cursor.forget(pid);
         if self.alive_pids.remove(&pid) {
             self.exporter
                 .mark_process_lifecycle(pid, ProcessLifecycle::Died, 0);
@@ -151,208 +148,42 @@ impl<'a> MonitorContext<'a> {
     }
 }
 
-/// Select the stats fresher than the last seen ts for their OWN `(generation, entry)`,
-/// returned in timestamp order so the trace stays ordered regardless of the
-/// generation-major order the entries arrive in (C4). Advances `seen` to the new marks.
-///
-/// `ts_start == 0` means an untouched entry (never collected) and is never selected —
-/// the initial mark is 0 and selection is strictly greater-than.
-///
-/// An entry caught mid-collection ([`GcStat::is_complete`] false) is skipped *without
-/// advancing its mark*. Both halves matter: emitting it writes a Chrome slice whose `E`
-/// precedes its `B`, and advancing the mark past its `ts_start` rejects the same entry once
-/// it finishes, since the finished record republishes that `ts_start`.
-fn select_fresh<'s>(stats: &'s [GcStat], seen: &mut HashMap<(u32, usize), i64>) -> Vec<&'s GcStat> {
-    let mut fresh: Vec<&GcStat> = Vec::new();
-    for stat in stats {
-        if !stat.is_complete() {
-            continue;
-        }
-        let mark = seen.entry((stat.generation, stat.index)).or_insert(0);
-        if stat.ts_start() > *mark {
-            *mark = stat.ts_start();
-            fresh.push(stat);
-        }
-    }
-    fresh.sort_by_key(|s| s.ts_start());
-    fresh
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote_debugging::offsets::offset_table::{GcItemLayout, seq_layout};
-    use std::sync::LazyLock;
+    use crate::monitor::cursor::RingKey;
+    use crate::monitor::exporters::chrome::ChromeTraceExporter;
+    use crate::remote_debugging::gc_stats::GcStat;
+    use crate::remote_debugging::offsets::offset_table::seq_layout;
 
-    /// Minimal entry layout for the dedup tests — they only ever set/read `ts_start`
-    /// (`generation`/`entry` are identity fields on the view, not layout fields).
-    static TEST_LAYOUT: LazyLock<&'static GcItemLayout> =
-        LazyLock::new(|| seq_layout(&["ts_start"]));
-
-    /// A ring build's entry layout — both timestamps, so the completeness gate is live.
-    static TIMED_LAYOUT: LazyLock<&'static GcItemLayout> =
-        LazyLock::new(|| seq_layout(&["ts_start", "ts_stop"]));
-
-    fn stat(generation: u32, index: usize, ts_start: i64) -> GcStat {
-        GcStat::from_fields(
-            generation,
-            index,
-            0,
-            *TEST_LAYOUT,
-            &[("ts_start", ts_start)],
-        )
-    }
-
-    fn timed_stat(generation: u32, index: usize, ts_start: i64, ts_stop: i64) -> GcStat {
-        GcStat::from_fields(
-            generation,
-            index,
-            0,
-            *TIMED_LAYOUT,
-            &[("ts_start", ts_start), ("ts_stop", ts_stop)],
-        )
-    }
-
-    fn mark(seen: &HashMap<(u32, usize), i64>, generation: u32, index: usize) -> i64 {
-        seen.get(&(generation, index)).copied().unwrap_or(0)
-    }
-
-    fn fresh_ts(stats: &[GcStat], seen: &mut HashMap<(u32, usize), i64>) -> Vec<i64> {
-        select_fresh(stats, seen)
-            .into_iter()
-            .map(|s| s.ts_start())
-            .collect()
-    }
-
-    /// Entries that have never been collected read back as zero. The initial mark is
-    /// also zero and selection is strictly greater-than, so they must never be
-    /// emitted — otherwise every attach floods the trace with phantom events at t=0.
+    /// The single eviction point drops the dead PID's cursor, so a PID the OS recycles cannot
+    /// read its predecessor's `collections` counters as already-seen and swallow the new
+    /// process's first Collections.
+    ///
+    /// `poll` is what fills the cursor in a real run, and it needs a live target — see
+    /// `tests/monitor.rs`. The eviction rule itself does not, so it is pinned here. An
+    /// unopened `ChromeTraceExporter` stands in as an inert sink rather than a bespoke double
+    /// whose methods this test would never call.
     #[test]
-    fn untouched_entries_are_never_emitted() {
-        let mut seen = HashMap::new();
-        let stats = vec![stat(0, 0, 0), stat(1, 0, 0), stat(2, 0, 0)];
-        assert!(fresh_ts(&stats, &mut seen).is_empty());
-        // Still nothing on a second poll of the same untouched entries.
-        assert!(fresh_ts(&stats, &mut seen).is_empty());
-    }
+    fn marking_a_pid_dead_clears_its_cursor() {
+        let mut exporter = ChromeTraceExporter::new();
+        let mut context = MonitorContext::new(&mut exporter);
 
-    #[test]
-    fn a_entry_is_emitted_once_per_new_timestamp() {
-        let mut seen = HashMap::new();
-        assert_eq!(fresh_ts(&[stat(0, 0, 100)], &mut seen), vec![100]);
-        // Same reading on the next tick: already seen.
-        assert!(fresh_ts(&[stat(0, 0, 100)], &mut seen).is_empty());
-        // The entry was overwritten by a newer collection.
-        assert_eq!(fresh_ts(&[stat(0, 0, 150)], &mut seen), vec![150]);
-    }
+        let layout = seq_layout(&["collections"]);
+        let record = GcStat::from_fields(0, 0, 0, layout, &[("collections", 9)]);
+        context.cursor.admit(77, std::slice::from_ref(&record));
 
-    /// The C4 regression. `read_gc_stats` yields entries generation-major, not in
-    /// timestamp order, so a single per-PID high-water mark lets a high-timestamped
-    /// generation-2 event swallow a genuinely new — but older — generation-0 event.
-    /// The mark is per `(generation, entry)` precisely to stop that.
-    #[test]
-    fn a_high_timestamp_in_one_generation_does_not_mask_another() {
-        let mut seen = HashMap::new();
-        // Tick 1: only generation 2 has run, and it ran late.
-        assert_eq!(fresh_ts(&[stat(2, 0, 900)], &mut seen), vec![900]);
-        // Tick 2: generation 0 collected at t=100 — older than the gen-2 mark, but
-        // new for its own entry. A per-PID mark would drop it.
-        assert_eq!(
-            fresh_ts(&[stat(0, 0, 100), stat(2, 0, 900)], &mut seen),
-            vec![100]
+        let key = RingKey {
+            pid: 77,
+            interpreter: 0,
+            generation: 0,
+        };
+        assert!(context.cursor.observation(key).is_some());
+
+        context.mark_died(77);
+        assert!(
+            context.cursor.observation(key).is_none(),
+            "a recycled PID must not inherit its predecessor's counters"
         );
-    }
-
-    /// Same hazard inside one generation: the ring's entries are overwritten in turn,
-    /// so entry 7 can hold an older timestamp than entry 3 and still be unreported.
-    #[test]
-    fn entries_within_a_generation_are_tracked_independently() {
-        let mut seen = HashMap::new();
-        assert_eq!(fresh_ts(&[stat(0, 3, 500)], &mut seen), vec![500]);
-        assert_eq!(
-            fresh_ts(&[stat(0, 3, 500), stat(0, 7, 200)], &mut seen),
-            vec![200]
-        );
-    }
-
-    /// Entries arrive generation-major but the trace must be ordered by time, or
-    /// Perfetto renders the begin/end pairs out of sequence.
-    #[test]
-    fn output_is_sorted_by_timestamp_regardless_of_input_order() {
-        let mut seen = HashMap::new();
-        let stats = vec![
-            stat(0, 0, 300),
-            stat(0, 1, 100),
-            stat(1, 0, 400),
-            stat(2, 0, 200),
-        ];
-        assert_eq!(fresh_ts(&stats, &mut seen), vec![100, 200, 300, 400]);
-    }
-
-    /// An entry read mid-collection has `ts_start` published and `ts_stop` not yet written.
-    /// Emitting it writes a Chrome slice that ends before it begins; the worse failure is
-    /// silent, because the finished record republishes that same `ts_start` and a mark
-    /// advanced on the in-flight read rejects it forever.
-    #[test]
-    fn an_in_flight_entry_is_held_back_until_its_collection_completes() {
-        let mut seen = HashMap::new();
-        assert!(fresh_ts(&[timed_stat(0, 0, 100, 0)], &mut seen).is_empty());
-        assert_eq!(
-            mark(&seen, 0, 0),
-            0,
-            "a skipped entry must not move its mark"
-        );
-
-        // The same collection, finished: same ts_start, real ts_stop.
-        assert_eq!(
-            fresh_ts(&[timed_stat(0, 0, 100, 150)], &mut seen),
-            vec![100]
-        );
-        // Once only; this time the mark advanced.
-        assert!(fresh_ts(&[timed_stat(0, 0, 100, 150)], &mut seen).is_empty());
-    }
-
-    /// The ring-wrap flavor: `ts_stop` is not zero but the previous occupant's value, so it
-    /// sits before the new `ts_start`.
-    #[test]
-    fn an_entry_holding_a_previous_occupants_ts_stop_is_held_back() {
-        let mut seen = HashMap::new();
-        assert!(fresh_ts(&[timed_stat(1, 2, 900, 400)], &mut seen).is_empty());
-        assert_eq!(mark(&seen, 1, 2), 0);
-        assert_eq!(
-            fresh_ts(&[timed_stat(1, 2, 900, 950)], &mut seen),
-            vec![900]
-        );
-    }
-
-    /// Completeness is `ts_start < ts_stop`, not `<=`, so a zero-width entry counts as
-    /// unfinished. `snapshot::collect` and gcmon's `_is_complete` use the same form.
-    #[test]
-    fn a_zero_width_entry_is_not_treated_as_complete() {
-        let mut seen = HashMap::new();
-        assert!(fresh_ts(&[timed_stat(0, 0, 100, 100)], &mut seen).is_empty());
-        assert_eq!(mark(&seen, 0, 0), 0);
-    }
-
-    /// The gate is on the layout, not the values. A build with no `ts_stop` field reads it
-    /// back as 0 through the zero-fallback accessor, so a value-only gate would call every
-    /// one of its entries in-flight and emit nothing at all.
-    #[test]
-    fn a_layout_without_a_stop_timestamp_is_not_gated_on_completeness() {
-        let mut seen = HashMap::new();
-        let s = stat(0, 0, 100);
-        assert_eq!(s.ts_stop(), 0, "absent field, not an unfinished collection");
-        assert_eq!(fresh_ts(std::slice::from_ref(&s), &mut seen), vec![100]);
-    }
-
-    #[test]
-    fn marks_advance_only_for_the_entries_that_were_selected() {
-        let mut seen = HashMap::new();
-        let _ = fresh_ts(&[stat(0, 0, 100), stat(1, 0, 0)], &mut seen);
-        assert_eq!(seen.get(&(0, 0)), Some(&100));
-        // The zero-timestamp entry was still recorded (at 0) but never emitted, so a
-        // later real collection in it is not suppressed.
-        assert_eq!(seen.get(&(1, 0)), Some(&0));
-        assert_eq!(fresh_ts(&[stat(1, 0, 50)], &mut seen), vec![50]);
     }
 }
