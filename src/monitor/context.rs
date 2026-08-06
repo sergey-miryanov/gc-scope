@@ -14,7 +14,7 @@ use crate::remote_debugging::session::{PySession, Revalidated};
 /// revalidate ladder (see [`poll`](Self::poll)).
 ///
 /// Owns the exporter and, per PID, an attached [`PySession`] (resolved once and
-/// reused every tick) plus lifecycle/last-timestamp state. All per-PID state is
+/// reused every tick) plus lifecycle state and the read cursor. All per-PID state is
 /// evicted together in [`MonitorContext::mark_died`] — the single death path
 /// `run_loop::run_loop` funnels every give-up through (C7).
 pub struct MonitorContext<'a> {

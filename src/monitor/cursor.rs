@@ -101,10 +101,14 @@ fn pause_ns(record: &GcStat) -> i64 {
 #[derive(Debug, Default)]
 pub struct Cursor {
     rings: HashMap<RingKey, RingObservation>,
-    /// Per `(pid, interpreter)`, the latest `ts_start` on a Collection still running.
-    /// Collections serialize within an interpreter, so one that had started is later evidence
-    /// than the newest finished Record, and so the strongest bound on when the Observer last
-    /// had certainty.
+    /// Per `(pid, interpreter)`, the latest moment the Observer has proof the interpreter
+    /// reached: the newest `ts_start` of a Collection caught running, and the newest `ts_stop`
+    /// of one read finished.
+    ///
+    /// Within a single poll the in-flight start is the stronger of the two, since Collections
+    /// serialize and one that had started is later evidence than one that had ended. Across
+    /// polls both apply: learning where a later Collection ended raises the bound again, and
+    /// a bound left at an old in-flight start would widen every Loss window opened after it.
     last_certainty: HashMap<(u32, i64), i64>,
 }
 
@@ -136,13 +140,7 @@ impl Cursor {
                 // An Entry that never held a Collection reads zero at both ends and so fails
                 // the completeness test too. A start it never published is no evidence, and a
                 // fresh attach reads a ring that is mostly these.
-                if record.ts_start() > 0 {
-                    let bound = self
-                        .last_certainty
-                        .entry((pid, record.interpreter_id))
-                        .or_insert(i64::MIN);
-                    *bound = (*bound).max(record.ts_start());
-                }
+                self.raise_certainty(pid, record.interpreter_id, record.ts_start());
                 continue;
             }
             let counter = record.collections();
@@ -161,6 +159,8 @@ impl Cursor {
                 continue;
             }
             observation.fold(record);
+            // A Record read finished proves the interpreter reached its stop.
+            self.raise_certainty(pid, record.interpreter_id, record.ts_stop());
             fresh.push(record);
         }
 
@@ -168,6 +168,19 @@ impl Cursor {
         // none) keep the ring order they were folded in.
         fresh.sort_by_key(|r| r.ts_start());
         fresh
+    }
+
+    /// Raise this interpreter's certainty bound to `moment`, if `moment` is later. A
+    /// non-positive moment is no evidence: a build with no timestamps reports zero at both
+    /// ends of every Entry, and so does an Entry that never held a Collection.
+    fn raise_certainty(&mut self, pid: u32, interpreter: i64, moment: i64) {
+        if moment <= 0 {
+            return;
+        }
+        self.last_certainty
+            .entry((pid, interpreter))
+            .and_modify(|bound| *bound = (*bound).max(moment))
+            .or_insert(moment);
     }
 
     /// Drop everything known about `pid`. The single eviction point for a process that died,
@@ -183,8 +196,8 @@ impl Cursor {
         self.rings.get(&key)
     }
 
-    /// The latest moment the Observer had certainty about this interpreter: the `ts_start` of
-    /// the newest Collection it caught still running. `None` until it catches one.
+    /// The latest moment the Observer has proof this interpreter reached. `None` on a build
+    /// that publishes no timestamps, and until the first Record is read.
     pub fn last_certainty(&self, pid: u32, interpreter: i64) -> Option<i64> {
         self.last_certainty.get(&(pid, interpreter)).copied()
     }
@@ -333,8 +346,16 @@ mod tests {
     #[test]
     fn untouched_entries_are_not_mistaken_for_a_running_collection() {
         let mut c = Cursor::new();
-        c.admit(1, &[done(0, 0, 0), done(0, 0, 0), done(3, 100, 150)]);
-        assert_eq!(c.last_certainty(1, 0), None);
+        c.admit(1, &[done(0, 0, 0), done(0, 0, 0)]);
+        assert_eq!(
+            c.last_certainty(1, 0),
+            None,
+            "an unused Entry proves nothing"
+        );
+
+        // Nor do they drag the bound back down once a Record has set one.
+        c.admit(1, &[done(3, 100, 150), done(0, 0, 0)]);
+        assert_eq!(c.last_certainty(1, 0), Some(150));
     }
 
     /// An Entry whose timestamps landed but whose counter did not (a torn read of a ring
@@ -375,9 +396,31 @@ mod tests {
         c.admit(1, &[running(5, 500)]);
         assert_eq!(c.last_certainty(1, 0), Some(900));
 
-        // And it survives the Record never coming back.
-        c.admit(1, &[done(20, 2_000, 2_100)]);
+        // And it survives the Record never coming back: the Entry is overwritten, nothing
+        // newer is observed, and the bound stands.
+        c.admit(1, &[running(9, 900)]);
         assert_eq!(c.last_certainty(1, 0), Some(900));
+    }
+
+    /// Certainty is a high-water mark of proof, so a finished Record raises it too: its stop
+    /// is a moment the Observer knows the interpreter reached. An in-flight start is the
+    /// stronger bound only within one poll, where a Collection that had started is later
+    /// evidence than one that had ended. Across polls, learning where a later Collection
+    /// ended raises the bound further, and both apply. gcmon's `_ingest` carries the same
+    /// rule; without it a stale start from the first poll bounds every Loss window for the
+    /// rest of the run, making each one orders of magnitude too wide.
+    #[test]
+    fn a_finished_record_raises_certainty_past_a_stale_in_flight_start() {
+        let mut c = Cursor::new();
+        c.admit(1, &[running(4, 900)]);
+        assert_eq!(c.last_certainty(1, 0), Some(900));
+
+        c.admit(1, &[done(20, 2_000, 2_100)]);
+        assert_eq!(c.last_certainty(1, 0), Some(2_100));
+
+        // Still only forward: an older Record admitted late does not walk it back.
+        c.admit(1, &[at(1, 0, 0, 3, 1_000, 1_050)]);
+        assert_eq!(c.last_certainty(1, 0), Some(2_100));
     }
 
     /// Collections serialize within an interpreter and not across them, so one interpreter's
