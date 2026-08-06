@@ -306,8 +306,8 @@ mod tests {
     }
 
     /// Dedup by cumulative counter applies to both tiers alike: a poll re-reading the same
-    /// Entries emits nothing, so a counter track carries one sample per Collection rather
-    /// than one per tick.
+    /// Entries emits nothing, so a counter track steps only where the count moved rather than
+    /// once per tick.
     #[test]
     fn a_repeated_poll_emits_nothing_on_either_tier() {
         let mut exporter = ChromeTraceExporter::new();

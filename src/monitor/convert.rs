@@ -135,9 +135,10 @@ pub fn convert_record(pid: u32, record: &GcStat, observed_at_ns: i64) -> Vec<Tra
     events
 }
 
-/// The events for a Record from a build that publishes no timestamps: one counter sample per
-/// generation, carrying the Lifetime totals CPython does publish. Their rise over a run is the
-/// GC rate, which is what such a build can show.
+/// The events for a Record from a build that publishes no timestamps: one counter sample
+/// carrying the Lifetime totals CPython does publish, whose rise over a run is the GC rate.
+/// The sample holds the generation's totals as of the read, not one Collection: an inline
+/// Entry carries nothing per-Collection.
 ///
 /// Nothing pause-derived appears, down to the zero-width span. A `duration` of `0` reads as
 /// "this process spends no time in GC" when the truth is that the build cannot say (spec 0011

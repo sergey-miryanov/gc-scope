@@ -113,6 +113,9 @@ fn expected_shape(
 ///
 /// The monitor compares no version; it reads the fields off the Entry layout. This is the
 /// outside view of that decision, and the only place a version belongs.
+///
+/// Split at the minor like [`expected_shape`], though the ring landed in 3.15.0a8: the offset
+/// registry refuses an earlier 3.15 alpha before either check runs.
 fn expects_spans(version: Option<(u8, u8)>) -> Option<bool> {
     Some(version? >= (3, 15))
 }

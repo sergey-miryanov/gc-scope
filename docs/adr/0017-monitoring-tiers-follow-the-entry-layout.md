@@ -9,23 +9,22 @@ published what a ring build publishes. Delivers §4 of
 ## Context
 
 An inline Entry (3.8–3.14) holds three Lifetime totals: collections, collected,
-uncollectable. A ring Entry (3.15+) keeps those and adds per-Collection detail, including the
-start and stop timestamps (`docs/version-support.md` §6). The monitor was built on the second
+uncollectable. A ring Entry (3.15+) keeps those and adds per-Collection detail, the start and
+stop timestamps among it (`docs/version-support.md` §6). The monitor was built on the second
 shape. Selection keyed on `ts_start` advancing, so where no `ts_start` exists nothing was ever
 selected: `gcscope monitor` wrote a trace with no GC activity against a process collecting
-constantly, and reported neither an error nor a warning.
+constantly, with no error and no warning.
 
 Keying the cursor on the cumulative `collections` counter (ticket 02) got those Records as far
 as the exporter, which exposed the rest. The conversion still described every Record as a
-pause, so each one drew a zero-width span at the epoch reporting `duration: 0`. An operator
-reads that as "this process spends no time in GC" — a wrong answer where the empty trace was
-a missing one.
+pause, so each drew a zero-width span at the epoch reporting `duration: 0`. An operator reads
+that as "this process spends no time in GC", which is worse than the empty trace.
 
 Two ways to draw the line:
 
 - **By version:** below 3.15, do less. Wrong for the reason the offset registry keys on
-  version only at its edge — a custom build, a pre-release with a different field set or an
-  instrumented fork is described by its layout. It also puts a version comparison in the
+  version only at its edge: a custom build, an odd pre-release or an instrumented fork is
+  described by its layout, not by the number on it. It also puts a version comparison in the
   monitor, the conversion, and later the statistics.
 - **By field presence:** ask whether this Record's layout defines `ts_start` and `ts_stop`.
   The layout is the authority on what a build carries, `None`-means-absent is the contract
@@ -39,8 +38,10 @@ Two ways to draw the line:
 2. **A build with timing is unchanged:** a span per Collection with its sub-phases, on the
    target's own clock, byte-for-byte what it emitted before. The Chrome encoder's
    byte-identity gate keeps that true.
-3. **A build without timing produces counter samples**, one per Collection per generation,
-   carrying the Lifetime totals CPython does publish. Their rise over a run is the GC rate.
+3. **A build without timing produces counter samples**, one per generation per poll whose
+   count advanced, carrying the Lifetime totals CPython does publish. Their rise over a run is
+   the GC rate. None describes a single Collection: an inline Entry holds a running total, so
+   many Collections between two polls arrive as one step.
 4. **A figure the build cannot supply is absent, not zero.** No duration, no candidates, no
    heap size, and no zero-width span standing in for a pause.
 5. **Counter samples sit on the Observer's clock,** passed into the conversion per poll rather
@@ -55,13 +56,13 @@ Two ways to draw the line:
   no monitor change. A Probe ring publishing timing lands in the timed tier by the same rule.
 - Both tiers are reachable through the poll seam (`MonitorContext::events_for`) as two layout
   fixtures, so no monitor test names a Python version. The live matrix asserts the tier
-  against the target's reported version — the outside view of a decision the code makes from
-  field presence.
-- Coverage on the counter tier is `0`: counts with no distribution behind them. The statistics
-  surface reports it when that lands; nothing fabricates it here.
+  against the target's reported version, which is the outside view of a decision the code
+  makes from field presence.
+- Coverage on the counter tier is `0`: counts with no distribution behind them, since nothing
+  these builds publish is per-Collection. The statistics surface reports that when it lands.
 - Pause time on these builds stays unavailable rather than estimated. Sampling the
-  `collecting` flag yields an aggregate duty cycle, and splitting an aggregate per generation
-  by count is fabrication (spec 0011 §4).
-- One file mixing tiers — a 3.12 parent spawning a 3.15 child — carries two timelines, since
-  one tier rides the Observer's clock and the other the target's. Tiers are per Record, so
-  each track holds together; nothing aligns them across the split.
+  `collecting` flag yields an aggregate duty cycle, and splitting one per generation by count
+  is fabrication (spec 0011 §4).
+- One file mixing tiers, a 3.12 parent spawning a 3.15 child, carries two timelines: one tier
+  rides the Observer's clock and the other the target's. Tiers are per Record, so each track
+  holds together, and nothing aligns them across the split.
