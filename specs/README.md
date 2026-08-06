@@ -22,6 +22,10 @@ Complements the two backward-looking docs:
 | [0009](0009-venv-launcher-child-retarget.md) | Feature — ergonomics | M | Windows venv shim PIDs fail single-shot commands; `attach` should re-target to the child |
 | [0010](0010-tree-last-child-connector.md) | Bug — cosmetic | S | `tree_prefixes` never emits the last-child connector its doc comment promises |
 | [0011](0011-loss-reconstruction-and-gc-statistics.md) | Feature — enhancement | L | `monitor` writes an empty trace below 3.15 and silently under-reports above it; reconstruct Loss from CPython's cumulative counters and report Coverage |
+| [0012](0012-gen-offsets-serves-the-probe.md) | Feature — enhancement | S | The Probe transcribes the Ring layout instead of sharing it, and the interpreter fields it compiles in are unswept |
+| [0013](0013-probe-portable-core.md) | Feature — enhancement | L | The Probe is Windows-only, hardcoded to one patch release, and publishes counters that do not mean what a reader assumes |
+| [0014](0014-read-probe-regions.md) | Feature — enhancement | L | gcscope ignores a Probe region entirely, and never tells an operator on 3.13/3.14 that per-Collection timing is obtainable |
+| [0015](0015-publish-probe-wheels.md) | Feature — ergonomics | M | There is no way to get a Probe except to build one on Windows with MSVC |
 
 **Suggested order:** 0001 (the only crash) → 0002 (one line, unblocks embedders) → 0003 →
 0004 (smallest user-visible wrongness) → then the cosmetic and efficiency tail in any
@@ -32,6 +36,20 @@ increment of porting gcmon's consumer stack, and it carries its own increments b
 (Perfetto, then the control plane and pyperf hook, then `convert` and the option surface).
 It is blocked by one local issue, `.scratch/monitor-inflight-entries/issues/01-…`, which
 ships on its own first.
+
+**0012–0015 are a third track — the Probe**, and they run in that order: 0012 (the generated
+layout header the rest asserts against) → 0013 (the port, and the move into this tree) → 0014
+(the reader side) → 0015 (wheels and release). 0013 and 0014 are each L and each independently
+useful to review; 0012 is small and unblocks both. The decisions behind the track are recorded
+in [ADR 0013–0016](../docs/adr/README.md); the specs carry only the work.
+
+**0011 and the Probe track collide, deliberately and in one place.** 0011 states that below
+3.15 there are no spans, Coverage is `0`, and pause figures are absent. A Probe falsifies all
+three on 3.13 and 3.14. The two are compatible in substance — 0011's reconstruction arithmetic
+works on a Probe ring precisely because
+[ADR 0015](../docs/adr/0015-probe-counters-are-seeded.md) seeds the counters — but whichever
+lands second must amend the other's sub-3.15 branch rather than leave two accounts of the same
+behaviour standing.
 
 ## Templates
 
