@@ -11,16 +11,18 @@ license = "MIT"
 authors = [{ name = "Sergey Miryanov", email = "sergey.miryanov@gmail.com" }]
 keywords = ["gc", "garbage-collection", "profiling", "gcscope"]
 
-# 3.14 only. PyInit repeats the gate at import, because a wheel tag is a hint: the offsets
-# `src/internals.c` compiles in describe one interpreter minor, and another lays
-# `PyInterpreterState` out differently. Spec 0013 widens this to 3.13.
-requires-python = ">=3.14,<3.15"
+# PyInit repeats this gate at import, and tightens it to the patch release: a wheel tag pins the
+# minor and the stable ABI, and neither covers the internal struct layout the offsets in
+# `src/internals.c` are taken from. 3.12 and below have no public PyTime_PerfCounterRaw; 3.15
+# publishes these statistics itself.
+requires-python = ">=3.13,<3.15"
 
 # No license classifier: PEP 639 supersedes it, and setuptools refuses both together.
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
   "Programming Language :: C",
+  "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   "Programming Language :: Python :: Implementation :: CPython",
   "Topic :: Software Development :: Debuggers",

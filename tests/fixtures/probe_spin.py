@@ -11,7 +11,7 @@ The only output is a pid. The reader finds the module among this process's mappi
 resolves `gcscope_probe_header` from its export table, and takes the region address and
 geometry from there.
 
-`spin.py` stays 3.8-compatible; this runs only where the Probe does, which is 3.14 today.
+`spin.py` stays 3.8-compatible; this runs only where the Probe does, which is 3.13 and 3.14.
 """
 
 import gc

@@ -1,4 +1,4 @@
-/* gcscope_probe -- publish a 3.15-shaped GC statistics Ring from inside CPython 3.14.
+/* gcscope_probe -- publish a 3.15-shaped GC statistics Ring from inside CPython 3.13 or 3.14.
  *
  * CPython below 3.15 records `collections`, `collected` and `uncollectable` per generation
  * and no timestamps, so gcscope can say how often the collector ran but not what any
@@ -6,10 +6,15 @@
  * `struct gc_stats` byte-for-byte (3.15/Include/internal/pycore_interp_structs.h:180-222),
  * which gcscope's ring decoder reads unmodified.
  *
- * Scope today: 3.14 only. Nothing here is Windows- or x86-64-shaped any more; CI builds this
- * with gcc, MSVC and Apple clang and attaches to all three, the macOS leg on native arm64.
- * `specs/0013-probe-portable-core.md` covers 3.13, `specs/0015-publish-probe-wheels.md` the
- * wheels and the rest of the platform matrix.
+ * Scope today: 3.13 and 3.14, both with the GIL, on every OS gcscope claims. Nothing here is
+ * Windows- or x86-64-shaped any more; CI builds this with gcc, MSVC and Apple clang and
+ * attaches to all three, the macOS leg on native arm64. Anything else is refused at import,
+ * naming which gate refused and why. `specs/0015-publish-probe-wheels.md` covers the wheels and
+ * the rest of the platform matrix.
+ *
+ * The two minors differ in one place beyond their internal headers: 3.13 has no `heap_size` in
+ * `_gc_runtime_state`, so the field is absent rather than zero there. `internals.c` carries
+ * both differences.
  */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
@@ -31,7 +36,7 @@
 #  define GCSCOPE_PROBE_EXPORT __attribute__((visibility("default")))
 #endif
 
-/* What Ring index 1 means, which is NOT the same across the 3.14 line.
+/* What Ring index 1 means, which is NOT the same across the builds this supports.
  *
  * 3.14.0-3.14.4 run the incremental collector: `_PyGC_Collect` dispatches on the
  * `generation` argument as a MODE -- 0 = young, 1 = *increment* of the old space,
@@ -40,9 +45,13 @@
  * is per-increment.
  *
  * 3.14.5 forward-ported the generational collector, so 0/1/2 are true generations
- * (3.14.5/Python/gc.c:1337-1348). Same Ring, same field names, different meaning. Average
- * across the two and you compare unlike quantities with nothing to warn you, which is why
- * the header publishes which one this is. */
+ * (3.14.5/Python/gc.c:1337-1348). 3.13 is generational too, and always was: the incremental
+ * collector was reverted before 3.13 shipped, which its `_gc_runtime_state` still shows --
+ * `generations[NUM_GENERATIONS]` and `long_lived_pending`, not `young` and `old[2]`.
+ *
+ * Same Ring, same field names, different meaning. Average across the two and you compare
+ * unlike quantities with nothing to warn you, which is why the header publishes which one
+ * this is. */
 #define GCSCOPE_PROBE_COLLECTOR_INCREMENTAL  0
 #define GCSCOPE_PROBE_COLLECTOR_GENERATIONAL 1
 
@@ -288,9 +297,9 @@ gcscope_probe_add_stats(struct gcscope_probe_stats *s, int gen,
 
 /* `heap_size` sits in the internal `_gc_runtime_state` with no accessor, so the Probe reaches
  * it by offset. `internals.c` supplies the three offsets as compile-time facts of the
- * interpreter this module was built against. The self-check below covers what that leaves: a
- * wheel built against one 3.14 patch release and loaded into another that moved a field the
- * ABI never promised to hold still (ADR 0013). */
+ * interpreter this module was built against, and says whether the field exists at all: 3.13's
+ * `_gc_runtime_state` ends before it. The self-check below covers what the offsets leave: a
+ * field moved out from under them within the minor (ADR 0013). */
 
 /* Set to 1 once the offsets have been confirmed against a live collection; -1 if the
  * self-check failed, in which case heap_size reports 0 rather than garbage.
@@ -334,6 +343,13 @@ gcscope_probe_check_offsets(void)
 static Py_ssize_t
 gcscope_probe_heap_size(void)
 {
+    /* On 3.13 there is no field to read. The offset would land on `trash_delete_later` at the
+     * top of the struct, which is exactly the plausible garbage this whole mechanism exists to
+     * avoid publishing. 0 is all there is to say until ticket 06's capability word lets a reader
+     * tell absent from failed from genuinely empty. */
+    if (!gcscope_probe_has_heap_size) {
+        return 0;
+    }
     /* GIL builds only; PyInit refuses a free-threaded one, where nothing maintains heap_size. */
     if (gcscope_probe_offsets_ok != 1) {
         return 0;
@@ -435,6 +451,122 @@ gcscope_probe_noop(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
     Py_RETURN_NONE;
 }
 
+/* ---- the load gates ----------------------------------------------------- */
+
+/* `GCSCOPE_PROBE_MIN_MINOR` and `GCSCOPE_PROBE_MAX_MINOR` come from `internals.h`, which also
+ * derives the compile-time floor from them. Every message below is formatted from those two
+ * rather than spelling the range out, so widening the gate cannot leave a refusal claiming the
+ * old range while letting the new one through.
+ *
+ * Room for the longest message below. PyOS_snprintf truncates rather than overruns, so a
+ * sentence added later that outgrows this loses its tail instead of the stack. */
+#define GCSCOPE_PROBE_REFUSAL_MAX 512
+
+/* Spell a PY_VERSION_HEX word the way CPython does: 0x030E05F0 -> "3.14.5",
+ * 0x030D00C1 -> "3.13.0rc1".
+ *
+ * A release level outside `patchlevel.h`'s four is printed as itself rather than dropped.
+ * Printing "3.13.0" for it would name the released version of a build that is not it, which is
+ * the approximation ADR 0012 refuses one layer up. */
+static void
+gcscope_probe_format_version(unsigned long v, char *buf, size_t n)
+{
+    unsigned int major  = (unsigned int)((v >> 24) & 0xFF);
+    unsigned int minor  = (unsigned int)((v >> 16) & 0xFF);
+    unsigned int micro  = (unsigned int)((v >>  8) & 0xFF);
+    unsigned int level  = (unsigned int)((v >>  4) & 0x0F);
+    unsigned int serial = (unsigned int)(v & 0x0F);
+
+    switch (level) {
+    case 0xA: PyOS_snprintf(buf, n, "%u.%u.%ua%u",  major, minor, micro, serial); break;
+    case 0xB: PyOS_snprintf(buf, n, "%u.%u.%ub%u",  major, minor, micro, serial); break;
+    case 0xC: PyOS_snprintf(buf, n, "%u.%u.%urc%u", major, minor, micro, serial); break;
+    case 0xF: PyOS_snprintf(buf, n, "%u.%u.%u",     major, minor, micro);         break;
+    default:
+        PyOS_snprintf(buf, n, "%u.%u.%u (release level %#x, serial %u)",
+                      major, minor, micro, level, serial);
+        break;
+    }
+}
+
+/* Why `runtime` may not load this module, written into `buf`; 0 if it may.
+ *
+ * A function of a version word rather than a read of `Py_Version`, so `version_refusal` below
+ * can put every arm in front of a test from an interpreter that loads. Testing these by
+ * importing into a refused build needs one interpreter per case and still cannot reach the
+ * free-threaded arm, which is decided at compile time and lives in `PyInit_gcscope_probe`.
+ *
+ * Each arm names the version it refused and what it was refused for, because the operator
+ * seeing this ImportError is holding a module that would otherwise have worked. */
+static int
+gcscope_probe_version_refusal(unsigned long runtime, char *buf, size_t n)
+{
+    unsigned int major = (unsigned int)((runtime >> 24) & 0xFF);
+    unsigned int minor = (unsigned int)((runtime >> 16) & 0xFF);
+    char running[64], built[64];
+
+    gcscope_probe_format_version(runtime, running, sizeof(running));
+
+    if (major < 3 || (major == 3 && minor < GCSCOPE_PROBE_MIN_MINOR)) {
+        PyOS_snprintf(buf, n,
+                      "gcscope_probe supports CPython 3.%u to 3.%u; this interpreter is %s",
+                      (unsigned int)GCSCOPE_PROBE_MIN_MINOR,
+                      (unsigned int)GCSCOPE_PROBE_MAX_MINOR, running);
+        return 1;
+    }
+    if (major > 3 || minor > GCSCOPE_PROBE_MAX_MINOR) {
+        PyOS_snprintf(buf, n,
+                      "gcscope_probe supports CPython 3.%u to 3.%u; this interpreter is %s. "
+                      "From 3.%u no need to use Probe since CPython publishes "
+                      "these statistics itself",
+                      (unsigned int)GCSCOPE_PROBE_MIN_MINOR,
+                      (unsigned int)GCSCOPE_PROBE_MAX_MINOR, running,
+                      (unsigned int)GCSCOPE_PROBE_MAX_MINOR + 1);
+        return 1;
+    }
+    if (runtime != (unsigned long)PY_VERSION_HEX) {
+        gcscope_probe_format_version((unsigned long)PY_VERSION_HEX, built, sizeof(built));
+        PyOS_snprintf(buf, n,
+                      "gcscope_probe was built against CPython %s and this interpreter is %s. "
+                      "It reads gc statistics through offsets taken from %s's internal headers. "
+                      "Rebuild it against %s",
+                      built, running, built, running);
+        return 1;
+    }
+    return 0;
+}
+
+/* What Ring index 1 counts in `runtime`, for the header's `collector` field. Only 3.14.0-3.14.4
+ * ran the incremental collector; 3.13 and 3.14.5 onward count generations. */
+static uint32_t
+gcscope_probe_collector_for(unsigned long runtime)
+{
+    unsigned int minor = (unsigned int)((runtime >> 16) & 0xFF);
+    unsigned int micro = (unsigned int)((runtime >>  8) & 0xFF);
+
+    if (minor == 14 && micro < 5) {
+        return GCSCOPE_PROBE_COLLECTOR_INCREMENTAL;
+    }
+    return GCSCOPE_PROBE_COLLECTOR_GENERATIONAL;
+}
+
+/* The gate above, callable. `version_refusal(PY_VERSION_HEX_word)` gives the ImportError text
+ * that word would produce, or None. Exposed so the refusals are exercised rather than read. */
+static PyObject *
+gcscope_probe_version_refusal_py(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    unsigned long ver = PyLong_AsUnsignedLong(arg);
+    if (ver == (unsigned long)-1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    char buf[GCSCOPE_PROBE_REFUSAL_MAX];
+    if (!gcscope_probe_version_refusal(ver, buf, sizeof(buf))) {
+        Py_RETURN_NONE;
+    }
+    return PyUnicode_FromString(buf);
+}
+
 /* ---- in-process introspection ------------------------------------------- */
 
 /* For liveness and the benchmarks. None is a correctness gate: the Probe's output is the
@@ -518,12 +650,14 @@ static PyMethodDef gcscope_probe_methods[] = {
     {"region_addr", gcscope_probe_region_addr, METH_NOARGS, "address of this interpreter's Ring region"},
     {"geometry",    gcscope_probe_geometry,    METH_NOARGS, "region geometry, for the reader"},
     {"records",     gcscope_probe_records,     METH_NOARGS, "count of Records published"},
+    {"version_refusal", gcscope_probe_version_refusal_py, METH_O,
+     "why a PY_VERSION_HEX word would be refused at import, or None if it would load"},
     {NULL, NULL, 0, NULL}
 };
 
 static struct PyModuleDef gcscope_probe_module = {
     PyModuleDef_HEAD_INIT, "gcscope_probe",
-    "3.15-shaped GC statistics Ring for CPython 3.14", -1, gcscope_probe_methods,
+    "3.15-shaped GC statistics Ring for CPython 3.13 and 3.14", -1, gcscope_probe_methods,
     NULL, NULL, NULL, NULL
 };
 
@@ -583,24 +717,20 @@ PyInit_gcscope_probe(void)
 #endif
 
     /* Version gate. `internals.c` compiled the offsets against ONE interpreter; another minor
-     * lays `PyInterpreterState` out differently, so they would point at whatever sits there.
-     * Refuse at import rather than publish plausible garbage. Spec 0013 §4 adds the
-     * patch-level gate; until it lands the self-check catches a moved field on the first
-     * collection.
+     * lays `PyInterpreterState` out differently, and another patch release may move a field
+     * inside `_gc_runtime_state`, so they would point at whatever sits there. Refuse at import
+     * rather than publish plausible garbage (ADR 0012, ADR 0013 decision 3).
      *
-     * Py_Version is the RUNTIME version (pylifecycle.h:64), not PY_VERSION_HEX, which is what
-     * this was compiled against. They differ exactly in the case that matters: one module
-     * built against 3.14.5 loads fine into any other 3.14.x, since the ABI is stable across a
-     * minor version. */
+     * Py_Version is the RUNTIME version (pylifecycle.h:64); PY_VERSION_HEX, which
+     * `gcscope_probe_version_refusal` compares it against, is what this was compiled against.
+     * They differ exactly in the case that matters: the wheel tag pins the minor and the stable
+     * ABI, and neither covers internal struct layout. The self-check on `collecting` still runs
+     * on the first Collection, but it fires after a Record has been published rather than
+     * before, and it cannot see a `heap_size` that moved on its own. */
     unsigned long ver = Py_Version;
-    unsigned int major = (unsigned int)((ver >> 24) & 0xFF);
-    unsigned int minor = (unsigned int)((ver >> 16) & 0xFF);
-    unsigned int micro = (unsigned int)((ver >> 8) & 0xFF);
-    if (major != 3 || minor != 14) {
-        PyErr_Format(PyExc_ImportError,
-                     "gcscope_probe supports CPython 3.14.x only; this interpreter is "
-                     "%u.%u.%u, whose internal offsets this build has not verified",
-                     major, minor, micro);
+    char refusal[GCSCOPE_PROBE_REFUSAL_MAX];
+    if (gcscope_probe_version_refusal(ver, refusal, sizeof(refusal))) {
+        PyErr_SetString(PyExc_ImportError, refusal);
         return NULL;
     }
 
@@ -609,8 +739,7 @@ PyInit_gcscope_probe(void)
     gcscope_probe_header.header_size = (uint32_t)sizeof(struct gcscope_probe_header_t);
     gcscope_probe_header.slots_addr  = (uint64_t)(uintptr_t)&gcscope_probe_slots[0];
     gcscope_probe_header.py_version  = (uint32_t)ver;
-    gcscope_probe_header.collector   = (micro >= 5) ? GCSCOPE_PROBE_COLLECTOR_GENERATIONAL
-                                                    : GCSCOPE_PROBE_COLLECTOR_INCREMENTAL;
+    gcscope_probe_header.collector   = gcscope_probe_collector_for(ver);
 
     return PyModule_Create(&gcscope_probe_module);
 }
