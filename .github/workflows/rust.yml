@@ -466,21 +466,28 @@ jobs:
 
   # The contract leg ADR 0016 section 4 calls non-optional: build a Probe on a machine that is
   # not the maintainer's Windows box, attach to it, and assert the Records decode. Without it,
-  # "the Probe works on Linux" rests on nobody having checked.
+  # "the Probe works" rests on nobody having checked.
   #
-  # `specs/0015-publish-probe-wheels.md` owns wheels, musllinux, native arm64 and publishing.
-  # This builds one module from source and throws it away.
+  # `specs/0015-publish-probe-wheels.md` owns wheels, musllinux and publishing. This builds one
+  # module from source on each OS and throws it away.
   #
-  # Nothing builds the Probe on Windows in CI. Spec 0015 adds that leg; until then a
-  # Windows-only break merges green.
+  # The macOS runner is where the release store on `ts_stop` earns its keep. `macos-latest` is
+  # Apple Silicon from macos-14 on, so this leg is native arm64 — the only configuration that
+  # can order those writes differently from x86-64's TSO, and the one spec 0013 section 5 case 3
+  # says emulation cannot stand in for. `Assert the macOS leg is arm64` below fails rather than
+  # lets that coverage disappear if GitHub ever moves the label back to Intel.
   probe-contract:
-    name: Probe contract (ubuntu-latest py${{ matrix.python }})
+    name: Probe contract (${{ matrix.os }} py${{ matrix.python }})
     needs: probe-scope
     if: needs.probe-scope.outputs.run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # Every OS gcscope claims. Each builds the Probe with its own toolchain — gcc, MSVC and
+        # Apple clang — against its own interpreter's internal headers, so a construct only one
+        # of them rejects goes red here instead of at a user.
+        os: [ubuntu-latest, windows-latest, macos-latest]
         # The one place the leg's interpreter is named. The Probe refuses to load on any minor
         # it was not built for, so ticket 05 adding 3.13 is one more entry here and nothing
         # else. Bare minor, floated by setup-python, and `matrix-unpinned` enforces that, for
@@ -515,36 +522,75 @@ jobs:
           allow-prereleases: true
 
       - name: Allow ptrace (best-effort)
+        if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      # No compiler or interpreter path appears here; setuptools finds the toolchain. A compile
-      # error fails the leg at this step, named, rather than downstream as a test that found no
-      # module.
+      # 3.14 attaches unprivileged on macOS through PEP 768's get-task-allow, so this leg needs
+      # only the authorization database change and none of the sudo-plus-coverage dance the
+      # `live-smoke` 3.8-3.12 legs carry. Ticket 05 adding 3.13 stays on this path; anything
+      # older would not.
+      - name: Configure macOS taskport permissions
+        if: runner.os == 'macOS'
+        run: |
+          sudo security authorizationdb write system.privilege.taskport is-developer
+          sudo security authorizationdb read system.privilege.taskport
+
+      # This leg is the project's only arm64 coverage, and it is arm64 by virtue of a label
+      # rather than anything declared. A silent move back to Intel would leave every assertion
+      # passing and prove nothing about publication ordering, which is the one defect class
+      # x86-64 cannot exhibit. Fail loudly instead.
+      - name: Assert the macOS leg is arm64
+        if: runner.os == 'macOS'
+        run: |
+          arch="$(uname -m)"
+          echo "runner architecture: $arch"
+          [ "$arch" = "arm64" ] || {
+            echo "::error::macos-latest is $arch, not arm64; the release store on ts_stop is" \
+                 "no longer covered by any leg. See specs/0013-probe-portable-core.md section 5."
+            exit 1
+          }
+
+      # No compiler or interpreter path appears here; setuptools finds the toolchain — gcc,
+      # MSVC and Apple clang in turn. A compile error fails the leg at this step, named, rather
+      # than downstream as a test that found no module.
       #
       # This needs the interpreter's *internal* headers, which belong to the runner's Python
       # rather than to anything in this repository. Both `make install` and the standalone
       # builds setup-python uses carry them; a Python without them stops here with the
       # diagnostic `src/internals.c` raises.
       - name: Build and install the Probe
+        shell: bash
         run: python -m pip install --verbose ./gcscope_probe
 
       # GCSCOPE_REQUIRE_PROBE=1 stops a skip reading as a pass. The test skips when no Probe is
       # installed, which is right on a laptop and would turn a Probe that failed to compile
       # into a green leg here.
+      #
+      # `--include-ignored` rather than `--ignored`: the export-table assertion needs no attach,
+      # so it is a plain test, and `--ignored` runs only the ones marked. This is the leg that
+      # has a built module to inspect, so it is the leg that has to run it.
+      #
+      # `sys.executable` rather than `command -v python`: under `shell: bash` on Windows that
+      # resolves to an MSYS path like `/c/hostedtoolcache/...`, which the Rust harness hands
+      # straight to `Command::new` and Windows cannot open. `sys.executable` is native on all
+      # three runners.
       - name: Attach and assert the Ring decodes
+        shell: bash
         env:
           GCSCOPE_REQUIRE_PROBE: '1'
         run: |
-          export GCSCOPE_TEST_PYTHON="$(command -v python)"
+          GCSCOPE_TEST_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+          export GCSCOPE_TEST_PYTHON
+          echo "interpreter: $GCSCOPE_TEST_PYTHON"
           "$GCSCOPE_TEST_PYTHON" -c "import gcscope_probe; print(gcscope_probe.geometry())"
-          cargo llvm-cov --test probe --lcov --output-path lcov.info --fail-under-lines 1 -- --ignored --nocapture
+          cargo llvm-cov --test probe --lcov --output-path lcov.info --fail-under-lines 1 -- --include-ignored --nocapture
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: lcov.info
-          flags: probe,ubuntu-latest
-          name: probe-ubuntu-latest-py${{ matrix.python }}
+          flags: probe,${{ matrix.os }}
+          name: probe-${{ matrix.os }}-py${{ matrix.python }}
           disable_search: true
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}

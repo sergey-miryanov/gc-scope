@@ -12,14 +12,19 @@
 //! `gc.generation_stats` for gcscope's discovery path, and nothing in the interpreter points
 //! at a Probe region. `specs/0014-read-probe-regions.md` moves that lookup into gcscope.
 //!
-//! `#[ignore]`d like the other live-attach tests (ADR 0005 §3):
-//!   cargo test --test probe -- --ignored
-//! With no Probe installed it skips; see `common::probe_python`.
+//! The two tests that attach are `#[ignore]`d like the other live-attach tests (ADR 0005 §3);
+//! `probe_module_exports_its_discovery_anchor` only reads the built module off disk and is not.
+//! To run all three:
+//!   cargo test --test probe -- --include-ignored
+//! With no Probe installed each skips; see `common::probe_python`.
 
 mod common;
 
-use common::{SpawnedPython, full_python_version, is_free_threaded, probe_python, probe_required};
-use gcscope::memory::binary::elf_load_bias;
+use common::{
+    SpawnedPython, full_python_version, is_free_threaded, probe_module_path, probe_python,
+    probe_required,
+};
+use gcscope::memory::binary::{elf_load_bias, parse_macho};
 use gcscope::memory::reader::{open_handle, read_memory_h};
 use gcscope::memory::regions::list_regions;
 use gcscope::remote_debugging::gc_stats::GcStat;
@@ -27,8 +32,9 @@ use gcscope::remote_debugging::offsets::offset_table::{
     GcItemLayout, GcStatsKind, OffsetTable, compute_ring_base_offsets,
 };
 use read_process_memory::ProcessHandle;
+use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The Probe module's filename prefix, a wire contract rather than a detail: gcscope's
 /// discovery matches on it (ADR 0014), and the module name in `gcscope_probe/src` fixes it.
@@ -44,11 +50,23 @@ const MODULE_SUFFIX: &str = ".so";
 /// The exported discovery anchor.
 const HEADER_SYMBOL: &str = "gcscope_probe_header";
 
+/// The slot array. Not part of the discovery contract — the header publishes `slots_addr`, so a
+/// reader never looks this up — but it carries the same export macro, and it losing default
+/// visibility is the same regression one step earlier.
+const SLOTS_SYMBOL: &str = "gcscope_probe_slots";
+
 /// Samples across the run, and the gap between them. Three samples check a counter sequence
 /// rather than a pair; the fixture collects gen 0 every ~50 ms, so this gap guarantees
 /// progress without slowing the test.
 const SAMPLES: usize = 3;
 const SAMPLE_GAP: Duration = Duration::from_millis(700);
+
+/// The sustained-churn window and its polling gap. Five seconds spans ~100 gen-0 Collections at
+/// the fixture's ~50 ms cadence, ~20 gen-1 and ~4 gen-2. A 2 ms gap puts ~25 samples inside
+/// each gen-0 Collection, so a reader crosses every publication boundary several times over and
+/// an 11-entry young Ring cannot lap between two samples.
+const CHURN_WINDOW: Duration = Duration::from_secs(5);
+const CHURN_GAP: Duration = Duration::from_millis(2);
 
 /// Real counters stay far below this; garbage from a wrong address rarely does. Same bound as
 /// the live-smoke shape check.
@@ -122,7 +140,8 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 /// find the mapped Probe module, parse its symbol table, rebase the symbol onto the module's
 /// load address. No scanning and no hardcoded address, which is the chain ADR 0014 specifies.
 ///
-/// One goblin match covers PE and ELF, so both platforms read the same fact through one lookup.
+/// One goblin match covers PE, ELF and Mach-O, so every platform reads the same fact through
+/// one lookup.
 fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
     let regions = list_regions(pid).map_err(|e| format!("listing target regions: {e}"))?;
 
@@ -139,6 +158,14 @@ fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
         if !(name.starts_with(MODULE_PREFIX) && name.ends_with(MODULE_SUFFIX)) {
             continue;
         }
+        // On macOS the kernel attributes several low no-access reservations to an image's
+        // path, so its lowest mapping sits well below the Mach-O header and every address
+        // derived from it lands inside *some* mapped range — a successful read of garbage
+        // rather than a clean failure. The header sits at the start of `__TEXT`, which is the
+        // executable mapping. gcscope's `find_python_modules` filters the same way.
+        if cfg!(target_os = "macos") && !r.is_exec() {
+            continue;
+        }
         // An image's lowest mapping is where its first loadable segment landed, on both
         // formats here. The load bias below accounts for what that address is relative to.
         let entry = (path.to_string(), r.start() as u64);
@@ -151,52 +178,78 @@ fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
     })?;
 
     let bytes = std::fs::read(&path).map_err(|e| format!("reading {path}: {e}"))?;
-    let addr = match goblin::Object::parse(&bytes) {
-        Ok(goblin::Object::PE(pe)) => pe
-            .exports
-            .iter()
-            .find(|e| e.name == Some(HEADER_SYMBOL))
-            .map(|e| base + e.rva as u64),
-        Ok(goblin::Object::Elf(elf)) => {
-            // `dynsyms` only. The static `.symtab` carries the symbol whatever its visibility,
-            // so a fallback there would let a `-fvisibility=hidden` regression pass here while
-            // breaking discovery in the field. gcscope's `resolve_symbol_elf` does fall back,
-            // for a different question. This lookup asserts the symbol sits where a remote
-            // reader will look.
-            let bias = elf_load_bias(&elf)
-                .ok_or_else(|| format!("{path} has no PT_LOAD segment to take a load bias from"))?;
-            elf.dynsyms
-                .iter()
-                .find(|s| elf.dynstrtab.get_at(s.st_name) == Some(HEADER_SYMBOL))
-                .map(|s| base.wrapping_add(s.st_value.wrapping_sub(bias)))
-        }
-        // Mach-O belongs to spec 0013's port. Nothing here has run on macOS, and an untested
-        // arm reads as support, so ticket 04 adds it against a leg that can prove it.
-        Ok(other) => {
-            return Err(format!(
-                "{path} parses as {}, which this lookup does not handle yet",
-                object_kind(&other)
-            ));
-        }
-        Err(e) => return Err(format!("parsing {path}: {e}")),
-    };
 
     // ADR 0014 §2 names this failure: a module that works and is invisible to discovery. Say
     // which of the two happened.
-    let addr = addr.ok_or_else(|| {
-        format!(
-            "{path} does not export {HEADER_SYMBOL}; the module built but its discovery anchor \
-             is not in the table a remote reader consults"
-        )
-    })?;
+    let addr = dynamic_symbol(&bytes, base, HEADER_SYMBOL)
+        .map_err(|e| format!("{path}: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "{path} does not export {HEADER_SYMBOL}; the module built but its discovery \
+                 anchor is not in the table a remote reader consults"
+            )
+        })?;
 
     Ok((path, addr))
+}
+
+/// Resolve `symbol` in the **dynamic** symbol table of an image, rebased onto `base`.
+///
+/// Dynamic on every format, never the static table: `.symtab`, and a Mach-O `nlist` marked
+/// private-extern, carry the symbol whatever its visibility, so a fallback there would let a
+/// `-fvisibility=hidden` regression pass while breaking discovery in the field. gcscope's
+/// `resolve_symbol_elf` does fall back, for a different question. This asks whether the symbol
+/// sits where a remote reader will look, so it consults only that table.
+///
+/// `Ok(None)` means the image parsed and does not export the symbol. `Err` means the image
+/// could not be read as one of the three formats.
+fn dynamic_symbol(bytes: &[u8], base: u64, symbol: &str) -> Result<Option<u64>, String> {
+    match goblin::Object::parse(bytes) {
+        Ok(goblin::Object::PE(pe)) => Ok(pe
+            .exports
+            .iter()
+            .find(|e| e.name == Some(symbol))
+            .map(|e| base + e.rva as u64)),
+        Ok(goblin::Object::Elf(elf)) => {
+            let bias = elf_load_bias(&elf)
+                .ok_or_else(|| "no PT_LOAD segment to take a load bias from".to_string())?;
+            Ok(elf
+                .dynsyms
+                .iter()
+                .find(|s| elf.dynstrtab.get_at(s.st_name) == Some(symbol))
+                .map(|s| base.wrapping_add(s.st_value.wrapping_sub(bias))))
+        }
+        Ok(goblin::Object::Mach(_)) => {
+            // Through gcscope's own unwrapper: a Probe built against the universal2 Python
+            // from python.org can itself be fat, and `MachO::parse` at offset 0 fails outright
+            // on a fat header. Virtual addresses only below, so the slice offset goes unused.
+            let (macho, _) = parse_macho(bytes)
+                .ok_or_else(|| "Mach-O image did not parse for this architecture".to_string())?;
+            // The export trie, which is what `-exported_symbols_list` and visibility control
+            // and therefore the counterpart of `.dynsym` above. Its offsets are already
+            // relative to the mach header, which is what `base` addresses on macOS once the
+            // caller has skipped the non-executable reservations below `__TEXT`.
+            let exports = macho
+                .exports()
+                .map_err(|e| format!("reading the Mach-O export trie: {e}"))?;
+            // Mach-O prefixes C symbols with an underscore. Accept the undecorated spelling
+            // too rather than assuming either form, as `resolve_symbol_macho` does.
+            Ok(exports
+                .iter()
+                .find(|e| e.name == symbol || e.name.strip_prefix('_') == Some(symbol))
+                .map(|e| base.wrapping_add(e.offset)))
+        }
+        Ok(other) => Err(format!(
+            "parses as {}, which this lookup does not handle",
+            object_kind(&other)
+        )),
+        Err(e) => Err(format!("parsing it: {e}")),
+    }
 }
 
 /// Names the format goblin found, for the error above.
 fn object_kind(obj: &goblin::Object) -> &'static str {
     match obj {
-        goblin::Object::Mach(_) => "Mach-O",
         goblin::Object::Archive(_) => "an archive",
         goblin::Object::COFF(_) => "COFF",
         _ => "a format goblin does not recognise",
@@ -286,18 +339,90 @@ fn ring_table(h: &ProbeHeader) -> OffsetTable {
     }
 }
 
-/// Newest entry per generation: the largest `collections`, since Records are cumulative and
-/// the Ring wraps. Mirrors how a real consumer picks the head.
-fn newest_per_gen<'a>(written: &[&'a GcStat]) -> Vec<&'a GcStat> {
-    (0..3u32)
-        .filter_map(|g| {
-            written
-                .iter()
-                .copied()
-                .filter(|s| s.generation == g)
-                .max_by_key(|s| s.collections())
+/// One generation's entries, split the way a reader consuming this Ring has to split them.
+///
+/// The writer publishes a Record by copying the previous entry forward, overwriting the
+/// counters, and storing `ts_stop` last. Between those two acts the entry carries this
+/// Collection's `ts_start` beside the previous occupant's `ts_stop`, and gcscope's
+/// `is_complete()` calls it in-flight. A reader skips it and reports the newest entry that did
+/// finish, which is what this models.
+struct Head<'a> {
+    /// The newest finished Collection: largest `collections`, since Records are cumulative and
+    /// the Ring wraps.
+    newest: Option<&'a GcStat>,
+    /// Written but unfinished. At most one — the Record being published right now.
+    in_flight: Vec<&'a GcStat>,
+    /// Entries carrying a Collection at all. Unwritten ones are zeroed.
+    written: usize,
+}
+
+fn head_of<'a>(stats: &'a [GcStat], generation: u32) -> Head<'a> {
+    let written: Vec<&GcStat> = stats
+        .iter()
+        .filter(|s| s.generation == generation && s.collections() > 0)
+        .collect();
+    Head {
+        newest: written
+            .iter()
+            .copied()
+            .filter(|s| s.is_complete())
+            .max_by_key(|s| s.collections()),
+        in_flight: written
+            .iter()
+            .copied()
+            .filter(|s| !s.is_complete())
+            .collect(),
+        written: written.len(),
+    }
+}
+
+/// The message for a generation whose every written entry reads as unfinished. One is the
+/// publication window; all of them means `ts_stop` never lands after `ts_start` — the field is
+/// not being written, or is being read at the wrong offset.
+fn describe_all_in_flight(head: &Head<'_>, generation: u32) -> String {
+    let detail: Vec<String> = head
+        .in_flight
+        .iter()
+        .map(|s| {
+            format!(
+                "entry {} ts_start={} ts_stop={}",
+                s.index,
+                s.ts_start(),
+                s.ts_stop()
+            )
         })
-        .collect()
+        .collect();
+    format!(
+        "gen {generation}: all {} written entries read as unfinished ({})",
+        head.written,
+        detail.join(", ")
+    )
+}
+
+/// What one sample took from a generation's newest finished Record, kept for the next sample to
+/// compare against. Copied out rather than borrowed, since the buffer it decodes from is
+/// replaced every round.
+#[derive(Clone, Copy)]
+struct Newest {
+    index: usize,
+    collections: i64,
+    collected: i64,
+    uncollectable: i64,
+    duration: f64,
+    ts_start: i64,
+}
+
+impl Newest {
+    fn of(s: &GcStat) -> Self {
+        Newest {
+            index: s.index,
+            collections: s.collections(),
+            collected: s.collected(),
+            uncollectable: s.uncollectable(),
+            duration: s.duration(),
+            ts_start: s.ts_start(),
+        }
+    }
 }
 
 /// Assert the decoded table's **shape** rather than a successful read. A Probe writing at a
@@ -367,42 +492,143 @@ fn check_shape(stats: &[GcStat], entries: [usize; 3]) -> Result<(), String> {
     Ok(())
 }
 
-/// The four invariants the prototype's verifier established, asserted against Records read
-/// out of the process: every written entry decodes, passes `is_complete()`, carries a
-/// positive duration, and cumulative counters never regress between samples. A fifth checks
-/// `heap_size`, the one field the Probe reaches by raw offset into an internal struct.
-#[test]
-#[ignore = "attaches to a live process; needs ptrace/taskport and an installed Probe — run with --ignored"]
-fn probe_ring_decodes_out_of_process() {
-    let Some(python) = probe_python() else {
-        // "installed", not "importable": the source directory in the crate root imports as a
-        // namespace package on any interpreter, so the check calls into the module.
-        let msg = "no interpreter with the `gcscope_probe` extension installed \
-                   (build it: pip install ./gcscope_probe)";
-        assert!(
-            !probe_required(),
-            "GCSCOPE_REQUIRE_PROBE=1 but {msg}; a leg that builds a Probe must not pass by \
-             skipping"
-        );
-        eprintln!("SKIP probe_ring_decodes_out_of_process: {msg}");
-        return;
-    };
+/// An interpreter with a Probe, or `None` after logging a skip.
+///
+/// "Installed", not "importable": the source directory in the crate root imports as a namespace
+/// package on any interpreter, so [`probe_python`] calls into the module. `GCSCOPE_REQUIRE_PROBE=1`
+/// turns the skip into a failure, since a leg that just built a Probe must not pass by not
+/// finding one.
+fn probe_python_or_skip(test: &str) -> Option<PathBuf> {
+    if let Some(python) = probe_python() {
+        return Some(python);
+    }
+    let msg = "no interpreter with the `gcscope_probe` extension installed \
+               (build it: pip install ./gcscope_probe)";
+    assert!(
+        !probe_required(),
+        "GCSCOPE_REQUIRE_PROBE=1 but {msg}; a leg that builds a Probe must not pass by skipping"
+    );
+    eprintln!("SKIP {test}: {msg}");
+    None
+}
+
+/// A running fixture with its Ring located — the preamble both live tests share.
+struct Attached {
+    /// Kept alive rather than read: dropping it kills the interpreter.
+    _proc: SpawnedPython,
+    module: String,
+    handle: ProcessHandle,
+    header: ProbeHeader,
+    table: OffsetTable,
+    /// Bytes to read per sample, from the geometry the target declared.
+    region_len: usize,
+    /// The first claimed interpreter slot: `(id, region address)`.
+    iid: i64,
+    addr: u64,
+}
+
+/// Spawn `probe_spin.py`, find its published header, and resolve the first claimed slot's Ring.
+fn attach(python: &Path) -> Attached {
     // A free-threaded build never maintains `heap_size`, so the Probe refuses to load there
     // rather than publish a column of zeros. Reaching this assertion means it loaded anyway,
     // a broken gate rather than an unsupported configuration, so it fails instead of skipping.
     assert!(
-        !is_free_threaded(&python),
+        !is_free_threaded(python),
         "GCSCOPE_TEST_PYTHON selected a free-threaded build and the Probe imported anyway; \
          the Py_GIL_DISABLED gate in PyInit_gcscope_probe is not doing its job"
     );
 
-    let proc = SpawnedPython::spawn_fixture(&python, "probe_spin.py")
+    let proc = SpawnedPython::spawn_fixture(python, "probe_spin.py")
         .expect("probe_spin.py should reach READY");
     let pid = proc.pid();
 
     let (module, header_addr) = find_header_addr(pid).expect("locate the published header");
     let handle = open_handle(pid).expect("open the target process");
-    let h = read_header(&handle, header_addr).expect("decode the published header");
+    let header = read_header(&handle, header_addr).expect("decode the published header");
+
+    let regions = live_regions(&handle, &header).expect("walk the slot array");
+    let (iid, addr) = *regions
+        .first()
+        .expect("no claimed interpreter slot; the callback never ran");
+
+    let table = ring_table(&header);
+    let region_len = table
+        .stats_buffer_len()
+        .expect("ring geometry is decodable");
+
+    Attached {
+        _proc: proc,
+        module,
+        handle,
+        header,
+        table,
+        region_len,
+        iid,
+        addr,
+    }
+}
+
+/// The discovery anchor is genuinely in the table a remote reader consults.
+///
+/// Off disk, not out of a live process: no ptrace and no fixture, so the failure ADR 0014 §2
+/// calls silent — a module that loads, installs its callback, publishes a valid region and
+/// exports nothing to find it by — goes red in any job that builds a Probe rather than only
+/// where an attach is possible. `PyMODINIT_FUNC` carries default visibility on its own and
+/// these two do not, so a build that picked up `-fvisibility=hidden` would import fine and
+/// vanish from discovery.
+///
+/// Through the same [`dynamic_symbol`] the live test resolves the region address with, so what
+/// passes here is what discovery performs.
+#[test]
+fn probe_module_exports_its_discovery_anchor() {
+    let Some(python) = probe_python_or_skip("probe_module_exports_its_discovery_anchor") else {
+        return;
+    };
+    let path = probe_module_path(&python)
+        .expect("an interpreter that imported the extension has it on disk");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+
+    for symbol in [HEADER_SYMBOL, SLOTS_SYMBOL] {
+        let found =
+            dynamic_symbol(&bytes, 0, symbol).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(
+            found.is_some(),
+            "{} does not export {symbol} in its dynamic symbol table",
+            path.display()
+        );
+    }
+
+    // The negative control, without which the loop above passes on a lookup that answers Some
+    // to everything. `gcscope_probe_records_written` is a file-scope `static` in
+    // `gcscope_probe.c` and reaches no dynamic table on any of the three formats.
+    let internal = dynamic_symbol(&bytes, 0, "gcscope_probe_records_written")
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(
+        internal.is_none(),
+        "{} exports gcscope_probe_records_written, which has internal linkage; the lookup is \
+         answering from a table wider than the one a remote reader consults",
+        path.display()
+    );
+}
+
+/// The four invariants the prototype's verifier established, asserted against Records read
+/// out of the process: every generation decodes an entry a reader can report, that entry is a
+/// finished Collection, it carries a positive duration, and cumulative counters never regress
+/// between samples. A fifth checks `heap_size`, the one field the Probe reaches by raw offset
+/// into an internal struct.
+///
+/// The prototype demanded `is_complete()` of *every* written entry, which the Ring does not
+/// owe a reader: the Record being published is torn by construction until its `ts_stop` lands.
+/// See [`Head`]. `probe_ring_survives_sustained_churn` polls hard enough to be the test that
+/// holds that window to one entry.
+#[test]
+#[ignore = "attaches to a live process; needs ptrace/taskport and an installed Probe — run with --ignored"]
+fn probe_ring_decodes_out_of_process() {
+    let Some(python) = probe_python_or_skip("probe_ring_decodes_out_of_process") else {
+        return;
+    };
+    let t = attach(&python);
+    let (h, module, handle) = (&t.header, &t.module, &t.handle);
 
     // Ask the target rather than hardcode the answer: the header's py_version must match what
     // the interpreter reports about itself. A Probe loaded into the wrong runtime is what the
@@ -432,22 +658,14 @@ fn probe_ring_decodes_out_of_process() {
         h.collector
     );
 
-    let regions = live_regions(&handle, &h).expect("walk the slot array");
-    let (iid, addr) = *regions
-        .first()
-        .expect("no claimed interpreter slot; the callback never ran");
-
-    let table = ring_table(&h);
-    let expected_len = table
-        .stats_buffer_len()
-        .expect("ring geometry is decodable");
     // gcscope's `stats_buffer_len` stops at the end of gen 2's entries, while the producer's
     // region also carries gen 2's trailing cursor word, making it 8 bytes longer. A superset
     // is correct; a shorter region would mean the two disagree about geometry.
     assert!(
-        h.region_size as usize >= expected_len,
-        "declared region {} is smaller than its own geometry implies ({expected_len})",
-        h.region_size
+        h.region_size as usize >= t.region_len,
+        "declared region {} is smaller than its own geometry implies ({})",
+        h.region_size,
+        t.region_len
     );
 
     let entries = [
@@ -463,37 +681,36 @@ fn probe_ring_decodes_out_of_process() {
         thread::sleep(SAMPLE_GAP);
 
         // gcscope's reader, gcscope's decoder. The only local step was the address.
-        let raw = read_memory_h(&handle, addr, expected_len)
+        let raw = read_memory_h(handle, t.addr, t.region_len)
             .unwrap_or_else(|e| panic!("sample {round}: reading the region: {e}"));
-        let stats = table.decode_gc_stats(&raw, iid);
+        let stats = t.table.decode_gc_stats(&raw, t.iid);
 
         if let Err(e) = check_shape(&stats, entries) {
             panic!("sample {round}: {e}");
         }
 
-        // Invariants 1 and 2: every *written* entry is a finished Collection, ts_start <
-        // ts_stop. Unwritten entries are zeroed, so `collections() > 0` excludes them instead
-        // of weakening the predicate to accommodate them.
-        let written: Vec<&GcStat> = stats.iter().filter(|s| s.collections() > 0).collect();
-        assert!(
-            !written.is_empty(),
-            "sample {round}: no entry carries a collection; the Ring is shaped but empty"
-        );
-        for s in &written {
+        let mut totals: Vec<i64> = Vec::with_capacity(3);
+        for generation in 0..3u32 {
+            let head = head_of(&stats, generation);
             assert!(
-                s.is_complete(),
-                "sample {round}: gen {} entry {} written but not complete: \
-                 ts_start={} ts_stop={}",
-                s.generation,
-                s.index,
-                s.ts_start(),
-                s.ts_stop()
+                head.written > 0,
+                "sample {round}: gen {generation} carries no Record; the fixture collects all three"
             );
+            // Invariants 1 and 2, as a reader applies them: at most the entry being published
+            // right now is unfinished, and the newest finished one is what gets reported. See
+            // `Head` for why one incomplete entry is expected rather than a defect, and
+            // `probe_ring_survives_sustained_churn` for the check that keeps it to one.
+            let s = head.newest.unwrap_or_else(|| {
+                panic!(
+                    "sample {round}: {}",
+                    describe_all_in_flight(&head, generation)
+                )
+            });
+
             // Invariant 3. `duration` is cumulative, so a written entry carries some.
             assert!(
                 s.duration() > 0.0,
-                "sample {round}: gen {} entry {} has non-positive duration {}",
-                s.generation,
+                "sample {round}: gen {generation} entry {} has non-positive duration {}",
                 s.index,
                 s.duration()
             );
@@ -504,25 +721,17 @@ fn probe_ring_decodes_out_of_process() {
             // tolerated before those offsets came from the interpreter's own headers.
             assert!(
                 s.heap_size() >= MIN_TRACKED_OBJECTS,
-                "sample {round}: gen {} entry {} reports heap_size {}, below the {} tracked \
+                "sample {round}: gen {generation} entry {} reports heap_size {}, below the {} tracked \
                  objects the fixture holds at every Collection; the interpreter offsets look \
                  wrong for this build",
-                s.generation,
                 s.index,
                 s.heap_size(),
                 MIN_TRACKED_OBJECTS
             );
+            totals.push(s.collections());
         }
 
         // Invariant 4: cumulative counters only ever grow.
-        let heads = newest_per_gen(&written);
-        let totals: Vec<i64> = heads.iter().map(|s| s.collections()).collect();
-        assert_eq!(
-            totals.len(),
-            3,
-            "sample {round}: only {} generations have Records; the fixture collects all three",
-            totals.len()
-        );
         if let Some(prev) = &prev_totals {
             for (g, (before, now)) in prev.iter().zip(totals.iter()).enumerate() {
                 assert!(
@@ -544,5 +753,160 @@ fn probe_ring_decodes_out_of_process() {
         last_gen0 > first,
         "gen 0 collections did not advance across {SAMPLES} samples ({first} -> {last_gen0}); \
          the region looks frozen rather than live"
+    );
+}
+
+/// Poll the Ring far faster than it is written and hold every sample to what a reader is
+/// entitled to assume about the entry it picks as newest.
+///
+/// This is the publication-ordering guard `specs/0013-probe-portable-core.md` §5 case 3 asks
+/// for. `gcscope_probe_add_stats` copies the previous entry forward, overwrites the counters
+/// and publishes `ts_stop` with `memory_order_release`; a reader that sees a Record's `ts_stop`
+/// is thereby entitled to see the payload it describes. The three-sample test above visits that
+/// boundary a handful of times, which is not enough to call it exercised.
+///
+/// **On x86-64 this cannot go red from a missing release store.** TSO orders the stores whether
+/// or not the code asks it to, so the Linux and Windows legs prove the invariants hold and not
+/// that the release is what holds them. The `probe-contract` leg on `macos-latest` runs this on
+/// native Apple Silicon, which is the one runner that can tell the difference. Emulation could
+/// not: it may serialise the writes and mask the defect entirely, which is why the workflow
+/// asserts that leg is really arm64 rather than trusting the label.
+///
+/// The one check that would fire on a reordering anywhere is the `ts_start` clause below: it
+/// asks whether an entry whose counters have not moved has quietly taken on a newer
+/// Collection's start time, which is precisely what an early-visible `ts_stop` exposes.
+#[test]
+#[ignore = "attaches to a live process; needs ptrace/taskport and an installed Probe — run with --ignored"]
+fn probe_ring_survives_sustained_churn() {
+    let Some(python) = probe_python_or_skip("probe_ring_survives_sustained_churn") else {
+        return;
+    };
+    let t = attach(&python);
+
+    let mut prev: [Option<Newest>; 3] = [None; 3];
+    let mut first_gen0: Option<i64> = None;
+    let mut last_gen0 = 0i64;
+    let mut samples = 0usize;
+    let mut in_flight_seen = 0usize;
+
+    let deadline = Instant::now() + CHURN_WINDOW;
+    while Instant::now() < deadline {
+        thread::sleep(CHURN_GAP);
+        samples += 1;
+
+        let raw = read_memory_h(&t.handle, t.addr, t.region_len)
+            .unwrap_or_else(|e| panic!("sample {samples}: reading the region: {e}"));
+        let stats = t.table.decode_gc_stats(&raw, t.iid);
+
+        for generation in 0..3u32 {
+            let head = head_of(&stats, generation);
+            assert!(
+                head.written > 0,
+                "sample {samples}: gen {generation} carries no Record; probe_spin.py seeds all three \
+                 before it reports READY"
+            );
+
+            // The writer publishes one Record at a time, so one entry may be part-way through
+            // and no more. A second would mean an entry left torn by something other than the
+            // window this samples across.
+            in_flight_seen += head.in_flight.len();
+            assert!(
+                head.in_flight.len() <= 1,
+                "sample {samples}: {}",
+                describe_all_in_flight(&head, generation)
+            );
+
+            let s = head.newest.unwrap_or_else(|| {
+                panic!(
+                    "sample {samples}: {}",
+                    describe_all_in_flight(&head, generation)
+                )
+            });
+            let now = Newest::of(s);
+
+            // `Head::newest` already filtered on `is_complete()`, which today *is*
+            // `ts_start < ts_stop`. Restated here so the invariant this test exists for is
+            // asserted rather than inherited: gcscope owns that definition, and a reader is
+            // entitled to this whatever it loosens to.
+            assert!(
+                s.ts_stop() > now.ts_start,
+                "sample {samples}: gen {generation} entry {} is the newest finished Record and its \
+                 ts_stop {} does not follow its ts_start {}",
+                now.index,
+                s.ts_stop(),
+                now.ts_start
+            );
+            assert!(
+                now.duration > 0.0,
+                "sample {samples}: gen {generation} entry {} has non-positive duration {}",
+                now.index,
+                now.duration
+            );
+            assert!(
+                s.heap_size() >= MIN_TRACKED_OBJECTS,
+                "sample {samples}: gen {generation} entry {} reports heap_size {}, below the {} \
+                 tracked objects the fixture holds at every Collection",
+                now.index,
+                s.heap_size(),
+                MIN_TRACKED_OBJECTS
+            );
+
+            if let Some(before) = prev[generation as usize] {
+                for (name, was, is) in [
+                    ("collections", before.collections, now.collections),
+                    ("collected", before.collected, now.collected),
+                    ("uncollectable", before.uncollectable, now.uncollectable),
+                ] {
+                    assert!(
+                        is >= was,
+                        "sample {samples}: gen {generation} {name} went backwards: {was} -> {is}"
+                    );
+                }
+                assert!(
+                    now.duration >= before.duration,
+                    "sample {samples}: gen {generation} duration went backwards: {} -> {}",
+                    before.duration,
+                    now.duration
+                );
+                // The payload and `ts_stop` belong to the same Collection. Counters that have
+                // not moved beside a start time that has means a reader was handed this
+                // Collection's timestamps over the previous one's totals — an entry published
+                // before it was finished being written. A partly-copied entry moves ts_start
+                // the other way, backwards to the occupant a full lap ago, so this asks only
+                // that it not run ahead.
+                assert!(
+                    now.collections > before.collections || now.ts_start <= before.ts_start,
+                    "sample {samples}: gen {generation} still reports {} collections while its \
+                     ts_start advanced {} -> {}; the Record was visible before its payload was",
+                    now.collections,
+                    before.ts_start,
+                    now.ts_start
+                );
+            }
+
+            if generation == 0 {
+                first_gen0.get_or_insert(now.collections);
+                last_gen0 = now.collections;
+            }
+            prev[generation as usize] = Some(now);
+        }
+    }
+
+    // Both a floor on the polling this actually did and the frozen-region check: a reader
+    // latched onto a stale copy satisfies every invariant above.
+    let first = first_gen0.expect("the churn window fits at least one sample");
+    assert!(
+        samples > 100,
+        "only {samples} samples fit in {CHURN_WINDOW:?}; too few to call the Ring churned"
+    );
+    assert!(
+        last_gen0 > first,
+        "gen 0 collections did not advance across {samples} samples ({first} -> {last_gen0}); \
+         the region looks frozen rather than live"
+    );
+    eprintln!(
+        "{samples} samples over {CHURN_WINDOW:?}, gen 0 collections {first} -> {last_gen0}, \
+         {in_flight_seen} entries caught mid-publication ({})",
+        t.module
     );
 }
