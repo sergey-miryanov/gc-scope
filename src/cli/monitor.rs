@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use crate::cli::monitor_options::MonitorOptions;
 use crate::monitor::exporters::EventsExporter;
 use crate::monitor::exporters::chrome::ChromeTraceExporter;
-use crate::monitor::{MonitorContext, StartupTimeoutPolicy, run_loop};
+use crate::monitor::{MonitorContext, StartupTimeoutPolicy, run_loop, statistics};
 
 // ---------------------------------------------------------------------------
 // ProcessRunner — abstracts attach-vs-spawn
@@ -144,6 +144,15 @@ fn run_monitoring_loop(runner: &mut impl ProcessRunner, opts: &MonitorOptions) -
     run_loop(&mut ctx, pid, opts.rate, &running, || {
         StartupTimeoutPolicy::new(Duration::from_secs(2))
     })?;
+
+    if opts.summary {
+        // On stderr, beside the other run messages: `run` forwards the target's stdout to
+        // ours, and this is gcscope talking, not the program being watched. Ticket 07's JSON
+        // gets stdout to itself.
+        for line in statistics::render(&ctx.summary()) {
+            eprintln!("{}", line);
+        }
+    }
 
     ctx.close()?;
     eprintln!("Trace written to {}", opts.output);

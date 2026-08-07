@@ -10,4 +10,8 @@ pub struct MonitorOptions {
     /// Output trace file path
     #[arg(short = 'o', long, default_value = "gcmon_trace.json")]
     pub output: String,
+
+    /// Print a per-generation summary of what was observed when the run ends
+    #[arg(long)]
+    pub summary: bool,
 }

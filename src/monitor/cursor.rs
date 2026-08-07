@@ -4,31 +4,56 @@
 //! what its ring did against what the Observer read of it, so the difference between the two
 //! is recoverable later as Loss.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::remote_debugging::gc_stats::GcStat;
 
 /// One ring: the Entries one generation of one interpreter publishes its Records through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RingKey {
     pub pid: u32,
     pub interpreter: i64,
     pub generation: u32,
 }
 
+/// The totals CPython keeps for the life of a generation, as of one Record.
+///
+/// All four are cumulative on both shapes of Entry: an inline Entry holds nothing else, a ring
+/// Entry adds per-Collection detail beside them (`docs/version-support.md` §6). What a run did
+/// is a difference between two of these, never a sum over Records.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Lifetime {
+    pub collections: i64,
+    pub collected: i64,
+    pub uncollectable: i64,
+    /// Pause total in seconds. Zero on a build that publishes no timing.
+    pub duration: f64,
+}
+
+impl Lifetime {
+    fn of(record: &GcStat) -> Self {
+        Lifetime {
+            collections: record.collections(),
+            collected: record.collected(),
+            uncollectable: record.uncollectable(),
+            duration: record.duration(),
+        }
+    }
+}
+
 /// What one ring did, against what the Observer saw of it.
 ///
-/// The `_counter` fields come from CPython and describe the ring; the rest describe the
-/// reading. Every Loss figure is the difference between the two, so nothing derived is stored
-/// here. Ticket 06 computes exact count, exact pause, Coverage and scale factor from these.
+/// [`first`](Self::first) and [`last`](Self::last) come from CPython and describe the ring;
+/// [`sampled`](Self::sampled) and [`measured_pause_ns`](Self::measured_pause_ns) describe the
+/// reading. Every summary figure is a difference between the two, so nothing derived is stored
+/// here. Ticket 06 computes exact count, exact pause, Coverage and scale factor from them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RingObservation {
-    first_counter: i64,
-    last_counter: i64,
-    first_duration: f64,
-    last_duration: f64,
+    first: Lifetime,
+    last: Lifetime,
     sampled: u64,
     measured_pause_ns: i64,
+    timed: bool,
 }
 
 impl RingObservation {
@@ -38,24 +63,14 @@ impl RingObservation {
         self.sampled == 0
     }
 
-    /// The cumulative `collections` CPython reported on the first Record read.
-    pub fn first_counter(&self) -> i64 {
-        self.first_counter
+    /// The Lifetime totals on the first Record read.
+    pub fn first(&self) -> Lifetime {
+        self.first
     }
 
-    /// The cumulative `collections` on the most recent Record read.
-    pub fn last_counter(&self) -> i64 {
-        self.last_counter
-    }
-
-    /// The cumulative pause total, in seconds, on the first Record read.
-    pub fn first_duration(&self) -> f64 {
-        self.first_duration
-    }
-
-    /// The cumulative pause total, in seconds, on the most recent Record read.
-    pub fn last_duration(&self) -> f64 {
-        self.last_duration
+    /// The Lifetime totals on the most recent Record read.
+    pub fn last(&self) -> Lifetime {
+        self.last
     }
 
     /// How many Records were read. Against the counter span, this is Coverage.
@@ -69,19 +84,24 @@ impl RingObservation {
         self.measured_pause_ns
     }
 
+    /// Whether this ring's Records bound their Collections with timestamps. The tier, carried
+    /// here because the summary is built after the last Record is gone.
+    pub fn has_timing(&self) -> bool {
+        self.timed
+    }
+
     /// Whether `counter` is past this ring's cursor. The first Record of a ring is always
     /// past it; afterwards the counter must have advanced.
     fn admits(&self, counter: i64) -> bool {
-        self.is_empty() || counter > self.last_counter
+        self.is_empty() || counter > self.last.collections
     }
 
     fn fold(&mut self, record: &GcStat) {
         if self.is_empty() {
-            self.first_counter = record.collections();
-            self.first_duration = record.duration();
+            self.first = Lifetime::of(record);
+            self.timed = record.has_timing();
         }
-        self.last_counter = record.collections();
-        self.last_duration = record.duration();
+        self.last = Lifetime::of(record);
         self.sampled += 1;
         self.measured_pause_ns += pause_ns(record);
     }
@@ -100,7 +120,20 @@ fn pause_ns(record: &GcStat) -> i64 {
 /// Entry says nothing about how many Collections passed through it between two polls.
 #[derive(Debug, Default)]
 pub struct Cursor {
-    rings: HashMap<RingKey, RingObservation>,
+    /// Ordered, so the end-of-run summary walks processes, interpreters and generations in a
+    /// stable order instead of whatever order a hash gave this run.
+    rings: BTreeMap<RingKey, RingObservation>,
+    /// Rings whose process has gone, each tagged with the eviction that retired it. Dedup state
+    /// must not outlive a PID the OS can recycle, but what the dead process did is still part
+    /// of the run, so [`forget`](Self::forget) retires an accumulator instead of dropping it.
+    /// Every pool worker ends up here, and so does any target that exits before the run.
+    ///
+    /// The tag keeps a span's rings together in [`observations`](Self::observations). A PID
+    /// observed, forgotten and observed again holds two spans under one key, and sorting on the
+    /// key alone shuffles their generations into each other.
+    retired: Vec<(RingKey, u64, RingObservation)>,
+    /// Evictions so far, numbering the retired spans. Live rings sort after all of them.
+    evictions: u64,
     /// Per `(pid, interpreter)`, the latest moment the Observer has proof the interpreter
     /// reached: the newest `ts_start` of a Collection caught running, and the newest `ts_stop`
     /// of one read finished.
@@ -182,10 +215,25 @@ impl Cursor {
             .or_insert(moment);
     }
 
-    /// Drop everything known about `pid`. The single eviction point for a process that died,
-    /// so a recycled PID cannot read its predecessor's counters as already-seen.
+    /// Drop everything `pid` is cursored on. The single eviction point for a process that
+    /// died, so a recycled PID cannot read its predecessor's counters as already-seen.
+    ///
+    /// Its accumulators are retired rather than destroyed: nothing selects against them again,
+    /// and they stay in the run's summary. A recycled PID contributes a second set of figures
+    /// under the same key, which is what it is: a different process.
     pub fn forget(&mut self, pid: u32) {
-        self.rings.retain(|key, _| key.pid != pid);
+        let doomed: Vec<RingKey> = self
+            .rings
+            .keys()
+            .copied()
+            .filter(|key| key.pid == pid)
+            .collect();
+        for key in doomed {
+            if let Some(observation) = self.rings.remove(&key) {
+                self.retired.push((key, self.evictions, observation));
+            }
+        }
+        self.evictions += 1;
         self.last_certainty.retain(|&(p, _), _| p != pid);
     }
 
@@ -193,6 +241,23 @@ impl Cursor {
     /// read.
     pub fn observation(&self, key: RingKey) -> Option<&RingObservation> {
         self.rings.get(&key)
+    }
+
+    /// Every ring a Record has been read from this run, retired ones included. The end-of-run
+    /// summary's whole input.
+    ///
+    /// Ordered by process, interpreter, observation span, generation. The span outranks the
+    /// generation so a PID observed twice yields two runs of generations rather than one
+    /// interleaved sequence, and the live rings sort last, being the newest span.
+    pub fn observations(&self) -> impl Iterator<Item = (RingKey, &RingObservation)> {
+        let mut all: Vec<(RingKey, u64, &RingObservation)> = self
+            .retired
+            .iter()
+            .map(|(key, span, obs)| (*key, *span, obs))
+            .chain(self.rings.iter().map(|(&key, obs)| (key, u64::MAX, obs)))
+            .collect();
+        all.sort_by_key(|&(key, span, _)| (key.pid, key.interpreter, span, key.generation));
+        all.into_iter().map(|(key, _, obs)| (key, obs))
     }
 
     /// The latest moment the Observer has proof this interpreter reached. `None` on a build
@@ -481,9 +546,9 @@ mod tests {
         assert_eq!(admitted(&mut c, 200, &[done(50, 100, 110)]), []);
     }
 
-    /// The accumulator holds what its ring did against what was read of it: cumulative counter
-    /// and cumulative pause at the first and last Record seen, how many were sampled, and the
-    /// pause measured across them. Every Loss figure comes from these six numbers.
+    /// The accumulator holds what its ring did against what was read of it: the Lifetime
+    /// totals at the first and last Record seen, how many were sampled, and the pause measured
+    /// across them. Every summary and Loss figure comes from those.
     #[test]
     fn an_accumulator_records_the_span_it_observed() {
         let mut c = Cursor::new();
@@ -507,13 +572,94 @@ mod tests {
 
         let obs = c.observation(key(1, 0, 0)).expect("an observed ring");
         assert!(!obs.is_empty());
-        assert_eq!(obs.first_counter(), 10);
-        assert_eq!(obs.last_counter(), 14);
-        assert_eq!(obs.first_duration(), 0.25);
-        assert_eq!(obs.last_duration(), 0.90);
+        assert_eq!(obs.first().collections, 10);
+        assert_eq!(obs.last().collections, 14);
+        assert_eq!(obs.first().duration, 0.25);
+        assert_eq!(obs.last().duration, 0.90);
         assert_eq!(obs.sampled(), 2);
         // 500 ns + 300 ns actually measured, against 4 collections the counter says ran.
         assert_eq!(obs.measured_pause_ns(), 800);
+    }
+
+    /// `collected` and `uncollectable` are Lifetime totals like `collections`, on both shapes
+    /// of Entry. Holding each at both ends of the watched span is what lets the summary report
+    /// what moved during the run instead of a total running since interpreter startup.
+    #[test]
+    fn an_accumulator_records_both_ends_of_every_lifetime_total() {
+        let mut c = Cursor::new();
+        let totals = |counter: i64, collected: i64, uncollectable: i64| {
+            GcStat::from_fields(
+                0,
+                0,
+                0,
+                *COUNTERS_ONLY,
+                &[
+                    ("collections", counter),
+                    ("collected", collected),
+                    ("uncollectable", uncollectable),
+                ],
+            )
+        };
+
+        c.admit(1, &[totals(100, 4_000, 2)]);
+        c.admit(1, &[totals(140, 9_500, 7)]);
+
+        let obs = c.observation(key(1, 0, 0)).expect("an observed ring");
+        assert_eq!(obs.first().collected, 4_000);
+        assert_eq!(obs.last().collected, 9_500);
+        assert_eq!(obs.first().uncollectable, 2);
+        assert_eq!(obs.last().uncollectable, 7);
+    }
+
+    /// The summary needs the tier after the last poll, when no Record is left to ask. The
+    /// accumulator carries it.
+    #[test]
+    fn an_accumulator_records_whether_its_ring_publishes_timing() {
+        let mut c = Cursor::new();
+        c.admit(1, &[done(3, 100, 150)]);
+        c.admit(1, &[untimed(1, 0, 3)]);
+
+        assert!(c.observation(key(1, 0, 0)).unwrap().has_timing());
+        assert!(!c.observation(key(1, 0, 1)).unwrap().has_timing());
+    }
+
+    /// A run's summary is read after its target has exited, by which point `forget` has run.
+    /// The dedup state has to go, since a recycled PID must not inherit it. The figures must
+    /// not, or every completed run summarizes to nothing.
+    #[test]
+    fn a_forgotten_pid_keeps_its_figures_out_of_selection_and_in_the_summary() {
+        let mut c = Cursor::new();
+        c.admit(100, &[done(50, 100, 110)]);
+        c.admit(200, &[done(3, 100, 110)]);
+
+        c.forget(100);
+
+        // Nothing selects against it any more: the recycled PID starts from nothing.
+        assert_eq!(c.observation(key(100, 0, 0)), None);
+        assert_eq!(admitted(&mut c, 100, &[done(1, 10, 20)]), [1]);
+        // But what it did is still the run's, alongside the sibling that outlived it.
+        let counters: Vec<i64> = c
+            .observations()
+            .map(|(_, obs)| obs.last().collections)
+            .collect();
+        assert_eq!(counters, [50, 1, 3]);
+    }
+
+    /// The summary walks every ring the run touched, so the cursor hands them over in a stable
+    /// order rather than a hash order that reshuffles the table each run.
+    #[test]
+    fn observations_come_out_in_process_interpreter_generation_order() {
+        let mut c = Cursor::new();
+        c.admit(200, &[at(1, 0, 0, 5, 100, 110)]);
+        c.admit(100, &[at(2, 0, 3, 5, 100, 110)]);
+        c.admit(100, &[at(0, 0, 0, 5, 100, 110)]);
+        c.admit(100, &[at(1, 0, 0, 5, 100, 110)]);
+
+        let order: Vec<(u32, i64, u32)> = c
+            .observations()
+            .map(|(k, _)| (k.pid, k.interpreter, k.generation))
+            .collect();
+        assert_eq!(order, [(100, 0, 0), (100, 0, 1), (100, 3, 2), (200, 0, 1)]);
     }
 
     /// A ring nobody has read has no accumulator, which is what lets ticket 06 tell "covered

@@ -5,6 +5,7 @@ use crate::monitor::convert::convert_record;
 use crate::monitor::cursor::Cursor;
 use crate::monitor::exporters::{EventsExporter, ProcessLifecycle};
 use crate::monitor::run_loop::PollStatus;
+use crate::monitor::statistics::{InterpreterSummary, summarize};
 use crate::monitor::trace_event::TraceEvent;
 use crate::remote_debugging::gc_stats::GcStat;
 use crate::remote_debugging::session::{PySession, Revalidated};
@@ -166,6 +167,10 @@ impl<'a> MonitorContext<'a> {
     /// session + cursor here means no per-PID state can leak or go stale
     /// across a reused PID. No lifecycle event if the PID was never reported as
     /// started or was already marked dead.
+    ///
+    /// What the PID's rings *did* survives, retired inside the cursor. `run_loop` marks the
+    /// target dead before the run ends, so without that every completed run would summarize
+    /// to nothing.
     pub fn mark_died(&mut self, pid: u32) {
         self.sessions.remove(&pid);
         self.cursor.forget(pid);
@@ -173,6 +178,14 @@ impl<'a> MonitorContext<'a> {
             self.exporter
                 .mark_process_lifecycle(pid, ProcessLifecycle::Died, 0);
         }
+    }
+
+    /// What the run read, per interpreter per generation.
+    ///
+    /// Folded as the Records were polled, so this reads the accumulator rather than the trace
+    /// it wrote: the same figures a replayed stream of Records gives.
+    pub fn summary(&self) -> Vec<InterpreterSummary> {
+        summarize(&self.cursor)
     }
 
     /// Close the underlying exporter.
@@ -323,6 +336,38 @@ mod tests {
         let advanced = [counted(0, 41, 950)];
         let events = context.events_for(1, &advanced, 7_000);
         assert_eq!(kinds(&events), ["M", "M", "C"]);
+    }
+
+    /// The summary is folded from the same polls that fed the exporter, so a run's figures
+    /// reach the seam without a live interpreter or a written trace.
+    #[test]
+    fn the_summary_reports_what_the_polls_admitted() {
+        let mut exporter = ChromeTraceExporter::new();
+        let mut context = MonitorContext::new(&mut exporter);
+
+        context.events_for(1, &[counted(0, 10, 100), timed(1, 4, 1_000, 1_400)], 5_000);
+        context.events_for(1, &[counted(0, 14, 180), timed(1, 5, 2_000, 2_600)], 6_000);
+
+        let summary = context.summary();
+        assert_eq!(summary.len(), 1);
+        let generations = &summary[0].generations;
+        // The counter's rise alone: this ring publishes no timestamps, so its Entries are
+        // snapshots and the one that opened the span is no Collection of its own.
+        assert_eq!(generations[0].collections, 4);
+        assert_eq!(generations[0].collected, 80);
+        // Tier follows each ring's own layout, so one interpreter holds both here even though
+        // no real build does.
+        assert_eq!(generations[0].pause_total_ns, None);
+        assert_eq!(generations[1].pause_total_ns, Some(1_000));
+    }
+
+    /// A run that read nothing summarizes to nothing, which is what lets the CLI say so
+    /// instead of printing an empty table.
+    #[test]
+    fn a_run_that_admitted_nothing_has_an_empty_summary() {
+        let mut exporter = ChromeTraceExporter::new();
+        let context = MonitorContext::new(&mut exporter);
+        assert!(context.summary().is_empty());
     }
 
     /// The single eviction point drops the dead PID's cursor, so a PID the OS recycles cannot
