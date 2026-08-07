@@ -42,16 +42,21 @@ pub fn write(destination: &str, summary: &[InterpreterSummary]) -> Result<()> {
     let document = encode(summary);
     if destination == STDOUT {
         // The one thing gcscope puts on stdout, which is why the table goes to stderr.
-        // Written rather than `print!`ed: a consumer piping into `head` closes the pipe, and
-        // `print!` panics on that.
-        let mut out = std::io::stdout().lock();
-        return out
-            .write_all(document.as_bytes())
-            .and_then(|()| out.flush())
+        return to_sink(&mut std::io::stdout().lock(), &document)
             .context("Failed to write the JSON summary to stdout");
     }
     std::fs::write(destination, document)
         .with_context(|| format!("Failed to write the JSON summary to {destination}"))
+}
+
+/// The document into a sink, flushed.
+///
+/// Split from [`write`] so the failure a closed pipe produces is reachable from a test.
+/// `print!` would panic there instead, and swallowing it would hand a consumer half a
+/// document under a zero exit code.
+fn to_sink(sink: &mut impl Write, document: &str) -> std::io::Result<()> {
+    sink.write_all(document.as_bytes())?;
+    sink.flush()
 }
 
 /// One interpreter of one process, as the lines of its object.
@@ -416,6 +421,39 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert_eq!(written, encode(&summary));
+    }
+
+    /// A consumer piping the document into `head` stops reading, and stdout is buffered, so
+    /// the failure surfaces when the bytes are pushed out rather than when they are handed
+    /// over. Swallowing it would report a summary the consumer holds part of, under a zero
+    /// exit code.
+    #[test]
+    fn a_sink_that_fails_on_the_way_out_is_reported() {
+        struct ClosedPipe;
+        impl Write for ClosedPipe {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "the consumer stopped reading",
+                ))
+            }
+        }
+
+        let error = to_sink(&mut ClosedPipe, "{}").expect_err("a closed pipe fails the write");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// A sink that takes the document takes all of it.
+    #[test]
+    fn the_document_reaches_a_sink_whole() {
+        let document = encode(&[block(7, 0, vec![timed(0)])]);
+        let mut sink = Vec::new();
+
+        to_sink(&mut sink, &document).expect("a buffer accepts the document");
+        assert_eq!(String::from_utf8(sink).expect("valid UTF-8"), document);
     }
 
     /// A path gcscope cannot write says so, rather than losing the summary quietly.
