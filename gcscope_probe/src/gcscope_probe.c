@@ -6,8 +6,10 @@
  * `struct gc_stats` byte-for-byte (3.15/Include/internal/pycore_interp_structs.h:180-222),
  * which gcscope's ring decoder reads unmodified.
  *
- * Scope today: 3.14 only, x86-64 only, Windows and Linux.
- * `specs/0013-probe-portable-core.md` covers what each becomes.
+ * Scope today: 3.14 only. Nothing here is Windows- or x86-64-shaped any more; CI builds this
+ * with gcc, MSVC and Apple clang and attaches to all three, the macOS leg on native arm64.
+ * `specs/0013-probe-portable-core.md` covers 3.13, `specs/0015-publish-probe-wheels.md` the
+ * wheels and the rest of the platform matrix.
  */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
@@ -64,16 +66,22 @@
 #define GC_OLD_STATS_SIZE   GCSCOPE_PROBE_OLD_STATS_SIZE
 #define NUM_GENERATIONS     3
 
-/* 3.15/Include/internal/pycore_interp_structs.h:180-196. 64 bytes, 8-byte aligned. */
+/* 3.15/Include/internal/pycore_interp_structs.h:180-196. 64 bytes, 8-byte aligned.
+ *
+ * 3.15 declares `ts_stop` a plain `int64_t`. The `_Atomic` here buys the release store in
+ * `gcscope_probe_add_stats` and changes no layout: an 8-byte integer keeps its size and
+ * alignment under the qualifier on every ABI this builds for, and the `Py_BUILD_ASSERT`s in
+ * `PyInit_gcscope_probe` fail the build if a region drifts out of shape. No other field is
+ * atomic. A remote reader takes them as raw bytes on the far side of that one store. */
 struct gcscope_probe_generation_stats {
-    int64_t    ts_start;        /*  0 */
-    int64_t    ts_stop;         /*  8  -- published LAST, see gcscope_probe_add_stats */
-    Py_ssize_t collections;     /* 16  cumulative */
-    Py_ssize_t collected;       /* 24  cumulative */
-    Py_ssize_t uncollectable;   /* 32  cumulative */
-    Py_ssize_t candidates;      /* 40  cumulative -- NOT reconstructible on 3.14 */
-    double     duration;        /* 48  cumulative seconds */
-    Py_ssize_t heap_size;       /* 56  per-collection snapshot */
+    int64_t         ts_start;       /*  0 */
+    _Atomic int64_t ts_stop;        /*  8  -- published LAST, see gcscope_probe_add_stats */
+    Py_ssize_t      collections;    /* 16  cumulative */
+    Py_ssize_t      collected;      /* 24  cumulative */
+    Py_ssize_t      uncollectable;  /* 32  cumulative */
+    Py_ssize_t      candidates;     /* 40  cumulative -- NOT reconstructible on 3.14 */
+    double          duration;       /* 48  cumulative seconds */
+    Py_ssize_t      heap_size;      /* 56  per-collection snapshot */
 };
 
 /* :205-213 -- the trailing index is what pads each buffer by 8 bytes, which is the
@@ -245,17 +253,33 @@ gcscope_probe_add_stats(struct gcscope_probe_stats *s, int gen,
     cur->heap_size      = heap_size;
 
     /* Publish ts_stop last so a remote reader never selects a torn Record as newest
-     * (3.15/Python/gc.c:1415-1417). The fence keeps the compiler and CPU from hoisting this
-     * store above the field writes above.
+     * (3.15/Python/gc.c:1415-1417, which stores it plain and leaves the reader to reject an
+     * entry whose ts_stop precedes its ts_start).
      *
-     * A release FENCE followed by a plain store establishes this on x86-64's TSO and NOT on
-     * aarch64. That is a correctness defect no supported platform can exhibit yet, and the
-     * port left it alone on purpose: `specs/0013-probe-portable-core.md` §4 replaces it with
-     * an explicit release store on `ts_stop`, paired there with the native arm64 leg that
-     * would fail without it. Fixing it on an x86-64 leg would land the change where nothing
-     * can show it working. */
-    atomic_thread_fence(memory_order_release);
-    cur->ts_stop = ts_stop;
+     * This replaces the prototype's release fence and plain store. C11 grants a release fence
+     * its ordering against a following ATOMIC store, and that one was plain, so the writes above
+     * stayed on the correct side of it by whatever the compiler emitted. On x86-64 that is TSO,
+     * which orders them with no fence at all. A release store states the dependency, and costs a
+     * single `stlr` on aarch64 where a fence costs `dmb ish`.
+     *
+     * A reader that saw ts_stop early would get a Record whose ts_start belongs to this
+     * Collection and whose counters belong to the previous one. No x86-64 leg can show that, so
+     * the `probe-contract` job runs on native Apple Silicon and fails if that runner stops being
+     * arm64.
+     *
+     * The memcpy above copies the previous entry's ts_stop forward, so once the new ts_start
+     * lands the entry reads as ts_stop < ts_start and gcscope's `is_complete()` calls it
+     * in-flight. `probe_ring_survives_sustained_churn` bounds that state to one entry per
+     * generation. It does not catch it, and on a healthy Ring never sees it.
+     *
+     * Before the new ts_start lands, the entry is a byte copy of the previous one and reads as
+     * finished. x86-64 stores ts_start before the counters, so the entry is in-flight by the
+     * time `collections` moves. Nothing orders those two plain stores on aarch64, where a reader
+     * seeing the increment first gets this Collection's count over the previous one's interval.
+     * The release below orders these stores against ts_stop rather than against each other, so
+     * it leaves that open. Ticket 11 of `specs/0013-probe-portable-core.md` carries the
+     * two-phase publish that closes it; CPython 3.15 has the same hole (gc.c:1405-1417). */
+    atomic_store_explicit(&cur->ts_stop, ts_stop, memory_order_release);
 
     gcscope_probe_records_written++;
 }

@@ -138,6 +138,28 @@ pub fn probe_python() -> Option<PathBuf> {
     ok.then_some(python)
 }
 
+/// The file `python` would load for `import gcscope_probe`, or `None` if it has no Probe.
+///
+/// This asks the interpreter rather than searching the filesystem, so it resolves the same
+/// `sys.path` the fixture will and inspects the file that gets mapped. `-P` for the reason
+/// [`probe_python`] gives: without it the source directory in the crate root answers, and that
+/// is not a built module.
+pub fn probe_module_path(python: &Path) -> Option<PathBuf> {
+    let out = Command::new(python)
+        .args([
+            "-P",
+            "-c",
+            "import gcscope_probe; print(gcscope_probe.__file__)",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    path.is_file().then_some(path)
+}
+
 /// Whether a missing Probe must **fail** rather than skip. Skipping is right on a laptop and
 /// wrong in CI, where it would turn a Probe that failed to compile into a green leg, so the
 /// leg that builds one sets `GCSCOPE_REQUIRE_PROBE=1`.

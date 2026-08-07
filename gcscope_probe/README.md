@@ -13,16 +13,25 @@ Rust repository.
 
 ## Status
 
-3.14 only, x86-64 only. CI builds a Linux Probe, attaches to it and decodes it on every pull
-request that reaches the layout contract. Windows passes the same test when someone runs it by
-hand; no CI leg compiles this on Windows, so a Windows-only break merges green until
-`specs/0015` adds one. macOS is written for and unproven. The behaviour matches the prototype
-that proved the approach works (`docs/research/cpython-314-gc-hook-points.md` §11–§12).
+3.14 only. On every pull request that reaches the layout contract, CI builds a Probe from
+source on Linux, Windows and macOS, attaches to each, and decodes the Records out of the
+process. `macos-latest` is Apple Silicon, so that leg runs on native arm64. That is the only
+configuration where the release store on `ts_stop` does work x86-64's TSO would have done
+anyway. Emulation would not settle it, since it may serialise the writes and hide the defect,
+so the workflow fails if that runner ever stops being arm64.
+
+Each leg compiles against its own interpreter's internal headers, under gcc, MSVC or Apple
+clang. The header lookup reads PE exports, ELF `.dynsym` and the Mach-O export trie through one
+path.
+
+No leg covers 3.13, musllinux, 32-bit, debug builds, or arm64 outside macOS. `specs/0015` owns
+wheels and the rest of the matrix.
+
+The behaviour otherwise matches the prototype that proved the approach works
+(`docs/research/cpython-314-gc-hook-points.md` §11–§12).
 
 | Today | Becomes | Where |
 |---|---|---|
-| A release fence before a plain `ts_stop` store | An explicit release store, which aarch64 needs | spec 0013 §4 |
-| Mach-O untested, no arm64 anywhere | macOS and arm64 proven by a leg, not by compiling | spec 0013 §4, spec 0015 |
 | Counters starting at zero on install | Seeded from CPython's own, so they stay Lifetime totals | spec 0013 §4 |
 | `heap_size` 0 meaning absent, failed and empty alike | A capability word that tells the three apart | spec 0013 §4 |
 | Read by an integration test | Discovered and validated by gcscope | spec 0014 |
