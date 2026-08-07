@@ -93,20 +93,30 @@ fn format_row(s: &GcStat, has_extended: bool) -> String {
     }
 }
 
-pub fn print_stats(stats: &[GcStat]) {
+/// The whole table as lines, ready to print. Pure for the same reason the row and header
+/// formatters are: it puts the parts of the table that are not a single row — the
+/// empty-slice message, the separator's width, the order the lines come in — behind an
+/// assertion instead of behind stdout, which no test can read back.
+fn render(stats: &[GcStat]) -> Vec<String> {
     if stats.is_empty() {
-        println!("No GC stats found.");
-        return;
+        return vec!["No GC stats found.".to_string()];
     }
 
     let has_extended = has_extended(stats);
 
     let header = format_header(has_extended);
-    println!("{}", header);
-    println!("{}", "-".repeat(header.len()));
+    let separator = "-".repeat(header.len());
 
-    for s in stats {
-        println!("{}", format_row(s, has_extended));
+    let mut lines = Vec::with_capacity(stats.len() + 2);
+    lines.push(header);
+    lines.push(separator);
+    lines.extend(stats.iter().map(|s| format_row(s, has_extended)));
+    lines
+}
+
+pub fn print_stats(stats: &[GcStat]) {
+    for line in render(stats) {
+        println!("{}", line);
     }
 }
 
@@ -230,6 +240,41 @@ mod tests {
             ["0", "0", "0", "0", "0"],
             "absent +inc fields fall back to 0"
         );
+    }
+
+    /// An empty slice — the ordinary answer from a target that has not collected yet, and
+    /// from every 3.8 build — renders the message and nothing else. No header, no separator,
+    /// no blank trailing line: a bare ruler under a bare header would read as "the table is
+    /// there but the values failed to decode", which is a different diagnosis.
+    #[test]
+    fn an_empty_slice_renders_only_the_not_found_message() {
+        assert_eq!(render(&[]), ["No GC stats found."]);
+    }
+
+    /// The table's non-row parts, which no per-row test reaches: a header, then a separator
+    /// exactly as wide as that header, then one row per entry in the order given. The width
+    /// tie is the assertion that matters — the ruler is built from `header.len()`, so a
+    /// header change that forgot it would print a rule that stops short of the columns.
+    #[test]
+    fn the_table_is_a_header_then_a_matching_rule_then_one_row_per_entry() {
+        let stats = [
+            GcStat::from_fields(0, 0, 1, *REGULAR, &[("collections", 5)]),
+            GcStat::from_fields(1, 0, 1, *REGULAR, &[("collections", 6)]),
+            GcStat::from_fields(2, 0, 1, *REGULAR, &[("collections", 7)]),
+        ];
+
+        let lines = render(&stats);
+
+        assert_eq!(lines.len(), stats.len() + 2, "header + rule + one row each");
+        assert_eq!(lines[0], format_header(false));
+        assert_eq!(lines[1].len(), lines[0].len(), "the rule spans the header");
+        assert!(lines[1].chars().all(|c| c == '-'));
+        // Rows keep the order they were given, so generation 2 is not printed above 0.
+        let collections: Vec<&str> = lines[2..]
+            .iter()
+            .map(|l| l.split_whitespace().nth(3).unwrap())
+            .collect();
+        assert_eq!(collections, ["5", "6", "7"]);
     }
 
     /// The core (non-extended) row is the 9-column subset — no `+inc` columns — matching the
