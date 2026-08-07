@@ -12,6 +12,9 @@ resolves `gcscope_probe_header` from its export table, and takes the region addr
 geometry from there.
 
 `spin.py` stays 3.8-compatible; this runs only where the Probe does, which is 3.13 and 3.14.
+
+Set `GCSCOPE_PROBE_FAULT_HEAP_SIZE_OFF` to a byte displacement and the Probe reads `heap_size`
+from the wrong place, showing a reader a failed field check.
 """
 
 import gc
@@ -44,6 +47,13 @@ def make_garbage(count):
 
 def main():
     max_seconds = float(sys.argv[1]) if len(sys.argv) > 1 else 120.0
+
+    # Displace the compiled-in heap_size offset before anything is published, so the whole Ring
+    # comes from a Probe whose check on that field failed. Set only by
+    # `probe_reports_a_suppressed_heap_size`.
+    fault = os.environ.get("GCSCOPE_PROBE_FAULT_HEAP_SIZE_OFF")
+    if fault:
+        gcscope_probe._fault_heap_size_offset(int(fault))
 
     # Before any collection below, so every Record in the Ring comes from this run.
     gcscope_probe.install()
