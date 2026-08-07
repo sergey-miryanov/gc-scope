@@ -509,7 +509,7 @@ gcscope_probe_version_refusal(unsigned long runtime, char *buf, size_t n)
 
     if (major < 3 || (major == 3 && minor < GCSCOPE_PROBE_MIN_MINOR)) {
         PyOS_snprintf(buf, n,
-                      "gcscope_probe supports CPython 3.%u to 3.%u; this interpreter is %s. ",
+                      "gcscope_probe supports CPython 3.%u to 3.%u; this interpreter is %s",
                       (unsigned int)GCSCOPE_PROBE_MIN_MINOR,
                       (unsigned int)GCSCOPE_PROBE_MAX_MINOR, running);
         return 1;

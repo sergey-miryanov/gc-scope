@@ -736,19 +736,22 @@ fn probe_refuses_versions_it_was_not_built_for() {
          against and imported into"
     );
 
-    // Each bound gets its own reason, so a message naming the wrong one is a failure rather
-    // than a wording difference.
-    for (version, name, why) in [
-        (0x030C_00F0u32, "3.12.0", "PyTime_PerfCounterRaw"),
-        (0x030F_00F0u32, "3.15.0", "publish"),
-    ] {
-        let m = refusal(&python, version)
-            .unwrap_or_else(|| panic!("{name} is outside 3.13-3.14 and has to be refused"));
-        assert!(
-            m.contains(name) && m.contains(why),
-            "the refusal of {name} names neither the version nor `{why}`: {m}"
-        );
-    }
+    // Each bound gets its own message, so an arm answering for the other is a failure rather
+    // than a wording difference. Only the upper message carries a reason, so the lower one is
+    // pinned by what it must *not* say.
+    let below = refusal(&python, 0x030C_00F0).expect("3.12 is under the floor and gets refused");
+    assert!(
+        below.contains("3.12.0") && !below.contains("publishes"),
+        "the refusal of 3.12.0 either fails to name it or is the message for a version above \
+         the range: {below}"
+    );
+
+    let above = refusal(&python, 0x030F_00F0).expect("3.15 is over the ceiling and gets refused");
+    assert!(
+        above.contains("3.15.0") && above.contains("publishes"),
+        "the refusal of 3.15.0 names neither the version nor what makes a Probe redundant \
+         there: {above}"
+    );
 
     // Same minor, the neighbouring patch release. ADR 0013 decision 3 asks for this gate
     // because a wheel tag pins only the minor, while `sizeof(_gc_runtime_state)` moved 240 ->
