@@ -17,7 +17,9 @@
 mod common;
 
 use common::{SpawnedPython, is_free_threaded, python_version, test_python};
+use std::collections::HashSet;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -102,6 +104,20 @@ fn expected_shape(
     } else {
         Some(("RingBuffer", [11, 3, 3]))
     }
+}
+
+/// Whether this interpreter publishes the pause timestamps a span needs, and so which tier
+/// `monitor` should produce. Read from the target's own version, and it tracks
+/// [`expected_shape`]: the builds that brought the timestamps brought the ring. `None` if the
+/// version is unknown.
+///
+/// The monitor compares no version; it reads the fields off the Entry layout. This is the
+/// outside view of that decision, and the only place a version belongs.
+///
+/// Split at the minor like [`expected_shape`], though the ring landed in 3.15.0a8: the offset
+/// registry refuses an earlier 3.15 alpha before either check runs.
+fn expects_spans(version: Option<(u8, u8)>) -> Option<bool> {
+    Some(version? >= (3, 15))
 }
 
 /// Rows of `gc-stats` output, skipping header and rule lines. Columns are fixed-width and
@@ -298,4 +314,93 @@ fn live_smoke_attaches_and_decodes_shape() {
             ))
         );
     }
+}
+
+/// The monitoring counterpart of the shape check above: `gcscope run` against a real
+/// interpreter writes the tier that interpreter's Entry layout supports, and writes
+/// *something* either way. A build below the ring builds used to produce an empty trace
+/// against a process collecting constantly, and the fix must not swap that for a trace
+/// reporting pause figures it does not have.
+#[test]
+#[ignore = "spawns and attaches to a live interpreter; needs ptrace/taskport — run with --ignored"]
+fn live_monitor_writes_the_tier_the_build_supports() {
+    let Some(python) = test_python() else {
+        eprintln!("SKIP live_monitor: no Python found (set GCSCOPE_TEST_PYTHON)");
+        return;
+    };
+    let Some(expect_spans) = expects_spans(python_version(&python)) else {
+        eprintln!("WARN: could not determine the target version; skipping the tier check");
+        return;
+    };
+
+    let spin = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("spin.py");
+    let trace: PathBuf =
+        std::env::temp_dir().join(format!("gcscope_live_tier_{}.json", std::process::id()));
+
+    // `run` spawns the interpreter and returns when it exits, so the fixture's own lifetime
+    // bounds the capture. Four seconds at a 50 ms poll is dozens of gen-0 Collections.
+    let (rc, out) = gcscope(&[
+        "run",
+        "-p",
+        &python.to_string_lossy(),
+        "-s",
+        &spin.to_string_lossy(),
+        "-o",
+        &trace.to_string_lossy(),
+        "-r",
+        "50",
+        "4",
+    ]);
+    assert_eq!(rc, 0, "gcscope run exited {rc}\n{out}");
+
+    let written = std::fs::read_to_string(&trace)
+        .unwrap_or_else(|e| panic!("no trace at {}: {e}\n{out}", trace.display()));
+    std::fs::remove_file(&trace).ok();
+    let count = |needle: &str| written.matches(needle).count();
+    let head = &written.chars().take(2_000).collect::<String>();
+
+    // Whatever the tier, the trace must contain GC activity: an interpreter running spin.py
+    // collects continuously.
+    assert!(
+        count(r#""ph":"C""#) > 0,
+        "no GC activity in the trace\n{head}"
+    );
+
+    if expect_spans {
+        assert!(
+            count(r#""ph":"B""#) > 0 && written.contains("GC Pause"),
+            "this build publishes pause timestamps, so its Collections are spans\n{head}"
+        );
+        return;
+    }
+
+    assert_eq!(
+        count(r#""ph":"B""#),
+        0,
+        "this build publishes no timestamps, so it has no pause to draw\n{head}"
+    );
+    assert!(
+        !written.contains("duration"),
+        "a pause figure this build never published belongs absent, not at zero\n{head}"
+    );
+    assert!(
+        written.contains(r#""collections""#),
+        "the cumulative count is what this tier reports\n{head}"
+    );
+
+    // The counts read as a rate only when spread over the timeline; samples stamped alike
+    // draw one point for the whole run.
+    let stamps: HashSet<&str> = written
+        .lines()
+        .filter(|l| l.contains(r#""ph":"C""#))
+        .filter_map(|l| l.split(r#""ts":"#).nth(1))
+        .filter_map(|rest| rest.split(',').next())
+        .collect();
+    assert!(
+        stamps.len() > 1,
+        "counter samples share one timestamp, so they show no rate: {stamps:?}\n{head}"
+    );
 }

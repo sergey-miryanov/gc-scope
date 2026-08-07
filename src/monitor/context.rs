@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use crate::monitor::convert::convert_record;
 use crate::monitor::cursor::Cursor;
 use crate::monitor::exporters::{EventsExporter, ProcessLifecycle};
 use crate::monitor::run_loop::PollStatus;
+use crate::monitor::trace_event::TraceEvent;
+use crate::remote_debugging::gc_stats::GcStat;
 use crate::remote_debugging::session::{PySession, Revalidated};
 
 /// Per-process polling context.
@@ -27,6 +30,9 @@ pub struct MonitorContext<'a> {
     /// did against what was read of it, which is what makes Loss recoverable.
     cursor: Cursor,
     alive_pids: HashSet<u32>,
+    /// When monitoring began: the origin of the Observer's clock, read only for builds that
+    /// publish no timestamps of their own. See [`observed_at_ns`](Self::observed_at_ns).
+    started: Instant,
 }
 
 impl<'a> MonitorContext<'a> {
@@ -36,6 +42,7 @@ impl<'a> MonitorContext<'a> {
             sessions: HashMap::new(),
             cursor: Cursor::new(),
             alive_pids: HashSet::new(),
+            started: Instant::now(),
         }
     }
 
@@ -106,12 +113,38 @@ impl<'a> MonitorContext<'a> {
                 .mark_process_lifecycle(pid, ProcessLifecycle::Started, 0);
         }
 
-        // Convert once here, so every output format is handed the same events instead of
-        // deriving its own from the raw Record.
-        for record in self.cursor.admit(pid, &stats) {
-            self.exporter.add_events(&convert_record(pid, record));
-        }
+        let events = self.events_for(pid, &stats, self.observed_at_ns());
+        self.exporter.add_events(&events);
         PollStatus::Ok
+    }
+
+    /// The poll seam: one read's Records in, the events an exporter receives out.
+    ///
+    /// Which Records are new (the cursor) and what each looks like in a trace (the
+    /// conversion) both happen here, so a test drives them with scripted Records and no live
+    /// interpreter (`docs/adr/0005-testing-strategy.md`). Converting here rather than per
+    /// format also hands a fan-out to two formats the same events.
+    ///
+    /// `observed_at_ns` is the Observer's clock for this poll, shared by every Record it
+    /// returns. A build publishing no timestamps has nothing else to place a sample on the
+    /// timeline with; one that does ignores it.
+    fn events_for(&mut self, pid: u32, stats: &[GcStat], observed_at_ns: i64) -> Vec<TraceEvent> {
+        self.cursor
+            .admit(pid, stats)
+            .into_iter()
+            .flat_map(|record| convert_record(pid, record, observed_at_ns))
+            .collect()
+    }
+
+    /// The Observer's own clock, in nanoseconds since monitoring began. Not the wall clock: a
+    /// trace starting near zero reads more easily, and nothing correlates these samples with
+    /// anything outside the run.
+    fn observed_at_ns(&self) -> i64 {
+        self.started
+            .elapsed()
+            .as_nanos()
+            .try_into()
+            .unwrap_or(i64::MAX)
     }
 
     /// Emit `Died` (once) if the PID was alive, and return `InvalidProcess`.
@@ -154,7 +187,143 @@ mod tests {
     use crate::monitor::cursor::RingKey;
     use crate::monitor::exporters::chrome::ChromeTraceExporter;
     use crate::remote_debugging::gc_stats::GcStat;
-    use crate::remote_debugging::offsets::offset_table::seq_layout;
+    use crate::remote_debugging::offsets::offset_table::{GcItemLayout, seq_layout};
+    use std::sync::LazyLock;
+
+    /// A build that publishes the pause timestamps, so its Records describe spans.
+    static TIMED: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
+        seq_layout(&[
+            "ts_start",
+            "ts_stop",
+            "collections",
+            "collected",
+            "uncollectable",
+            "candidates",
+            "duration",
+            "heap_size",
+        ])
+    });
+
+    /// A build that publishes cumulative counts and no timing at all. The two layouts are
+    /// how the tiers are expressed here: no test names a Python version, because nothing in
+    /// the monitor reads one.
+    static COUNTS_ONLY: LazyLock<&'static GcItemLayout> =
+        LazyLock::new(|| seq_layout(&["collections", "collected", "uncollectable"]));
+
+    /// A Record from a build with timing.
+    fn timed(generation: u32, counter: i64, ts_start: i64, ts_stop: i64) -> GcStat {
+        GcStat::from_fields(
+            generation,
+            0,
+            0,
+            *TIMED,
+            &[
+                ("collections", counter),
+                ("ts_start", ts_start),
+                ("ts_stop", ts_stop),
+            ],
+        )
+    }
+
+    /// A Record from a build with no timing.
+    fn counted(generation: u32, counter: i64, collected: i64) -> GcStat {
+        GcStat::from_fields(
+            generation,
+            0,
+            0,
+            *COUNTS_ONLY,
+            &[("collections", counter), ("collected", collected)],
+        )
+    }
+
+    /// Run one poll's Records through the seam against an inert exporter: the events an
+    /// output format would be handed.
+    fn poll_events(records: &[GcStat], observed_at_ns: i64) -> Vec<TraceEvent> {
+        let mut exporter = ChromeTraceExporter::new();
+        let mut context = MonitorContext::new(&mut exporter);
+        context.events_for(1, records, observed_at_ns)
+    }
+
+    fn kinds(events: &[TraceEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .map(|e| match e {
+                TraceEvent::ProcessMeta { .. } | TraceEvent::ThreadMeta { .. } => "M",
+                TraceEvent::Begin { .. } => "B",
+                TraceEvent::End { .. } => "E",
+                TraceEvent::Instant { .. } => "I",
+                TraceEvent::Counter { .. } => "C",
+            })
+            .collect()
+    }
+
+    /// A build with no timing monitors as counter tracks: one sample per generation per poll,
+    /// no spans. Such a target used to yield an empty trace, then a zero-width pause at the
+    /// epoch reporting a pause it never published.
+    #[test]
+    fn a_build_without_timing_polls_to_counter_samples_only() {
+        let poll = [counted(0, 40, 900), counted(1, 7, 30), counted(2, 2, 4)];
+        let events = poll_events(&poll, 5_000);
+
+        assert_eq!(
+            kinds(&events),
+            ["M", "M", "C", "M", "M", "C", "M", "M", "C"]
+        );
+        let series: Vec<(&str, i64)> = events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::Counter { name, ts_ns, .. } => Some((name.as_str(), *ts_ns)),
+                _ => None,
+            })
+            .collect();
+        // One track per generation, every sample of the poll on the Observer's clock.
+        assert_eq!(series, [("G0", 5_000), ("G1", 5_000), ("G2", 5_000)]);
+    }
+
+    /// The other tier through the same seam, unchanged: a build that publishes timestamps
+    /// still produces a span per Collection, on the target's own clock.
+    #[test]
+    fn a_build_with_timing_polls_to_spans() {
+        let events = poll_events(&[timed(0, 40, 1_000, 2_000)], 5_000);
+        assert_eq!(kinds(&events), ["M", "M", "B", "E", "C", "C"]);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TraceEvent::Begin { ts_ns, .. } if *ts_ns == 1_000)),
+            "the pause is placed on the target's clock: {events:?}"
+        );
+    }
+
+    /// Tier selection is per Record, from its own layout — a process tree can hold both, and
+    /// nothing consults a version to tell them apart.
+    #[test]
+    fn each_record_takes_the_tier_its_own_layout_puts_it_in() {
+        let events = poll_events(&[counted(0, 40, 900), timed(1, 7, 1_000, 2_000)], 5_000);
+        assert_eq!(
+            kinds(&events),
+            ["M", "M", "C", "M", "M", "B", "E", "C", "C"]
+        );
+    }
+
+    /// Dedup by cumulative counter applies to both tiers alike: a poll re-reading the same
+    /// Entries emits nothing, so a counter track steps only where the count moved rather than
+    /// once per tick.
+    #[test]
+    fn a_repeated_poll_emits_nothing_on_either_tier() {
+        let mut exporter = ChromeTraceExporter::new();
+        let mut context = MonitorContext::new(&mut exporter);
+        let poll = [counted(0, 40, 900), timed(1, 7, 1_000, 2_000)];
+
+        assert!(!context.events_for(1, &poll, 5_000).is_empty());
+        assert!(
+            context.events_for(1, &poll, 6_000).is_empty(),
+            "the ring has not moved, so there is nothing new to report"
+        );
+        // A Collection past the cursor is reported, on the clock of the poll that read it.
+        let advanced = [counted(0, 41, 950)];
+        let events = context.events_for(1, &advanced, 7_000);
+        assert_eq!(kinds(&events), ["M", "M", "C"]);
+    }
 
     /// The single eviction point drops the dead PID's cursor, so a PID the OS recycles cannot
     /// read its predecessor's `collections` counters as already-seen and swallow the new
