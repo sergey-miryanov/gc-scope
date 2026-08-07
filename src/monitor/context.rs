@@ -31,9 +31,10 @@ pub struct MonitorContext<'a> {
     /// did against what was read of it, which is what makes Loss recoverable.
     cursor: Cursor,
     alive_pids: HashSet<u32>,
-    /// Processes already told about for running past the interpreter cap. Not per-PID state
-    /// `mark_died` evicts: a PID warned about once should not warn again on the next tick,
-    /// and the set is bounded by the process tree either way.
+    /// Processes already told about for running past the interpreter cap. Evicted with the
+    /// rest of a PID's state, since the cursor's own count restarts there: left behind, a
+    /// recycled PID's overflow would go unannounced, which is what the warning exists to
+    /// prevent.
     overflowed_pids: HashSet<u32>,
     /// When monitoring began: the origin of the Observer's clock, read only for builds that
     /// publish no timestamps of their own. See [`observed_at_ns`](Self::observed_at_ns).
@@ -110,6 +111,7 @@ impl<'a> MonitorContext<'a> {
                         // Dead, and give-up paths are covered in tests/monitor.rs.
                         self.sessions.remove(&pid);
                         self.cursor.forget(pid);
+                        self.overflowed_pids.remove(&pid);
                         return self.on_invalid(pid);
                     }
                     Revalidated::Dead => return self.on_invalid(pid),
@@ -152,24 +154,24 @@ impl<'a> MonitorContext<'a> {
             .into_iter()
             .flat_map(|record| convert_record(pid, record, observed_at_ns))
             .collect();
-        self.warn_if_interpreters_refused(pid);
+        self.warn_if_interpreters_dropped(pid);
         events
     }
 
-    /// Say once, per process, that it runs more interpreters than gcscope accounts for.
+    /// Say once, per process, that it has run more interpreters than gcscope accounts for.
     ///
     /// The cap keeps a long run's memory flat (`cursor::MAX_INTERPRETERS_PER_PROCESS`), and
-    /// what it costs is that some interpreters reach neither the trace nor the summary.
-    /// Unannounced, that reads as a process that had stopped collecting.
-    fn warn_if_interpreters_refused(&mut self, pid: u32) {
-        if self.cursor.refused(pid) == 0 || !self.overflowed_pids.insert(pid) {
+    /// what it costs is that an interpreter which stopped collecting long ago drops out of
+    /// the summary. Unannounced, a missing interpreter reads as one that never collected.
+    fn warn_if_interpreters_dropped(&mut self, pid: u32) {
+        if self.cursor.dropped(pid) == 0 || !self.overflowed_pids.insert(pid) {
             return;
         }
         eprintln!(
-            "warning: process {pid} has run more than {} interpreters. gcscope accounts for \
-             the first {} and no more, so Collections from the rest appear in neither the \
-             trace nor the summary.",
-            MAX_INTERPRETERS_PER_PROCESS, MAX_INTERPRETERS_PER_PROCESS
+            "warning: process {pid} has run more than {MAX_INTERPRETERS_PER_PROCESS} \
+             interpreters. gcscope accounts for that many at a time, dropping whichever it \
+             has seen least recently, so an interpreter that stopped collecting early in the \
+             run may be missing from the summary. Every interpreter still running is kept."
         );
     }
 
@@ -210,6 +212,7 @@ impl<'a> MonitorContext<'a> {
     pub fn mark_died(&mut self, pid: u32) {
         self.sessions.remove(&pid);
         self.cursor.forget(pid);
+        self.overflowed_pids.remove(&pid);
         if self.alive_pids.remove(&pid) {
             self.exporter
                 .mark_process_lifecycle(pid, ProcessLifecycle::Died, 0);

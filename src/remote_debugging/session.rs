@@ -11,7 +11,7 @@
 //! `gc_stats`/`collect`, are consumed by gc-stats, monitor, the TUI,
 //! and list-pids.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 #[cfg(feature = "test-hooks")]
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -555,6 +555,17 @@ impl PySession {
     /// attach, and each interpreter costs its id, its `next` link, its stats region (one more
     /// pointer read on a ring build) and one read of the region itself. The per-interpreter
     /// table is a stride-and-offsets copy taken once for the whole walk, not per interpreter.
+    ///
+    /// **The chain is read without holding CPython's lock**, and the monitor now walks it
+    /// every tick against exactly the sub-interpreter churn that mutates it, so three things
+    /// guard it. A `next` into freed-and-reused memory can point back into the chain, so
+    /// visited addresses end the walk rather than cycling it forever. The same read can
+    /// produce a nonsense `id`, so a negative one skips that link instead of entering the
+    /// account as an interpreter. And a read failing **past the head** skips its interpreter
+    /// rather than failing the poll: an interpreter torn down mid-walk would otherwise cost
+    /// the tick every other interpreter's Records, and route a live process into the
+    /// give-up ladder. The head keeps propagating its error, which is the same signal this
+    /// returned before it read more than one interpreter (C6).
     fn gc_stats_per_interpreter(
         &self,
         head_addr: u64,
@@ -568,26 +579,64 @@ impl PySession {
         let mut interp_table = table.clone();
 
         let mut stats = Vec::new();
+        let mut visited: HashSet<u64> = HashSet::new();
         let mut current = head_addr;
         let mut first = true;
         while current != 0 {
-            let iid = self.read_i64(current + id_off)?;
-            let gc_addr = table.gc_state_addr(self.runtime_addr, current);
-            if let Some(addr) = self.gc_stats_region_addr(gc_addr)? {
-                interp_table.gc_stats_addr = Some(addr);
-                stats.extend(interp_table.read_gc_stats(&self.handle, iid)?);
+            if !visited.insert(current) {
+                break; // a chain read mid-mutation looped back on itself
+            }
+            let head = first;
+            first = false;
+
+            match self.read_interpreter_stats(&mut interp_table, current, id_off) {
+                Ok(Some(read)) => stats.extend(read),
+                Ok(None) => {}
+                // The head decides whether this process reads at all; past it, one
+                // interpreter going away is not the poll's failure.
+                Err(e) if head => return Err(e),
+                Err(_) => {}
             }
 
-            // Always advance — the walk must make progress even for an interpreter with no
-            // readable stats (this is what previously hung on NULL pointers).
-            current = self.read_u64(current + next_off)?;
-            if first && !all_interpreters {
+            if head && !all_interpreters {
                 break;
             }
-            first = false;
+            // Always advance — the walk must make progress even for an interpreter with no
+            // readable stats (this is what previously hung on NULL pointers). An unreadable
+            // link ends the walk, since nothing else says where the rest of the chain is.
+            match self.read_u64(current + next_off) {
+                Ok(next) => current = next,
+                Err(e) if head => return Err(e),
+                Err(_) => break,
+            }
         }
 
         Ok(stats)
+    }
+
+    /// One interpreter of the walk: its id, its stats region and that region's Records.
+    /// `Ok(None)` for an interpreter with no readable region (not-yet-allocated, teardown)
+    /// and for a link whose id reads back as nonsense.
+    fn read_interpreter_stats(
+        &self,
+        interp_table: &mut OffsetTable,
+        interp_addr: u64,
+        id_off: u64,
+    ) -> Result<Option<Vec<GcStat>>> {
+        let iid = self.read_i64(interp_addr + id_off)?;
+        if iid < 0 {
+            // CPython numbers interpreters from zero, so this link is not one.
+            return Ok(None);
+        }
+        let gc_addr = self
+            .resolved
+            .table()
+            .gc_state_addr(self.runtime_addr, interp_addr);
+        let Some(addr) = self.gc_stats_region_addr(gc_addr)? else {
+            return Ok(None);
+        };
+        interp_table.gc_stats_addr = Some(addr);
+        interp_table.read_gc_stats(&self.handle, iid).map(Some)
     }
 }
 

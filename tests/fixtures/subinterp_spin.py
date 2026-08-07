@@ -126,6 +126,19 @@ def sub_interpreter_runner(source):
     )
 
 
+def give_up(worker, reason):
+    """Report `reason` and exit non-zero, waiting for the sub-interpreter on the way out.
+
+    The wait is the point. Every path out of this process has to leave the sub-interpreter
+    destroyed, or finalization takes the process down with an access violation and a
+    harness reads that crash as gcscope's — hiding the reason printed here, which is the
+    one thing that would have explained the failure.
+    """
+    sys.stderr.write(reason + "\n")
+    worker.join(SUB_SHUTDOWN_GRACE)
+    return 1
+
+
 def main():
     max_seconds = float(sys.argv[1]) if len(sys.argv) > 1 else 120.0
 
@@ -159,11 +172,9 @@ def main():
     deadline = time.monotonic() + max_seconds
     while not os.path.exists(marker):
         if not worker.is_alive():
-            sys.stderr.write("the sub-interpreter died before it collected\n")
-            return 1
+            return give_up(worker, "the sub-interpreter died before it collected")
         if time.monotonic() >= deadline:
-            sys.stderr.write("the sub-interpreter never reported collecting\n")
-            return 1
+            return give_up(worker, "the sub-interpreter never reported collecting")
         time.sleep(0.05)
 
     sys.stdout.write("READY %d\n" % os.getpid())

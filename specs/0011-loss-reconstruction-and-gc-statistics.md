@@ -164,7 +164,15 @@ several interpreters do reach a long capture, each in a window of its own — an
 check is that every interpreter is read *throughout* the run rather than merely present. The
 second is why the accumulators are capped per process: without one, a workload creating and
 destroying sub-interpreters holds an accumulator per `(interpreter, generation)` until the
-process exits. Records past the cap are refused whole and counted, and the run says so once.
+process exits. The cap makes room by dropping the interpreter seen least recently, so what
+goes is one that stopped appearing in the chain and never one still collecting. The run says
+how many went.
+
+Walking that chain every tick, without the lock CPython holds over it, is also what makes a
+torn read reachable: the walk ends on an address it has already visited, skips a link whose
+id reads back negative, and lets a failure past the head cost that interpreter rather than
+the poll — an interpreter torn down mid-walk would otherwise take every other interpreter's
+Records with it and route a live process into the give-up ladder.
 
 ### Completeness is a producer-side filter, and the excluded Entry is evidence
 

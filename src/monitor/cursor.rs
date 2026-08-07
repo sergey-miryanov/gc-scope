@@ -4,11 +4,11 @@
 //! what its ring did against what the Observer read of it, so the difference between the two
 //! is recoverable later as Loss.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use crate::remote_debugging::gc_stats::GcStat;
 
-/// The most interpreters one process is accounted for.
+/// The most interpreters one process is accounted for at once.
 ///
 /// CPython numbers interpreters monotonically and never reuses an id, so a workload that
 /// creates and destroys sub-interpreters would otherwise hold a [`RingObservation`] per
@@ -16,6 +16,11 @@ use crate::remote_debugging::gc_stats::GcStat;
 /// keyed on `(generation, Entry)` and bounded by the ring geometry. Set well above any real
 /// concurrent interpreter count, since what this guards against is a long run's churn rather
 /// than a wide one's fan-out.
+///
+/// The account makes room by dropping the interpreter it has seen least recently, which
+/// against that churn is always a destroyed one: an interpreter that is still running turns
+/// up in every poll. Refusing the newcomer instead would fill the account with the *oldest*
+/// ids and report only interpreters that no longer exist.
 pub const MAX_INTERPRETERS_PER_PROCESS: usize = 1024;
 
 /// One ring: the Entries one generation of one interpreter publishes its Records through.
@@ -171,14 +176,17 @@ pub struct Cursor {
     /// one that had started is later evidence than one that had ended. Across polls both
     /// apply: a bound left at an old start would widen every Loss window opened after it.
     last_certainty: HashMap<(u32, i64), i64>,
-    /// The interpreters each process is accounted for, capped at
-    /// [`MAX_INTERPRETERS_PER_PROCESS`]. Every other map here is keyed on an interpreter, so
-    /// this is what bounds all of them.
-    accounted: HashMap<u32, HashSet<i64>>,
-    /// Records refused for arriving from an interpreter past the cap, per process. Counted
-    /// rather than dropped quietly: an operator reading a summary that omits an interpreter
-    /// has no other way to tell that from one that stopped collecting.
-    refused: HashMap<u32, u64>,
+    /// Per process, the interpreters it is accounted for and the poll each was last seen in.
+    /// Capped at [`MAX_INTERPRETERS_PER_PROCESS`]. Every other map here is keyed on an
+    /// interpreter, so this is what bounds all of them.
+    accounted: HashMap<u32, HashMap<i64, u64>>,
+    /// Interpreters whose account was dropped to make room, per process. Counted rather than
+    /// dropped quietly: an operator reading a summary that omits an interpreter has no other
+    /// way to tell that from one that stopped collecting.
+    dropped: HashMap<u32, u64>,
+    /// Polls admitted so far, which is what orders [`accounted`](Self::accounted) for
+    /// eviction.
+    polls: u64,
 }
 
 impl Cursor {
@@ -202,15 +210,11 @@ impl Cursor {
     pub fn admit<'r>(&mut self, pid: u32, records: &'r [GcStat]) -> Vec<&'r GcStat> {
         let mut candidates: Vec<&GcStat> = records.iter().collect();
         candidates.sort_by_key(|r| (r.interpreter_id, r.generation, r.collections()));
+        self.polls += 1;
 
         let mut fresh: Vec<&GcStat> = Vec::new();
         for record in candidates {
-            if !self.account_for(pid, record.interpreter_id) {
-                // Refused whole, evidence included: with nothing holding this ring's counter,
-                // admitting the Record would re-emit the same Collection on every poll left
-                // in the run.
-                continue;
-            }
+            self.account_for(pid, record.interpreter_id);
             if !record.is_complete() {
                 // An Entry that never held a Collection reads zero at both ends and so fails
                 // the completeness test too. A start it never published is no evidence, and a
@@ -245,29 +249,53 @@ impl Cursor {
         fresh
     }
 
-    /// Whether this process is accounted for `interpreter`, taking it on if it is new and
-    /// there is room under [`MAX_INTERPRETERS_PER_PROCESS`]. A refusal is counted.
+    /// Take this process's `interpreter` into the account, marking it seen in this poll and
+    /// making room by dropping the one seen least recently if the process is at the cap.
     ///
     /// The single gate every per-interpreter map goes through, so the cap bounds the
     /// accumulators and the certainty bounds together rather than each holding its own idea
     /// of which interpreters exist.
-    fn account_for(&mut self, pid: u32, interpreter: i64) -> bool {
+    fn account_for(&mut self, pid: u32, interpreter: i64) {
+        let poll = self.polls;
         let accounted = self.accounted.entry(pid).or_default();
-        if accounted.contains(&interpreter) {
-            return true;
+        if let Some(seen) = accounted.get_mut(&interpreter) {
+            *seen = poll;
+            return;
         }
         if accounted.len() < MAX_INTERPRETERS_PER_PROCESS {
-            accounted.insert(interpreter);
-            return true;
+            accounted.insert(interpreter, poll);
+            return;
         }
-        *self.refused.entry(pid).or_default() += 1;
-        false
+
+        // A destroyed interpreter stops appearing in the chain, so the one seen longest ago
+        // is the one least likely to still exist. A running interpreter is in every poll and
+        // so is never what goes.
+        let stalest = *accounted
+            .iter()
+            .min_by_key(|&(id, &seen)| (seen, *id))
+            .map(|(id, _)| id)
+            .expect("a full account holds at least one interpreter");
+        accounted.remove(&stalest);
+        accounted.insert(interpreter, poll);
+        self.drop_interpreter(pid, stalest);
+        *self.dropped.entry(pid).or_default() += 1;
     }
 
-    /// How many Records this process lost to the cap. Zero for anything but a workload
-    /// creating sub-interpreters by the thousand.
-    pub fn refused(&self, pid: u32) -> u64 {
-        self.refused.get(&pid).copied().unwrap_or(0)
+    /// Drop everything one interpreter of `pid` is cursored on.
+    ///
+    /// Unlike [`forget`](Self::forget) this retires nothing: the account is being dropped to
+    /// make room for one that is still running, and keeping the figures would defeat the cap
+    /// that dropped them. The run says how many went.
+    fn drop_interpreter(&mut self, pid: u32, interpreter: i64) {
+        self.rings
+            .retain(|key, _| key.pid != pid || key.interpreter != interpreter);
+        self.last_certainty.remove(&(pid, interpreter));
+    }
+
+    /// How many of this process's interpreters were dropped to make room. Zero for anything
+    /// but a workload creating sub-interpreters by the thousand.
+    pub fn dropped(&self, pid: u32) -> u64 {
+        self.dropped.get(&pid).copied().unwrap_or(0)
     }
 
     /// Raise this interpreter's certainty bound to `moment` when `moment` is later. A
@@ -304,7 +332,7 @@ impl Cursor {
         self.evictions += 1;
         self.last_certainty.retain(|&(p, _), _| p != pid);
         self.accounted.remove(&pid);
-        self.refused.remove(&pid);
+        self.dropped.remove(&pid);
     }
 
     /// What one ring did against what was read of it, or `None` if no Record of it has been
@@ -758,9 +786,16 @@ mod tests {
         assert_eq!(c.observation(key(1, 0, 0)), None);
     }
 
+    /// Fill one process's account to the cap, one interpreter per poll.
+    fn fill_the_account(cursor: &mut Cursor, pid: u32) {
+        for interpreter in 0..MAX_INTERPRETERS_PER_PROCESS as i64 {
+            cursor.admit(pid, &[at(0, 0, interpreter, 5, 100, 110)]);
+        }
+    }
+
     /// Interpreter ids are never reused, so a process that creates and destroys them holds an
     /// accumulator for each one it ever ran. The cap is what keeps a day-long run's memory
-    /// flat, and the interpreters under it are unaffected.
+    /// flat.
     #[test]
     fn a_process_is_accounted_for_a_bounded_number_of_interpreters() {
         let mut c = Cursor::new();
@@ -774,59 +809,81 @@ mod tests {
             MAX_INTERPRETERS_PER_PROCESS,
             "the accumulators a process holds are capped"
         );
-        // The interpreters that arrived first keep their accounts in full.
-        assert!(c.observation(key(1, 0, 0)).is_some());
-        assert!(
-            c.observation(key(1, MAX_INTERPRETERS_PER_PROCESS as i64 - 1, 0))
-                .is_some()
-        );
-        assert!(c.observation(key(1, past_the_cap - 1, 0)).is_none());
+        assert_eq!(c.dropped(1), 2, "and what went is counted, not silent");
+        // What went is the two seen longest ago, and the newcomers are in the account.
+        assert!(c.observation(key(1, 0, 0)).is_none());
+        assert!(c.observation(key(1, 1, 0)).is_none());
+        assert!(c.observation(key(1, past_the_cap - 1, 0)).is_some());
     }
 
-    /// A Record from an interpreter past the cap is refused whole rather than reported
-    /// undeduped: nothing holds its counter, so admitting it would re-emit the same
-    /// Collection on every poll for the rest of the run.
+    /// The property that makes the cap survivable: an interpreter that is still running
+    /// appears in every poll, so churn around it never costs it its account. Filling the cap
+    /// with the *oldest* ids instead would leave a summary describing only interpreters that
+    /// no longer exist.
     #[test]
-    fn a_record_past_the_cap_is_refused_rather_than_repeated() {
+    fn churn_evicts_the_interpreters_that_stopped_appearing_not_the_running_one() {
         let mut c = Cursor::new();
-        for interpreter in 0..MAX_INTERPRETERS_PER_PROCESS as i64 {
-            c.admit(1, &[at(0, 0, interpreter, 5, 100, 110)]);
-        }
-        let overflow = MAX_INTERPRETERS_PER_PROCESS as i64;
+        let live = 7;
+        c.admit(1, &[at(0, 0, live, 1, 100, 110)]);
 
-        for poll in 0..3 {
-            assert_eq!(
-                admitted(&mut c, 1, &[at(0, 0, overflow, 5, 100, 110)]),
-                [],
-                "poll {poll}"
+        // Every other interpreter runs for exactly one poll, as an interpreter-per-task pool
+        // does, while `live` keeps collecting alongside them.
+        for task in 0..(MAX_INTERPRETERS_PER_PROCESS as i64 * 2) {
+            let interpreter = 1_000 + task;
+            c.admit(
+                1,
+                &[
+                    at(0, 0, live, 2 + task, 200 + task, 210 + task),
+                    at(0, 0, interpreter, 1, 100, 110),
+                ],
             );
         }
-        assert_eq!(c.refused(1), 3, "and each refusal is counted, not silent");
-        // An in-flight Entry from such an interpreter leaves no certainty bound behind
-        // either, since that map is keyed per interpreter too.
-        c.admit(1, &[at(0, 0, overflow, 6, 900, 0)]);
-        assert_eq!(c.last_certainty(1, overflow), None);
+
+        let observed = c
+            .observation(key(1, live, 0))
+            .expect("the live interpreter");
+        assert_eq!(observed.first().collections, 1, "its account is unbroken");
+        assert_eq!(
+            observed.last().collections,
+            MAX_INTERPRETERS_PER_PROCESS as i64 * 2 + 1
+        );
+        assert!(c.dropped(1) > 0, "the finished interpreters are what went");
     }
 
-    /// The cap is per process: one process running many interpreters must not stop its
-    /// sibling from being accounted at all.
+    /// The cap is per process: one process running many interpreters must not cost its
+    /// sibling its account.
     #[test]
     fn the_cap_is_per_process_and_goes_when_the_process_does() {
         let mut c = Cursor::new();
-        for interpreter in 0..MAX_INTERPRETERS_PER_PROCESS as i64 {
-            c.admit(100, &[at(0, 0, interpreter, 5, 100, 110)]);
-        }
+        fill_the_account(&mut c, 100);
         c.admit(100, &[at(0, 0, 9_000, 5, 100, 110)]);
-        assert_eq!(c.refused(100), 1);
+        assert_eq!(c.dropped(100), 1);
 
         // The sibling has its own budget.
         assert_eq!(admitted(&mut c, 200, &[at(0, 0, 9_000, 5, 100, 110)]), [5]);
-        assert_eq!(c.refused(200), 0);
+        assert_eq!(c.dropped(200), 0);
 
         // And a recycled PID starts from a full one, like every other kind of per-PID state.
         c.forget(100);
-        assert_eq!(c.refused(100), 0);
-        assert_eq!(admitted(&mut c, 100, &[at(0, 0, 9_000, 5, 100, 110)]), [5]);
+        assert_eq!(c.dropped(100), 0);
+        assert_eq!(admitted(&mut c, 100, &[at(0, 0, 9_001, 5, 100, 110)]), [5]);
+    }
+
+    /// A dropped interpreter leaves nothing behind — not its rings, and not the certainty
+    /// bound that is keyed the same way — or the cap would bound one map and not the other.
+    #[test]
+    fn a_dropped_interpreter_takes_its_certainty_bound_with_it() {
+        let mut c = Cursor::new();
+        c.admit(1, &[at(0, 0, 0, 5, 100, 110)]);
+        assert_eq!(c.last_certainty(1, 0), Some(110));
+
+        // Fill the account past the cap with interpreters seen more recently than 0.
+        for interpreter in 1..=MAX_INTERPRETERS_PER_PROCESS as i64 {
+            c.admit(1, &[at(0, 0, interpreter, 5, 100, 110)]);
+        }
+
+        assert_eq!(c.observation(key(1, 0, 0)), None);
+        assert_eq!(c.last_certainty(1, 0), None);
     }
 
     /// A build with no timestamp fields publishes nothing a timestamp key could order, so the
