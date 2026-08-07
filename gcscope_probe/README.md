@@ -13,8 +13,10 @@ Rust repository.
 
 ## Status
 
-3.14 only, x86-64 only. Windows and Linux are built and tested every pull request that reaches
-the layout contract; macOS is written for and unproven. The behaviour matches the prototype
+3.14 only, x86-64 only. Linux is built, attached to and decoded on every pull request that
+reaches the layout contract. Windows builds and passes the same test, but only when someone
+runs it: no CI leg compiles this on Windows, so a Windows-only break merges green until
+`specs/0015` adds one. macOS is written for and unproven. The behaviour matches the prototype
 that proved the approach works (`docs/research/cpython-314-gc-hook-points.md` §11–§12).
 
 | Today | Becomes | Where |
@@ -42,7 +44,10 @@ for your interpreter. The python.org installer ships them on Windows; on Debian 
 they are in `pythonX.Y-dev`.
 
 MSVC needs `/std:c11 /experimental:c11atomics` for `<stdatomic.h>`, which `setup.py` adds when
-it sees MSVC. gcc and clang need nothing.
+it sees MSVC. That puts a floor under the Windows toolchain: **Visual Studio 2022 17.5 or
+newer**, where the second flag first exists. On 2019, or on a 2022 older than that, the build
+fails at `"C atomic support is not enabled"`. No CI leg catches this, so it is on you to
+notice. gcc and clang need no flags.
 
 Ring depths default to 11 young and 3 old, making the region byte-identical to a Native 3.15
 one. Override at build time:

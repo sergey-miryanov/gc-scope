@@ -6,8 +6,11 @@
  * `struct gc_stats` byte-for-byte (3.15/Include/internal/pycore_interp_structs.h:180-222),
  * which gcscope's ring decoder reads unmodified.
  *
- * Scope today: 3.14 only, x86-64 only, offsets transcribed rather than compiled in.
- * `specs/0013-probe-portable-core.md` covers what each becomes.
+ * Scope today: 3.14 only, x86-64 only, and the interpreter offsets below are transcribed from
+ * a WINDOWS build. The code compiles and runs on Linux; that one constant has not been
+ * re-derived there, and `PyInterpreterState` is not layout-identical across platforms, so the
+ * self-check is expected to fail on Linux and `heap_size` to read 0 until ticket 03 compiles
+ * the offsets in. `specs/0013-probe-portable-core.md` covers what each becomes.
  */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>

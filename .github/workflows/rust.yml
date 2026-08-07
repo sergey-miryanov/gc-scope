@@ -454,7 +454,11 @@ jobs:
           git fetch --no-tags --quiet origin "$BASE"
           CHANGED=$(git diff --name-only FETCH_HEAD...HEAD)
           echo "::group::changed files"; echo "$CHANGED"; echo "::endgroup::"
-          if printf '%s\n' "$CHANGED" | grep -qE '^(gcscope_probe/|src/|tests/|scripts/gen-offsets\.py$|Cargo\.(toml|lock)$|\.github/workflows/rust\.yml$)'; then
+          # A herestring, not a pipe into `grep -q`: `-q` exits at the first match, and under
+          # `set -o pipefail` a SIGPIPE'd producer makes the pipeline non-zero even though the
+          # pattern matched. That routes a matching change to the else branch and skips the
+          # leg — the silent skip the comment above says this gate must never produce.
+          if grep -qE '^(gcscope_probe/|src/|tests/|scripts/gen-offsets\.py$|Cargo\.(toml|lock)$|\.github/workflows/rust\.yml$)' <<< "$CHANGED"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "Reaches the Probe contract; the leg runs."
           else
@@ -478,8 +482,15 @@ jobs:
       matrix:
         # The one place the leg's interpreter is named. The Probe refuses to load on any minor
         # it was not built for, so ticket 05 adding 3.13 is one more entry here and nothing
-        # else. Bare minor, floated by setup-python, and `matrix-unpinned` enforces that —
-        # the float is what catches a patch release moving the offsets this build transcribes.
+        # else. Bare minor, floated by setup-python, and `matrix-unpinned` enforces that, for
+        # the reason ADR 0010 section 2 gives: a pinned entry stops testing anything new.
+        #
+        # What the float does NOT yet catch is a patch release moving the interpreter offsets
+        # this build transcribes. `offsets_ok` lives behind a Python call an out-of-process
+        # reader cannot make, so the test never sees it, and a failed self-check reads as
+        # `heap_size = 0`, which passes the sane-magnitude check. Spec 0013 tickets 03 and 06
+        # close that: offsets compiled from the interpreter's own headers, and the self-check
+        # result published in the region header where this test can assert on it.
         python: ['3.14']
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
