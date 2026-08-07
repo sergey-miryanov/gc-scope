@@ -33,8 +33,7 @@ pub struct MonitorContext<'a> {
     alive_pids: HashSet<u32>,
     /// Processes already told about for outrunning the retained-interpreter bound. Evicted
     /// with the rest of a PID's state, since the cursor's own count restarts there: left
-    /// behind, a recycled PID's overflow would go unannounced, which is what the warning
-    /// exists to prevent.
+    /// behind, a recycled PID's overflow goes unannounced.
     overflowed_pids: HashSet<u32>,
     /// When monitoring began: the origin of the Observer's clock, read only for builds that
     /// publish no timestamps of their own. See [`observed_at_ns`](Self::observed_at_ns).
@@ -86,8 +85,8 @@ impl<'a> MonitorContext<'a> {
         }
 
         // Every interpreter, not just the head: the accumulator is keyed on one, and a
-        // process's sub-interpreters were otherwise absent from the trace with nothing
-        // saying so. See [`events_for`](Self::events_for) for what a poll costs.
+        // process's sub-interpreters were otherwise missing from the trace with nothing
+        // saying so. [`events_for`](Self::events_for) gives what a poll costs.
         let stats = match self.sessions.get(&pid).unwrap().gc_stats(true) {
             Ok(stats) => stats,
             Err(_) => {
@@ -140,13 +139,11 @@ impl<'a> MonitorContext<'a> {
     /// returns. A build publishing no timestamps has nothing else to place a sample on the
     /// timeline with; one that does ignores it.
     ///
-    /// **What a poll of N interpreters costs.** Linear in N, and nothing per-interpreter is
-    /// resolved twice: the layout, the version and the runtime address are settled once at
-    /// attach and reused every tick. Per interpreter a tick reads its id, its `next` link,
-    /// its stats region (one extra pointer read on a ring build, which reaches its ring
-    /// through a pointer) and folds one Entry per generation. The walk cannot be cached
-    /// across ticks — an interpreter created or destroyed between them changes the chain,
-    /// which is the whole reason to re-read it.
+    /// **What a poll of N interpreters costs.** Linear in N. The layout, the version and the
+    /// runtime address are settled once at attach, so a tick reads only each interpreter's id,
+    /// its `next` link and its stats region (one more pointer read on a ring build), then
+    /// folds an Entry per generation. Caching the walk across ticks would defeat it: an
+    /// interpreter created or destroyed between two ticks is the change worth re-reading.
     fn events_for(&mut self, pid: u32, stats: &[GcStat], observed_at_ns: i64) -> Vec<TraceEvent> {
         let events = self
             .cursor
@@ -158,12 +155,11 @@ impl<'a> MonitorContext<'a> {
         events
     }
 
-    /// Say once, per process, that it has run more interpreters than gcscope keeps figures
-    /// for.
+    /// Say once, per process, that it has run more interpreters than gcscope keeps figures for.
     ///
-    /// The bound keeps a long run's memory flat (`cursor::MAX_RETAINED_INTERPRETERS`), and
-    /// what it costs is that an interpreter which stopped collecting long ago drops out of
-    /// the summary. Unannounced, a missing interpreter reads as one that never collected.
+    /// `cursor::MAX_RETAINED_INTERPRETERS` keeps a long run's memory flat and costs an
+    /// interpreter that stopped collecting early its place in the summary. Unannounced, that
+    /// missing interpreter reads as one which never collected.
     fn warn_if_interpreters_dropped(&mut self, pid: u32) {
         if self.cursor.dropped(pid) == 0 || !self.overflowed_pids.insert(pid) {
             return;
@@ -172,7 +168,7 @@ impl<'a> MonitorContext<'a> {
             "warning: process {pid} has run more than {MAX_RETAINED_INTERPRETERS} \
              interpreters. gcscope keeps figures for that many at a time, dropping whichever \
              it has seen least recently, so an interpreter that stopped collecting early in \
-             the run may be missing from the summary. Every interpreter still running is kept."
+             the run may be missing from the summary. Every one still running is kept."
         );
     }
 
@@ -394,9 +390,9 @@ mod tests {
         assert_eq!(kinds(&events), ["M", "M", "C"]);
     }
 
-    /// A poll now hands over every interpreter's rings, and each Record reaches the exporter
-    /// on the track of the interpreter that produced it. Two interpreters collecting at
-    /// different rates keep their own cursors: neither one's counter advances past the other.
+    /// A poll hands over every interpreter's rings, and each Record reaches the exporter on
+    /// the track of the interpreter that produced it. Two interpreters collecting at different
+    /// rates keep their own cursors, so neither counter advances past the other.
     #[test]
     fn every_interpreter_in_a_poll_reaches_the_exporter_on_its_own_track() {
         let mut exporter = ChromeTraceExporter::new();

@@ -552,20 +552,19 @@ impl PySession {
     ///
     /// Linear in the number of interpreters, which is what makes the monitor's per-tick walk
     /// affordable: the layout, the version and the runtime address are resolved once at
-    /// attach, and each interpreter costs its id, its `next` link, its stats region (one more
-    /// pointer read on a ring build) and one read of the region itself. The per-interpreter
-    /// table is a stride-and-offsets copy taken once for the whole walk, not per interpreter.
+    /// attach, so each interpreter costs its id, its `next` link, its stats region (one more
+    /// pointer read on a ring build) and one read of that region. The per-interpreter table is
+    /// a stride-and-offsets copy taken once for the whole walk.
     ///
-    /// **The chain is read without holding CPython's lock**, and the monitor now walks it
-    /// every tick against exactly the sub-interpreter churn that mutates it, so three things
-    /// guard it. A `next` into freed-and-reused memory can point back into the chain, so
-    /// visited addresses end the walk rather than cycling it forever. The same read can
-    /// produce a nonsense `id`, so a negative one skips that link instead of entering the
-    /// account as an interpreter. And a read failing **past the head** skips its interpreter
-    /// rather than failing the poll: an interpreter torn down mid-walk would otherwise cost
-    /// the tick every other interpreter's Records, and route a live process into the
-    /// give-up ladder. The head keeps propagating its error, which is the same signal this
-    /// returned before it read more than one interpreter (C6).
+    /// **The chain is read without CPython's lock**, and the monitor walks it every tick
+    /// against the sub-interpreter churn that mutates it, so three guards apply. A `next` into
+    /// freed-and-reused memory can point back into the chain, so a revisited address ends the
+    /// walk instead of cycling forever. The same read can yield a nonsense `id`, so a negative
+    /// one skips its link. And a read failing **past the head** skips its interpreter rather
+    /// than failing the poll: one interpreter torn down mid-walk would otherwise cost the tick
+    /// every other interpreter's Records and route a live process into the give-up ladder. The
+    /// head still propagates its error, the signal this returned when it read one interpreter
+    /// (C6).
     fn gc_stats_per_interpreter(
         &self,
         head_addr: u64,
@@ -574,8 +573,8 @@ impl PySession {
         let table = self.resolved.table();
         let next_off = table.interp_next();
         let id_off = table.interp_id();
-        // The walk's own copy: everything but `gc_stats_addr` is the same for every
-        // interpreter, and that field is the one thing each iteration sets.
+        // The walk's own copy: `gc_stats_addr` is the one field an iteration sets, and the
+        // rest is the same for every interpreter.
         let mut interp_table = table.clone();
 
         let mut stats = Vec::new();
@@ -592,8 +591,8 @@ impl PySession {
             match self.read_interpreter_stats(&mut interp_table, current, id_off) {
                 Ok(Some(read)) => stats.extend(read),
                 Ok(None) => {}
-                // The head decides whether this process reads at all; past it, one
-                // interpreter going away is not the poll's failure.
+                // The head says whether this process reads at all. Past it, one interpreter
+                // going away belongs to that interpreter, not to the poll.
                 Err(e) if head => return Err(e),
                 Err(_) => {}
             }
@@ -601,9 +600,9 @@ impl PySession {
             if head && !all_interpreters {
                 break;
             }
-            // Always advance — the walk must make progress even for an interpreter with no
+            // Always advance: the walk must make progress even for an interpreter with no
             // readable stats (this is what previously hung on NULL pointers). An unreadable
-            // link ends the walk, since nothing else says where the rest of the chain is.
+            // link ends it, since nothing else says where the rest of the chain is.
             match self.read_u64(current + next_off) {
                 Ok(next) => current = next,
                 Err(e) if head => return Err(e),
@@ -615,8 +614,8 @@ impl PySession {
     }
 
     /// One interpreter of the walk: its id, its stats region and that region's Records.
-    /// `Ok(None)` for an interpreter with no readable region (not-yet-allocated, teardown)
-    /// and for a link whose id reads back as nonsense.
+    /// `Ok(None)` for a region that cannot be read (not yet allocated, or teardown) and for a
+    /// link whose id reads back as nonsense.
     fn read_interpreter_stats(
         &self,
         interp_table: &mut OffsetTable,

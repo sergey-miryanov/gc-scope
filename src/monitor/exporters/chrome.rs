@@ -118,9 +118,9 @@ pub struct ChromeTraceExporter {
     /// conversion each need their own copy, and reopening starts a file that needs metadata
     /// again.
     pid_meta_done: HashSet<u32>,
-    /// Keyed on `(pid, tid)`, not `tid`: every process's main interpreter is id `0`, so a set
-    /// of ids alone let the first process to report claim `0` and dropped every later one's
-    /// `thread_name`. The track still appeared under its `process_name`, unnamed.
+    /// Keyed on `(pid, tid)`. Every process's main interpreter is id `0`, so a set of ids
+    /// alone let the first process to report claim `0` and dropped every later one's
+    /// `thread_name`, leaving its track unnamed under its own `process_name`.
     tid_meta_done: HashSet<(u32, i64)>,
 }
 
@@ -334,8 +334,8 @@ mod tests {
 
     /// The digest of the bytes `random_matrix` produced before the same change.
     ///
-    /// Moved once since, by the `(pid, tid)` metadata keying. Its matrix draws three pids
-    /// against four interpreter ids, so the old key collided across processes; the new bytes
+    /// Moved once since, by the `(pid, tid)` metadata keying: this matrix draws three pids
+    /// against four interpreter ids, so the old key collided across processes. The new bytes
     /// differ by eight added `thread_name` lines and nothing else, diffed before the constant
     /// was rewritten. `golden_matrix` names no id twice and did not move.
     const RANDOM_MATRIX_DIGEST: u64 = 0xf6d48cee11f99f17;
@@ -815,10 +815,10 @@ mod tests {
         assert_eq!(count(&out, r#""name":"thread_name""#), 2, "output: {out}");
     }
 
-    /// The case the test above cannot reach: two processes whose interpreter ids are the
-    /// same. Every main interpreter is id `0`, so this is what a pool capture looks like —
-    /// and under a set of ids alone the first worker to report claimed `0` and every later
-    /// one drew a nameless track under its own `process_name`.
+    /// The case the test above cannot reach: two processes sharing an interpreter id. Every
+    /// main interpreter is id `0`, so this is what a pool capture looks like, and under a set
+    /// of ids alone the first worker to report claimed `0` while every later one drew a
+    /// nameless track under its own `process_name`.
     #[test]
     fn two_processes_sharing_an_interpreter_id_each_get_a_thread_name() {
         let sample = |ts_start: i64| {

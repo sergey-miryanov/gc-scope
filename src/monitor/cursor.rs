@@ -10,26 +10,19 @@ use crate::remote_debugging::gc_stats::GcStat;
 
 /// How many interpreters' accumulators one process keeps.
 ///
-/// **A bound on retained history, not on how many interpreters a process may run.** Which
-/// interpreters exist is a fact of each poll — the chain walk returns Records for exactly
-/// those alive when it ran — and nothing here caches that. What outlives a poll is the
-/// accumulator, which does two jobs: it is the dedup cursor while the interpreter is in the
-/// chain, bounded there by CPython's own live count, and it is what the summary reports after
-/// the interpreter is gone, which is where it grows. Ids are never reused, so without a bound
-/// a workload creating and destroying sub-interpreters holds one per `(interpreter,
-/// generation)` until the *process* exits. Set well above any real concurrent count: what it
-/// guards against is a long run's churn, not a wide one's fan-out.
+/// **A bound on retained history, not on existence.** Each poll names the interpreters that
+/// exist, and nothing here caches that. The accumulator outlives the poll because it serves
+/// twice over: the dedup cursor while the interpreter is in the chain, bounded there by
+/// CPython's own live count, and the figures the summary reports once it is gone, which is the
+/// half that grows. Ids are never reused, so a workload creating and destroying
+/// sub-interpreters would hold one per `(interpreter, generation)` until the process exits.
 ///
-/// Room is made by dropping the interpreter seen least recently. That is a proxy for "this
-/// one is finished", and a deliberately lazy one: absence from a single poll no longer proves
-/// death, since the walk skips an interpreter whose read failed
-/// ([`crate::remote_debugging::session::PySession::gc_stats`]), and dropping a live cursor
-/// re-admits its whole ring on the next poll — every Record in it emitted twice. Evicting
-/// only under pressure, oldest first, is hysteresis that never fires on an interpreter still
-/// collecting: it appears in every poll, so reaching it would take a run of
-/// [`MAX_RETAINED_INTERPRETERS`] distinct newcomers between two sightings. Refusing the
-/// newcomer instead would fill the account with the *oldest* ids and report only interpreters
-/// that no longer exist.
+/// Room is made by dropping the interpreter seen least recently: a lazy proxy for "finished",
+/// chosen because absence from one poll no longer proves death (the walk skips an interpreter
+/// whose read failed) and because dropping a live cursor re-admits its whole ring, emitting
+/// every Record in it twice. Evicting under pressure, oldest first, cannot reach an
+/// interpreter still collecting, which appears in every poll. Refusing the newcomer instead
+/// fills the set with the *oldest* ids and reports only interpreters that no longer exist.
 pub const MAX_RETAINED_INTERPRETERS: usize = 1024;
 
 /// One ring: the Entries one generation of one interpreter publishes its Records through.
@@ -185,13 +178,13 @@ pub struct Cursor {
     /// one that had started is later evidence than one that had ended. Across polls both
     /// apply: a bound left at an old start would widen every Loss window opened after it.
     last_certainty: HashMap<(u32, i64), i64>,
-    /// Per process, the interpreters whose accumulators are retained and the poll each was
-    /// last seen in. Capped at [`MAX_RETAINED_INTERPRETERS`]. Every other map here is keyed on
-    /// an interpreter, so this is what bounds all of them.
+    /// Per process, the interpreters whose accumulators are kept and the poll each was last
+    /// seen in, bounded by [`MAX_RETAINED_INTERPRETERS`]. Every other map here is keyed on an
+    /// interpreter, so this bounds all of them.
     retained: HashMap<u32, HashMap<i64, u64>>,
-    /// Interpreters whose accumulators were dropped to make room, per process. Counted rather
-    /// than dropped quietly: an operator reading a summary that omits an interpreter has no
-    /// other way to tell that from one that never collected.
+    /// Interpreters whose accumulators went to make room, per process. Counted, since an
+    /// operator reading a summary that omits an interpreter has no other way to tell that from
+    /// one that never collected.
     dropped: HashMap<u32, u64>,
     /// Polls admitted so far, which is what orders [`retained`](Self::retained) for eviction.
     polls: u64,
@@ -257,12 +250,11 @@ impl Cursor {
         fresh
     }
 
-    /// Mark this process's `interpreter` seen in this poll, retaining its accumulator and
-    /// making room by dropping the one seen least recently if the process is at the bound.
+    /// Mark this process's `interpreter` seen in this poll, keeping its accumulator and, at
+    /// the bound, dropping the one seen least recently.
     ///
-    /// The single gate every per-interpreter map goes through, so the accumulators and the
-    /// certainty bounds are bounded together rather than each keeping its own idea of which
-    /// interpreters are worth remembering.
+    /// The single gate every per-interpreter map goes through, so one bound covers the
+    /// accumulators and the certainty bounds together.
     fn retain(&mut self, pid: u32, interpreter: i64) {
         let poll = self.polls;
         let retained = self.retained.entry(pid).or_default();
@@ -290,17 +282,16 @@ impl Cursor {
 
     /// Drop everything one interpreter of `pid` is cursored on.
     ///
-    /// Unlike [`forget`](Self::forget) this retires nothing: the accumulator is going to make
-    /// room for one that is still running, and keeping the figures would defeat the bound
-    /// that dropped them. The run says how many went.
+    /// [`forget`](Self::forget) retires an accumulator; this destroys it. Keeping the figures
+    /// would defeat the bound that dropped them, so the run reports how many went instead.
     fn drop_interpreter(&mut self, pid: u32, interpreter: i64) {
         self.rings
             .retain(|key, _| key.pid != pid || key.interpreter != interpreter);
         self.last_certainty.remove(&(pid, interpreter));
     }
 
-    /// How many of this process's interpreters lost their accumulators to make room. Zero for
-    /// anything but a workload creating sub-interpreters by the thousand.
+    /// How many of this process's interpreters lost their accumulators to make room. Zero
+    /// unless a workload creates sub-interpreters by the thousand.
     pub fn dropped(&self, pid: u32) -> u64 {
         self.dropped.get(&pid).copied().unwrap_or(0)
     }
@@ -793,16 +784,15 @@ mod tests {
         assert_eq!(c.observation(key(1, 0, 0)), None);
     }
 
-    /// Retain accumulators for one process up to the bound, one interpreter per poll.
+    /// Fill one process to the bound, one interpreter per poll.
     fn fill_the_retained_set(cursor: &mut Cursor, pid: u32) {
         for interpreter in 0..MAX_RETAINED_INTERPRETERS as i64 {
             cursor.admit(pid, &[at(0, 0, interpreter, 5, 100, 110)]);
         }
     }
 
-    /// Interpreter ids are never reused, so a process that creates and destroys them keeps an
-    /// accumulator for each one it ever ran. The bound is what keeps a day-long run's memory
-    /// flat.
+    /// Ids are never reused, so a process that creates and destroys interpreters keeps an
+    /// accumulator for every one it ever ran. The bound keeps a day-long run's memory flat.
     #[test]
     fn a_process_retains_a_bounded_number_of_interpreter_accumulators() {
         let mut c = Cursor::new();
@@ -823,10 +813,10 @@ mod tests {
         assert!(c.observation(key(1, past_the_bound - 1, 0)).is_some());
     }
 
-    /// The property that makes the bound survivable: an interpreter that is still running
-    /// appears in every poll, so churn around it never costs it its accumulator. Refusing the
-    /// newcomer instead would fill the set with the *oldest* ids and leave a summary
-    /// describing only interpreters that no longer exist.
+    /// The property that makes the bound survivable: an interpreter still running appears in
+    /// every poll, so churn around it never costs it its accumulator. Refusing the newcomer
+    /// instead fills the set with the *oldest* ids, leaving a summary that describes only
+    /// interpreters which no longer exist.
     #[test]
     fn churn_evicts_the_interpreters_that_stopped_appearing_not_the_running_one() {
         let mut c = Cursor::new();
@@ -880,8 +870,8 @@ mod tests {
         assert_eq!(admitted(&mut c, 100, &[at(0, 0, 9_001, 5, 100, 110)]), [5]);
     }
 
-    /// A dropped interpreter leaves nothing behind — not its rings, and not the certainty
-    /// bound that is keyed the same way — or one map would be bounded and the other not.
+    /// A dropped interpreter leaves nothing behind: not its rings, and not the certainty bound
+    /// keyed the same way. Otherwise one map is bounded and the other is not.
     #[test]
     fn a_dropped_interpreter_takes_its_certainty_bound_with_it() {
         let mut c = Cursor::new();

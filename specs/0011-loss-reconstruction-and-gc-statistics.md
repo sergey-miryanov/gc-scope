@@ -159,27 +159,25 @@ address are resolved once at attach, so a tick costs each interpreter its id, it
 and one read of its stats region.
 
 CPython links a new interpreter at the *head* of the chain and never reuses an id. Both facts
-shape this. The first is why a head-only read looks like it works — the head changes, so
-several interpreters do reach a long capture, each in a window of its own — and so the live
-check is that every interpreter is read *throughout* the run rather than merely present. The
-second is why the accumulators a process keeps are bounded: without a bound, a workload
-creating and destroying sub-interpreters holds one per `(interpreter, generation)` until the
-process exits.
+shape this. The first is why a head-only read looks like it works: the head changes, so several
+interpreters do reach a long capture, each in a window of its own, and the live check has to be
+that every interpreter is read *throughout* the run rather than merely present. The second is
+why the accumulators a process keeps are bounded, since a workload creating and destroying
+sub-interpreters otherwise holds one per `(interpreter, generation)` until the process exits.
 
-That bound is on retained *history*, not on existence. Which interpreters exist is a fact of
-each poll, and nothing caches it; the accumulator outlives the poll because it is both the
-dedup cursor while an interpreter is in the chain — bounded there by CPython's own live count
-— and the figures the summary reports once it is gone. Room is made by dropping the one seen
-least recently, so what goes is an interpreter that stopped appearing and never one still
-collecting. Absence from a single poll is deliberately not the trigger: the walk skips an
-interpreter whose read failed, and dropping a live cursor re-admits its whole ring on the next
-poll. The run says how many went.
+That bound is on retained *history*, not on existence. Each poll names the interpreters that
+exist and nothing caches it; the accumulator outlives the poll by serving as both the dedup
+cursor while an interpreter is in the chain, bounded there by CPython's own live count, and the
+figures the summary reports once it is gone. Room is made by dropping the one seen least
+recently, so what goes stopped appearing rather than stopped mattering. Absence from a single
+poll is deliberately not the trigger: the walk skips an interpreter whose read failed, and
+dropping a live cursor re-admits its whole ring on the next poll. The run reports how many went.
 
-Walking that chain every tick, without the lock CPython holds over it, is also what makes a
-torn read reachable: the walk ends on an address it has already visited, skips a link whose
-id reads back negative, and lets a failure past the head cost that interpreter rather than
-the poll — an interpreter torn down mid-walk would otherwise take every other interpreter's
-Records with it and route a live process into the give-up ladder.
+Walking that chain every tick without CPython's lock also makes a torn read reachable. The walk
+ends on an address it has already visited, skips a link whose id reads back negative, and lets
+a failure past the head cost that interpreter rather than the poll. An interpreter torn down
+mid-walk would otherwise take every other interpreter's Records with it and route a live
+process into the give-up ladder.
 
 ### Completeness is a producer-side filter, and the excluded Entry is evidence
 

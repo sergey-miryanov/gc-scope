@@ -7,9 +7,9 @@ harness attaching on the marker knows there is more than interpreter zero to fin
 Self-terminates after max_seconds (default 120) so a crashed harness cannot orphan it.
 
 Exits non-zero with the reason on stderr if this build cannot create a sub-interpreter,
-rather than quietly running as one: a harness that read a skip out of a silent success
-would pass against the very thing it exists to catch. Callers gate on 3.12, the first
-version that can create one from Python.
+instead of running as one: a harness reading a skip out of that silent success would pass
+against the thing it exists to catch. Callers gate on 3.12, the first version that can
+create one from Python.
 """
 
 import gc
@@ -20,10 +20,10 @@ import threading
 import time
 
 CYCLES_PER_BURST = 2000
-# How long the main interpreter waits for the sub-interpreter to stop. Both run to the
-# same deadline, so this covers the last burst rather than a stretch of the run: an
-# interpreter destroyed early hands the head of the chain back to interpreter zero, and a
-# reader that only ever looks at the head then appears to have read both.
+# How long the main interpreter waits for the sub-interpreter to stop. Both run to the same
+# deadline, so this covers the last burst rather than a stretch of the run. An interpreter
+# destroyed early hands the head of the chain back to interpreter zero, and a reader that
+# only looks at the head then appears to have read both.
 SUB_SHUTDOWN_GRACE = 10.0
 
 # The sub-interpreter's own program. A source string rather than a function, since the
@@ -73,16 +73,15 @@ def make_garbage(count):
 
 
 def sub_interpreter_runner(source):
-    """A zero-argument callable that runs `source` in a fresh sub-interpreter and
-    destroys it afterwards.
+    """A zero-argument callable that runs `source` in a fresh sub-interpreter and destroys
+    it afterwards.
 
-    Three spellings, newest first: PEP 734's `concurrent.interpreters` (3.14+), the
-    private `_interpreters` (3.13) and `_xxsubinterpreters` (3.12). Raises if this
-    build has none of them.
+    Three spellings, newest first: PEP 734's `concurrent.interpreters` (3.14+), the private
+    `_interpreters` (3.13) and `_xxsubinterpreters` (3.12). Raises if this build has none.
 
-    Destroying it is not tidiness. A sub-interpreter still running while the main one
-    finalizes takes the process down with an access violation, and the harness reads
-    that crash as gcscope's.
+    Destroying it is load-bearing. A sub-interpreter still running while the main one
+    finalizes takes the process down with an access violation, which a harness reads as
+    gcscope's crash.
     """
     try:
         from concurrent import interpreters
@@ -130,9 +129,8 @@ def give_up(worker, reason):
     """Report `reason` and exit non-zero, waiting for the sub-interpreter on the way out.
 
     The wait is the point. Every path out of this process has to leave the sub-interpreter
-    destroyed, or finalization takes the process down with an access violation and a
-    harness reads that crash as gcscope's — hiding the reason printed here, which is the
-    one thing that would have explained the failure.
+    destroyed, or finalization crashes it and buries the reason printed here under a crash
+    the harness attributes to gcscope.
     """
     sys.stderr.write(reason + "\n")
     worker.join(SUB_SHUTDOWN_GRACE)

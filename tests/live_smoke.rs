@@ -655,10 +655,10 @@ for g in block["generations"]:
 
 /// A process running a sub-interpreter has both of them in the account.
 ///
-/// The one check that can catch reading only the head of the interpreter chain: the wrong
-/// walk and the right one produce the same shape, the same figures and the same clean exit
-/// against every single-interpreter target, and differ only in what is missing. No unit test
-/// reaches it, since the chain is a target's memory.
+/// The one check that catches a walk stopping at the head of the interpreter chain. Against
+/// every single-interpreter target the wrong walk and the right one produce the same shape,
+/// the same figures and the same clean exit, differing only in what is absent. No unit test
+/// reaches it: the chain is a target's memory.
 #[test]
 #[ignore = "spawns and attaches to a live interpreter; needs ptrace/taskport — run with --ignored"]
 fn live_monitor_records_every_interpreter_not_only_the_first() {
@@ -754,17 +754,16 @@ for block in document["interpreters"]:
         let collections = figure(block, 2);
         assert!(
             collections > 0 && collections < SANE_COUNTER_MAX as i64,
-            "an interpreter accounted for no work of its own: {block:?}\n{out}"
+            "an interpreter shows no work of its own: {block:?}\n{out}"
         );
     }
 
-    // The assertion that actually catches a walk stopping at the head of the interpreter
-    // chain. Such a walk still produces two blocks: CPython links a new interpreter at the
-    // *head*, so interpreter zero is what gets read for the moments before the fixture's
-    // sub-interpreter exists, and its account then stops there. What it cannot produce is
-    // two interpreters read all through the run. The fixture collects in both from READY to
-    // exit, at one Collection per burst each, so a poll that reads both hands them Records
-    // at the same rate.
+    // The assertion that catches the head-only walk. Such a walk still produces two blocks,
+    // since CPython links a new interpreter at the *head*: interpreter zero is read for the
+    // moments before the fixture's sub-interpreter exists, and its account stops there. What
+    // it cannot produce is two interpreters read all through the run. The fixture collects in
+    // both from READY to exit at one Collection per burst, so a poll that reads both hands
+    // them Records at the same rate.
     let records: Vec<i64> = blocks.iter().map(|b| figure(b, 3)).collect();
     let busiest = *records.iter().max().expect("a block");
     assert!(
@@ -773,7 +772,7 @@ for block in document["interpreters"]:
          records {records:?}\n{blocks:#?}\n{out}"
     );
 
-    // And each reaches the trace on a track of its own — the metadata dedup keyed on the
+    // And each reaches the trace on a track of its own. Metadata dedup keyed on the
     // interpreter id alone left every one after the first nameless.
     let pid = &blocks[0][0];
     for block in &blocks {
