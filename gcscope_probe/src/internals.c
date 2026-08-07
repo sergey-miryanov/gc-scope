@@ -27,15 +27,27 @@
  *
  * The guard turns a missing internal-headers install into an instruction. Without it the build
  * stops at "cannot open include file", naming a header the person building has no reason to
- * recognise and no obvious way to get. */
-#if defined(__has_include) && !__has_include(<internal/pycore_interp_structs.h>)
-#  error "gcscope_probe needs CPython's internal headers: <internal/pycore_interp_structs.h> \
+ * recognise and no obvious way to get.
+ *
+ * Nested rather than `#if defined(__has_include) && !__has_include(...)`. `&&` does not
+ * short-circuit at parse time, so a preprocessor without `__has_include` would substitute 0 and
+ * then have to parse `0(<internal/pycore_interp_structs.h>)`, which is a syntax error rather
+ * than the fallback intended. Every compiler in range defines it; the nested form costs nothing
+ * to be sure.
+ *
+ * The include below stays unconditional. `#error` is fatal to MSVC and not to gcc, so on gcc
+ * the message is followed by the incomplete-type errors it was meant to explain. Putting the
+ * include in an `#else` would suppress those and leave the rest of the file referring to types
+ * that do not exist, which trades one cascade for another. First diagnostic wins. */
+#ifdef __has_include
+#  if !__has_include(<internal/pycore_interp_structs.h>)
+#    error "gcscope_probe needs CPython's internal headers: <internal/pycore_interp_structs.h> \
 is missing from this interpreter's include directory. They ship with the python.org installers \
 and in pythonX.Y-dev on Debian and Ubuntu. Install the development headers for the interpreter \
 you are building against, then rebuild."
-#else
-#  include <internal/pycore_interp_structs.h>
+#  endif
 #endif
+#include <internal/pycore_interp_structs.h>
 
 #include "internals.h"
 

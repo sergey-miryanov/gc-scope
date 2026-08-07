@@ -55,12 +55,19 @@ const SAMPLE_GAP: Duration = Duration::from_millis(700);
 const SANE_COUNTER_MAX: i64 = 1_000_000_000_000; // 1e12
 
 /// Floor for a written entry's `heap_size`, the count of GC-tracked objects the Probe snapshots
-/// when a Collection starts. `probe_spin.py` allocates 2000 reference cycles — 6000 tracked
-/// objects — immediately before every `gc.collect()`, so any real snapshot clears this by a
-/// wide margin. The margin is what makes the check worth having: everything following
-/// `heap_size` in `_gc_runtime_state` is a near-zero counter — `work_to_do` and `phase` on
-/// 3.14.4, the `dummy` placeholders that replaced them on 3.14.5 — so an offset one field out
-/// reads a small number that a bare positivity check waves through.
+/// when a Collection starts.
+///
+/// What holds it up is the interpreter's own baseline, not the fixture's garbage. Only
+/// generation 0 snapshots the fresh burst: `probe_spin.py` collects generations 1 and 2
+/// immediately after `gc.collect(0)` has already reclaimed it, so those entries see roughly
+/// what a started interpreter tracks. Measured on 3.14, that is ~6800 for generations 1 and 2
+/// against ~8500 for generation 0. The floor sits below both by a factor of five, and is not
+/// a number to raise on the assumption that 6000 fresh objects are always in view.
+///
+/// The margin is what makes the check worth having: everything following `heap_size` in
+/// `_gc_runtime_state` is a near-zero counter — `work_to_do` and `phase` on 3.14.4, the `dummy`
+/// placeholders that replaced them on 3.14.5 — so an offset one field out reads a small number
+/// that a bare positivity check waves through.
 const MIN_TRACKED_OBJECTS: i64 = 1_000;
 
 /// The 3.15 `gc_generation_stats` field layout the Probe writes.
@@ -380,13 +387,14 @@ fn probe_ring_decodes_out_of_process() {
         eprintln!("SKIP probe_ring_decodes_out_of_process: {msg}");
         return;
     };
-    // A free-threaded build never maintains `heap_size`, so the Probe reads something that is
-    // not a heap size and its self-check cannot tell. Spec 0013 §4 makes the Probe refuse to
-    // load there; until then, refuse here rather than assert on meaningless numbers.
+    // A free-threaded build never maintains `heap_size`, so the Probe refuses to load there
+    // rather than publish a column of zeros. Reaching this assertion means it did load, which
+    // is a broken gate rather than an unsupported configuration — so it fails loudly instead
+    // of skipping.
     assert!(
         !is_free_threaded(&python),
-        "GCSCOPE_TEST_PYTHON selected a free-threaded build; the Probe does not support one \
-         and does not yet refuse to load on it"
+        "GCSCOPE_TEST_PYTHON selected a free-threaded build and the Probe imported anyway; \
+         the Py_GIL_DISABLED gate in PyInit_gcscope_probe is not doing its job"
     );
 
     let proc = SpawnedPython::spawn_fixture(&python, "probe_spin.py")

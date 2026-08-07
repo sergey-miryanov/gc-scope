@@ -29,7 +29,9 @@ that proved the approach works (`docs/research/cpython-314-gc-hook-points.md` §
 | Built from source | Wheels | spec 0015 |
 
 On anything but 3.14 it refuses to import, naming the reason, rather than publishing numbers
-read at offsets it was not built for.
+read at offsets it was not built for. Free-threaded builds are refused too: `heap_size` is
+there in the struct and nothing in `gc_free_threading.c` ever writes it, so a Probe would
+report 0 for every Collection and its self-check would call that healthy.
 
 ## Install
 

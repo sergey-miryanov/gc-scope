@@ -310,7 +310,7 @@ gcscope_probe_check_offsets(void)
 static Py_ssize_t
 gcscope_probe_heap_size(void)
 {
-    /* 3.14 GIL build only -- the free-threaded build never maintains heap_size. */
+    /* GIL builds only; PyInit refuses a free-threaded one, where nothing maintains heap_size. */
     if (gcscope_probe_offsets_ok != 1) {
         return 0;
     }
@@ -537,6 +537,29 @@ PyInit_gcscope_probe(void)
     Py_BUILD_ASSERT(offsetof(struct gcscope_probe_stats, old) == GCSCOPE_PROBE_YOUNG_BYTES);
     Py_BUILD_ASSERT(sizeof(struct gcscope_probe_stats)
                     == GCSCOPE_PROBE_YOUNG_BYTES + 2 * GCSCOPE_PROBE_OLD_BYTES);
+
+    /* Free-threaded gate. `_gc_runtime_state.heap_size` exists in a Py_GIL_DISABLED build and
+     * nothing ever writes it: `Python/gc_free_threading.c` never names the field, while the GIL
+     * collector decrements it at 3.14.5/Python/gc.c:1985. So every Record would carry
+     * heap_size 0.
+     *
+     * This gate is load-bearing precisely BECAUSE the offsets are now right. Until ticket 03 a
+     * free-threaded build got a GIL build's transcribed offsets, `collecting` did not read 1,
+     * and the self-check failed -- which made the Probe look broken for the wrong reason, but
+     * did make it look broken. Correct offsets remove that accident: the self-check would pass
+     * and the Probe would publish a plausible table with one silently dead column. ADR 0013
+     * decision 5 says refuse rather than degrade, and this is where that becomes necessary
+     * rather than tidy.
+     *
+     * Compile-time, not runtime: an extension built for cp314 cannot load into cp314t, so the
+     * build's configuration is the runtime's. */
+#ifdef Py_GIL_DISABLED
+    PyErr_SetString(PyExc_ImportError,
+                    "gcscope_probe does not support free-threaded CPython: the interpreter "
+                    "never maintains gc heap_size there, so every Collection would report 0. "
+                    "Install it into a build with the GIL");
+    return NULL;
+#endif
 
     /* Version gate. `internals.c` compiled the offsets against ONE interpreter; a different
      * minor lays `PyInterpreterState` out differently, so they would point at whatever happens
