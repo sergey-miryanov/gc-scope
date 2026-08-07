@@ -118,7 +118,10 @@ pub struct ChromeTraceExporter {
     /// conversion each need their own copy, and reopening starts a file that needs metadata
     /// again.
     pid_meta_done: HashSet<u32>,
-    tid_meta_done: HashSet<i64>,
+    /// Keyed on `(pid, tid)`, not `tid`: every process's main interpreter is id `0`, so a set
+    /// of ids alone let the first process to report claim `0` and dropped every later one's
+    /// `thread_name`. The track still appeared under its `process_name`, unnamed.
+    tid_meta_done: HashSet<(u32, i64)>,
 }
 
 impl ChromeTraceExporter {
@@ -154,12 +157,12 @@ impl EventsExporter for ChromeTraceExporter {
 
         let mut first = !*has_written;
         for event in events {
-            // Repeated metadata is dropped. The thread set is keyed on the interpreter id
-            // alone, so two processes whose interpreter ids collide share one `thread_name`
-            // line; kept as-is, since the monitor reads one interpreter per process today.
+            // Repeated metadata is dropped, each set keyed on what identifies its track: a
+            // process by its pid, a track by the process it belongs to and the interpreter
+            // running on it.
             let skip = match event {
                 TraceEvent::ProcessMeta { pid, .. } => !pid_meta_done.insert(*pid),
-                TraceEvent::ThreadMeta { tid, .. } => !tid_meta_done.insert(*tid),
+                TraceEvent::ThreadMeta { pid, tid, .. } => !tid_meta_done.insert((*pid, *tid)),
                 _ => false,
             };
             if skip {
@@ -330,7 +333,12 @@ mod tests {
 ]"#;
 
     /// The digest of the bytes `random_matrix` produced before the same change.
-    const RANDOM_MATRIX_DIGEST: u64 = 0x691ac7286d6f515d;
+    ///
+    /// Moved once since, by the `(pid, tid)` metadata keying. Its matrix draws three pids
+    /// against four interpreter ids, so the old key collided across processes; the new bytes
+    /// differ by eight added `thread_name` lines and nothing else, diffed before the constant
+    /// was rewritten. `golden_matrix` names no id twice and did not move.
+    const RANDOM_MATRIX_DIGEST: u64 = 0xf6d48cee11f99f17;
 
     /// A unique scratch path per test invocation. `Date.now()`-style entropy is
     /// avoided; a process-id + monotonic counter is enough for isolation within
@@ -804,6 +812,56 @@ mod tests {
         );
         let out = export(&[(100, p1), (200, p2)]);
         assert_eq!(count(&out, r#""name":"process_name""#), 2, "output: {out}");
+        assert_eq!(count(&out, r#""name":"thread_name""#), 2, "output: {out}");
+    }
+
+    /// The case the test above cannot reach: two processes whose interpreter ids are the
+    /// same. Every main interpreter is id `0`, so this is what a pool capture looks like —
+    /// and under a set of ids alone the first worker to report claimed `0` and every later
+    /// one drew a nameless track under its own `process_name`.
+    #[test]
+    fn two_processes_sharing_an_interpreter_id_each_get_a_thread_name() {
+        let sample = |ts_start: i64| {
+            GcStat::from_fields(
+                0,
+                0,
+                0, // the id every main interpreter has
+                *FULL_LAYOUT,
+                &[("ts_start", ts_start), ("ts_stop", ts_start + 500)],
+            )
+        };
+        let out = export(&[(100, sample(1_000)), (200, sample(2_000))]);
+
+        assert_eq!(count(&out, r#""name":"process_name""#), 2, "output: {out}");
+        assert_eq!(count(&out, r#""name":"thread_name""#), 2, "output: {out}");
+        for pid in [100, 200] {
+            assert!(
+                out.contains(&format!(r#""pid":{pid},"tid":0,"name":"thread_name""#)),
+                "pid {pid} has no named track: {out}"
+            );
+        }
+    }
+
+    /// The dedup the fix must not have loosened: one process reporting the same interpreter
+    /// twice still writes one `thread_name`, and two interpreters inside it still write two.
+    #[test]
+    fn one_process_still_names_each_of_its_interpreters_once() {
+        let sample = |interpreter: i64, ts_start: i64| {
+            GcStat::from_fields(
+                0,
+                0,
+                interpreter,
+                *FULL_LAYOUT,
+                &[("ts_start", ts_start), ("ts_stop", ts_start + 500)],
+            )
+        };
+        let out = export(&[
+            (100, sample(0, 1_000)),
+            (100, sample(0, 2_000)),
+            (100, sample(1, 3_000)),
+        ]);
+
+        assert_eq!(count(&out, r#""name":"process_name""#), 1, "output: {out}");
         assert_eq!(count(&out, r#""name":"thread_name""#), 2, "output: {out}");
     }
 
