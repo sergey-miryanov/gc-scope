@@ -11,13 +11,11 @@ license = "MIT"
 authors = [{ name = "Sergey Miryanov", email = "sergey.miryanov@gmail.com" }]
 keywords = ["gc", "garbage-collection", "profiling", "gcscope"]
 
-# 3.14 only, and the load gate in PyInit says so again at import: a wheel tag is a hint,
-# not an enforcement, and the transcribed interpreter offsets are correct for exactly the
-# builds someone checked. `specs/0013-probe-portable-core.md` widens this to 3.13.
+# 3.14 only. PyInit repeats the gate at import, because a wheel tag is a hint and the
+# transcribed offsets hold for the builds someone checked. Spec 0013 widens this to 3.13.
 requires-python = ">=3.14,<3.15"
 
-# No license classifier: PEP 639 supersedes it with the `license` field above, and
-# setuptools now refuses a project that carries both.
+# No license classifier: PEP 639 supersedes it, and setuptools refuses both together.
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -31,7 +29,5 @@ classifiers = [
 Homepage = "https://github.com/sergey-miryanov/gc-scope"
 Source = "https://github.com/sergey-miryanov/gc-scope"
 
-# No [tool.setuptools] packages: this distribution is one extension module and nothing else.
-# The extension itself is declared in setup.py, since ext-modules in pyproject.toml is still
-# experimental in setuptools and a build that fails at packaging time is indistinguishable,
-# from a CI leg, from one that failed to compile.
+# No [tool.setuptools] packages: this distribution is one extension module. It is declared in
+# setup.py, since ext-modules in pyproject.toml is still experimental.

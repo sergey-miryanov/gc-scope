@@ -16,15 +16,14 @@ between publishing gcscope to crates.io as a library — a public contract maint
 indefinitely for exactly one internal consumer — and abandoning the verifier. A workspace
 member dissolves the problem instead of solving it.
 
-> **Amended 2026-08-07, implementing the move.** The verifier did not become a workspace
-> member; it stopped being a program. Its whole reason to exist was that a *separate
-> repository* needed a way to reach gcscope's decoder, and the move removes that reason —
-> `tests/probe.rs` reaches the decoder directly, on the live-attach harness this repo already
-> has, and its four invariants are assertions rather than printed output. A test that fails
-> is a better instrument than a binary someone has to run and read. The force above is
-> answered more completely by there being no second crate at all than it would have been by a
-> workspace, so the workspace conversion was dropped and the root `Cargo.toml` stays a single
-> package. The decision below is untouched: the Probe ships from this repo.
+> **Amended 2026-08-07, implementing the move.** The verifier stopped being a program instead
+> of becoming a workspace member. It existed so a *separate repository* could reach gcscope's
+> decoder, and the move removes that need: `tests/probe.rs` reaches the decoder directly on
+> the live-attach harness this repo already has, and its four invariants are assertions rather
+> than printed output that someone has to run and read. Having no second crate answers the
+> force above more completely than a workspace would, so we dropped the conversion and the
+> root `Cargo.toml` stays one package. The decision below is untouched: the Probe ships from
+> this repo.
 
 **The layout contract is bidirectional and silent.** The Probe writes a region this repo's
 decoder reads. Its compile-time assertions encode the reader's expectations. Split across

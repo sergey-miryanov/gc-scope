@@ -1,24 +1,20 @@
-//! Read a `gcscope_probe` Ring out of a live interpreter and assert the decoded shape.
+//! Read a `gcscope_probe` Ring out of a live interpreter and assert the decoded shape. This
+//! is the Probe's correctness gate, replacing the prototype's `verify/` binary, which existed
+//! only so a separate repository could reach gcscope's decoder across a path dependency
+//! (`docs/adr/0016-probe-ships-from-this-repo.md`).
 //!
-//! This is the correctness gate for the Probe. It replaces the prototype's standalone
-//! `verify/` binary, which existed only because a separate repository needed a way to reach
-//! gcscope's decoder across a path dependency — a reason that disappeared when the Probe
-//! moved here (`docs/adr/0016-probe-ships-from-this-repo.md`).
+//! **The seam is the region bytes, read from outside the process.** Asserting through the
+//! Probe's Python-level `geometry()` would test the one surface no consumer uses. Downstream
+//! of the address this runs gcscope's own memory reader, `OffsetTable` and ring decoder, so a
+//! decode that passes here passes in the CLI.
 //!
-//! **The seam is the region bytes, read from outside the process.** The Probe's entire
-//! output is memory a reader decodes; asserting through its Python-level `geometry()` would
-//! test the one surface no real consumer uses. Everything downstream of the address is
-//! gcscope production code — its memory reader, its `OffsetTable`, its ring decoder — so a
-//! decode that works here is a decode that works in the CLI.
+//! Only the address is supplied by hand: below 3.15 CPython publishes no
+//! `gc.generation_stats` for gcscope's discovery path, and nothing in the interpreter points
+//! at a Probe region. `specs/0014-read-probe-regions.md` moves that lookup into gcscope.
 //!
-//! The only thing supplied by hand is the *address*, because CPython below 3.15 publishes no
-//! `gc.generation_stats` for gcscope's discovery path to find and nothing in the interpreter
-//! points at a Probe region. `specs/0014-read-probe-regions.md` moves that lookup into gcscope
-//! proper; until then it lives here.
-//!
-//! `#[ignore]`d like the other tests that attach to a live process (ADR 0005, §3):
+//! `#[ignore]`d like the other live-attach tests (ADR 0005 §3):
 //!   cargo test --test probe -- --ignored
-//! With no Probe installed it skips with a log — see `common::probe_python`.
+//! With no Probe installed it skips; see `common::probe_python`.
 
 mod common;
 
@@ -33,35 +29,34 @@ use read_process_memory::ProcessHandle;
 use std::thread;
 use std::time::Duration;
 
-/// The Probe module's filename prefix. This is a **wire contract**, not a detail: discovery
-/// matches on it (ADR 0014), so it is fixed by the module name in `gcscope_probe/src`.
+/// The Probe module's filename prefix, a wire contract rather than a detail: gcscope's
+/// discovery matches on it (ADR 0014), and the module name in `gcscope_probe/src` fixes it.
 const MODULE_PREFIX: &str = "gcscope_probe";
 
-/// Windows only for now, matching what the Probe builds on. `specs/0013-probe-portable-core.md`
-/// carries this to ELF and Mach-O, at which point both this suffix and the PE parse in
-/// [`find_header_addr`] generalise together.
+/// Windows only, matching what the Probe builds on. `specs/0013-probe-portable-core.md`
+/// carries this to ELF and Mach-O, generalising both this suffix and the PE parse in
+/// [`find_header_addr`].
 const MODULE_SUFFIX: &str = ".pyd";
 
 /// The exported discovery anchor.
 const HEADER_SYMBOL: &str = "gcscope_probe_header";
 
-/// Samples taken across the run, and the gap between them. Three is what it takes to check a
-/// counter *sequence* rather than a pair, and the fixture collects gen 0 every ~50 ms so a
-/// gap this size guarantees progress without making the test slow.
+/// Samples across the run, and the gap between them. Three samples check a counter sequence
+/// rather than a pair; the fixture collects gen 0 every ~50 ms, so this gap guarantees
+/// progress without slowing the test.
 const SAMPLES: usize = 3;
 const SAMPLE_GAP: Duration = Duration::from_millis(700);
 
-/// Real counters stay far below this; garbage from a wrong address rarely does. Same bound
-/// the live-smoke shape check uses.
+/// Real counters stay far below this; garbage from a wrong address rarely does. Same bound as
+/// the live-smoke shape check.
 const SANE_COUNTER_MAX: i64 = 1_000_000_000_000; // 1e12
 
-/// The 3.15 `gc_generation_stats` field layout, which is what the Probe writes.
+/// The 3.15 `gc_generation_stats` field layout the Probe writes.
 ///
-/// Restated here rather than imported: gcscope's generated `v_3_15_0b4::GC_LAYOUT` is
-/// private, and this must match the *Probe's* struct, which is a separate thing that happens
-/// to agree today. `specs/0012-gen-offsets-serves-the-probe.md` gives the Probe a generated
-/// header to assert against; the digest that would let this side check the same fact is
-/// ticket 09.
+/// Restated rather than imported: gcscope's generated `v_3_15_0b4::GC_LAYOUT` is private, and
+/// this has to match the *Probe's* struct, a separate thing that agrees with it today.
+/// `specs/0012-gen-offsets-serves-the-probe.md` gives the Probe a generated header to assert
+/// against, and ticket 09 gives this side the digest to check the same fact.
 static FIELDS: &[(&str, usize)] = &[
     ("ts_start", 0),
     ("ts_stop", 8),
@@ -78,8 +73,8 @@ static LAYOUT: GcItemLayout = GcItemLayout {
     fields: FIELDS,
 };
 
-/// The `gcscope_probe_header` a live target publishes, decoded. Everything needed to walk the
-/// slots and decode a region comes from here — no geometry is passed out of band.
+/// The `gcscope_probe_header` a live target publishes, decoded. Walking the slots and decoding
+/// a region needs nothing beyond this, so no geometry passes out of band.
 #[derive(Debug)]
 struct ProbeHeader {
     version: u32,
@@ -104,9 +99,9 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b[off..off + 8].try_into().expect("8 bytes in range"))
 }
 
-/// Locate `gcscope_probe_header` in a live process from what the OS and the on-disk image
-/// say: find the mapped Probe module, parse its export table, add the export's RVA to the
-/// module base. No scanning, no hardcoded address — the same chain ADR 0014 specifies.
+/// Locate `gcscope_probe_header` in a live process from what the OS and the on-disk image say:
+/// find the mapped Probe module, parse its export table, add the export's RVA to the module
+/// base. No scanning and no hardcoded address, which is the chain ADR 0014 specifies.
 fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
     let regions = list_regions(pid).map_err(|e| format!("listing target regions: {e}"))?;
 
@@ -141,8 +136,8 @@ fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
         .find(|e| e.name == Some(HEADER_SYMBOL))
         .map(|e| e.rva)
         .ok_or_else(|| {
-            // The silent-failure mode ADR 0014 §2 names: a module that works perfectly and is
-            // invisible to discovery. Say which of the two it is.
+            // ADR 0014 §2 names this failure: a module that works and is invisible to
+            // discovery. Say which of the two happened.
             format!(
                 "{path} does not export {HEADER_SYMBOL}; the module built but its discovery \
                  anchor is not in the export table"
@@ -203,9 +198,8 @@ fn live_regions(handle: &ProcessHandle, h: &ProbeHeader) -> Result<Vec<(i64, u64
     Ok(out)
 }
 
-/// An `OffsetTable` describing the region *the target declared*, not one this test assumed.
-/// Every geometry input comes from the header; only the per-entry field layout is local,
-/// because the header does not carry one yet.
+/// An `OffsetTable` describing the region the target declared. Every geometry input comes from
+/// the header; only the per-entry field layout stays local, since the header carries none yet.
 fn ring_table(h: &ProbeHeader) -> OffsetTable {
     let item_size = h.item_size as u64;
     let entries = [
@@ -250,10 +244,10 @@ fn newest_per_gen<'a>(written: &[&'a GcStat]) -> Vec<&'a GcStat> {
         .collect()
 }
 
-/// Assert the decoded table's **shape**, not that a read succeeded. A Probe writing at a
+/// Assert the decoded table's **shape** rather than a successful read. A Probe writing at a
 /// wrong offset publishes a full table of plausible garbage that any non-empty check waves
-/// through, so what is checked is the exact `(generation, entry)` index set the declared
-/// geometry implies, plausible magnitudes, and a relationship the fixture controls.
+/// through, so this checks the exact `(generation, entry)` index set the declared geometry
+/// implies, plausible magnitudes, and a relationship the fixture controls.
 fn check_shape(stats: &[GcStat], entries: [usize; 3]) -> Result<(), String> {
     let want: usize = entries.iter().sum();
     if stats.len() != want {
@@ -263,8 +257,8 @@ fn check_shape(stats: &[GcStat], entries: [usize; 3]) -> Result<(), String> {
         ));
     }
 
-    // Every (generation, entry) pair exactly once — catches a base offset that aliases two
-    // generations onto the same entry range.
+    // Every (generation, entry) pair appears once, which catches a base offset that aliases
+    // two generations onto the same entry range.
     let mut got: Vec<(u32, usize)> = stats.iter().map(|s| (s.generation, s.index)).collect();
     got.sort_unstable();
     let mut expect: Vec<(u32, usize)> = Vec::with_capacity(want);
@@ -295,9 +289,9 @@ fn check_shape(stats: &[GcStat], entries: [usize; 3]) -> Result<(), String> {
         }
     }
 
-    // The pyramid. probe_spin.py seeds 20/5/1 into generations 0/1/2 and keeps that
-    // weighting, so this is deterministic — and it catches a right-shaped table carrying
-    // another generation's data, which the index-set check cannot.
+    // The pyramid. probe_spin.py seeds 20/5/1 into generations 0/1/2 and holds that weighting,
+    // making this deterministic. It catches a right-shaped table carrying another generation's
+    // data, which the index-set check above cannot.
     let peak: Vec<i64> = (0..3u32)
         .map(|g| {
             stats
@@ -311,7 +305,7 @@ fn check_shape(stats: &[GcStat], entries: [usize; 3]) -> Result<(), String> {
     if !(peak[0] > peak[1] && peak[1] > peak[2]) {
         return Err(format!(
             "generation collections {peak:?} are not a strict pyramid; generations may be \
-             aliased, or the Probe missed a generation entirely"
+             aliased, or the Probe missed one"
         ));
     }
     Ok(())
@@ -324,20 +318,21 @@ fn check_shape(stats: &[GcStat], entries: [usize; 3]) -> Result<(), String> {
 #[ignore = "attaches to a live process; needs ptrace/taskport and an installed Probe — run with --ignored"]
 fn probe_ring_decodes_out_of_process() {
     let Some(python) = probe_python() else {
-        let msg = "no interpreter with `gcscope_probe` importable \
+        // "installed", not "importable": the source directory in the crate root imports as a
+        // namespace package on any interpreter, so the check calls into the module.
+        let msg = "no interpreter with the `gcscope_probe` extension installed \
                    (build it: pip install ./gcscope_probe)";
         assert!(
             !probe_required(),
-            "GCSCOPE_REQUIRE_PROBE=1 but {msg} — a leg that builds a Probe must not pass by \
+            "GCSCOPE_REQUIRE_PROBE=1 but {msg}; a leg that builds a Probe must not pass by \
              skipping"
         );
         eprintln!("SKIP probe_ring_decodes_out_of_process: {msg}");
         return;
     };
-    // A free-threaded build never maintains `heap_size`, so the Probe's offsets read something
-    // that is not a heap size and its self-check cannot tell. Spec 0013 §4 makes the Probe
-    // refuse to load there; until it does, refuse here rather than assert on numbers that mean
-    // nothing.
+    // A free-threaded build never maintains `heap_size`, so the Probe reads something that is
+    // not a heap size and its self-check cannot tell. Spec 0013 §4 makes the Probe refuse to
+    // load there; until then, refuse here rather than assert on meaningless numbers.
     assert!(
         !is_free_threaded(&python),
         "GCSCOPE_TEST_PYTHON selected a free-threaded build; the Probe does not support one \
@@ -352,9 +347,9 @@ fn probe_ring_decodes_out_of_process() {
     let handle = open_handle(pid).expect("open the target process");
     let h = read_header(&handle, header_addr).expect("decode the published header");
 
-    // Ask the target, never hardcode the answer: the header's own py_version must be the
-    // version the interpreter reports about itself. A Probe loaded into the wrong runtime is
-    // exactly the case the load gate exists to prevent, and this is where it shows.
+    // Ask the target rather than hardcode the answer: the header's py_version must match what
+    // the interpreter reports about itself. A Probe loaded into the wrong runtime is what the
+    // load gate exists to prevent, and this is where that shows.
     if let Some((major, minor, micro, level, serial)) = full_python_version(&python) {
         let expected = ((major as u32) << 24)
             | ((minor as u32) << 16)
@@ -376,22 +371,22 @@ fn probe_ring_decodes_out_of_process() {
     );
     assert!(
         h.collector <= 1,
-        "header declares collector {} — a value this build does not define",
+        "header declares collector {}, a value this build does not define",
         h.collector
     );
 
     let regions = live_regions(&handle, &h).expect("walk the slot array");
     let (iid, addr) = *regions
         .first()
-        .expect("no claimed interpreter slot — the callback never ran");
+        .expect("no claimed interpreter slot; the callback never ran");
 
     let table = ring_table(&h);
     let expected_len = table
         .stats_buffer_len()
         .expect("ring geometry is decodable");
-    // gcscope's `stats_buffer_len` stops at the end of gen 2's entries; the producer's region
-    // additionally carries gen 2's own trailing cursor word, so the region is 8 bytes longer.
-    // A superset is correct; a shorter region would mean the two disagree about geometry.
+    // gcscope's `stats_buffer_len` stops at the end of gen 2's entries, while the producer's
+    // region also carries gen 2's trailing cursor word, making it 8 bytes longer. A superset
+    // is correct; a shorter region would mean the two disagree about geometry.
     assert!(
         h.region_size as usize >= expected_len,
         "declared region {} is smaller than its own geometry implies ({expected_len})",
@@ -419,9 +414,9 @@ fn probe_ring_decodes_out_of_process() {
             panic!("sample {round}: {e}");
         }
 
-        // Invariant 1 & 2: every *written* entry is a finished Collection, ts_start < ts_stop.
-        // Unwritten entries are zeroed, and `is_complete()` is false for them by construction,
-        // so they are excluded by `collections() > 0` rather than by weakening the predicate.
+        // Invariants 1 and 2: every *written* entry is a finished Collection, ts_start <
+        // ts_stop. Unwritten entries are zeroed, so `collections() > 0` excludes them instead
+        // of weakening the predicate to accommodate them.
         let written: Vec<&GcStat> = stats.iter().filter(|s| s.collections() > 0).collect();
         assert!(
             !written.is_empty(),
@@ -437,7 +432,7 @@ fn probe_ring_decodes_out_of_process() {
                 s.ts_start(),
                 s.ts_stop()
             );
-            // Invariant 3. `duration` is cumulative, so a written entry always has some.
+            // Invariant 3. `duration` is cumulative, so a written entry carries some.
             assert!(
                 s.duration() > 0.0,
                 "sample {round}: gen {} entry {} has non-positive duration {}",
@@ -469,9 +464,9 @@ fn probe_ring_decodes_out_of_process() {
         prev_totals = Some(totals);
     }
 
-    // Non-regression alone is satisfied by a region that never changes — which is what a
-    // reader would see if it had latched onto a stale copy. The fixture collects gen 0 every
-    // ~50 ms, so across the sampling window the counter must actually have moved.
+    // A region that never changes satisfies non-regression on its own, and that is what a
+    // reader latched onto a stale copy would see. The fixture collects gen 0 every ~50 ms, so
+    // the counter has to move across the sampling window.
     let first = first_gen0.expect("at least one sample");
     assert!(
         last_gen0 > first,

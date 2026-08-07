@@ -10,7 +10,7 @@
 // uses a different subset, so some helpers look unused per binary.
 #![allow(dead_code)]
 
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -112,16 +112,24 @@ fn runs(python: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// A Python that can `import gcscope_probe`, or `None` — callers then **skip with a log**,
-/// since a checkout where nobody ran `pip install ./gcscope_probe` has no Probe to read and
-/// that is the normal state of a developer's machine.
+/// A Python with the Probe **extension** installed, or `None`, in which case callers **skip
+/// with a log**: a checkout where nobody ran `pip install ./gcscope_probe` has no Probe to
+/// read. Selected like [`test_python`], then filtered.
 ///
-/// Selected the same way as [`test_python`], then filtered: an interpreter with no Probe is
-/// not a different interpreter, it is the same one missing a package.
+/// A plain `import gcscope_probe` answers the wrong question here: it passed on a runner with
+/// no Probe at all, so the test ran instead of skipping. Two guards close that.
+///
+/// - `-P` keeps the cwd off `sys.path` (3.11+, and the Probe needs 3.13+), so the source
+///   directory `gcscope_probe/` in the crate root cannot import as a namespace package and
+///   pass on a machine that never built anything. `PYTHONPATH` still applies, which `-I`
+///   would have dropped.
+/// - Calling `geometry()` proves this is the extension. A namespace package imports fine and
+///   carries no attributes, and the `AttributeError` surfaces later in the spawned fixture,
+///   where it reads as a timeout.
 pub fn probe_python() -> Option<PathBuf> {
     let python = test_python()?;
     let ok = Command::new(&python)
-        .args(["-c", "import gcscope_probe"])
+        .args(["-P", "-c", "import gcscope_probe; gcscope_probe.geometry()"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -130,9 +138,9 @@ pub fn probe_python() -> Option<PathBuf> {
     ok.then_some(python)
 }
 
-/// Whether a missing Probe must **fail** rather than skip. A skip is right on a laptop and
-/// wrong in CI, where it would turn a Probe that failed to compile into a green leg — so the
-/// leg that builds one sets `GCSCOPE_REQUIRE_PROBE=1` and gets a failure instead.
+/// Whether a missing Probe must **fail** rather than skip. Skipping is right on a laptop and
+/// wrong in CI, where it would turn a Probe that failed to compile into a green leg, so the
+/// leg that builds one sets `GCSCOPE_REQUIRE_PROBE=1`.
 pub fn probe_required() -> bool {
     std::env::var("GCSCOPE_REQUIRE_PROBE").ok().as_deref() == Some("1")
 }
@@ -168,16 +176,26 @@ impl SpawnedPython {
         Self::spawn_fixture(python, "spin.py")
     }
 
-    /// As [`Self::spawn`], for a fixture other than `spin.py` — currently `probe_spin.py`,
-    /// which installs the Probe before collecting. Every fixture takes the same lifetime
-    /// argument and prints the same `READY <pid>` marker, so the wait is shared.
+    /// As [`Self::spawn`], for a fixture other than `spin.py`: today `probe_spin.py`, which
+    /// installs the Probe before collecting. Both take the same lifetime argument and print
+    /// the same `READY <pid>` marker, so they share the wait.
     pub fn spawn_fixture(python: &Path, fixture_name: &str) -> io::Result<Self> {
         let mut child = Command::new(python)
             .arg(fixture(fixture_name))
             .arg(SPIN_LIFETIME_SECS)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()?;
+
+        // Capture stderr rather than discarding it. A fixture that dies on startup, usually on
+        // a failed import, otherwise surfaces only as "never reported READY", which reports
+        // the symptom and hides the traceback naming the cause.
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let err_h = thread::spawn(move || {
+            let mut s = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut s);
+            s
+        });
 
         // Drain the fixture's stdout on a worker thread so the wait is bounded: an
         // interpreter that fails to start closes stdout (EOF → sender dropped) and a hung
@@ -200,11 +218,22 @@ impl SpawnedPython {
         match rx.recv_timeout(READY_TIMEOUT) {
             Ok(pid) => Ok(SpawnedPython { child, pid }),
             Err(_) => {
+                // Kill first: that closes the stderr pipe, so the drain thread reaches EOF and
+                // the join cannot hang on a child that is merely stuck rather than dead.
                 let _ = child.kill();
                 let _ = child.wait();
+                let stderr = err_h.join().unwrap_or_default();
+                let tail: Vec<&str> = stderr.lines().rev().take(12).collect();
+                let detail = if tail.is_empty() {
+                    " (it wrote nothing to stderr)".to_string()
+                } else {
+                    let mut lines = tail;
+                    lines.reverse();
+                    format!("\n----- {fixture_name} stderr -----\n{}", lines.join("\n"))
+                };
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("{fixture_name} exited or never reported READY"),
+                    format!("{fixture_name} exited or never reported READY{detail}"),
                 ))
             }
         }

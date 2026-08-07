@@ -1,15 +1,13 @@
 /* gcscope_probe -- publish a 3.15-shaped GC statistics Ring from inside CPython 3.14.
  *
  * CPython below 3.15 records `collections`, `collected` and `uncollectable` per generation
- * and no timestamps at all, so gcscope can say how often the collector ran but not what any
- * Collection cost. This module closes that gap from a `gc.callbacks` entry, writing a region
- * that mirrors 3.15's `struct gc_stats` byte-for-byte
- * (3.15/Include/internal/pycore_interp_structs.h:180-222) so gcscope's ring decoder reads it
- * unmodified.
+ * and no timestamps, so gcscope can say how often the collector ran but not what any
+ * Collection cost. A `gc.callbacks` entry here writes a region mirroring 3.15's
+ * `struct gc_stats` byte-for-byte (3.15/Include/internal/pycore_interp_structs.h:180-222),
+ * which gcscope's ring decoder reads unmodified.
  *
- * Scope today, deliberately: CPython 3.14 only, Windows only, x86-64 only, with the
- * interpreter offsets transcribed rather than compiled in. See
- * `specs/0013-probe-portable-core.md` for what each of those becomes.
+ * Scope today: 3.14 only, Windows only, x86-64 only, offsets transcribed rather than
+ * compiled in. `specs/0013-probe-portable-core.md` covers what each becomes.
  */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
@@ -31,10 +29,9 @@
  * here depends on it. 3.14.1-3.14.3 were not checked (no source tree available), but they sit
  * between two agreeing endpoints.
  *
- * That throwaway TU is what `specs/0013-probe-portable-core.md` §4 turns into a permanent
- * second translation unit compiled with Py_BUILD_CORE, at which point these three constants
- * become compile-time facts of the interpreter being built against and this comment goes
- * away. Until then the module is 3.14-only: PyInit refuses to load on any other minor
+ * `specs/0013-probe-portable-core.md` §4 makes that throwaway TU permanent, compiled with
+ * Py_BUILD_CORE, turning these three constants into compile-time facts of the interpreter
+ * being built against. Until then the module stays 3.14-only: PyInit refuses any other minor
  * version, and `collecting` self-checks the other two against a live collection. */
 /* What Ring index 1 means, which is NOT the same across the 3.14 line.
  *
@@ -45,9 +42,9 @@
  * is per-increment.
  *
  * 3.14.5 forward-ported the generational collector, so 0/1/2 are true generations
- * (3.14.5/Python/gc.c:1337-1348). Same Ring, same field names, different meaning --
- * a consumer that averages across the two silently compares unlike quantities, which is
- * why the header publishes which one this is. */
+ * (3.14.5/Python/gc.c:1337-1348). Same Ring, same field names, different meaning. Average
+ * across the two and you compare unlike quantities with nothing to warn you, which is why
+ * the header publishes which one this is. */
 #define GCSCOPE_PROBE_COLLECTOR_INCREMENTAL  0
 #define GCSCOPE_PROBE_COLLECTOR_GENERATIONAL 1
 
@@ -61,11 +58,10 @@
  * is byte-identical to a Native 3.15 one. Override at build time with
  *     CFLAGS=-DGCSCOPE_PROBE_YOUNG_STATS_SIZE=512 ...
  *
- * Depth buys per-Collection fidelity and nothing else: every other field is cumulative and so
- * survives wrap-around by differencing. At the young-generation rate measured on this machine
- * -- ~176 collections/s under churn -- an 11-slot Ring laps in about 62 ms, so any poll
- * interval above that drops most individual pause Records. Cost is 64 bytes per entry per
- * interpreter. */
+ * Depth buys per-Collection fidelity. The other fields are cumulative and survive wrap-around
+ * by differencing. At the young-generation rate measured on this machine, ~176 collections/s
+ * under churn, an 11-slot Ring laps in about 62 ms, so a poll interval above that drops most
+ * individual pause Records. Cost is 64 bytes per entry per interpreter. */
 #ifndef GCSCOPE_PROBE_YOUNG_STATS_SIZE
 #  define GCSCOPE_PROBE_YOUNG_STATS_SIZE 11
 #endif
@@ -136,11 +132,10 @@ __declspec(dllexport) gcscope_probe_slot gcscope_probe_slots[GCSCOPE_PROBE_MAX_I
  *
  * THE MODULE FILENAME IS A WIRE CONTRACT. gcscope discovers a Probe by enumerating the
  * target's mapped images, keeping those whose basename starts with `gcscope_probe`, and
- * looking up `gcscope_probe_header` in the export table (ADR 0014). Renaming either the module
- * or this symbol breaks discovery in every gcscope already released -- silently, because a
- * renamed module still loads, still installs its callback and still publishes a perfectly
- * valid region that nothing can find. There is no error to read. Rename only with a header
- * version bump and a matching reader change.
+ * looking up `gcscope_probe_header` in the export table (ADR 0014). Rename the module or this
+ * symbol and discovery breaks in every gcscope already released, with no error to read: the
+ * renamed module still loads, still installs its callback, still publishes a valid region
+ * nothing can find. Rename only with a header version bump and a matching reader change.
  *
  * `magic` is a char array, NOT a uint64_t literal: a `uint64_t` constant is stored
  * little-endian, so 0x4743505242303135 ("GCPRB015" read big-endian) lands in memory as the
@@ -209,8 +204,8 @@ gcscope_probe_slot_for_current_interp(void)
 
 /* ---- the Ring writer, mirroring 3.15's add_stats ------------------------ */
 
-/* Total Records published. Not part of the 3.15 shape -- just a liveness counter for the
- * benchmarks. Never the correctness gate: that is the region, read from outside. */
+/* Total Records published. Not part of the 3.15 shape; a liveness counter for the benchmarks.
+ * Never the correctness gate, which is the region read from outside. */
 static volatile long long gcscope_probe_records_written = 0;
 
 static struct gcscope_probe_generation_stats *
@@ -261,7 +256,7 @@ gcscope_probe_add_stats(struct gcscope_probe_stats *s, int gen,
      * this store above the field writes above.
      *
      * A release FENCE followed by a plain store establishes this on x86-64's TSO and NOT on
-     * aarch64. It is a correctness defect that the only supported platform cannot exhibit;
+     * aarch64. That is a correctness defect the only supported platform cannot exhibit;
      * `specs/0013-probe-portable-core.md` §4 replaces it with an explicit release store
      * before any arm64 build ships. */
     MemoryBarrier();
@@ -273,11 +268,11 @@ gcscope_probe_add_stats(struct gcscope_probe_stats *s, int gen,
 /* ---- heap_size ---------------------------------------------------------- */
 
 /* Set to 1 once the offsets have been confirmed against a live collection; -1 if the
- * self-check failed, in which case heap_size is reported as 0 rather than as garbage.
+ * self-check failed, in which case heap_size reports 0 rather than garbage.
  *
- * Reachable only through `geometry()`, which an out-of-process reader cannot call -- so a
- * failed self-check is currently indistinguishable from success to the one consumer that
- * matters. It moves into the header's capability word in spec 0013 §4. */
+ * Reachable only through `geometry()`, which an out-of-process reader cannot call, so a
+ * failed self-check looks like success to the one consumer that matters. It moves into the
+ * header's capability word in spec 0013 §4. */
 static int gcscope_probe_offsets_ok = 0;
 
 static char *
@@ -295,8 +290,8 @@ gcscope_probe_gcstate(void)
  * it doesn't read 1, GCSCOPE_PROBE_INTERP_GC_OFF is wrong for this build and every other
  * offset-derived read is garbage.
  *
- * This validates the `gc` and `collecting` offsets JOINTLY: a heap_size-only move passes it
- * and then publishes plausible garbage. Spec 0013 §4 gives heap_size its own validation. */
+ * This validates the `gc` and `collecting` offsets JOINTLY, so a heap_size-only move passes
+ * it and then publishes plausible garbage. Spec 0013 §4 gives heap_size its own check. */
 static void
 gcscope_probe_check_offsets(void)
 {
@@ -407,7 +402,7 @@ gcscope_probe_on_gc(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
 
 /* Registered in gc.callbacks by bench/*.py to isolate the cost CPython pays to marshal the
  * callback arguments and dispatch, with no work of our own on top. The difference between
- * this and `on_gc` is what writing a Record actually costs. */
+ * this and `on_gc` is the cost of writing a Record. */
 static PyObject *
 gcscope_probe_noop(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
 {
@@ -417,9 +412,9 @@ gcscope_probe_noop(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
 
 /* ---- in-process introspection ------------------------------------------- */
 
-/* These exist for liveness and for the benchmarks. None of them is a correctness gate: the
- * Probe's output is the region, and asserting through a Python call would test the one
- * surface no real consumer uses (spec 0013 §5). */
+/* For liveness and the benchmarks. None is a correctness gate: the Probe's output is the
+ * region, and asserting through a Python call would test the one surface no consumer uses
+ * (spec 0013 §5). */
 
 static PyObject *
 gcscope_probe_install(PyObject *self, PyObject *noargs)

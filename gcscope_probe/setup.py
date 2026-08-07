@@ -1,13 +1,11 @@
-"""Declares the one extension module. All metadata lives in pyproject.toml.
+"""Declares the one extension module. Metadata lives in pyproject.toml.
 
-The module name is `gcscope_probe`, which fixes the built filename's prefix — and that
-prefix is what gcscope matches on to discover a Probe (ADR 0014). Changing it here breaks
-discovery in every released gcscope, silently; see the comment at the header declaration in
-`src/gcscope_probe.c`.
+The module name fixes the built filename's prefix, and gcscope matches on that prefix to
+discover a Probe (ADR 0014). Rename it and discovery breaks with no error anywhere; see the
+header declaration in `src/gcscope_probe.c`.
 
-No compiler paths, SDK paths or interpreter paths appear anywhere in this file or in the
-repository. setuptools locates the toolchain itself, which is the whole point of replacing
-the prototype's three `.bat` files: `pip install .` is the build.
+No compiler, SDK or interpreter path appears here or elsewhere in the repository. setuptools
+locates the toolchain, so `pip install .` is the build.
 """
 
 from setuptools import Extension, setup

@@ -2,17 +2,16 @@
 
 Usage:  python probe_spin.py [max_seconds]
 
-Same harness contract as `spin.py` — one flushed "READY <pid>" line, self-terminates
-after max_seconds so a crashed harness cannot orphan it — but this one imports
-`gcscope_probe` and registers its `gc.callbacks` entry *first*, so every generation
-already has Records by the time a reader attaches.
+Same harness contract as `spin.py`: one flushed "READY <pid>" line, self-terminating after
+max_seconds so a crashed harness cannot orphan it. This one imports `gcscope_probe` and
+registers its `gc.callbacks` entry before collecting, so every generation already holds
+Records when a reader attaches.
 
-Nothing about the region is passed out of band. The reader finds the module among this
-process's mappings, resolves `gcscope_probe_header` from its export table, and takes the
-region address and the full geometry from there; this file's only output is a pid.
+The only output is a pid. The reader finds the module among this process's mappings,
+resolves `gcscope_probe_header` from its export table, and takes the region address and
+geometry from there.
 
-Unlike `spin.py` this is not 3.8-compatible by policy — it runs only on interpreters the
-Probe supports, which is 3.14 today.
+`spin.py` stays 3.8-compatible; this runs only where the Probe does, which is 3.14 today.
 """
 
 import gc
@@ -23,18 +22,18 @@ import time
 import gcscope_probe
 
 CYCLES_PER_BURST = 2000
-# Gen-0 seed rounds. Gen 1 gets 5 and gen 2 gets 1, matching spin.py: the counts are
-# deliberately unequal so a reader sees a strict collections[0] > [1] > [2] pyramid and
-# can tell a correct decode from one whose base offsets alias two generations onto the
-# same entries. An even rotation would make those indistinguishable.
+# Gen-0 seed rounds. Gen 1 gets 5 and gen 2 gets 1, matching spin.py: unequal counts give a
+# reader a strict collections[0] > [1] > [2] pyramid, which separates a correct decode from
+# one whose base offsets alias two generations onto the same entries. An even rotation would
+# leave those two indistinguishable.
 GEN_SEED_ROUNDS = 20
 
 
 def make_garbage(count):
     """Allocate `count` unreachable reference cycles and drop them.
 
-    Cycles are the point: a plain list would be reclaimed by refcounting and never
-    reach the collector, so no callback would fire and no Record would be written.
+    They have to be cycles: refcounting reclaims a plain list without reaching the
+    collector, so no callback fires and no Record gets written.
     """
     for _ in range(count):
         a = {}
