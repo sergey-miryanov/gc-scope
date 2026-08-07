@@ -46,8 +46,8 @@ impl Lifetime {
 /// [`first`](Self::first) and [`last`](Self::last) come from CPython and describe the ring;
 /// [`sampled`](Self::sampled) and [`measured_pause_ns`](Self::measured_pause_ns) describe the
 /// reading. Every summary figure is a difference between the two, so nothing derived is stored
-/// here: [`crate::monitor::loss::account`] computes exact count, exact pause, Coverage and
-/// scale factor from these.
+/// here: [`crate::monitor::loss::account`] derives exact count, exact pause, Coverage and
+/// scale factor.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RingObservation {
     first: Lifetime,
@@ -71,9 +71,9 @@ impl RingObservation {
         self.first
     }
 
-    /// The first Record's own pause, in nanoseconds. Its Collection is inside the observed
-    /// span but its duration is already inside [`first`](Self::first), so a delta between the
-    /// two ends leaves it out and this puts it back.
+    /// The first Record's own pause, in nanoseconds. Its Collection is inside the span but
+    /// its duration is already inside [`first`](Self::first), so a delta between the two ends
+    /// leaves it out and this puts it back.
     pub fn first_pause_ns(&self) -> i64 {
         self.first_pause_ns
     }
@@ -101,9 +101,8 @@ impl RingObservation {
     }
 
     /// Whether this ring's Records carry the generation's cumulative pause total. Asked
-    /// separately from [`has_timing`](Self::has_timing): the timestamps say what one
-    /// Collection cost, and only this says what every Collection cost, so only a ring
-    /// publishing it can be differenced for a pause nobody watched.
+    /// separately from [`has_timing`](Self::has_timing): timestamps say what one Collection
+    /// cost, and only this says what every Collection cost.
     pub fn has_pause_total(&self) -> bool {
         self.prices_pause
     }
@@ -632,8 +631,8 @@ mod tests {
     }
 
     /// The cumulative duration at the first Record already covers that Record's own
-    /// Collection, so a delta between the two ends starts *after* it. Keeping its pause is
-    /// what lets the exact figure cover the same Collections the exact count counts.
+    /// Collection, so a delta between the two ends starts after it. Keeping its pause is what
+    /// makes the exact figure cover the Collections the exact count counts.
     #[test]
     fn an_accumulator_keeps_the_opening_records_own_pause() {
         let mut c = Cursor::new();

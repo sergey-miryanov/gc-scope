@@ -1,6 +1,10 @@
 # 0011 — Reconstruct lost collections and report exact GC statistics
 
-- **Status:** Not started
+- **Status:** In progress. The `TraceEvent` extraction, the counter-keyed cursor, the
+  counter-only tier, the `--summary` table and the Loss arithmetic have landed
+  ([ADR 0017](../docs/adr/0017-monitoring-tiers-follow-the-entry-layout.md),
+  [ADR 0019](../docs/adr/0019-loss-is-accounted-over-the-observed-span.md)). Reading every
+  interpreter and the JSON form have not.
 - **Kind:** feature — enhancement
 - **Effort:** L
 - **Origin:** Grilling session 2026-08-05 on porting gcmon's consumer stack into gcscope.
@@ -175,42 +179,33 @@ fields produces spans and pause figures; one without produces counters and Cover
 
 ### Loss reconstruction
 
-Per poll, per accumulator: Records are folded in counter order. A run whose first Record's
-counter exceeds the cursor by more than one has a gap behind it, carrying a lost count and
-a lost pause derived from the cumulative-duration delta with the observed Record's own
-pause taken back out.
+**Shipped — see [ADR 0019](../docs/adr/0019-loss-is-accounted-over-the-observed-span.md)**,
+which records the accounted span, the tier-dependent count, Coverage, the `duration` gate and
+the pause floor.
 
-**Only the accounting lands here — the span geometry does not.** Turning those gaps into
-drawn intervals requires bounding each into a window, merging windows across an
-interpreter's generations, splitting the result around Collections that *were* observed,
-and apportioning counts and pause across the pieces. That work belongs with the Perfetto
-increment, where [gcmon's ADR-0015] puts Loss spans on a track of their own — "own track"
-being a Perfetto concept, not a Chrome one. What this spec delivers is the *numbers*: how
-many Collections ran, how many were read, how much pause time is unaccounted, per
-generation per interpreter.
+**Only the accounting lands here, not the span geometry.** Turning gaps into drawn intervals
+needs each bounded into a window, windows merged across an interpreter's generations, the
+result split around Collections that *were* observed, and counts and pause apportioned across
+the pieces. That belongs with the Perfetto increment, where gcmon's ADR-0015 puts Loss spans on
+a track of their own, "own track" being a Perfetto concept and not a Chrome one. This spec
+delivers the numbers: how many Collections ran, how many were read, how much pause is
+unaccounted, per generation per interpreter.
 
-Two numeric hazards carry over from gcmon and must be preserved: the cumulative duration is
-a float of seconds while timestamps are integer nanoseconds, so a gap holding almost no
-pause can subtract to slightly below zero and must be floored; and an empty accumulator
-reports Coverage `1.0`, having lost none of the nothing it covers.
-
-*Rejected:* estimating pre-3.15 pause time by sampling the `collecting` flag. It would
-yield an aggregate GC duty cycle, not per-generation figures, since that flag is a single
-value; splitting an aggregate across generations by count would be fabrication. Worth
-revisiting later as a separately-named feature, never as a backfill for absent data.
+*Rejected:* estimating pre-3.15 pause time by sampling the `collecting` flag. That flag is a
+single value, so it yields an aggregate GC duty cycle rather than per-generation figures, and
+splitting an aggregate across generations by count would be fabrication. Worth revisiting as a
+separately-named feature, never as a backfill for absent data.
 
 ### Statistics fold live and emit at end of run
 
-A streaming accumulator folds Records as they are polled, producing per-generation
-collections, collected, uncollectable, Coverage, and — where the build has timing — pause
-total, mean and percentiles with their scale factor. Absent fields are omitted from the
-output rather than defaulted.
+A streaming accumulator folds Records as they are polled, producing per-generation collections,
+collected, uncollectable, Coverage, and, where the build has timing, pause total and mean with
+their scale factor. Absent fields are omitted rather than defaulted.
 
-Emitted at end of run as a human-readable table or as JSON, selected by flag. **The
-replay-from-file path is not built here**: reconstructing this from a written trace is what
-the pyperf hook needs, and it arrives with the JSONL exporter in a later increment. The
-accumulator is designed to be fed from either source, which is the only concession made to
-that future.
+The table shipped behind `--summary`. **Percentiles and the JSON form have not**, and neither
+has the replay-from-file path: reconstructing this from a written trace is what the pyperf hook
+needs, and it arrives with the JSONL exporter. The accumulator takes a stream of Records from
+either source, which is the only concession made to that future.
 
 ## 5. Seams and testing decisions
 

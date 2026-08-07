@@ -3,10 +3,10 @@
 //! Read from the poll-time accumulator in [`super::cursor`], never from the written trace, so
 //! a replayed stream of Records gives the same figures.
 //!
-//! Counts and pause totals are what ran, reconstructed from CPython's own cumulative counters
-//! by [`super::loss`], and stay exact however many Records a poll missed. Coverage is the share
-//! of them gcscope has a Record for, and it is what says whether a figure derived from the
-//! Records themselves describes the run or a biased sample of it.
+//! Counts and pause totals are what ran: [`super::loss`] reconstructs them from CPython's own
+//! cumulative counters, so they stay exact however many Records a poll missed. Coverage is the
+//! share gcscope holds a Record for, and says whether a figure derived from those Records
+//! describes the run or a biased sample of it.
 
 use crate::monitor::cursor::Cursor;
 use crate::monitor::loss::account;
@@ -15,36 +15,34 @@ use crate::monitor::loss::account;
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerationSummary {
     pub generation: u32,
-    /// Collections that ran over the span, from the target's counter rather than from the
-    /// Records read: exact under any amount of Loss.
+    /// Collections that ran over the span, from the target's counter rather than the Records
+    /// read: exact under any amount of Loss.
     pub collections: i64,
     /// Objects collected across the span. Never counts the opening Record: CPython publishes a
     /// running total, and the total before it was never read.
     pub collected: i64,
     /// Uncollectable objects across the span, on the same basis as `collected`.
     pub uncollectable: i64,
-    /// Records read. Below `collections` where Entries were overwritten between polls.
-    ///
-    /// Not the same quantity as [`observed`](Self::observed) on the counter-only tier: a
-    /// Record there is a snapshot of running totals, so reading two of them witnesses no
-    /// Collection at all.
+    /// Records read. Below `collections` where Entries were overwritten between polls, and a
+    /// different quantity from [`observed`](Self::observed) on the counter-only tier, where two
+    /// snapshots witness no Collection between them.
     pub records: u64,
-    /// Collections a Record was read for. `collections` is this plus [`lost`](Self::lost),
-    /// which is the identity an auditor checks the reconstruction against.
+    /// Collections a Record was read for. `collections` is this plus [`lost`](Self::lost), the
+    /// identity an auditor checks the reconstruction against.
     pub observed: i64,
-    /// Collections no Record was read for. Overwritten unread on the ring tier; every
+    /// Collections no Record was read for. Overwritten unread on the ring tier, and every
     /// Collection in the span on the counter-only tier, where nothing describes one.
     pub lost: i64,
     /// The share of `collections` a Record was read for, in `[0, 1]`. Zero on a build whose
-    /// Entries describe no single Collection.
+    /// Entries describe no Collection.
     pub coverage: f64,
-    /// Pause over the span, from the target's cumulative accumulator. `None` where the Entry
-    /// layout carries no timestamps: absent, never zero (ADR 0017).
+    /// Pause over the span, from the target's cumulative accumulator. `None` where the layout
+    /// carries no `duration`: absent, never zero (ADR 0017).
     pub pause_total_ns: Option<i64>,
-    /// Pause summed over the Records read, which is as much of the total as gcscope watched.
+    /// Pause summed over the Records read: as much of the total as gcscope watched.
     pub pause_measured_ns: Option<i64>,
-    /// The multiplier taking a measured figure to its exact counterpart. Applies to a figure
-    /// that partitions the pause, never to a percentile — see [`super::loss::LossAccount`].
+    /// The multiplier taking a measured figure to its exact counterpart. For figures that
+    /// partition the pause, never for a percentile. See [`super::loss::LossAccount`].
     pub scale_factor: Option<f64>,
 }
 
@@ -74,9 +72,9 @@ impl InterpreterSummary {
     /// Whether this build bounds its Collections with timestamps. One answer per interpreter:
     /// its generations share a build.
     ///
-    /// Read off the measured figure rather than the exact one, which a build can be timed
-    /// without publishing. Keying on the exact figure would drop `records` and `coverage` from
-    /// such a build's table over a pause it cannot reconstruct.
+    /// Read off the measured figure, not the exact one, which a timed build can lack. Keying on
+    /// the exact figure would drop `records` and `coverage` from such a build's table over a
+    /// pause it cannot reconstruct.
     pub fn has_timing(&self) -> bool {
         self.generations
             .iter()
@@ -89,7 +87,7 @@ impl InterpreterSummary {
 /// They arrive ordered, so this walks them once and starts a block where the process or
 /// interpreter changes.
 ///
-/// The counts and the pause come from [`super::loss::account`]; what is left here is the two
+/// The counts and the pause come from [`super::loss::account`]. What is left here is the two
 /// Lifetime totals it does not carry, and the grouping.
 pub fn summarize(cursor: &Cursor) -> Vec<InterpreterSummary> {
     let mut blocks: Vec<InterpreterSummary> = Vec::new();
@@ -146,7 +144,7 @@ pub fn summarize(cursor: &Cursor) -> Vec<InterpreterSummary> {
 /// Each block names the process and interpreter it covers, so no figure reads as a tree-wide
 /// total. Its column set follows the tier: a build with no timing shows no pause, and no
 /// `records` either, since a counter snapshot is not a Collection to compare a count against.
-/// Coverage appears on both, being the figure that says which of those a reader is looking at.
+/// Coverage appears on both, being what says which of the two a reader is looking at.
 pub fn render(summary: &[InterpreterSummary]) -> Vec<String> {
     if summary.is_empty() {
         return vec!["No GC collections were observed.".to_string()];
@@ -173,8 +171,7 @@ pub fn render(summary: &[InterpreterSummary]) -> Vec<String> {
     lines
 }
 
-/// The columns a tier shows, each with the width its heading and its figures share. One list,
-/// so a column cannot reach the header without reaching the rows under it.
+/// The columns a tier shows, each with the width its heading and its figures share.
 fn columns(timed: bool) -> Vec<(&'static str, usize)> {
     let mut columns = vec![
         ("gen", 3),
@@ -225,9 +222,9 @@ fn format_row(g: &GenerationSummary, timed: bool) -> String {
 /// Right-align each cell under its column.
 fn lay_out(cells: &[String], timed: bool) -> String {
     let columns = columns(timed);
-    // `zip` yields the shorter of the two, so a column added to one side and not the other
-    // would slide every figure past it one heading to the left, under a rule still cut to the
-    // header's width. Nothing about the output would look wrong.
+    // `zip` yields the shorter side, so a column added to one and not the other slides every
+    // figure past it one heading left, under a rule still cut to the header's width. Nothing
+    // about the output would look wrong.
     debug_assert_eq!(cells.len(), columns.len(), "a column lost its cell");
     columns
         .iter()
@@ -255,8 +252,8 @@ mod tests {
     use crate::remote_debugging::offsets::offset_table::{GcItemLayout, seq_layout};
     use std::sync::LazyLock;
 
-    /// A build that bounds each Collection with timestamps, so its Records carry a pause, and
-    /// keeps the generation's cumulative pause total beside them.
+    /// A build that bounds each Collection with timestamps and keeps the generation's
+    /// cumulative pause total beside them.
     static TIMED: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
         seq_layout(&[
             "ts_start",
@@ -298,8 +295,8 @@ mod tests {
         )
     }
 
-    /// A timed Record from generation 0 of interpreter 0, carrying the generation's running
-    /// pause total. What the exact figures are reconstructed from.
+    /// A timed Record from generation 0 of interpreter 0, carrying the running pause total the
+    /// exact figures are reconstructed from.
     fn with_duration(
         collections: i64,
         ts_start: i64,
@@ -400,9 +397,8 @@ mod tests {
         assert_eq!(gen0.records, 3, "nothing was lost, so the two agree");
     }
 
-    /// The headline of the whole surface. A ring that ran 100 Collections while two polls
-    /// caught two of them reports 100, and Coverage is what says how much of that was watched
-    /// rather than counted.
+    /// The headline of the surface. A ring that ran 100 Collections while two polls caught two
+    /// reports 100, with Coverage saying how much of that was watched rather than counted.
     #[test]
     fn the_counts_are_what_ran_not_what_was_read() {
         let summary = run(&[
@@ -417,8 +413,8 @@ mod tests {
         assert!((gen0.coverage - 0.02).abs() < 1e-12, "{}", gen0.coverage);
     }
 
-    /// Nothing an inline build publishes describes a single Collection, so its counts stand
-    /// alone with no distribution behind them and Coverage says so (ADR 0017).
+    /// Nothing an inline build publishes describes a Collection, so its counts stand alone
+    /// with no distribution behind them and Coverage says so (ADR 0017).
     #[test]
     fn the_counter_only_tier_reports_zero_coverage() {
         let summary = run(&[
@@ -436,9 +432,8 @@ mod tests {
         assert_eq!(gen0.observed, 0);
     }
 
-    /// What ran is what was read plus what was lost, on both tiers. Spec 0011's story 19: the
-    /// reconstruction is auditable against CPython's own counters, and the JSON form publishes
-    /// the three figures that make it so.
+    /// What ran is what was read plus what was lost, on both tiers. Spec 0011's story 19, and
+    /// the three figures the JSON form publishes to make it checkable.
     #[test]
     fn the_counts_reconcile_on_both_tiers() {
         let summary = run(&[
@@ -463,8 +458,8 @@ mod tests {
         }
     }
 
-    /// The pause is the target's own cumulative figure over the span, not the share of it the
-    /// polls caught. Under Loss the two differ by the pause of everything overwritten.
+    /// The pause is the target's own cumulative figure over the span, not the share the polls
+    /// caught. Under Loss the two differ by the pause of everything overwritten.
     #[test]
     fn the_pause_total_is_the_targets_figure_not_the_sum_of_what_was_read() {
         let summary = run(&[
@@ -481,10 +476,9 @@ mod tests {
         assert_eq!(gen0.pause_mean_ns(), Some(5_000.0));
     }
 
-    /// A build can bound its Collections without publishing the cumulative total the exact
-    /// pause is differenced from. Its rows keep the columns describing what was read and leave
-    /// the pause blank, rather than losing `records` and `coverage` over a figure it cannot
-    /// reconstruct.
+    /// A build can bound its Collections without publishing the total the exact pause is
+    /// differenced from. Its rows keep the columns describing what was read and leave the pause
+    /// blank, rather than losing `records` and `coverage` over a figure it cannot reconstruct.
     #[test]
     fn a_build_that_prices_no_pause_total_keeps_the_columns_it_can_fill() {
         static UNPRICED: LazyLock<&'static GcItemLayout> =
@@ -722,9 +716,9 @@ mod tests {
         assert!(header.contains("records"), "{header}");
     }
 
-    /// The figures reach the table intact and under the right headings. Splitting on
-    /// whitespace pins the column contents, as the `gc-stats` table's own test does. Four
-    /// Collections ran while two Records were read, so the row carries Loss too.
+    /// The figures reach the table intact and under the right headings, pinned by splitting on
+    /// whitespace as the `gc-stats` table's own test does. Four Collections ran against two
+    /// Records read, so the row carries Loss too.
     #[test]
     fn a_row_carries_its_generations_figures_in_column_order() {
         let summary = run(&[

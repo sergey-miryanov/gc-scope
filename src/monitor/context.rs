@@ -361,9 +361,9 @@ mod tests {
         assert_eq!(generations[1].pause_total_ns, Some(1_000));
     }
 
-    /// Loss reaches the summary through the same seam the exporter is fed from: an interpreter
-    /// that collected a hundred times between two polls reports a hundred, not the two Records
-    /// those polls caught, and Coverage says how much of it was watched.
+    /// Loss reaches the summary through the seam the exporter is fed from: an interpreter that
+    /// collected a hundred times between two polls reports a hundred, not the two Records those
+    /// polls caught.
     #[test]
     fn the_summary_reconstructs_the_collections_the_polls_could_not_read() {
         let mut exporter = ChromeTraceExporter::new();
