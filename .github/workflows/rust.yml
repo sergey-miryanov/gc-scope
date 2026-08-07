@@ -504,10 +504,12 @@ jobs:
         # instead of publishing 0.
         #
         # 3.13 has no such field to check, which leaves `offsets_ok` as the only thing holding
-        # `offsetof(PyInterpreterState, gc)` up there — and it sits behind a Python call no
-        # out-of-process reader can make, so the build step below asserts it rather than the
-        # test. Ticket 06 publishes it in the region header and moves the check to where it
-        # belongs.
+        # `offsetof(PyInterpreterState, gc)` up there. The header's capability word carries it
+        # now, so `tests/probe.rs` asserts it from outside the process on both minors.
+        #
+        # The 3.14 entry is also the only one that can fail the `heap_size` check on purpose:
+        # `probe_reports_a_suppressed_heap_size` displaces the offset and asserts the Probe
+        # suppresses the field, and there is nothing to displace on 3.13, where it skips.
         python: ['3.13', '3.14']
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -583,16 +585,20 @@ jobs:
           GCSCOPE_TEST_PYTHON="$(python -c 'import sys; print(sys.executable)')"
           export GCSCOPE_TEST_PYTHON
           echo "interpreter: $GCSCOPE_TEST_PYTHON"
-          # The self-check, which nothing outside the process can read yet. It compares
-          # `gcstate->collecting` against the 1 it must be inside a gc callback, so it validates
-          # `offsetof(PyInterpreterState, gc)` and `collecting` together. On 3.14 a wrong `gc`
-          # offset also drags `heap_size` down and the test below catches it; on 3.13 there is no
-          # `heap_size` to catch it with, and this is the only check standing. Ticket 06 moves it
-          # into the region header, where the test can own it.
+          # The self-check, in process. `tests/probe.rs` now asserts the same fact from the
+          # region header's capability word, which is where a real consumer reads it; this stays
+          # because it needs no attach. A leg whose ptrace or taskport permissions are wrong
+          # fails every test below for that reason and would leave the offsets unexamined,
+          # whereas this says plainly which of the two happened.
           #
-          # It reads 0 until a Collection has run with the callback installed, so this installs
-          # and collects rather than calling geometry() straight after import. `-P` keeps the
-          # checkout off sys.path, where the source directory `gcscope_probe/` would otherwise
+          # It compares `gcstate->collecting` against the 1 it must be inside a gc callback, so it
+          # validates `offsetof(PyInterpreterState, gc)` and `collecting` together. `heap_size`
+          # answers separately, through the causal check in `gcscope_probe_validate_heap_size`,
+          # and reports separately in the same word.
+          #
+          # `offsets_ok` reads 0 until a Collection has run with the callback installed, so this
+          # installs and collects rather than calling geometry() straight after import. `-P` keeps
+          # the checkout off sys.path, where the source directory `gcscope_probe/` would otherwise
           # be a candidate for the import.
           "$GCSCOPE_TEST_PYTHON" -P - <<'PY'
           import gc, gcscope_probe

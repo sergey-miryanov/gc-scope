@@ -33,7 +33,7 @@ The behaviour otherwise matches the prototype that proved the approach works
 | Today | Becomes | Where |
 |---|---|---|
 | Counters starting at zero on install | Seeded from CPython's own, so they stay Lifetime totals | spec 0013 §4 |
-| `heap_size` 0 meaning absent, failed and empty alike | A capability word that tells the three apart | spec 0013 §4 |
+| `layout_digest` empty | Filled from the generated layout header | spec 0012 |
 | Read by an integration test | Discovered and validated by gcscope | spec 0014 |
 | Built from source | Wheels | spec 0015 |
 
@@ -56,9 +56,39 @@ first two are testable from an interpreter that loads. The third is decided at c
 has no version word to take.
 
 **`heap_size` is absent on 3.13**, not zero: the field arrived with 3.14's collector rework, and
-3.13's `_gc_runtime_state` ends before it. The Probe reads nothing there and publishes 0, which
-a reader cannot yet tell from a failed self-check or an empty heap. Spec 0013 §4's capability
-word separates the three.
+3.13's `_gc_runtime_state` ends before it. The Probe reads nothing there and publishes 0.
+
+## What the capability word says
+
+Every field a Probe cannot fill publishes 0, and so does a field that is genuinely 0, and so
+does a field whose offset turned out to be wrong. The header's `capabilities` separates them.
+It is fail-closed — a set bit is a claim — so a reader finding it zero concludes nothing is
+meaningful rather than that everything is.
+
+| Bit | Set when |
+|---|---|
+| `OFFSETS_OK` | `gcstate->collecting` read 1 inside a callback, where it must be. Clear until the first Collection. |
+| `HEAP_SIZE_PRESENT` | This interpreter's `_gc_runtime_state` has the field at all. Clear on 3.13. |
+| `HEAP_SIZE_VALID` | ...and the check below reached it. Present without this is a field the Probe suppressed. |
+| `CANDIDATES_VALID` | Never. `deduce_unreachable()` is `static inline` and the count is reachable nowhere else. |
+| `COUNTERS_SEEDED` | `collections`, `collected` and `uncollectable` are Lifetime totals rather than counts since install. Spec 0013 §4. |
+
+`duration` has no bit because it could never earn one: CPython never recorded it, so there is
+nothing to seed from and it stays Install-relative on every build. That is the trap the word
+exists for — a Lifetime-total `collections` and an Install-relative `duration` sit in the same
+64-byte entry, and dividing one by the other is silently wrong.
+
+**`heap_size` is checked causally, not for plausibility.** The Probe allocates 1024 tracked
+objects at import, watches the field rise by at least that many, drops them, and watches it fall
+by at least that many. A one-sided rise is also what `generations[0].count` does; nothing else
+in the struct does both. This is a separate answer from `OFFSETS_OK`, which validates
+`offsetof(PyInterpreterState, gc)` and `collecting` against *each other* and so passes a
+`heap_size` that moved on its own — as it would have between 3.14.4 and 3.14.5, where
+`sizeof(_gc_runtime_state)` moved 24 bytes.
+
+A failed check suppresses the field rather than publishing what it found.
+`_fault_heap_size_offset` exists to execute that path: it displaces the offset so
+`probe_reports_a_suppressed_heap_size` can read the consequences out of the process.
 
 ## Install
 
@@ -105,8 +135,8 @@ gcscope_probe.install()   # appends on_gc to gc.callbacks
 ```
 
 Then attach gcscope. The exported `gcscope_probe_header` publishes the region address, item
-size, Ring depths, slot layout, host version and which collector this interpreter runs, so
-nothing passes out of band.
+size, Ring depths, slot layout, host version, which collector this interpreter runs, and which
+fields mean anything, so nothing passes out of band.
 
 ## Verify
 

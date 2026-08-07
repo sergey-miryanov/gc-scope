@@ -55,6 +55,48 @@
 #define GCSCOPE_PROBE_COLLECTOR_INCREMENTAL  0
 #define GCSCOPE_PROBE_COLLECTOR_GENERATIONAL 1
 
+/* ---- the capability word ------------------------------------------------ */
+
+/* Which of the Ring's fields this build and this run stand behind.
+ *
+ * Every field a Probe cannot fill publishes 0, and so does a field that is genuinely 0, and so
+ * does a field whose offset turned out to be wrong. A reader outside the process sees one number
+ * for three conditions it has to act differently on. This word separates them, and it is
+ * FAIL-CLOSED: a set bit is a claim, so a reader finding the word zero concludes nothing is
+ * meaningful rather than that everything is.
+ *
+ * Published in the header, updated in place as checks complete, so the answer travels with the
+ * region rather than behind a Python call no remote reader can make (spec 0013 section 4). */
+
+/* The self-check on `gcstate->collecting` passed, so `offsetof(PyInterpreterState, gc)` and
+ * `collecting` are right for the interpreter this loaded into. Clear until the first Collection
+ * runs with the callback installed -- unknown reads the same as failed, by design. */
+#define GCSCOPE_PROBE_CAP_OFFSETS_OK        (1u << 0)
+
+/* This interpreter's `_gc_runtime_state` HAS a `heap_size` field. Compile-time: 3.13's struct
+ * ends before it. Clear means absent, not empty. */
+#define GCSCOPE_PROBE_CAP_HEAP_SIZE_PRESENT (1u << 1)
+
+/* ...and `gcscope_probe_validate_heap_size` confirmed the offset reaches it. Present without
+ * this is a field the Probe deliberately suppressed; both set is the only case where a 0 in the
+ * Ring means an empty heap. */
+#define GCSCOPE_PROBE_CAP_HEAP_SIZE_VALID   (1u << 2)
+
+/* `candidates` carries the count of objects a Collection examined. Never set on any version the
+ * Probe supports: `deduce_unreachable()` is `static inline` and CPython exposes the number
+ * nowhere else, so the field is 0 because nothing could fill it. */
+#define GCSCOPE_PROBE_CAP_CANDIDATES_VALID  (1u << 3)
+
+/* `collections`, `collected` and `uncollectable` were seeded from CPython's own
+ * `generation_stats` at install, making them Lifetime totals rather than counts since the Probe
+ * loaded. Ticket 07 of spec 0013 sets this; until then they are Install-relative.
+ *
+ * `duration` has no such bit because it can never earn one -- CPython never recorded it, so
+ * there is nothing to seed from and it stays Install-relative on every build. That is the trap
+ * this word exists for: a Lifetime-total `collections` and an Install-relative `duration` sit in
+ * the same 64-byte entry, and dividing one by the other is silently wrong. */
+#define GCSCOPE_PROBE_CAP_COUNTERS_SEEDED   (1u << 4)
+
 /* ---- 3.15 region layout, reproduced exactly ----------------------------- */
 
 /* Ring depths. Defaults match 3.15 exactly (GIL build; free-threaded is 1/1), so the region
@@ -169,10 +211,23 @@ GCSCOPE_PROBE_EXPORT struct gcscope_probe_header_t {
     uint32_t old_entries;          /* GC_OLD_STATS_SIZE */
     uint32_t py_version;           /* Py_Version of the host, e.g. 0x030E0500 */
     uint32_t collector;            /* GCSCOPE_PROBE_COLLECTOR_* -- what Ring index 1 MEANS */
+    /* GCSCOPE_PROBE_CAP_* -- which fields mean anything. The one field written after init: the
+     * offset self-check can only run inside a Collection. `_Atomic` for that store and for the
+     * unsynchronised read on the far side of a process boundary; it changes no layout, as the
+     * `Py_BUILD_ASSERT` in `PyInit_gcscope_probe` holds. */
+    _Atomic uint32_t capabilities;
+    /* Which registered Ring shape this implements: `gen-offsets.py`'s 12-hex `stats` digest,
+     * NUL-padded, ASCII so a hexdump reads it (same reasoning as `magic`). All-NUL until ticket
+     * 09 of spec 0013 fills it from the generated header.
+     *
+     * Sizes cannot carry this. A field moving WITHIN the 64-byte entry leaves `item_size`,
+     * `region_size` and both entry counts identical, and a reader decoding by the old layout gets
+     * every number from the wrong place with nothing to notice. */
+    char layout_digest[16];
 } gcscope_probe_header = {
     {'G', 'C', 'P', 'R', 'B', '0', '1', '5'},
     0,                              /* header_size  -- set in PyInit_gcscope_probe */
-    3,
+    4,
     0,                              /* slots_addr   -- set in PyInit_gcscope_probe */
     GCSCOPE_PROBE_MAX_INTERP,
     (uint32_t)sizeof(gcscope_probe_slot),
@@ -182,8 +237,10 @@ GCSCOPE_PROBE_EXPORT struct gcscope_probe_header_t {
     (uint32_t)sizeof(struct gcscope_probe_generation_stats),
     (uint32_t)sizeof(struct gcscope_probe_stats),
     GC_YOUNG_STATS_SIZE, GC_OLD_STATS_SIZE,
-    0,                              /* py_version -- set in PyInit_gcscope_probe */
-    0                               /* collector  -- set in PyInit_gcscope_probe */
+    0,                              /* py_version   -- set in PyInit_gcscope_probe */
+    0,                              /* collector    -- set in PyInit_gcscope_probe */
+    0,                              /* capabilities -- published as each check answers */
+    {0}                             /* layout_digest -- ticket 09 */
 };
 
 static gcscope_probe_slot *
@@ -302,12 +359,43 @@ gcscope_probe_add_stats(struct gcscope_probe_stats *s, int gen,
  * field moved out from under them within the minor (ADR 0013). */
 
 /* Set to 1 once the offsets have been confirmed against a live collection; -1 if the
- * self-check failed, in which case heap_size reports 0 rather than garbage.
- *
- * Reachable only through `geometry()`, which an out-of-process reader cannot call, so a
- * failed self-check looks like success to the one consumer that matters. It moves into the
- * header's capability word in spec 0013 §4. */
+ * self-check failed, in which case heap_size reports 0 rather than garbage. Published in the
+ * header's capability word, so an out-of-process reader can tell the two apart. */
 static int gcscope_probe_offsets_ok = 0;
+
+/* Set to 1 once `heap_size` has answered the causal check below; -1 if it did not. A separate
+ * fact from `gcscope_probe_offsets_ok`: the check on `collecting` validates two offsets jointly
+ * and a `heap_size`-only move sails through it (spec 0013 section 4). */
+static int gcscope_probe_heap_size_ok = 0;
+
+/* Bytes added to `gcscope_probe_gc_heap_size_off` before reading. Zero in every real use; the
+ * `_fault_heap_size_offset` hook sets it so the suppression path can be executed rather than
+ * merely written. See that function. */
+static ptrdiff_t gcscope_probe_heap_size_fault = 0;
+
+/* Everything the capability word says, recomputed from the checks that have answered so far and
+ * stored in one go. Computed rather than OR-ed into the published value: a read-modify-write
+ * would need the header's word to be the state, and the state lives in the statics above.
+ *
+ * Called at import and again from the first Collection, which is when the offset self-check
+ * answers. A remote reader polls the word and sees bits appear; none is ever withdrawn. */
+static void
+gcscope_probe_publish_capabilities(void)
+{
+    uint32_t caps = 0;
+    if (gcscope_probe_offsets_ok == 1) {
+        caps |= GCSCOPE_PROBE_CAP_OFFSETS_OK;
+    }
+    if (gcscope_probe_has_heap_size) {
+        caps |= GCSCOPE_PROBE_CAP_HEAP_SIZE_PRESENT;
+    }
+    if (gcscope_probe_heap_size_ok == 1) {
+        caps |= GCSCOPE_PROBE_CAP_HEAP_SIZE_VALID;
+    }
+    /* GCSCOPE_PROBE_CAP_CANDIDATES_VALID is never set -- see its declaration.
+     * GCSCOPE_PROBE_CAP_COUNTERS_SEEDED waits for ticket 07. */
+    atomic_store_explicit(&gcscope_probe_header.capabilities, caps, memory_order_release);
+}
 
 static char *
 gcscope_probe_gcstate(void)
@@ -324,8 +412,9 @@ gcscope_probe_gcstate(void)
  * it doesn't read 1, `gcscope_probe_interp_gc_off` is wrong for the interpreter this module
  * was loaded INTO rather than built against, and every other offset-derived read is garbage.
  *
- * This validates the `gc` and `collecting` offsets JOINTLY, so a heap_size-only move passes
- * it and then publishes plausible garbage. Spec 0013 §4 gives heap_size its own check. */
+ * This validates the `gc` and `collecting` offsets JOINTLY, so a heap_size-only move passes it.
+ * `gcscope_probe_validate_heap_size` is that field's own check; the two answer separately and
+ * report separately in the capability word. */
 static void
 gcscope_probe_check_offsets(void)
 {
@@ -338,27 +427,111 @@ gcscope_probe_check_offsets(void)
     }
     int collecting = *(int *)(gcstate + gcscope_probe_gc_collecting_off);
     gcscope_probe_offsets_ok = (collecting == 1) ? 1 : -1;
+    gcscope_probe_publish_capabilities();
+}
+
+/* `heap_size` read with no gate on it, for the validation below and for nothing else. */
+static Py_ssize_t
+gcscope_probe_read_heap_size(char *gcstate)
+{
+    return *(Py_ssize_t *)(gcstate + gcscope_probe_gc_heap_size_off
+                           + gcscope_probe_heap_size_fault);
+}
+
+/* How many tracked objects the check below allocates and drops. Large enough that no other
+ * member of `_gc_runtime_state` moves by it -- the counters near `heap_size` are near-zero and
+ * the pointers beside it do not move at all -- and small enough that a module import pays about
+ * a hundred microseconds for it. */
+#define GCSCOPE_PROBE_HEAP_CHECK_OBJECTS 1024
+
+/* Does `gcscope_probe_gc_heap_size_off` reach the count of tracked objects? Answered by
+ * changing that count and watching, rather than by asking whether what sits there looks
+ * plausible.
+ *
+ * The check on `collecting` cannot cover this. It validates `offsetof(PyInterpreterState, gc)`
+ * and `collecting` against each other, so a `heap_size` that moved on its own -- as it did
+ * between 3.14.4 and 3.14.5, where `sizeof(_gc_runtime_state)` went 240 -> 264 -- passes it and
+ * publishes a full table of plausible numbers (spec 0013 section 4).
+ *
+ * Two-sided on purpose. A one-sided rise is also what `generations[0].count` does, being the
+ * allocation counter the collector triggers on; it does not come back down when the objects are
+ * dropped. Everything else nearby is a pointer or a near-zero counter, which does neither.
+ *
+ * Bounds rather than an exact delta: another thread can allocate across this, so the count may
+ * rise by more than we asked for. Nothing legitimate makes it rise by LESS.
+ *
+ * Empty lists because a list is GC-tracked from the moment it is created, with no deferred
+ * tracking to wait on. Collection is disabled across the measurement so the interpreter does not
+ * untrack somebody else's garbage in the middle of it. */
+static void
+gcscope_probe_validate_heap_size(void)
+{
+    if (!gcscope_probe_has_heap_size) {
+        return;                     /* nothing to validate; the field is absent (3.13) */
+    }
+    char *gcstate = gcscope_probe_gcstate();
+    if (gcstate == NULL) {
+        return;                     /* no interpreter to ask; leave the answer unknown */
+    }
+    PyObject *keep = PyList_New(0);
+    if (keep == NULL) {
+        PyErr_Clear();
+        return;
+    }
+
+    int was_enabled = PyGC_Disable();
+    Py_ssize_t before = gcscope_probe_read_heap_size(gcstate);
+    Py_ssize_t made = 0;
+    for (Py_ssize_t i = 0; i < GCSCOPE_PROBE_HEAP_CHECK_OBJECTS; i++) {
+        PyObject *o = PyList_New(0);
+        if (o == NULL || PyList_Append(keep, o) < 0) {
+            Py_XDECREF(o);
+            break;
+        }
+        Py_DECREF(o);
+        made++;
+    }
+    Py_ssize_t grown = gcscope_probe_read_heap_size(gcstate);
+    /* Clearing the list drops the last reference to each, and a list is reclaimed by refcount
+     * without the collector, which is disabled here. */
+    if (PyList_SetSlice(keep, 0, PyList_GET_SIZE(keep), NULL) < 0) {
+        made = 0;                   /* the objects are still alive; the fall proves nothing */
+    }
+    Py_ssize_t shrunk = gcscope_probe_read_heap_size(gcstate);
+    if (was_enabled) {
+        PyGC_Enable();
+    }
+    Py_DECREF(keep);
+    if (PyErr_Occurred()) {
+        PyErr_Clear();
+    }
+
+    if (made < GCSCOPE_PROBE_HEAP_CHECK_OBJECTS) {
+        return;                     /* the experiment did not run; unknown, not failed */
+    }
+    gcscope_probe_heap_size_ok =
+        (grown - before >= made && grown - shrunk >= made) ? 1 : -1;
 }
 
 static Py_ssize_t
 gcscope_probe_heap_size(void)
 {
-    /* On 3.13 there is no field to read. The offset would land on `trash_delete_later` at the
-     * top of the struct, which is exactly the plausible garbage this whole mechanism exists to
-     * avoid publishing. 0 is all there is to say until ticket 06's capability word lets a reader
-     * tell absent from failed from genuinely empty. */
-    if (!gcscope_probe_has_heap_size) {
-        return 0;
-    }
-    /* GIL builds only; PyInit refuses a free-threaded one, where nothing maintains heap_size. */
-    if (gcscope_probe_offsets_ok != 1) {
+    /* Absent on 3.13, where the offset would land on `trash_delete_later` at the top of the
+     * struct; unvalidated when the check above did not answer or answered no. Either way the
+     * Ring gets 0 and the header's capability word says which, so a reader is never left
+     * calling any of the three an empty heap.
+     *
+     * Gated on the heap_size check alone rather than on `gcscope_probe_offsets_ok` too: that
+     * check reads through the same `interp->gc` this does, causally, so a pass here already
+     * covers what the other one would add. */
+    if (gcscope_probe_heap_size_ok != 1) {
         return 0;
     }
     char *gcstate = gcscope_probe_gcstate();
     if (gcstate == NULL) {
         return 0;
     }
-    return *(Py_ssize_t *)(gcstate + gcscope_probe_gc_heap_size_off);
+    return gcscope_probe_read_heap_size(gcstate);
 }
 
 /* ---- the gc.callbacks entry point --------------------------------------- */
@@ -622,7 +795,7 @@ gcscope_probe_geometry(PyObject *self, PyObject *noargs)
 {
     (void)self; (void)noargs;
     return Py_BuildValue(
-        "{sksIsIsIsIsIsIsIsn}",
+        "{sksIsIsIsIsIsIsIsIsn}",
         "header_addr",     (unsigned long long)(uintptr_t)&gcscope_probe_header,
         "item_size",       (unsigned int)sizeof(struct gcscope_probe_generation_stats),
         "region_size",     (unsigned int)sizeof(struct gcscope_probe_stats),
@@ -631,7 +804,44 @@ gcscope_probe_geometry(PyObject *self, PyObject *noargs)
         "young_index_off", (unsigned int)offsetof(struct gcscope_probe_stats, young.index),
         "old0_off",        (unsigned int)offsetof(struct gcscope_probe_stats, old),
         "offsets_ok",      (unsigned int)(gcscope_probe_offsets_ok == 1),
+        /* The same word the header publishes. A reader takes it from the region; this is for a
+         * build step or a human standing in the process. */
+        "capabilities",    (unsigned int)atomic_load_explicit(
+                               &gcscope_probe_header.capabilities, memory_order_acquire),
         "heap_size",       gcscope_probe_heap_size());
+}
+
+/* Point the `heap_size` read `delta` bytes off, re-run its check, and hand back the capability
+ * word that resulted. Private, and the only way to reach the suppression path.
+ *
+ * Error handling that cannot be executed is error handling nobody has tested. The check this
+ * re-runs is causal, so on a healthy interpreter there is no input that fails it -- the only way
+ * to see the Probe suppress a field is to make the field wrong, which is what this does.
+ * `tests/probe.rs` then reads the consequences out of the process, which is where a reader would.
+ *
+ * `delta` is bounded and 8-aligned so the displaced read stays inside `_gc_runtime_state` and
+ * stays aligned; a misaligned `Py_ssize_t` load is undefined on the architectures this builds
+ * for, and would be a crash rather than the wrong answer this is asking for. */
+static PyObject *
+gcscope_probe_fault_heap_size_offset(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    long delta = PyLong_AsLong(arg);
+    if (delta == -1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    if (delta % (long)sizeof(Py_ssize_t) != 0 || delta < -64 || delta > 64) {
+        PyErr_Format(PyExc_ValueError,
+                     "heap_size offset fault must be a multiple of %zu within [-64, 64], not %ld",
+                     sizeof(Py_ssize_t), delta);
+        return NULL;
+    }
+    gcscope_probe_heap_size_fault = (ptrdiff_t)delta;
+    gcscope_probe_heap_size_ok = 0;
+    gcscope_probe_validate_heap_size();
+    gcscope_probe_publish_capabilities();
+    return PyLong_FromUnsignedLong(
+        atomic_load_explicit(&gcscope_probe_header.capabilities, memory_order_acquire));
 }
 
 static PyObject *
@@ -652,6 +862,8 @@ static PyMethodDef gcscope_probe_methods[] = {
     {"records",     gcscope_probe_records,     METH_NOARGS, "count of Records published"},
     {"version_refusal", gcscope_probe_version_refusal_py, METH_O,
      "why a PY_VERSION_HEX word would be refused at import, or None if it would load"},
+    {"_fault_heap_size_offset", gcscope_probe_fault_heap_size_offset, METH_O,
+     "displace the heap_size offset and re-run its check; returns the new capability word"},
     {NULL, NULL, 0, NULL}
 };
 
@@ -695,6 +907,19 @@ PyInit_gcscope_probe(void)
     Py_BUILD_ASSERT(offsetof(struct gcscope_probe_stats, old) == GCSCOPE_PROBE_YOUNG_BYTES);
     Py_BUILD_ASSERT(sizeof(struct gcscope_probe_stats)
                     == GCSCOPE_PROBE_YOUNG_BYTES + 2 * GCSCOPE_PROBE_OLD_BYTES);
+
+    /* The header's own layout. A reader decodes it by fixed offset -- there is nothing in the
+     * region to describe the thing that describes the region -- so a field inserted rather than
+     * appended shifts every later one and hands that reader another field's bytes with the
+     * version still reading 4. These pin the two fields version 4 added and the size the reader
+     * bounds against.
+     *
+     * The `_Atomic` on `capabilities` has to be free, or the qualifier alone would move
+     * `layout_digest` and change `header_size` on some ABI while every other assert held. */
+    Py_BUILD_ASSERT(sizeof(_Atomic uint32_t) == sizeof(uint32_t));
+    Py_BUILD_ASSERT(offsetof(struct gcscope_probe_header_t, capabilities) == 68);
+    Py_BUILD_ASSERT(offsetof(struct gcscope_probe_header_t, layout_digest) == 72);
+    Py_BUILD_ASSERT(sizeof(struct gcscope_probe_header_t) == 88);
 
     /* Free-threaded gate. `_gc_runtime_state.heap_size` exists in a Py_GIL_DISABLED build and
      * nothing writes it: `Python/gc_free_threading.c` never names the field, while the GIL
@@ -740,6 +965,13 @@ PyInit_gcscope_probe(void)
     gcscope_probe_header.slots_addr  = (uint64_t)(uintptr_t)&gcscope_probe_slots[0];
     gcscope_probe_header.py_version  = (uint32_t)ver;
     gcscope_probe_header.collector   = gcscope_probe_collector_for(ver);
+
+    /* Before the first Record rather than during it. The offset self-check has to wait for a
+     * Collection to be inside; this one only needs an interpreter to allocate in, so `heap_size`
+     * is gated from the very first entry the Ring carries and a reader attaching immediately
+     * finds an answer rather than an unknown. */
+    gcscope_probe_validate_heap_size();
+    gcscope_probe_publish_capabilities();
 
     return PyModule_Create(&gcscope_probe_module);
 }

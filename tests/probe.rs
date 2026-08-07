@@ -12,7 +12,7 @@
 //! `gc.generation_stats` for gcscope's discovery path, and nothing in the interpreter points
 //! at a Probe region. `specs/0014-read-probe-regions.md` moves that lookup into gcscope.
 //!
-//! The two tests that attach are `#[ignore]`d like the other live-attach tests (ADR 0005 §3).
+//! The three tests that attach are `#[ignore]`d like the other live-attach tests (ADR 0005 §3).
 //! The other two are not: one reads the built module off disk and one asks its load gate what it
 //! would refuse, so both run wherever a Probe was built even if nothing can attach there. To run
 //! the lot:
@@ -63,6 +63,30 @@ const SLOTS_SYMBOL: &str = "gcscope_probe_slots";
 /// quantities, which is why the Probe publishes which one it is.
 const COLLECTOR_INCREMENTAL: u32 = 0;
 const COLLECTOR_GENERATIONAL: u32 = 1;
+
+/// The region header version this reader decodes. Version 4 added `capabilities` and
+/// `layout_digest`; there are no external consumers to negotiate with yet, so a mismatch is a
+/// disagreement between this repository's two halves rather than a compatibility question.
+const HEADER_VERSION: u32 = 4;
+
+/// Bits of the header's `capability` word, mirroring `GCSCOPE_PROBE_CAP_*` in
+/// `gcscope_probe/src/gcscope_probe.c`. A set bit means the Probe stands behind the field; the
+/// word is fail-closed, so a reader that finds it zero concludes nothing is meaningful rather
+/// than that everything is.
+const CAP_OFFSETS_OK: u32 = 1 << 0;
+const CAP_HEAP_SIZE_PRESENT: u32 = 1 << 1;
+const CAP_HEAP_SIZE_VALID: u32 = 1 << 2;
+const CAP_CANDIDATES_VALID: u32 = 1 << 3;
+
+/// The environment variable `probe_spin.py` turns into a call to the Probe's private
+/// offset-fault hook, and the displacement handed to it.
+///
+/// -8 rather than +8: it lands on `_gc_runtime_state.callbacks`, a `PyObject *`, so a Probe
+/// that published the value read there would publish a pointer as a heap size. What follows
+/// `heap_size` on 3.14.5 is a zeroed `dummy1`, which would be indistinguishable from the
+/// suppression this test is asserting.
+const FAULT_ENV: &str = "GCSCOPE_PROBE_FAULT_HEAP_SIZE_OFF";
+const FAULT_DELTA: &str = "-8";
 
 /// Samples across the run, and the gap between them. Three samples check a counter sequence
 /// rather than a pair; the fixture collects gen 0 every ~50 ms, so this gap guarantees
@@ -141,6 +165,10 @@ struct ProbeHeader {
     old_entries: u32,
     py_version: u32,
     collector: u32,
+    capabilities: u32,
+    /// The registered Ring shape this Probe implements, as `specs/0012` spells it: 12 hex
+    /// characters, NUL-padded in the header. Empty until ticket 09 populates it.
+    layout_digest: String,
 }
 
 fn u32_at(b: &[u8], off: usize) -> u32 {
@@ -281,14 +309,26 @@ fn read_header(handle: &ProcessHandle, addr: u64) -> Result<ProbeHeader, String>
             String::from_utf8_lossy(&head[0..8])
         ));
     }
+    // `version` sits inside the prefix already read, so a target older than this reader is named
+    // as that rather than as an implausible size — the two failures look identical otherwise,
+    // since every field added to the header grows it.
+    let version = u32_at(&head, 12);
+    if version != HEADER_VERSION {
+        return Err(format!(
+            "header at {addr:#x} declares version {version}; this reader decodes {HEADER_VERSION}"
+        ));
+    }
     let header_size = u32_at(&head, 8) as usize;
-    if !(68..=512).contains(&header_size) {
+    // 88 is `sizeof(struct gcscope_probe_header_t)` at version 4 and the least this reader can
+    // decode. Larger is a header carrying fields it does not know about, which is what the
+    // declared size exists for.
+    if !(88..=512).contains(&header_size) {
         return Err(format!("implausible header_size {header_size}"));
     }
     let b = read_memory_h(handle, addr, header_size).map_err(|e| format!("reading header: {e}"))?;
 
     Ok(ProbeHeader {
-        version: u32_at(&b, 12),
+        version,
         slots_addr: u64_at(&b, 16),
         max_interp: u32_at(&b, 24),
         slot_stride: u32_at(&b, 28),
@@ -301,6 +341,10 @@ fn read_header(handle: &ProcessHandle, addr: u64) -> Result<ProbeHeader, String>
         old_entries: u32_at(&b, 56),
         py_version: u32_at(&b, 60),
         collector: u32_at(&b, 64),
+        capabilities: u32_at(&b, 68),
+        layout_digest: String::from_utf8_lossy(&b[72..88])
+            .trim_end_matches('\0')
+            .to_string(),
     })
 }
 
@@ -363,27 +407,42 @@ fn ring_table(h: &ProbeHeader) -> OffsetTable {
 /// 3.13's `_gc_runtime_state` ends before `heap_size`, so there is nothing to snapshot and the
 /// offset would land on the pointer at the top of the struct. Demanding 0 asserts that absence
 /// rather than stepping around it: any other value means something read at that offset anyway.
-/// A reader cannot yet tell that 0 from a failed self-check or an empty heap, which is what
-/// ticket 06's capability word is for.
-fn check_heap_size(s: &GcStat, py_version: u32) -> Result<(), String> {
+///
+/// The capability word is what tells the three zeroes apart. `HEAP_SIZE_PRESENT` clear means the
+/// field is absent on this interpreter; present-but-not-`VALID` means the Probe's own check on it
+/// failed and it is publishing 0 instead of whatever sits at the offset; both set means the
+/// number came from the field, and only then is a 0 an empty heap. A reader that ignored the word
+/// would read all three as an empty heap.
+fn check_heap_size(s: &GcStat, capabilities: u32) -> Result<(), String> {
     let heap_size = s.heap_size();
-    if py_version >> 16 >= 0x030E {
-        if heap_size < MIN_TRACKED_OBJECTS {
-            return Err(format!(
-                "gen {} entry {} reports heap_size {heap_size}, below the {MIN_TRACKED_OBJECTS} \
-                 tracked objects the fixture holds at every Collection; the interpreter offsets \
-                 look wrong for this build",
-                s.generation, s.index
-            ));
-        }
-    } else if heap_size != 0 {
-        return Err(format!(
-            "gen {} entry {} reports heap_size {heap_size} on an interpreter whose \
-             _gc_runtime_state has no such field; the Probe read something at that offset",
+    let present = capabilities & CAP_HEAP_SIZE_PRESENT != 0;
+    let valid = capabilities & CAP_HEAP_SIZE_VALID != 0;
+
+    match (present, valid) {
+        (false, true) => Err(format!(
+            "capabilities {capabilities:#x} declare heap_size valid on an interpreter whose \
+             _gc_runtime_state has no such field"
+        )),
+        (true, true) if heap_size < MIN_TRACKED_OBJECTS => Err(format!(
+            "gen {} entry {} reports heap_size {heap_size}, below the {MIN_TRACKED_OBJECTS} \
+             tracked objects the fixture holds at every Collection, while the header declares the \
+             field valid; the interpreter offsets look wrong for this build",
             s.generation, s.index
-        ));
+        )),
+        (true, true) => Ok(()),
+        (_, false) if heap_size != 0 => Err(format!(
+            "gen {} entry {} reports heap_size {heap_size} while the header declares the field \
+             {}; a suppressed field has to publish 0 rather than whatever sits at the offset",
+            s.generation,
+            s.index,
+            if present {
+                "unvalidated"
+            } else {
+                "absent on this interpreter"
+            }
+        )),
+        (_, false) => Ok(()),
     }
-    Ok(())
 }
 
 /// One generation's entries, split the way a reader consuming this Ring has to split them.
@@ -629,6 +688,12 @@ struct Attached {
 
 /// Spawn `probe_spin.py`, find its published header, and resolve the first claimed slot's Ring.
 fn attach(python: &Path) -> Attached {
+    attach_with(python, &[])
+}
+
+/// As [`attach`], with environment variables handed to the fixture — today the offset fault the
+/// suppression test needs.
+fn attach_with(python: &Path, env: &[(&str, &str)]) -> Attached {
     // A free-threaded build never maintains `heap_size`, so the Probe refuses to load there
     // rather than publish a column of zeros. Reaching this assertion means it loaded anyway,
     // a broken gate rather than an unsupported configuration, so it fails instead of skipping.
@@ -638,7 +703,7 @@ fn attach(python: &Path) -> Attached {
          the Py_GIL_DISABLED gate in PyInit_gcscope_probe is not doing its job"
     );
 
-    let proc = SpawnedPython::spawn_fixture(python, "probe_spin.py")
+    let proc = SpawnedPython::spawn_fixture_env(python, "probe_spin.py", env)
         .expect("probe_spin.py should reach READY");
     let pid = proc.pid();
 
@@ -826,7 +891,67 @@ fn probe_ring_decodes_out_of_process() {
             h.collector
         );
     }
-    assert_eq!(h.version, 3, "unexpected region header version");
+    assert_eq!(
+        h.version, HEADER_VERSION,
+        "unexpected region header version"
+    );
+
+    // The self-check on `gcstate->collecting`, read from outside the process. It ran in the
+    // fixture's first Collection, long before this attach, and until version 4 its result was
+    // reachable only through an in-process Python call — so a Probe whose compiled-in offsets
+    // were wrong for the interpreter it loaded into looked exactly like one whose were right.
+    // On 3.13 this is the only check standing behind `offsetof(PyInterpreterState, gc)`, since
+    // there is no `heap_size` whose magnitude would give a wrong `gc` offset away.
+    assert!(
+        h.capabilities & CAP_OFFSETS_OK != 0,
+        "capabilities {:#x} do not declare the offset self-check passed; the Probe published a \
+         full Ring against offsets it could not confirm ({module})",
+        h.capabilities
+    );
+
+    // `deduce_unreachable()` is `static inline` on both supported minors, so the count of
+    // candidates a Collection examined cannot be had at any price. The Probe writes 0 and has to
+    // say that 0 means nothing, or a reader averages it as a real measurement.
+    assert_eq!(
+        h.capabilities & CAP_CANDIDATES_VALID,
+        0,
+        "capabilities {:#x} declare `candidates` obtainable; no supported version can reach it",
+        h.capabilities
+    );
+
+    // `heap_size` is present exactly where `_gc_runtime_state` has the field: 3.14 and up. The
+    // header claiming otherwise means the compile-time branch in `internals.c` and the runtime
+    // it loaded into disagree, which is the condition the whole capability word exists to expose.
+    let heap_size_expected = h.py_version >> 16 >= 0x030E;
+    assert_eq!(
+        h.capabilities & CAP_HEAP_SIZE_PRESENT != 0,
+        heap_size_expected,
+        "capabilities {:#x} disagree with {:#010x} about whether _gc_runtime_state has a \
+         heap_size field",
+        h.capabilities,
+        h.py_version
+    );
+    // Where the field exists, its own validation has to have passed — this fixture injects no
+    // fault. `probe_reports_a_suppressed_heap_size` covers the other side.
+    if heap_size_expected {
+        assert!(
+            h.capabilities & CAP_HEAP_SIZE_VALID != 0,
+            "capabilities {:#x} report the heap_size check as failed on an unfaulted fixture",
+            h.capabilities
+        );
+    }
+
+    // Ticket 09 of `specs/0013-probe-portable-core.md` fills this from the generated header, so
+    // an unpopulated field is expected today. What is asserted is that the slot holds either
+    // nothing or a digest in the form `specs/0012` defines, never something in between.
+    assert!(
+        h.layout_digest.is_empty()
+            || (h.layout_digest.len() == 12
+                && h.layout_digest.bytes().all(|c| c.is_ascii_hexdigit())),
+        "layout_digest {:?} is neither empty nor the 12 hex characters gen-offsets.py emits",
+        h.layout_digest
+    );
+
     assert_eq!(
         h.item_size as usize, LAYOUT.item_size,
         "target item size {} disagrees with this reader's layout {}",
@@ -891,7 +1016,7 @@ fn probe_ring_decodes_out_of_process() {
             );
             // Invariant 5: `heap_size` came from the interpreter rather than from an offset
             // pointing elsewhere, or is absent because this minor has no such field.
-            if let Err(e) = check_heap_size(s, h.py_version) {
+            if let Err(e) = check_heap_size(s, h.capabilities) {
                 panic!("sample {round}: {e}");
             }
             totals.push(s.collections());
@@ -919,6 +1044,83 @@ fn probe_ring_decodes_out_of_process() {
         last_gen0 > first,
         "gen 0 collections did not advance across {SAMPLES} samples ({first} -> {last_gen0}); \
          the region looks frozen rather than live"
+    );
+}
+
+/// A Probe whose `heap_size` check failed says so where a reader can see it, and publishes 0
+/// rather than the number it read.
+///
+/// Without this the failure path is written and never executed. The Probe's own check is a causal
+/// one — allocate a known number of tracked objects, watch the field rise, drop them, watch it
+/// fall — so the only way to fail it on a healthy interpreter is to point it somewhere else,
+/// which is what the fixture's fault hook does. The displacement lands on a `PyObject *`, so a
+/// Probe that published what it read would publish a pointer, a number no bound on plausibility
+/// would question.
+///
+/// The suppressed field then reads 0, the same 0 an empty heap and an absent field give. Telling
+/// those apart from outside the process is the whole of ticket 06, and the capability word is
+/// where the difference lives.
+#[test]
+#[ignore = "attaches to a live process; needs ptrace/taskport and an installed Probe — run with --ignored"]
+fn probe_reports_a_suppressed_heap_size() {
+    let Some(python) = probe_python_or_skip("probe_reports_a_suppressed_heap_size") else {
+        return;
+    };
+    let t = attach_with(&python, &[(FAULT_ENV, FAULT_DELTA)]);
+    let h = &t.header;
+
+    // 3.13's `_gc_runtime_state` has no `heap_size` to point anywhere, so there is no check to
+    // fail. Read from the header rather than from the interpreter's version, since the header is
+    // what a reader has. `probe_ring_decodes_out_of_process` holds the two to each other.
+    if h.capabilities & CAP_HEAP_SIZE_PRESENT == 0 {
+        eprintln!(
+            "SKIP probe_reports_a_suppressed_heap_size: {:#010x} has no heap_size field to fault",
+            h.py_version
+        );
+        return;
+    }
+
+    assert_eq!(
+        h.capabilities & CAP_HEAP_SIZE_VALID,
+        0,
+        "capabilities {:#x} still declare heap_size valid with the offset displaced by \
+         {FAULT_DELTA} bytes; the check passes on a field it is not reading",
+        h.capabilities
+    );
+    // The other bits are untouched by the fault, so a reader learns which field went bad rather
+    // than that the Probe is unusable. A fault that cleared the word wholesale would pass the
+    // assertion above and say nothing.
+    assert!(
+        h.capabilities & CAP_OFFSETS_OK != 0,
+        "capabilities {:#x} lost the offset self-check to a heap_size fault; the two checks are \
+         supposed to be independent",
+        h.capabilities
+    );
+
+    let raw = read_memory_h(&t.handle, t.addr, t.region_len)
+        .unwrap_or_else(|e| panic!("reading the region: {e}"));
+    let stats = t.table.decode_gc_stats(&raw, t.iid);
+
+    let mut written = 0usize;
+    for s in &stats {
+        if s.collections() == 0 {
+            continue;
+        }
+        written += 1;
+        assert_eq!(
+            s.heap_size(),
+            0,
+            "gen {} entry {} published heap_size {} from a displaced offset; a failed check has \
+             to suppress the field, not publish what it found",
+            s.generation,
+            s.index,
+            s.heap_size()
+        );
+    }
+    assert!(
+        written > 0,
+        "no entry carries a Collection; probe_spin.py seeds all three generations before READY, \
+         so there is nothing here to have suppressed"
     );
 }
 
@@ -1014,7 +1216,7 @@ fn probe_ring_survives_sustained_churn() {
                 now.index,
                 now.duration
             );
-            if let Err(e) = check_heap_size(s, t.header.py_version) {
+            if let Err(e) = check_heap_size(s, t.header.capabilities) {
                 panic!("sample {samples}: {e}");
             }
 

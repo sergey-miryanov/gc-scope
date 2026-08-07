@@ -202,12 +202,24 @@ impl SpawnedPython {
     /// installs the Probe before collecting. Both take the same lifetime argument and print
     /// the same `READY <pid>` marker, so they share the wait.
     pub fn spawn_fixture(python: &Path, fixture_name: &str) -> io::Result<Self> {
-        let mut child = Command::new(python)
-            .arg(fixture(fixture_name))
-            .arg(SPIN_LIFETIME_SECS)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        Self::spawn_fixture_env(python, fixture_name, &[])
+    }
+
+    /// As [`Self::spawn_fixture`], with environment variables set on the child.
+    ///
+    /// The fault hooks a fixture reads are environment-driven, since a fixture takes one
+    /// positional argument and both fixtures have to keep taking the same one.
+    pub fn spawn_fixture_env(
+        python: &Path,
+        fixture_name: &str,
+        env: &[(&str, &str)],
+    ) -> io::Result<Self> {
+        let mut cmd = Command::new(python);
+        cmd.arg(fixture(fixture_name)).arg(SPIN_LIFETIME_SECS);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
 
         // Capture stderr rather than discarding it. A fixture that dies on startup, usually on
         // a failed import, otherwise surfaces only as "never reported READY", which reports
