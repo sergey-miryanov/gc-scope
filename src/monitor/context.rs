@@ -361,6 +361,24 @@ mod tests {
         assert_eq!(generations[1].pause_total_ns, Some(1_000));
     }
 
+    /// Loss reaches the summary through the same seam the exporter is fed from: an interpreter
+    /// that collected a hundred times between two polls reports a hundred, not the two Records
+    /// those polls caught, and Coverage says how much of it was watched.
+    #[test]
+    fn the_summary_reconstructs_the_collections_the_polls_could_not_read() {
+        let mut exporter = ChromeTraceExporter::new();
+        let mut context = MonitorContext::new(&mut exporter);
+
+        context.events_for(1, &[timed(0, 1, 1_000, 1_400)], 5_000);
+        context.events_for(1, &[timed(0, 100, 900_000, 900_600)], 6_000);
+
+        let gen0 = &context.summary()[0].generations[0];
+        assert_eq!(gen0.collections, 100);
+        assert_eq!(gen0.records, 2);
+        assert_eq!(gen0.lost, 98);
+        assert!((gen0.coverage - 0.02).abs() < 1e-12, "{}", gen0.coverage);
+    }
+
     /// A run that read nothing summarizes to nothing, which is what lets the CLI say so
     /// instead of printing an empty table.
     #[test]

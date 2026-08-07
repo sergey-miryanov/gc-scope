@@ -485,24 +485,48 @@ fn live_monitor_summarizes_every_generation_in_the_builds_tier() {
         );
     }
 
+    // Coverage rides both tiers: it is what says whether the counts beside it have a
+    // distribution behind them.
+    assert!(
+        header.contains("coverage"),
+        "every tier reports how much of what it counted it watched\n{out}"
+    );
+
     if expect_spans {
         assert!(
             header.contains("pause total") && header.contains("records"),
             "this build publishes pause timestamps, so the summary reports them\n{out}"
         );
-        // The last two columns are a scaled figure and its unit, so a row splits into nine.
+        // The last two columns are a scaled figure and its unit, so a row splits into ten.
         assert!(
-            rows.iter().all(|r| r.len() == 9),
-            "a timed row carries counts, records and both pause figures\n{out}"
+            rows.iter().all(|r| r.len() == 10),
+            "a timed row carries counts, records, coverage and both pause figures\n{out}"
         );
+        // Every Collection in the span is either read or reconstructed, so Coverage is a
+        // share. A build that lost none reports 1.000, and spin.py at this rate rarely does.
+        for row in &rows {
+            let coverage: f64 = row[5]
+                .parse()
+                .unwrap_or_else(|e| panic!("coverage {:?}: {e}\n{out}", row[5]));
+            assert!(
+                (0.0..=1.0).contains(&coverage),
+                "implausible coverage in {row:?}\n{out}"
+            );
+        }
     } else {
         assert!(
             !header.contains("pause"),
             "a pause figure this build never published belongs absent, not at zero\n{out}"
         );
         assert!(
-            rows.iter().all(|r| r.len() == 4),
-            "an untimed row carries the counts and nothing else\n{out}"
+            rows.iter().all(|r| r.len() == 5),
+            "an untimed row carries the counts and their coverage\n{out}"
+        );
+        // Nothing this build publishes describes a single Collection, so the counts stand
+        // alone (ADR 0017).
+        assert!(
+            rows.iter().all(|r| r[4] == "0.000"),
+            "this tier covers none of what it counts\n{out}"
         );
     }
 

@@ -13,6 +13,7 @@ pub mod context;
 pub mod convert;
 pub mod cursor;
 pub mod exporters;
+pub mod loss;
 pub mod run_loop;
 pub mod statistics;
 pub mod trace_event;
