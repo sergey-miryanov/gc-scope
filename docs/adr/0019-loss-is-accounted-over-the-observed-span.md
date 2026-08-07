@@ -36,11 +36,16 @@ nothing in an Entry says whether it was overwritten unread or simply predates th
    those builds publish is per-Collection, so the counts stand alone with no distribution
    behind them. A ring nothing ran on reports `1.0` — it lost none of the nothing it covers,
    and every call site would otherwise guard a division.
-4. **The exact pause cannot fall below the pause actually measured.** CPython accumulates
+4. **The exact pause needs `duration`, and is asked for separately from the tier.** Timestamps
+   price the Collections that were read; only the cumulative total prices the ones that were
+   not. A ring carrying the first and not the second reports what it measured and leaves the
+   exact figure absent — resolving the difference against an absent field would quietly yield
+   the measured sum and publish it as what ran.
+5. **The exact pause cannot fall below the pause actually measured.** CPython accumulates
    `duration` as a float of seconds while timestamps are integer nanoseconds, so a generation
    whose running total has outgrown its own precision subtracts to a hair under what gcscope
    watched with its own eyes. Flooring there is what keeps the lost pause off negative.
-5. **The scale factor corrects a figure that partitions the pause, never a percentile.**
+6. **The scale factor corrects a figure that partitions the pause, never a percentile.**
    Sub-phase totals have no cumulative counterpart in CPython but add up to the pause, so
    scaling their measured sum estimates the whole. A percentile describes the shape of a
    distribution rather than its total; the sample it comes from is biased, and multiplying it
@@ -57,6 +62,20 @@ nothing in an Entry says whether it was overwritten unread or simply predates th
   — every one of them was read — but a 4-second run of a script calling `gc.disable()` reports
   the handful that ran during startup. Excluding them needs a moment to compare against, and
   the target's clock is not the Observer's; that is a separate decision from this one.
+- `collections` and the pause cover the whole span while `collected` and `uncollectable` cover
+  it minus the opening Record. Both are running totals CPython publishes, and the total before
+  the first Record was never read, so that Collection's own objects are not recoverable the way
+  its pause is. A span holding one Record reads `collections 1, collected 0`, and objects-per-
+  collection computed off the table is low by `1/N`.
+- On free-threaded builds the reconstruction rides a write CPython does not order. The GIL
+  writer publishes `ts_stop` last, with a comment saying why: "so remote readers do not select a
+  partially updated stats record" (`Python/gc.c`). The free-threaded writer does not
+  (`Python/gc_free_threading.c`) — it stores both timestamps, then `collections++`, then
+  `duration +=`. A poll landing in that window admits a Record whose counter has advanced and
+  whose `duration` has not, and its young ring is one Entry deep, so the Entry is rewritten at
+  the full collection rate. The error is bounded by one Collection's pause at each end of the
+  span, the floor above catches the sign, and every later poll supersedes it. There is nothing
+  to fix on this side of the process boundary.
 - The arithmetic is derived from the accumulator rather than stored beside it, so a figure
   cannot drift from the Records it came out of. It is reachable through the poll seam with
   scripted batches, and pinned by property tests over a simulated ring driven past its own

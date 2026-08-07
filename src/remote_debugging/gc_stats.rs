@@ -144,8 +144,8 @@ impl GcStat {
 impl GcStat {
     /// Build a stat by naming the fields to set (as `i64` little-endian), zero-filling the
     /// rest — the test analogue of the old `GcStat { field: v, ..Default::default() }`. Fields
-    /// not in `layout` are ignored. `f64` fields (`duration`) aren't settable here; no test
-    /// asserts a decoded duration, so this stays `i64`-only for simplicity.
+    /// not in `layout` are ignored. Values go in as `i64`, so a `f64` field (`duration`) is set
+    /// through its bits: `("duration", f64::to_bits(0.25) as i64)`.
     pub fn from_fields(
         generation: u32,
         index: usize,

@@ -25,15 +25,18 @@ pub struct LossAccount {
     /// Collections the Observer holds a Record for. Zero on the counter-only tier, where an
     /// Entry is a snapshot of running totals and describes no Collection of its own.
     pub observed_collections: i64,
-    /// Collections overwritten before a poll reached them.
+    /// Collections the Observer holds no Record for. Overwritten unread on the ring tier; on
+    /// the counter-only tier it is every Collection in the span, nothing having been
+    /// overwritten and nothing there describing a single Collection either.
     pub lost_collections: i64,
     /// The observed share of the span, in `[0, 1]`. What tells an operator whether a sampled
     /// figure beside it is the distribution or the tail of a biased one.
     pub coverage: f64,
     /// Pause over the span, from the target's cumulative accumulator. `None` where the Entry
-    /// layout carries no timestamps: absent, never zero (ADR 0017).
+    /// layout carries no `duration` to difference: absent, never zero (ADR 0017).
     pub exact_pause_ns: Option<i64>,
-    /// Pause summed over the Records read. Under Loss it sits below `exact_pause_ns`.
+    /// Pause summed over the Records read. `None` where the Entry layout bounds no Collection
+    /// with timestamps. Under Loss it sits below `exact_pause_ns`.
     pub measured_pause_ns: Option<i64>,
     /// Pause belonging to Collections nobody read. Never negative.
     pub lost_pause_ns: Option<i64>,
@@ -90,8 +93,20 @@ pub fn account(observation: &RingObservation) -> LossAccount {
         ..UNOBSERVED
     };
 
-    if timed {
-        let measured = observation.measured_pause_ns();
+    if !timed {
+        return account;
+    }
+
+    // Timestamps price the Collections that were read, whether or not the ring carries a
+    // cumulative total to reconstruct the rest from.
+    let measured = observation.measured_pause_ns();
+    account.measured_pause_ns = Some(measured);
+
+    // Only a ring publishing `duration` can be differenced for the pause nobody watched.
+    // Without it the reconstruction would quietly resolve to the measured sum and report it
+    // under a figure meaning "what ran", which is the fail-open every layout question here is
+    // asked to avoid (ADR 0007).
+    if observation.has_pause_total() {
         // The cumulative duration at the first Record already covers that Record's own
         // Collection, so the delta starts after it and its pause goes back on.
         let spanned = secs_to_ns(last.duration - first.duration) + observation.first_pause_ns();
@@ -101,7 +116,6 @@ pub fn account(observation: &RingObservation) -> LossAccount {
         // keeps the lost pause off negative, which is the only value it must never take.
         let exact = spanned.max(measured);
         account.exact_pause_ns = Some(exact);
-        account.measured_pause_ns = Some(measured);
         account.lost_pause_ns = Some(exact - measured);
         account.scale_factor = Some(if measured == 0 {
             1.0
@@ -212,6 +226,42 @@ mod tests {
         assert_eq!(a.measured_pause_ns, Some(1_000));
         assert_eq!(a.lost_pause_ns, Some(499_000));
         assert_eq!(a.scale_factor, Some(500.0));
+    }
+
+    /// Timestamps price the Collections that were read; only the cumulative `duration` prices
+    /// the ones that were not. A ring carrying the first and not the second reports what it
+    /// measured and leaves the rest absent, rather than resolving the reconstruction to the
+    /// measured sum and publishing that as what ran.
+    #[test]
+    fn a_ring_without_a_cumulative_total_reports_no_exact_pause() {
+        static UNPRICED: LazyLock<&'static GcItemLayout> =
+            LazyLock::new(|| seq_layout(&["ts_start", "ts_stop", "collections"]));
+        let unpriced = |counter: i64, ts_start: i64, ts_stop: i64| {
+            GcStat::from_fields(
+                0,
+                0,
+                0,
+                *UNPRICED,
+                &[
+                    ("collections", counter),
+                    ("ts_start", ts_start),
+                    ("ts_stop", ts_stop),
+                ],
+            )
+        };
+
+        let a = observe(&[
+            &[unpriced(1, 1_000, 1_400)],
+            &[unpriced(100, 900_000, 900_600)],
+        ]);
+
+        // The counts still reconstruct: they come from a counter this ring does publish.
+        assert_eq!(a.exact_collections, 100);
+        assert_eq!(a.lost_collections, 98);
+        assert_eq!(a.measured_pause_ns, Some(1_000));
+        assert_eq!(a.exact_pause_ns, None);
+        assert_eq!(a.lost_pause_ns, None);
+        assert_eq!(a.scale_factor, None);
     }
 
     /// Nothing an inline build publishes is per-Collection, so its counts stand alone with no

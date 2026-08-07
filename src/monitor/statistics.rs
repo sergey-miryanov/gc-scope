@@ -25,7 +25,8 @@ pub struct GenerationSummary {
     pub uncollectable: i64,
     /// Records read. Below `collections` where Entries were overwritten between polls.
     pub records: u64,
-    /// Collections overwritten before a poll reached them.
+    /// Collections no Record was read for. Overwritten unread on the ring tier; every
+    /// Collection in the span on the counter-only tier, where nothing describes one.
     pub lost: i64,
     /// The share of `collections` a Record was read for, in `[0, 1]`. Zero on a build whose
     /// Entries describe no single Collection.
@@ -63,10 +64,16 @@ pub struct InterpreterSummary {
 }
 
 impl InterpreterSummary {
-    /// Whether this build publishes the timestamps a pause figure needs. One answer per
-    /// interpreter: its generations share a build.
+    /// Whether this build bounds its Collections with timestamps. One answer per interpreter:
+    /// its generations share a build.
+    ///
+    /// Read off the measured figure rather than the exact one, which a build can be timed
+    /// without publishing. Keying on the exact figure would drop `records` and `coverage` from
+    /// such a build's table over a pause it cannot reconstruct.
     pub fn has_timing(&self) -> bool {
-        self.generations.iter().any(|g| g.pause_total_ns.is_some())
+        self.generations
+            .iter()
+            .any(|g| g.pause_measured_ns.is_some())
     }
 }
 
@@ -209,7 +216,12 @@ fn format_row(g: &GenerationSummary, timed: bool) -> String {
 
 /// Right-align each cell under its column.
 fn lay_out(cells: &[String], timed: bool) -> String {
-    columns(timed)
+    let columns = columns(timed);
+    // `zip` yields the shorter of the two, so a column added to one side and not the other
+    // would slide every figure past it one heading to the left, under a rule still cut to the
+    // header's width. Nothing about the output would look wrong.
+    debug_assert_eq!(cells.len(), columns.len(), "a column lost its cell");
+    columns
         .iter()
         .zip(cells)
         .map(|(&(_, width), cell)| format!("{cell:>width$}"))
@@ -428,6 +440,47 @@ mod tests {
         // The mean is exact over exact: 500 us across the 100 Collections that ran, not the
         // 500 ns average of the two that happened to be caught.
         assert_eq!(gen0.pause_mean_ns(), Some(5_000.0));
+    }
+
+    /// A build can bound its Collections without publishing the cumulative total the exact
+    /// pause is differenced from. Its rows keep the columns describing what was read and leave
+    /// the pause blank, rather than losing `records` and `coverage` over a figure it cannot
+    /// reconstruct.
+    #[test]
+    fn a_build_that_prices_no_pause_total_keeps_the_columns_it_can_fill() {
+        static UNPRICED: LazyLock<&'static GcItemLayout> =
+            LazyLock::new(|| seq_layout(&["ts_start", "ts_stop", "collections"]));
+        let unpriced = |counter: i64, ts_start: i64, ts_stop: i64| {
+            GcStat::from_fields(
+                0,
+                0,
+                0,
+                *UNPRICED,
+                &[
+                    ("collections", counter),
+                    ("ts_start", ts_start),
+                    ("ts_stop", ts_stop),
+                ],
+            )
+        };
+
+        let summary = run(&[
+            (7, vec![unpriced(1, 1_000, 1_400)]),
+            (7, vec![unpriced(100, 900_000, 900_600)]),
+        ]);
+        assert!(summary[0].has_timing(), "its Collections are still spans");
+
+        let gen0 = &summary[0].generations[0];
+        assert_eq!(gen0.pause_total_ns, None);
+        assert_eq!(gen0.pause_mean_ns(), None);
+        assert_eq!(gen0.pause_measured_ns, Some(1_000));
+
+        let row = render(&summary).last().unwrap().clone();
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            ["0", "100", "0", "0", "2", "0.020"],
+            "the pause cells are empty, not zero"
+        );
     }
 
     /// A layout with no timestamps cannot say how long it spent collecting, so the figure is

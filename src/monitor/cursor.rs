@@ -56,6 +56,7 @@ pub struct RingObservation {
     sampled: u64,
     measured_pause_ns: i64,
     timed: bool,
+    prices_pause: bool,
 }
 
 impl RingObservation {
@@ -99,6 +100,14 @@ impl RingObservation {
         self.timed
     }
 
+    /// Whether this ring's Records carry the generation's cumulative pause total. Asked
+    /// separately from [`has_timing`](Self::has_timing): the timestamps say what one
+    /// Collection cost, and only this says what every Collection cost, so only a ring
+    /// publishing it can be differenced for a pause nobody watched.
+    pub fn has_pause_total(&self) -> bool {
+        self.prices_pause
+    }
+
     /// Whether `counter` is past this ring's cursor. The first Record of a ring is always
     /// past it; afterwards the counter must have advanced.
     fn admits(&self, counter: i64) -> bool {
@@ -110,6 +119,7 @@ impl RingObservation {
             self.first = Lifetime::of(record);
             self.first_pause_ns = pause_ns(record);
             self.timed = record.has_timing();
+            self.prices_pause = record.has("duration");
         }
         self.last = Lifetime::of(record);
         self.sampled += 1;
