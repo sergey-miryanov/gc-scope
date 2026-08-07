@@ -497,10 +497,14 @@ fn live_monitor_summarizes_every_generation_in_the_builds_tier() {
             header.contains("pause total") && header.contains("records"),
             "this build publishes pause timestamps, so the summary reports them\n{out}"
         );
-        // The last two columns are a scaled figure and its unit, so a row splits into ten.
+        // Ten tokens: the last two columns are each a scaled figure and its unit. A ring
+        // layout publishing no cumulative `duration` leaves those cells empty and splits into
+        // six instead — no registered layout does, and this is where that would surface.
         assert!(
             rows.iter().all(|r| r.len() == 10),
-            "a timed row carries counts, records, coverage and both pause figures\n{out}"
+            "a timed row carries counts, records, coverage and both pause figures; six \
+             tokens means this build publishes no cumulative duration to reconstruct \
+             them from\n{out}"
         );
         // Every Collection in the span is either read or reconstructed, so Coverage is a
         // share. A build that lost none reports 1.000, and spin.py at this rate rarely does.

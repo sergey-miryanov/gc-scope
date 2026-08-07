@@ -34,18 +34,24 @@ nothing in an Entry says whether it was overwritten unread or simply predates th
    tier with, not a version comparison.
 3. **Coverage is the observed share of the span,** and `0` on the counter-only tier: nothing
    those builds publish is per-Collection, so the counts stand alone with no distribution
-   behind them. A ring nothing ran on reports `1.0` — it lost none of the nothing it covers,
-   and every call site would otherwise guard a division.
-4. **The exact pause needs `duration`, and is asked for separately from the tier.** Timestamps
+   behind them. That `0` is the tier's constant and holds for its idle generations too — a
+   generation whose counter never moved during the run reports `0.000` like its siblings, not
+   the `1.0` that "lost none of the nothing it covers" would give. Only a ring no Record was
+   ever read from reports `1.0`, which spares every call site a division guard.
+4. **What ran is what was read plus what was lost, on both tiers.** The summary publishes all
+   three, so the reconstruction is auditable against CPython's own counters. On the
+   counter-only tier the Records read are not the term that reconciles: two snapshots witness
+   no Collection between them.
+5. **The exact pause needs `duration`, and is asked for separately from the tier.** Timestamps
    price the Collections that were read; only the cumulative total prices the ones that were
    not. A ring carrying the first and not the second reports what it measured and leaves the
    exact figure absent — resolving the difference against an absent field would quietly yield
    the measured sum and publish it as what ran.
-5. **The exact pause cannot fall below the pause actually measured.** CPython accumulates
+6. **The exact pause cannot fall below the pause actually measured.** CPython accumulates
    `duration` as a float of seconds while timestamps are integer nanoseconds, so a generation
    whose running total has outgrown its own precision subtracts to a hair under what gcscope
    watched with its own eyes. Flooring there is what keeps the lost pause off negative.
-6. **The scale factor corrects a figure that partitions the pause, never a percentile.**
+7. **The scale factor corrects a figure that partitions the pause, never a percentile.**
    Sub-phase totals have no cumulative counterpart in CPython but add up to the pause, so
    scaling their measured sum estimates the whole. A percentile describes the shape of a
    distribution rather than its total; the sample it comes from is biased, and multiplying it

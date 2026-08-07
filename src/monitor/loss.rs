@@ -81,15 +81,25 @@ pub fn account(observation: &RingObservation) -> LossAccount {
         0
     };
 
+    let coverage = if !timed {
+        // The tier's constant, and a constant for its idle generations too. A generation whose
+        // counter never moved during the run has covered none of the nothing it counted, which
+        // the empty-accumulator rule would call `1.0` — printed under a column of `0.000`
+        // siblings, that reads as the one generation gcscope watched properly.
+        0.0
+    } else if exact_collections == 0 {
+        // Guarding the division, not describing a case: `admits` keeps counters increasing, so
+        // a timed span holds at least the Record that opened it.
+        1.0
+    } else {
+        observed_collections as f64 / exact_collections as f64
+    };
+
     let mut account = LossAccount {
         exact_collections,
         observed_collections,
         lost_collections: exact_collections - observed_collections,
-        coverage: if exact_collections == 0 {
-            1.0
-        } else {
-            observed_collections as f64 / exact_collections as f64
-        },
+        coverage,
         ..UNOBSERVED
     };
 
@@ -109,7 +119,17 @@ pub fn account(observation: &RingObservation) -> LossAccount {
     if observation.has_pause_total() {
         // The cumulative duration at the first Record already covers that Record's own
         // Collection, so the delta starts after it and its pause goes back on.
-        let spanned = secs_to_ns(last.duration - first.duration) + observation.first_pause_ns();
+        //
+        // A `duration` resolved through a wrong offset — which the same-minor `LAYOUTS`
+        // fallback makes a documented possibility, and a torn read another — arrives as
+        // arbitrary bits. `f64 as i64` saturates, so it is the addition that would overflow,
+        // and a delta that is not a number has nothing to price the span with at all.
+        let delta = last.duration - first.duration;
+        let spanned = if delta.is_finite() {
+            secs_to_ns(delta).saturating_add(observation.first_pause_ns())
+        } else {
+            measured
+        };
         // CPython publishes that total as a float of seconds while the measured sum is integer
         // nanoseconds, so a span holding almost no pause subtracts to a hair under what was
         // actually measured. The exact figure cannot be below the observed one: flooring there
@@ -292,13 +312,32 @@ mod tests {
         assert_eq!(a.exact_pause_ns, None);
     }
 
-    /// So does a ring on which nothing moved: two identical snapshots span no Collection, and
-    /// `0/0` would otherwise be reported as Coverage.
+    /// An idle generation on the counter-only tier follows the tier rather than the
+    /// empty-accumulator rule. Attach to a process whose gen 2 collected once long ago and not
+    /// since, and `1.0` would put a fully-covered row directly under its siblings' `0.000`.
     #[test]
-    fn a_ring_that_collected_nothing_reports_full_coverage() {
+    fn an_idle_generation_on_the_counter_only_tier_still_covers_nothing() {
         let a = observe(&[&[counted(10)], &[counted(10)]]);
         assert_eq!(a.exact_collections, 0);
-        assert_eq!(a.coverage, 1.0);
+        assert_eq!(a.lost_collections, 0);
+        assert_eq!(a.coverage, 0.0);
+    }
+
+    /// A `duration` read through a wrong offset arrives as arbitrary bits, and the fallback
+    /// paths in layout resolution make that reachable. `f64 as i64` saturates, so the add-back
+    /// is what would overflow: a debug build panics and a release build wraps to a pause total
+    /// with the wrong sign.
+    #[test]
+    fn a_nonsense_cumulative_total_prices_the_span_at_what_was_measured() {
+        for bogus in [f64::INFINITY, f64::NAN, -f64::INFINITY, 1e300] {
+            let a = observe(&[
+                &[ring(10, 1_000, 1_400, 0.0)],
+                &[ring(11, 2_000, 2_600, bogus)],
+            ]);
+            assert_eq!(a.measured_pause_ns, Some(1_000), "{bogus}");
+            assert!(a.lost_pause_ns.unwrap() >= 0, "{bogus}");
+            assert!(a.exact_pause_ns.unwrap() >= 1_000, "{bogus}");
+        }
     }
 
     /// What ran before the first Record read is outside the accounted span. A ring whose

@@ -24,7 +24,14 @@ pub struct GenerationSummary {
     /// Uncollectable objects across the span, on the same basis as `collected`.
     pub uncollectable: i64,
     /// Records read. Below `collections` where Entries were overwritten between polls.
+    ///
+    /// Not the same quantity as [`observed`](Self::observed) on the counter-only tier: a
+    /// Record there is a snapshot of running totals, so reading two of them witnesses no
+    /// Collection at all.
     pub records: u64,
+    /// Collections a Record was read for. `collections` is this plus [`lost`](Self::lost),
+    /// which is the identity an auditor checks the reconstruction against.
+    pub observed: i64,
     /// Collections no Record was read for. Overwritten unread on the ring tier; every
     /// Collection in the span on the counter-only tier, where nothing describes one.
     pub lost: i64,
@@ -101,6 +108,7 @@ pub fn summarize(cursor: &Cursor) -> Vec<InterpreterSummary> {
             collected: last.collected - first.collected,
             uncollectable: last.uncollectable - first.uncollectable,
             records: observation.sampled(),
+            observed: reconstructed.observed_collections,
             lost: reconstructed.lost_collections,
             coverage: reconstructed.coverage,
             pause_total_ns: reconstructed.exact_pause_ns,
@@ -422,6 +430,37 @@ mod tests {
         assert_eq!(gen0.collections, 20);
         assert_eq!(gen0.coverage, 0.0);
         assert_eq!(gen0.lost, 20);
+        // Two Records were read and they witness no Collection between them, which is why
+        // `records` is not the term that reconciles against the count.
+        assert_eq!(gen0.records, 2);
+        assert_eq!(gen0.observed, 0);
+    }
+
+    /// What ran is what was read plus what was lost, on both tiers. Spec 0011's story 19: the
+    /// reconstruction is auditable against CPython's own counters, and the JSON form publishes
+    /// the three figures that make it so.
+    #[test]
+    fn the_counts_reconcile_on_both_tiers() {
+        let summary = run(&[
+            (
+                7,
+                vec![
+                    counted(0, 0, 10, 100, 0),
+                    timed(1, 0, 1, 10, 0, 1_000, 1_400),
+                ],
+            ),
+            (
+                7,
+                vec![
+                    counted(0, 0, 30, 900, 0),
+                    timed(1, 0, 100, 5_000, 0, 900_000, 900_600),
+                ],
+            ),
+        ]);
+
+        for g in &summary[0].generations {
+            assert_eq!(g.collections, g.observed + g.lost, "gen {}", g.generation);
+        }
     }
 
     /// The pause is the target's own cumulative figure over the span, not the share of it the
