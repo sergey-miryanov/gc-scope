@@ -425,7 +425,7 @@ jobs:
   # breaks it from the *reader* side has to go red on that pull request rather than on whichever
   # later one happens to touch C. So the gate opens on all of `src/`.
   probe-scope:
-    name: Does this change reach the Probe contract?
+    name: Scope the Probe leg
     runs-on: ubuntu-latest
     outputs:
       run: ${{ steps.decide.outputs.run }}
@@ -474,7 +474,7 @@ jobs:
   # Nothing builds the Probe on Windows in CI. Spec 0015 adds that leg; until then a
   # Windows-only break merges green.
   probe-contract:
-    name: Probe contract (ubuntu py${{ matrix.python }})
+    name: Probe contract (ubuntu-latest py${{ matrix.python }})
     needs: probe-scope
     if: needs.probe-scope.outputs.run == 'true'
     runs-on: ubuntu-latest
