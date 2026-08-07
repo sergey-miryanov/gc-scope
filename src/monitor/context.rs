@@ -444,6 +444,44 @@ mod tests {
         );
     }
 
+    /// A process that outruns the retained-interpreter bound is reported once, however many
+    /// polls keep dropping accumulators afterwards. Silence there reads as a process whose
+    /// sub-interpreters never collected.
+    #[test]
+    fn a_process_past_the_interpreter_bound_is_reported_once() {
+        let mut exporter = ChromeTraceExporter::new();
+        let mut context = MonitorContext::new(&mut exporter);
+
+        for interpreter in 0..MAX_RETAINED_INTERPRETERS as i64 {
+            context.events_for(1, &[timed_in(interpreter, 1, 1_000)], 5_000);
+        }
+        assert!(
+            !context.overflowed_pids.contains(&1),
+            "nothing has been dropped yet"
+        );
+
+        let overflow = MAX_RETAINED_INTERPRETERS as i64;
+        context.events_for(1, &[timed_in(overflow, 1, 2_000)], 6_000);
+        assert!(context.overflowed_pids.contains(&1), "the run says so");
+
+        // Further drops are silent, and the sibling process is unaffected.
+        context.events_for(1, &[timed_in(overflow + 1, 1, 3_000)], 7_000);
+        assert!(context.cursor.dropped(1) > 1);
+        assert!(!context.overflowed_pids.contains(&2));
+    }
+
+    /// The warning flag goes with the rest of a PID's state. Left behind, a recycled PID's
+    /// overflow is never announced: the cursor's own count restarts at zero there.
+    #[test]
+    fn a_dead_pid_takes_its_overflow_warning_with_it() {
+        let mut exporter = ChromeTraceExporter::new();
+        let mut context = MonitorContext::new(&mut exporter);
+        context.overflowed_pids.insert(1);
+
+        context.mark_died(1);
+        assert!(!context.overflowed_pids.contains(&1));
+    }
+
     /// The summary is folded from the same polls that fed the exporter, so a run's figures
     /// reach the seam without a live interpreter or a written trace.
     #[test]
