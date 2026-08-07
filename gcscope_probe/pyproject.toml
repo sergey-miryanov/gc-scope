@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gcscope-probe"
+version = "0.1.0"
+description = "Publish per-Collection GC timing from inside CPython, for gcscope to read"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Sergey Miryanov", email = "sergey.miryanov@gmail.com" }]
+keywords = ["gc", "garbage-collection", "profiling", "gcscope"]
+
+# 3.14 only. PyInit repeats the gate at import, because a wheel tag is a hint and the
+# transcribed offsets hold for the builds someone checked. Spec 0013 widens this to 3.13.
+requires-python = ">=3.14,<3.15"
+
+# No license classifier: PEP 639 supersedes it, and setuptools refuses both together.
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: C",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Topic :: Software Development :: Debuggers",
+]
+
+[project.urls]
+Homepage = "https://github.com/sergey-miryanov/gc-scope"
+Source = "https://github.com/sergey-miryanov/gc-scope"
+
+# No [tool.setuptools] packages: this distribution is one extension module. It is declared in
+# setup.py, since ext-modules in pyproject.toml is still experimental.
