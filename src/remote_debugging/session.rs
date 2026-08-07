@@ -11,7 +11,7 @@
 //! `gc_stats`/`collect`, are consumed by gc-stats, monitor, the TUI,
 //! and list-pids.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 #[cfg(feature = "test-hooks")]
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -549,6 +549,22 @@ impl PySession {
     /// region (the shape difference is absorbed by [`gc_stats_region_addr`](Self::gc_stats_region_addr)).
     /// Stops after the first interpreter unless `all_interpreters`. Always advances the walk
     /// even for an interpreter with no readable stats, so a NULL region never hangs it (C1).
+    ///
+    /// Linear in the number of interpreters, which is what makes the monitor's per-tick walk
+    /// affordable: the layout, the version and the runtime address are resolved once at
+    /// attach, so each interpreter costs its id, its `next` link, its stats region (one more
+    /// pointer read on a ring build) and one read of that region. The per-interpreter table is
+    /// a stride-and-offsets copy taken once for the whole walk.
+    ///
+    /// **The chain is read without CPython's lock**, and the monitor walks it every tick
+    /// against the sub-interpreter churn that mutates it, so three guards apply. A `next` into
+    /// freed-and-reused memory can point back into the chain, so a revisited address ends the
+    /// walk instead of cycling forever. The same read can yield a nonsense `id`, so a negative
+    /// one skips its link. And a read failing **past the head** skips its interpreter rather
+    /// than failing the poll: one interpreter torn down mid-walk would otherwise cost the tick
+    /// every other interpreter's Records and route a live process into the give-up ladder. The
+    /// head still propagates its error, the signal this returned when it read one interpreter
+    /// (C6).
     fn gc_stats_per_interpreter(
         &self,
         head_addr: u64,
@@ -557,30 +573,97 @@ impl PySession {
         let table = self.resolved.table();
         let next_off = table.interp_next();
         let id_off = table.interp_id();
+        // The walk's own copy: `gc_stats_addr` is the one field an iteration sets, and the
+        // rest is the same for every interpreter.
+        let mut interp_table = table.clone();
 
-        let mut stats = Vec::new();
-        let mut current = head_addr;
-        let mut first = true;
-        while current != 0 {
-            let iid = self.read_i64(current + id_off)?;
-            let gc_addr = table.gc_state_addr(self.runtime_addr, current);
-            if let Some(addr) = self.gc_stats_region_addr(gc_addr)? {
-                let mut interp_table = table.clone();
-                interp_table.gc_stats_addr = Some(addr);
-                stats.extend(interp_table.read_gc_stats(&self.handle, iid)?);
-            }
+        walk_interpreter_chain(
+            head_addr,
+            all_interpreters,
+            |addr| self.read_interpreter_stats(&mut interp_table, addr, id_off),
+            |addr| self.read_u64(addr + next_off),
+        )
+    }
 
-            // Always advance — the walk must make progress even for an interpreter with no
-            // readable stats (this is what previously hung on NULL pointers).
-            current = self.read_u64(current + next_off)?;
-            if first && !all_interpreters {
-                break;
-            }
-            first = false;
+    /// One interpreter of the walk: its id, its stats region and that region's Records.
+    /// `Ok(None)` for a region that cannot be read (not yet allocated, or teardown) and for a
+    /// link whose id reads back as nonsense.
+    fn read_interpreter_stats(
+        &self,
+        interp_table: &mut OffsetTable,
+        interp_addr: u64,
+        id_off: u64,
+    ) -> Result<Option<Vec<GcStat>>> {
+        let iid = self.read_i64(interp_addr + id_off)?;
+        if !is_interpreter_id(iid) {
+            return Ok(None);
+        }
+        let gc_addr = self
+            .resolved
+            .table()
+            .gc_state_addr(self.runtime_addr, interp_addr);
+        let Some(addr) = self.gc_stats_region_addr(gc_addr)? else {
+            return Ok(None);
+        };
+        interp_table.gc_stats_addr = Some(addr);
+        interp_table.read_gc_stats(&self.handle, iid).map(Some)
+    }
+}
+
+/// Whether `iid` can be an interpreter id at all. CPython numbers them from zero, so a
+/// negative one says the link was read while the chain was being mutated, not that this
+/// interpreter is unusual.
+fn is_interpreter_id(iid: i64) -> bool {
+    iid >= 0
+}
+
+/// The interpreter-chain walk's control flow, over a reader for one interpreter's Records and
+/// a reader for the link to the next.
+///
+/// Split from [`PySession::gc_stats_per_interpreter`] because every guard here answers "what
+/// should this believe about a chain read while CPython mutates it", and the answers are worth
+/// a test that no live target can stage: a cycle, a link that will not read, an interpreter
+/// that fails past the head.
+fn walk_interpreter_chain(
+    head_addr: u64,
+    all_interpreters: bool,
+    mut read_stats: impl FnMut(u64) -> Result<Option<Vec<GcStat>>>,
+    mut read_next: impl FnMut(u64) -> Result<u64>,
+) -> Result<Vec<GcStat>> {
+    let mut stats = Vec::new();
+    let mut visited: HashSet<u64> = HashSet::new();
+    let mut current = head_addr;
+    let mut first = true;
+    while current != 0 {
+        if !visited.insert(current) {
+            break; // a chain read mid-mutation looped back on itself
+        }
+        let head = first;
+        first = false;
+
+        match read_stats(current) {
+            Ok(Some(read)) => stats.extend(read),
+            Ok(None) => {}
+            // The head says whether this process reads at all. Past it, one interpreter going
+            // away belongs to that interpreter, not to the poll.
+            Err(e) if head => return Err(e),
+            Err(_) => {}
         }
 
-        Ok(stats)
+        if head && !all_interpreters {
+            break;
+        }
+        // Always advance: the walk must make progress even for an interpreter with no readable
+        // stats (this is what previously hung on NULL pointers). An unreadable link ends it,
+        // since nothing else says where the rest of the chain is.
+        match read_next(current) {
+            Ok(next) => current = next,
+            Err(e) if head => return Err(e),
+            Err(_) => break,
+        }
     }
+
+    Ok(stats)
 }
 
 /// Build the `(path, mtime)` cache key for a module path, or `None` if the mtime
@@ -814,5 +897,164 @@ mod tests {
         assert!(!kind_reads_stats(GcStatsKind::None));
         assert!(kind_reads_stats(GcStatsKind::InlineArray));
         assert!(kind_reads_stats(GcStatsKind::RingBuffer));
+    }
+
+    // ── the interpreter-chain walk ────────────────────────────────────────────────────
+    //
+    // The monitor walks this chain every tick while CPython mutates it, holding none of
+    // CPython's locks, so each guard below answers a chain read that came back wrong. A live
+    // target cannot stage any of them on demand, which is the whole reason the control flow
+    // is a free function taking its two reads as closures.
+
+    use crate::remote_debugging::offsets::offset_table::seq_layout;
+
+    /// One interpreter's Records, distinguishable by the counter they carry.
+    fn records(counter: i64) -> Vec<GcStat> {
+        let layout = seq_layout(&["collections"]);
+        vec![GcStat::from_fields(
+            0,
+            0,
+            counter,
+            layout,
+            &[("collections", counter)],
+        )]
+    }
+
+    /// Walk a chain given as `(address, next address)` links, where each interpreter reports
+    /// Records carrying its own address as the counter.
+    fn walk(chain: &[(u64, u64)], all: bool) -> Result<Vec<i64>> {
+        let links: std::collections::HashMap<u64, u64> = chain.iter().copied().collect();
+        walk_interpreter_chain(
+            chain.first().map(|&(head, _)| head).unwrap_or(0),
+            all,
+            |addr| Ok(Some(records(addr as i64))),
+            |addr| Ok(links[&addr]),
+        )
+        .map(|stats| stats.iter().map(|s| s.collections()).collect())
+    }
+
+    /// The ordinary shape, both ways: every interpreter under `all_interpreters`, and the head
+    /// alone without it.
+    #[test]
+    fn the_walk_follows_the_chain_to_its_end() {
+        let chain = [(0x100, 0x200), (0x200, 0x300), (0x300, 0)];
+        assert_eq!(walk(&chain, true).unwrap(), [0x100, 0x200, 0x300]);
+        assert_eq!(walk(&chain, false).unwrap(), [0x100]);
+    }
+
+    /// A `next` into freed-and-reused memory can point back into the chain. Without the
+    /// visited set the walk never terminates and `stats` grows until the monitor dies, which
+    /// is the failure this guard exists for.
+    #[test]
+    fn a_chain_that_loops_back_ends_the_walk() {
+        let looped = [(0x100, 0x200), (0x200, 0x300), (0x300, 0x200)];
+        assert_eq!(walk(&looped, true).unwrap(), [0x100, 0x200, 0x300]);
+
+        // Including a link pointing at the head, and one pointing at itself.
+        assert_eq!(
+            walk(&[(0x100, 0x200), (0x200, 0x100)], true).unwrap(),
+            [0x100, 0x200]
+        );
+        assert_eq!(walk(&[(0x100, 0x100)], true).unwrap(), [0x100]);
+    }
+
+    /// An interpreter torn down mid-walk must cost its own Records and no one else's. Failing
+    /// the poll instead discards every interpreter already read this tick and routes a live
+    /// process into the give-up ladder.
+    #[test]
+    fn a_read_that_fails_past_the_head_skips_that_interpreter_only() {
+        let stats = walk_interpreter_chain(
+            0x100,
+            true,
+            |addr| match addr {
+                0x200 => bail!("this interpreter went away mid-walk"),
+                _ => Ok(Some(records(addr as i64))),
+            },
+            |addr| Ok(if addr == 0x300 { 0 } else { addr + 0x100 }),
+        )
+        .expect("one interpreter going away is not the poll's failure");
+
+        let counters: Vec<i64> = stats.iter().map(|s| s.collections()).collect();
+        assert_eq!(counters, [0x100, 0x300]);
+    }
+
+    /// The head is the other half of that rule: it says whether this process can be read at
+    /// all, so its error is the poll's. This is the signal `gc_stats` returned when it read
+    /// one interpreter (C6), and the monitor's revalidate ladder is built on it.
+    #[test]
+    fn a_read_that_fails_at_the_head_fails_the_poll() {
+        let failed = walk_interpreter_chain(
+            0x100,
+            true,
+            |_| bail!("the process is gone"),
+            |addr| Ok(addr + 0x100),
+        );
+        assert!(failed.is_err(), "the head's error is the poll's");
+
+        // Same for the link out of the head: nothing readable, nothing to report.
+        let failed = walk_interpreter_chain(
+            0x100,
+            true,
+            |addr| Ok(Some(records(addr as i64))),
+            |_| bail!("the process is gone"),
+        );
+        assert!(failed.is_err());
+    }
+
+    /// A link that will not read ends the walk with what it has. Nothing else says where the
+    /// rest of the chain is, and the interpreters already read are still this poll's.
+    #[test]
+    fn an_unreadable_link_past_the_head_ends_the_walk() {
+        let stats = walk_interpreter_chain(
+            0x100,
+            true,
+            |addr| Ok(Some(records(addr as i64))),
+            |addr| match addr {
+                0x200 => bail!("the link is unreadable"),
+                _ => Ok(addr + 0x100),
+            },
+        )
+        .expect("what was read before the chain broke is still the poll's");
+
+        let counters: Vec<i64> = stats.iter().map(|s| s.collections()).collect();
+        assert_eq!(counters, [0x100, 0x200]);
+    }
+
+    /// An interpreter with no readable stats region (not yet allocated, or being torn down) is
+    /// skipped without ending the walk. This is what once hung the walk on a NULL pointer.
+    #[test]
+    fn an_interpreter_with_nothing_to_read_does_not_stop_the_walk() {
+        let stats = walk_interpreter_chain(
+            0x100,
+            true,
+            |addr| match addr {
+                0x200 => Ok(None),
+                _ => Ok(Some(records(addr as i64))),
+            },
+            |addr| Ok(if addr == 0x300 { 0 } else { addr + 0x100 }),
+        )
+        .expect("a NULL region is a normal transient state");
+
+        let counters: Vec<i64> = stats.iter().map(|s| s.collections()).collect();
+        assert_eq!(counters, [0x100, 0x300]);
+    }
+
+    /// A NULL head is a process with no interpreters yet, not an error.
+    #[test]
+    fn a_null_head_walks_nothing() {
+        let stats = walk_interpreter_chain(0, true, |_| Ok(Some(records(1))), |_| Ok(0)).unwrap();
+        assert!(stats.is_empty());
+    }
+
+    /// The id guard. CPython numbers interpreters from zero, so a negative id is a link read
+    /// mid-mutation; admitting one would put a fabricated interpreter in the trace and in the
+    /// summary beside the real ones.
+    #[test]
+    fn a_negative_id_is_not_an_interpreter() {
+        assert!(is_interpreter_id(0), "the main interpreter");
+        assert!(is_interpreter_id(1));
+        assert!(is_interpreter_id(i64::MAX));
+        assert!(!is_interpreter_id(-1));
+        assert!(!is_interpreter_id(i64::MIN));
     }
 }

@@ -1,10 +1,12 @@
 # 0011 — Reconstruct lost collections and report exact GC statistics
 
 - **Status:** In progress. The `TraceEvent` extraction, the counter-keyed cursor, the
-  counter-only tier, the `--summary` table, the Loss arithmetic and the JSON form have landed
+  counter-only tier, the `--summary` table, the Loss arithmetic, the JSON form and reading
+  every interpreter have all landed
   ([ADR 0017](../docs/adr/0017-monitoring-tiers-follow-the-entry-layout.md),
   [ADR 0019](../docs/adr/0019-loss-is-accounted-over-the-observed-span.md),
-  [`docs/summary-json.md`](../docs/summary-json.md)). Reading every interpreter has not.
+  [`docs/summary-json.md`](../docs/summary-json.md)). Percentiles and drawn Loss spans have
+  not; §7's two open questions are still open.
 - **Kind:** feature — enhancement
 - **Effort:** L
 - **Origin:** Grilling session 2026-08-05 on porting gcmon's consumer stack into gcscope.
@@ -152,7 +154,30 @@ and the pause time measured across them. From those, `exact_count`, `exact_pause
 `lost_count`, `coverage` and `scale_factor` are derived rather than stored.
 
 The monitor reads **all** interpreters rather than only the first, since the interpreter is
-part of the key.
+part of the key. Cheap enough to do every tick: the layout, the version and the runtime
+address are resolved once at attach, so a tick costs each interpreter its id, its `next` link
+and one read of its stats region.
+
+CPython links a new interpreter at the *head* of the chain and never reuses an id. Both facts
+shape this. The first is why a head-only read looks like it works: the head changes, so several
+interpreters do reach a long capture, each in a window of its own, and the live check has to be
+that every interpreter is read *throughout* the run rather than merely present. The second is
+why the accumulators a process keeps are bounded, since a workload creating and destroying
+sub-interpreters otherwise holds one per `(interpreter, generation)` until the process exits.
+
+That bound is on retained *history*, not on existence. Each poll names the interpreters that
+exist and nothing caches it; the accumulator outlives the poll by serving as both the dedup
+cursor while an interpreter is in the chain, bounded there by CPython's own live count, and the
+figures the summary reports once it is gone. Room is made by dropping the one seen least
+recently, so what goes stopped appearing rather than stopped mattering. Absence from a single
+poll is deliberately not the trigger: the walk skips an interpreter whose read failed, and
+dropping a live cursor re-admits its whole ring on the next poll. The run reports how many went.
+
+Walking that chain every tick without CPython's lock also makes a torn read reachable. The walk
+ends on an address it has already visited, skips a link whose id reads back negative, and lets
+a failure past the head cost that interpreter rather than the poll. An interpreter torn down
+mid-walk would otherwise take every other interpreter's Records with it and route a live
+process into the give-up ladder.
 
 ### Completeness is a producer-side filter, and the excluded Entry is evidence
 

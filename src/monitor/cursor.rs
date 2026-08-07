@@ -8,6 +8,23 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::remote_debugging::gc_stats::GcStat;
 
+/// How many interpreters' accumulators one process keeps.
+///
+/// **A bound on retained history, not on existence.** Each poll names the interpreters that
+/// exist, and nothing here caches that. The accumulator outlives the poll because it serves
+/// twice over: the dedup cursor while the interpreter is in the chain, bounded there by
+/// CPython's own live count, and the figures the summary reports once it is gone, which is the
+/// half that grows. Ids are never reused, so a workload creating and destroying
+/// sub-interpreters would hold one per `(interpreter, generation)` until the process exits.
+///
+/// Room is made by dropping the interpreter seen least recently: a lazy proxy for "finished",
+/// chosen because absence from one poll no longer proves death (the walk skips an interpreter
+/// whose read failed) and because dropping a live cursor re-admits its whole ring, emitting
+/// every Record in it twice. Evicting under pressure, oldest first, cannot reach an
+/// interpreter still collecting, which appears in every poll. Refusing the newcomer instead
+/// fills the set with the *oldest* ids and reports only interpreters that no longer exist.
+pub const MAX_RETAINED_INTERPRETERS: usize = 1024;
+
 /// One ring: the Entries one generation of one interpreter publishes its Records through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RingKey {
@@ -161,6 +178,16 @@ pub struct Cursor {
     /// one that had started is later evidence than one that had ended. Across polls both
     /// apply: a bound left at an old start would widen every Loss window opened after it.
     last_certainty: HashMap<(u32, i64), i64>,
+    /// Per process, the interpreters whose accumulators are kept and the poll each was last
+    /// seen in, bounded by [`MAX_RETAINED_INTERPRETERS`]. Every other map here is keyed on an
+    /// interpreter, so this bounds all of them.
+    retained: HashMap<u32, HashMap<i64, u64>>,
+    /// Interpreters whose accumulators went to make room, per process. Counted, since an
+    /// operator reading a summary that omits an interpreter has no other way to tell that from
+    /// one that never collected.
+    dropped: HashMap<u32, u64>,
+    /// Polls admitted so far, which is what orders [`retained`](Self::retained) for eviction.
+    polls: u64,
 }
 
 impl Cursor {
@@ -184,9 +211,11 @@ impl Cursor {
     pub fn admit<'r>(&mut self, pid: u32, records: &'r [GcStat]) -> Vec<&'r GcStat> {
         let mut candidates: Vec<&GcStat> = records.iter().collect();
         candidates.sort_by_key(|r| (r.interpreter_id, r.generation, r.collections()));
+        self.polls += 1;
 
         let mut fresh: Vec<&GcStat> = Vec::new();
         for record in candidates {
+            self.retain(pid, record.interpreter_id);
             if !record.is_complete() {
                 // An Entry that never held a Collection reads zero at both ends and so fails
                 // the completeness test too. A start it never published is no evidence, and a
@@ -219,6 +248,52 @@ impl Cursor {
         // none) keep the ring order they were folded in.
         fresh.sort_by_key(|r| r.ts_start());
         fresh
+    }
+
+    /// Mark this process's `interpreter` seen in this poll, keeping its accumulator and, at
+    /// the bound, dropping the one seen least recently.
+    ///
+    /// The single gate every per-interpreter map goes through, so one bound covers the
+    /// accumulators and the certainty bounds together.
+    fn retain(&mut self, pid: u32, interpreter: i64) {
+        let poll = self.polls;
+        let retained = self.retained.entry(pid).or_default();
+        if let Some(seen) = retained.get_mut(&interpreter) {
+            *seen = poll;
+            return;
+        }
+        if retained.len() < MAX_RETAINED_INTERPRETERS {
+            retained.insert(interpreter, poll);
+            return;
+        }
+
+        // Oldest first, for the reasons on `MAX_RETAINED_INTERPRETERS`: a destroyed
+        // interpreter stops appearing in the chain, and a running one is in every poll.
+        let stalest = *retained
+            .iter()
+            .min_by_key(|&(id, &seen)| (seen, *id))
+            .map(|(id, _)| id)
+            .expect("a full set holds at least one interpreter");
+        retained.remove(&stalest);
+        retained.insert(interpreter, poll);
+        self.drop_interpreter(pid, stalest);
+        *self.dropped.entry(pid).or_default() += 1;
+    }
+
+    /// Drop everything one interpreter of `pid` is cursored on.
+    ///
+    /// [`forget`](Self::forget) retires an accumulator; this destroys it. Keeping the figures
+    /// would defeat the bound that dropped them, so the run reports how many went instead.
+    fn drop_interpreter(&mut self, pid: u32, interpreter: i64) {
+        self.rings
+            .retain(|key, _| key.pid != pid || key.interpreter != interpreter);
+        self.last_certainty.remove(&(pid, interpreter));
+    }
+
+    /// How many of this process's interpreters lost their accumulators to make room. Zero
+    /// unless a workload creates sub-interpreters by the thousand.
+    pub fn dropped(&self, pid: u32) -> u64 {
+        self.dropped.get(&pid).copied().unwrap_or(0)
     }
 
     /// Raise this interpreter's certainty bound to `moment` when `moment` is later. A
@@ -254,6 +329,8 @@ impl Cursor {
         }
         self.evictions += 1;
         self.last_certainty.retain(|&(p, _), _| p != pid);
+        self.retained.remove(&pid);
+        self.dropped.remove(&pid);
     }
 
     /// What one ring did against what was read of it, or `None` if no Record of it has been
@@ -705,6 +782,109 @@ mod tests {
     fn an_unobserved_ring_has_no_accumulator() {
         let c = Cursor::new();
         assert_eq!(c.observation(key(1, 0, 0)), None);
+    }
+
+    /// Fill one process to the bound, one interpreter per poll.
+    fn fill_the_retained_set(cursor: &mut Cursor, pid: u32) {
+        for interpreter in 0..MAX_RETAINED_INTERPRETERS as i64 {
+            cursor.admit(pid, &[at(0, 0, interpreter, 5, 100, 110)]);
+        }
+    }
+
+    /// Ids are never reused, so a process that creates and destroys interpreters keeps an
+    /// accumulator for every one it ever ran. The bound keeps a day-long run's memory flat.
+    #[test]
+    fn a_process_retains_a_bounded_number_of_interpreter_accumulators() {
+        let mut c = Cursor::new();
+        let past_the_bound = MAX_RETAINED_INTERPRETERS as i64 + 2;
+        for interpreter in 0..past_the_bound {
+            c.admit(1, &[at(0, 0, interpreter, 5, 100, 110)]);
+        }
+
+        assert_eq!(
+            c.observations().count(),
+            MAX_RETAINED_INTERPRETERS,
+            "the accumulators a process holds are bounded"
+        );
+        assert_eq!(c.dropped(1), 2, "and what went is counted, not silent");
+        // What went is the two seen longest ago; the newcomers are retained.
+        assert!(c.observation(key(1, 0, 0)).is_none());
+        assert!(c.observation(key(1, 1, 0)).is_none());
+        assert!(c.observation(key(1, past_the_bound - 1, 0)).is_some());
+    }
+
+    /// The property that makes the bound survivable: an interpreter still running appears in
+    /// every poll, so churn around it never costs it its accumulator. Refusing the newcomer
+    /// instead fills the set with the *oldest* ids, leaving a summary that describes only
+    /// interpreters which no longer exist.
+    #[test]
+    fn churn_evicts_the_interpreters_that_stopped_appearing_not_the_running_one() {
+        let mut c = Cursor::new();
+        let live = 7;
+        c.admit(1, &[at(0, 0, live, 1, 100, 110)]);
+
+        // Every other interpreter runs for exactly one poll, as an interpreter-per-task pool
+        // does, while `live` keeps collecting alongside them.
+        for task in 0..(MAX_RETAINED_INTERPRETERS as i64 * 2) {
+            let interpreter = 1_000 + task;
+            c.admit(
+                1,
+                &[
+                    at(0, 0, live, 2 + task, 200 + task, 210 + task),
+                    at(0, 0, interpreter, 1, 100, 110),
+                ],
+            );
+        }
+
+        let observed = c
+            .observation(key(1, live, 0))
+            .expect("the live interpreter");
+        assert_eq!(
+            observed.first().collections,
+            1,
+            "its accumulator is unbroken"
+        );
+        assert_eq!(
+            observed.last().collections,
+            MAX_RETAINED_INTERPRETERS as i64 * 2 + 1
+        );
+        assert!(c.dropped(1) > 0, "the finished interpreters are what went");
+    }
+
+    /// The bound is per process: one process running many interpreters must not cost its
+    /// sibling its accumulators.
+    #[test]
+    fn the_bound_is_per_process_and_goes_when_the_process_does() {
+        let mut c = Cursor::new();
+        fill_the_retained_set(&mut c, 100);
+        c.admit(100, &[at(0, 0, 9_000, 5, 100, 110)]);
+        assert_eq!(c.dropped(100), 1);
+
+        // The sibling has its own budget.
+        assert_eq!(admitted(&mut c, 200, &[at(0, 0, 9_000, 5, 100, 110)]), [5]);
+        assert_eq!(c.dropped(200), 0);
+
+        // And a recycled PID starts from a full one, like every other kind of per-PID state.
+        c.forget(100);
+        assert_eq!(c.dropped(100), 0);
+        assert_eq!(admitted(&mut c, 100, &[at(0, 0, 9_001, 5, 100, 110)]), [5]);
+    }
+
+    /// A dropped interpreter leaves nothing behind: not its rings, and not the certainty bound
+    /// keyed the same way. Otherwise one map is bounded and the other is not.
+    #[test]
+    fn a_dropped_interpreter_takes_its_certainty_bound_with_it() {
+        let mut c = Cursor::new();
+        c.admit(1, &[at(0, 0, 0, 5, 100, 110)]);
+        assert_eq!(c.last_certainty(1, 0), Some(110));
+
+        // Push past the bound with interpreters seen more recently than 0.
+        for interpreter in 1..=MAX_RETAINED_INTERPRETERS as i64 {
+            c.admit(1, &[at(0, 0, interpreter, 5, 100, 110)]);
+        }
+
+        assert_eq!(c.observation(key(1, 0, 0)), None);
+        assert_eq!(c.last_certainty(1, 0), None);
     }
 
     /// A build with no timestamp fields publishes nothing a timestamp key could order, so the
