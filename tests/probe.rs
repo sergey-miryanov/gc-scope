@@ -34,8 +34,8 @@ use std::time::Duration;
 /// discovery matches on it (ADR 0014), and the module name in `gcscope_probe/src` fixes it.
 const MODULE_PREFIX: &str = "gcscope_probe";
 
-/// What CPython names a built extension module. `.so` covers macOS too — extensions there are
-/// `.so`, not `.dylib`.
+/// What CPython names a built extension module. macOS uses `.so` for extensions as well,
+/// whatever it uses elsewhere.
 #[cfg(windows)]
 const MODULE_SUFFIX: &str = ".pyd";
 #[cfg(not(windows))]
@@ -106,8 +106,7 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 /// find the mapped Probe module, parse its symbol table, rebase the symbol onto the module's
 /// load address. No scanning and no hardcoded address, which is the chain ADR 0014 specifies.
 ///
-/// One goblin match covers PE and ELF, so this reads the same fact on both platforms the leg
-/// runs on rather than diverging into two lookups.
+/// One goblin match covers PE and ELF, so both platforms read the same fact through one lookup.
 fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
     let regions = list_regions(pid).map_err(|e| format!("listing target regions: {e}"))?;
 
@@ -124,8 +123,8 @@ fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
         if !(name.starts_with(MODULE_PREFIX) && name.ends_with(MODULE_SUFFIX)) {
             continue;
         }
-        // An image's lowest mapping is where its first loadable segment landed, on every
-        // format here. What that address is relative to differs, which is the load bias below.
+        // An image's lowest mapping is where its first loadable segment landed, on both
+        // formats here. The load bias below accounts for what that address is relative to.
         let entry = (path.to_string(), r.start() as u64);
         if module.as_ref().is_none_or(|(_, base)| entry.1 < *base) {
             module = Some(entry);
@@ -144,10 +143,10 @@ fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
             .map(|e| base + e.rva as u64),
         Ok(goblin::Object::Elf(elf)) => {
             // `dynsyms` only. The static `.symtab` carries the symbol whatever its visibility,
-            // so falling back to it — as gcscope's own `resolve_symbol_elf` does, correctly,
-            // for a different question — would let a `-fvisibility=hidden` regression pass
-            // here while breaking discovery in the field. This lookup asserts the symbol is
-            // where a remote reader will look for it.
+            // so a fallback there would let a `-fvisibility=hidden` regression pass here while
+            // breaking discovery in the field. gcscope's `resolve_symbol_elf` does fall back,
+            // for a different question. This lookup asserts the symbol sits where a remote
+            // reader will look.
             let bias = elf_load_bias(&elf)
                 .ok_or_else(|| format!("{path} has no PT_LOAD segment to take a load bias from"))?;
             elf.dynsyms
@@ -155,8 +154,8 @@ fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
                 .find(|s| elf.dynstrtab.get_at(s.st_name) == Some(HEADER_SYMBOL))
                 .map(|s| base.wrapping_add(s.st_value.wrapping_sub(bias)))
         }
-        // Mach-O is spec 0013's port, not this leg's: nothing here has run on macOS, and an
-        // untested arm reads as support. Ticket 04 adds it against a leg that can prove it.
+        // Mach-O belongs to spec 0013's port. Nothing here has run on macOS, and an untested
+        // arm reads as support, so ticket 04 adds it against a leg that can prove it.
         Ok(other) => {
             return Err(format!(
                 "{path} parses as {}, which this lookup does not handle yet",

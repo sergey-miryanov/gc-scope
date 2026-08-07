@@ -145,15 +145,13 @@ jobs:
       # silently — the leg still passes, it just stops testing anything new. This is the
       # constraint ADR 0010 section 2 states; nothing enforced it until now.
       #
-      # Every `python:` matrix in the file, not the first one: the Probe leg added a second,
-      # and a guard that stops at `head -1` would have left it unguarded while still
-      # reporting green.
+      # Scans every `python:` matrix. The Probe leg added a second one, and a guard stopping at
+      # `head -1` would have left it unchecked while still reporting green.
       - name: Reject pinned patch versions in any python matrix
         run: |
           LINES=$(grep -nE "^ *python: \[.*\]" .github/workflows/rust.yml || true)
           echo "$LINES"
-          # A grep-based guard is worthless once the thing it greps for is renamed, and that
-          # rename would look like a pass. Find nothing, fail loudly.
+          # Rename the matrix key and this guard finds nothing, which reads as a pass. Fail.
           if [ -z "$LINES" ]; then
             echo "::error::no python matrix found in rust.yml; this guard has drifted"
             exit 1
@@ -419,13 +417,13 @@ jobs:
 
 
   # Decides whether the Probe contract leg below runs, so a docs-only pull request keeps its
-  # current turnaround. Done here with `git diff` rather than a `paths:` filter, because
-  # `paths:` gates the whole workflow file and every other job in it must keep running.
+  # current turnaround. `git diff` rather than a `paths:` filter, because `paths:` gates the
+  # whole workflow file and every other job in it has to keep running.
   #
-  # The list below is deliberately wide. ADR 0016 section 4 makes this leg the price of path
+  # The list below is wide on purpose. ADR 0016 section 4 makes this leg the price of path
   # filtering: the Probe and gcscope's decoder share a layout contract, and a pull request that
-  # breaks it from the *reader* side must go red on that pull request rather than on whichever
-  # later one happens to touch C. So anything under `src/` counts, not just the reader modules.
+  # breaks it from the *reader* side has to go red on that pull request rather than on whichever
+  # later one happens to touch C. So the gate opens on all of `src/`.
   probe-scope:
     name: Does this change reach the Probe contract?
     runs-on: ubuntu-latest
@@ -440,24 +438,24 @@ jobs:
           BASE: ${{ github.base_ref }}
         run: |
           set -euo pipefail
-          # A push to main and a manual dispatch have no base to diff against, and both are
-          # places where guessing wrong costs more than the four minutes the leg takes.
+          # A push to main and a manual dispatch have no base to diff against, and guessing
+          # wrong there costs more than the four minutes the leg takes.
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "event is ${{ github.event_name }}; the contract leg always runs."
             exit 0
           fi
-          # Fetch the base explicitly rather than trusting `origin/$BASE` to exist. What
-          # actions/checkout leaves in refs/remotes depends on its version and inputs, and the
-          # failure would be a `git diff` error that skips the leg — the exact outcome this
-          # gate must never produce by accident.
+          # Fetch the base rather than trusting `origin/$BASE` to exist. actions/checkout
+          # leaves different things in refs/remotes depending on version and inputs, and a
+          # missing ref fails `git diff` and skips the leg, which is the one outcome this gate
+          # must never produce by accident.
           git fetch --no-tags --quiet origin "$BASE"
           CHANGED=$(git diff --name-only FETCH_HEAD...HEAD)
           echo "::group::changed files"; echo "$CHANGED"; echo "::endgroup::"
-          # A herestring, not a pipe into `grep -q`: `-q` exits at the first match, and under
-          # `set -o pipefail` a SIGPIPE'd producer makes the pipeline non-zero even though the
-          # pattern matched. That routes a matching change to the else branch and skips the
-          # leg — the silent skip the comment above says this gate must never produce.
+          # A herestring keeps `grep -q` out of a pipeline. `-q` exits at the first match, and
+          # under `set -o pipefail` the SIGPIPE'd producer makes the pipeline non-zero even
+          # though the pattern matched, routing a matching change to the else branch. That is
+          # the silent skip the comment above forbids.
           if grep -qE '^(gcscope_probe/|src/|tests/|scripts/gen-offsets\.py$|Cargo\.(toml|lock)$|\.github/workflows/rust\.yml$)' <<< "$CHANGED"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "Reaches the Probe contract; the leg runs."
@@ -472,6 +470,9 @@ jobs:
   #
   # `specs/0015-publish-probe-wheels.md` owns wheels, musllinux, native arm64 and publishing.
   # This builds one module from source and throws it away.
+  #
+  # Nothing builds the Probe on Windows in CI. Spec 0015 adds that leg; until then a
+  # Windows-only break merges green.
   probe-contract:
     name: Probe contract (ubuntu py${{ matrix.python }})
     needs: probe-scope
@@ -485,9 +486,9 @@ jobs:
         # else. Bare minor, floated by setup-python, and `matrix-unpinned` enforces that, for
         # the reason ADR 0010 section 2 gives: a pinned entry stops testing anything new.
         #
-        # What the float does NOT yet catch is a patch release moving the interpreter offsets
-        # this build transcribes. `offsets_ok` lives behind a Python call an out-of-process
-        # reader cannot make, so the test never sees it, and a failed self-check reads as
+        # The float does not yet catch a patch release moving the interpreter offsets this
+        # build transcribes. `offsets_ok` sits behind a Python call an out-of-process reader
+        # cannot make, so the test never sees it, and a failed self-check reads as
         # `heap_size = 0`, which passes the sane-magnitude check. Spec 0013 tickets 03 and 06
         # close that: offsets compiled from the interpreter's own headers, and the self-check
         # result published in the region header where this test can assert on it.
@@ -512,15 +513,15 @@ jobs:
       - name: Allow ptrace (best-effort)
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      # No compiler or interpreter path appears here: setuptools finds the toolchain, which is
-      # the whole point of `pip install`. A compile error fails the leg here, named, rather
-      # than downstream as a test that found no module.
+      # No compiler or interpreter path appears here; setuptools finds the toolchain. A compile
+      # error fails the leg at this step, named, rather than downstream as a test that found no
+      # module.
       - name: Build and install the Probe
         run: python -m pip install --verbose ./gcscope_probe
 
-      # GCSCOPE_REQUIRE_PROBE=1 is what stops a skip reading as a pass. The test skips when no
-      # Probe is installed, which is right on a laptop and would turn a Probe that failed to
-      # compile into a green leg here.
+      # GCSCOPE_REQUIRE_PROBE=1 stops a skip reading as a pass. The test skips when no Probe is
+      # installed, which is right on a laptop and would turn a Probe that failed to compile
+      # into a green leg here.
       - name: Attach and assert the Ring decodes
         env:
           GCSCOPE_REQUIRE_PROBE: '1'

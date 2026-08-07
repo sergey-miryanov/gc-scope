@@ -16,13 +16,13 @@ class BuildExt(build_ext):
     """Give MSVC the two flags it needs for `<stdatomic.h>`.
 
     MSVC compiles `.c` in a legacy dialect unless told otherwise, and gates C11 atomics behind
-    an opt-in on top of that. Without them its own `vcruntime_c11_stdatomic.h` stops the build:
-    `"C atomics require C11 or later"` for the missing `/std:c11`, then `"C atomic support is
-    not enabled"` for the missing `/experimental:c11atomics`. The second flag is how VS 2022
-    ships C11 atomics from 17.5 on; the name is the shipping name, not a preview channel.
+    a second opt-in. Without them `vcruntime_c11_stdatomic.h` stops the build: `"C atomics
+    require C11 or later"` for the missing `/std:c11`, then `"C atomic support is not enabled"`
+    for the missing `/experimental:c11atomics`. Despite its name the second flag is how VS 2022
+    ships C11 atomics, from 17.5 on, which puts a floor under the Windows toolchain.
 
-    gcc and clang already default to a gnu1x mode that has the header, so pinning a standard
-    there would cap the dialect Python.h is compiled under and buy nothing.
+    gcc and clang default to a gnu1x mode that has the header, so pinning a standard there
+    would cap the dialect Python.h compiles under and buy nothing.
     """
 
     MSVC_C11_ATOMICS = ["/std:c11", "/experimental:c11atomics"]

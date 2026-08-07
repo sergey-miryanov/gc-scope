@@ -6,11 +6,11 @@
  * `struct gc_stats` byte-for-byte (3.15/Include/internal/pycore_interp_structs.h:180-222),
  * which gcscope's ring decoder reads unmodified.
  *
- * Scope today: 3.14 only, x86-64 only, and the interpreter offsets below are transcribed from
- * a WINDOWS build. The code compiles and runs on Linux; that one constant has not been
- * re-derived there, and `PyInterpreterState` is not layout-identical across platforms, so the
- * self-check is expected to fail on Linux and `heap_size` to read 0 until ticket 03 compiles
- * the offsets in. `specs/0013-probe-portable-core.md` covers what each becomes.
+ * Scope today: 3.14 only, x86-64 only, and the interpreter offsets below come from a WINDOWS
+ * build. The code compiles and runs on Linux, but nobody has re-derived that constant there
+ * and `PyInterpreterState` differs in layout across platforms. Expect the self-check to fail
+ * on Linux and `heap_size` to read 0 until ticket 03 compiles the offsets in.
+ * `specs/0013-probe-portable-core.md` covers what each becomes.
  */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
@@ -20,10 +20,10 @@
 #include <string.h>
 
 /* Default visibility for the two symbols an out-of-process reader looks up. `PyMODINIT_FUNC`
- * already carries it; `gcscope_probe_header` and the slot array do not, and drop out of the
- * dynamic symbol table under `-fvisibility=hidden` with no diagnostic at all -- discovery just
- * finds nothing. `tests/probe.rs` looks the symbol up in `.dynsym` alone, never the static
- * symbol table, so a regression here fails a test instead of shipping. */
+ * carries it; `gcscope_probe_header` and the slot array do not, and drop out of the dynamic
+ * symbol table under `-fvisibility=hidden` with no diagnostic. Discovery then finds nothing.
+ * `tests/probe.rs` looks the symbol up in `.dynsym` only, so a regression here fails a test
+ * instead of shipping. */
 #ifdef _WIN32
 #  define GCSCOPE_PROBE_EXPORT __declspec(dllexport)
 #else
@@ -273,11 +273,10 @@ gcscope_probe_add_stats(struct gcscope_probe_stats *s, int gen,
      *
      * A release FENCE followed by a plain store establishes this on x86-64's TSO and NOT on
      * aarch64. That is a correctness defect no supported platform can exhibit yet, and the
-     * port kept its shape deliberately rather than fixing it in passing:
-     * `specs/0013-probe-portable-core.md` §4 replaces it with an explicit release store on
-     * `ts_stop`, which the same spec pairs with the native arm64 leg that would fail without
-     * it. Fixing it here would land the change on the one architecture that cannot show it
-     * working. */
+     * port left it alone on purpose: `specs/0013-probe-portable-core.md` §4 replaces it with
+     * an explicit release store on `ts_stop`, paired there with the native arm64 leg that
+     * would fail without it. Fixing it on an x86-64 leg would land the change where nothing
+     * can show it working. */
     atomic_thread_fence(memory_order_release);
     cur->ts_stop = ts_stop;
 
@@ -543,10 +542,10 @@ PyInit_gcscope_probe(void)
 #define GCSCOPE_PROBE_OLD_BYTES   (GC_OLD_STATS_SIZE * GCSCOPE_PROBE_ITEM + 8)
     Py_BUILD_ASSERT(GC_YOUNG_STATS_SIZE >= 1 && GC_OLD_STATS_SIZE >= 1);
     /* `claimed` is a field an out-of-process reader inspects at the offset the header
-     * publishes, so it has to be a plain int in memory. An implementation whose atomic_int
-     * carried a lock alongside the value would keep every offsetof here correct and hand that
-     * reader a different field. Size is the property that matters, not ATOMIC_INT_LOCK_FREE:
-     * MSVC reports a lower value there than gcc while laying the type out identically. */
+     * publishes, so it has to be a plain int in memory. An implementation storing a lock
+     * beside the value would keep every offsetof here correct and hand that reader a different
+     * field. Size is the property that matters. ATOMIC_INT_LOCK_FREE is not: MSVC reports a
+     * lower value there than gcc for a type it lays out the same way. */
     Py_BUILD_ASSERT(sizeof(atomic_int) == sizeof(int));
     Py_BUILD_ASSERT(sizeof(struct gcscope_probe_young_stats_buffer)
                     == GCSCOPE_PROBE_YOUNG_BYTES);

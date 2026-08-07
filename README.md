@@ -23,11 +23,10 @@ but not what any Collection cost. [`gcscope_probe/`](gcscope_probe/README.md) is
 extension you install into your **own** process to publish that timing, shaped so gcscope's
 ring decoder already reads it. It ships as a separate distribution on its own release train;
 [ADR 0016](docs/adr/0016-probe-ships-from-this-repo.md) explains why a C extension lives in a
-Rust repository. Today it builds on 3.14, x86-64, for Windows and Linux; CI attaches to a Linux
-Probe and decodes it on every pull request that reaches the layout contract, while the Windows
-build is checked by hand. [`specs/0013`](specs/0013-probe-portable-core.md) carries it to macOS,
-arm64 and 3.13, and [`specs/0015`](specs/0015-publish-probe-wheels.md) is where Windows gets a
-leg of its own.
+Rust repository. Today it builds on 3.14, x86-64, for Windows and Linux. CI attaches to a Linux
+Probe and decodes it on every pull request that reaches the layout contract; the Windows build
+is checked by hand until [`specs/0015`](specs/0015-publish-probe-wheels.md) gives it a leg.
+[`specs/0013`](specs/0013-probe-portable-core.md) carries the Probe to macOS, arm64 and 3.13.
 
 ## Attaching: per-platform permissions
 
