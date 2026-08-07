@@ -204,13 +204,13 @@ their scale factor. Absent fields are omitted rather than defaulted.
 
 The table shipped behind `--summary` and the JSON document behind `--summary-json`, both
 rendering one folded summary so they cannot disagree. Its schema is in
-[`docs/summary-json.md`](../docs/summary-json.md), whose load-bearing rule is that a figure
-the build cannot supply has no key (story 11).
+[`docs/summary-json.md`](../docs/summary-json.md), where a figure the build cannot supply has
+no key (story 11).
 
 **Percentiles have not shipped**, and neither has the replay-from-file path: reconstructing
 this from a written trace is what the pyperf hook needs, and it arrives with the JSONL
-exporter. The accumulator takes a stream of Records from either source, which is the only
-concession made to that future.
+exporter. The accumulator takes a stream of Records from either source, the only concession
+made to that future.
 
 ## 5. Seams and testing decisions
 

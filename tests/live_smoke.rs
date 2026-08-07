@@ -545,9 +545,9 @@ fn live_monitor_summarizes_every_generation_in_the_builds_tier() {
 /// `--summary-json` writes the same account as a document, and the target's own `json` module
 /// is what says it parses.
 ///
-/// Live rather than at the poll seam because the seam's tests read the writer's output with a
-/// splitter that shares the writer's assumptions. A real parser on a real run is the only
-/// thing that catches a document gcscope can write and a consumer cannot read.
+/// Live rather than at the poll seam, whose tests read the writer's output with a splitter
+/// that shares the writer's assumptions. A real parser on a real run is what catches a
+/// document gcscope can write and a consumer cannot read.
 #[test]
 #[ignore = "spawns and attaches to a live interpreter; needs ptrace/taskport — run with --ignored"]
 fn live_monitor_writes_a_summary_a_json_parser_can_read() {

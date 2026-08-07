@@ -1,19 +1,16 @@
 //! The end-of-run summary as JSON, for a CI check or another tool to read.
 //!
-//! One rule shapes the schema: a figure the build cannot supply has no key. A check
+//! One rule shapes the schema: a figure the build cannot supply has no key, so a check
 //! thresholding on pause time fails to find the field against a 3.12 target rather than
-//! passing against a zero it reads as "this process spends no time in GC" (spec 0011 §2).
+//! passing against a zero (spec 0011 §2).
 //!
-//! The figures arrive already folded from [`super::statistics`], the same values the table
-//! prints, and nothing here computes one. Two renderings each doing their own arithmetic is
-//! how gcmon ended up with two disagreeing accounts of one run (its ADR-0007).
+//! The figures arrive folded from [`super::statistics`], the same values the table prints,
+//! and nothing here computes one. Two renderings each doing their own arithmetic is how gcmon
+//! ended up with two disagreeing accounts of one run (its ADR-0007).
 //!
-//! The JSON is hand-written, like the Chrome encoder's. The document is a fixed shape of
-//! numbers with one constant string in it, so there is nothing to escape, and the test at the
-//! bottom pins the bytes.
-//!
-//! `docs/summary-json.md` documents the schema, the absence rule and the consumer it is
-//! shaped for.
+//! The JSON is hand-written like the Chrome encoder's: a fixed shape of numbers with one
+//! constant string in it, nothing to escape, and the test at the bottom pinning the bytes.
+//! `docs/summary-json.md` carries the schema and its consumer.
 
 use std::io::Write;
 
@@ -21,10 +18,10 @@ use anyhow::{Context, Result};
 
 use crate::monitor::statistics::{GenerationSummary, InterpreterSummary};
 
-/// The document's name and version, carried in every document.
+/// The document's name and version.
 ///
-/// Coverage and the exact counts are in this first version rather than arriving in a second
-/// one: a consumer pinning `1` gets the reconstruction, not the observed counts alone.
+/// Coverage and the exact counts are in this first version rather than a second: a consumer
+/// pinning `1` gets the reconstruction, not the observed counts alone.
 pub const SCHEMA: &str = "gcscope.gc-summary/1";
 
 /// The destination meaning stdout, spelled the way every other CLI spells it.
@@ -44,9 +41,9 @@ pub fn encode(summary: &[InterpreterSummary]) -> String {
 pub fn write(destination: &str, summary: &[InterpreterSummary]) -> Result<()> {
     let document = encode(summary);
     if destination == STDOUT {
-        // The one thing gcscope puts on stdout, which is why the table goes to stderr beside
-        // the run's other messages. Written rather than `print!`ed: a consumer piping the
-        // document into `head` closes the pipe, and `print!` turns that into a panic.
+        // The one thing gcscope puts on stdout, which is why the table goes to stderr.
+        // Written rather than `print!`ed: a consumer piping into `head` closes the pipe, and
+        // `print!` panics on that.
         let mut out = std::io::stdout().lock();
         return out
             .write_all(document.as_bytes())
@@ -75,8 +72,8 @@ fn interpreter(block: &InterpreterSummary) -> Vec<String> {
     lines
 }
 
-/// One generation's figures, on one line. Every value is a number, so a reader scans a row of
-/// them the way they scan the table's.
+/// One generation's figures, on one line. Every value is a number, so it reads like a row of
+/// the table.
 fn generation(g: &GenerationSummary) -> String {
     let mut fields = vec![
         ("generation", g.generation.to_string()),
@@ -109,15 +106,14 @@ fn generation(g: &GenerationSummary) -> String {
     format!("{{{}}}", body.join(", "))
 }
 
-/// A float as JSON, or nothing where JSON has no spelling for it. A non-finite figure is not a
-/// figure, and absence is what this schema says about one it does not have.
+/// A float as JSON, or nothing where JSON has no spelling for it. A non-finite figure is not
+/// a figure, and absence is what this schema says about one.
 fn number(value: f64) -> Option<String> {
     value.is_finite().then(|| value.to_string())
 }
 
-/// `"name": [ … ]` with one item per line, as the lines of the enclosing object. An empty list
-/// keeps its brackets together: a run that read nothing still hands its consumer something to
-/// parse.
+/// `"name": [ … ]` with one item per line, as the lines of the enclosing object. An empty
+/// list keeps its brackets together, so a run that read nothing still parses.
 fn list(name: &str, items: Vec<Vec<String>>) -> Vec<String> {
     if items.is_empty() {
         return vec![format!(r#""{name}": []"#)];
@@ -145,8 +141,8 @@ mod tests {
     use super::*;
     use crate::monitor::statistics::render;
 
-    /// One generation of a ring build: counts reconstructed over the span, and the pause priced
-    /// from the target's own cumulative total.
+    /// One generation of a ring build: counts reconstructed over the span, and the pause
+    /// priced from the target's cumulative total.
     fn timed(generation: u32) -> GenerationSummary {
         GenerationSummary {
             generation,
@@ -196,7 +192,7 @@ mod tests {
     /// The key/value pairs of each generation object in the document, in order.
     ///
     /// Not a JSON parser: a generation object is one line of `"key": number` pairs with no
-    /// nesting and no strings inside it, which the byte-for-byte test below is what keeps true.
+    /// nesting and no strings in it, which the byte-for-byte test below keeps true.
     fn generations(document: &str) -> Vec<Vec<(&str, &str)>> {
         document
             .lines()
@@ -215,8 +211,7 @@ mod tests {
             .collect()
     }
 
-    /// The figures of the first generation of the first interpreter, which most cases below
-    /// only need one of.
+    /// The first generation of the first interpreter, which most cases below only need one of.
     fn only_generation(summary: &[InterpreterSummary]) -> Vec<(String, String)> {
         let document = encode(summary);
         generations(&document)
@@ -236,9 +231,9 @@ mod tests {
 
     /// The document, byte for byte, for a summary carrying both tiers.
     ///
-    /// Pinned the way the Chrome trace is: the consumers are outside this repo, so a key
-    /// renamed or a figure silently dropped has to fail here. Paste the new bytes in only
-    /// after deciding the schema changed.
+    /// Pinned the way the Chrome trace is: its consumers are outside this repo, so a renamed
+    /// key or a silently dropped figure has to fail here. Paste new bytes in only after
+    /// deciding the schema changed.
     #[test]
     fn the_document_is_this_shape() {
         let document = encode(&[
@@ -314,8 +309,8 @@ mod tests {
         }
     }
 
-    /// The rule the schema exists for. A CI check thresholding on pause time must fail to find
-    /// the key against a build that publishes none, rather than pass against a zero.
+    /// The rule the schema exists for. A CI check thresholding on pause time must fail to
+    /// find the key against a build that publishes none, rather than pass against a zero.
     #[test]
     fn a_figure_the_build_cannot_supply_has_no_key() {
         let fields = only_generation(&[block(7, 0, vec![counted(0)])]);
@@ -332,9 +327,9 @@ mod tests {
         assert_eq!(figure(&fields, "coverage").as_deref(), Some("0"));
     }
 
-    /// A ring build can bound its Collections without publishing the cumulative total the exact
-    /// pause is differenced from. What it measured is still a figure; what it cannot
-    /// reconstruct is absent.
+    /// A ring build can bound its Collections without publishing the total the exact pause is
+    /// differenced from. What it measured is still a figure; what it cannot reconstruct is
+    /// absent.
     #[test]
     fn a_build_that_prices_no_total_keeps_the_pause_it_measured() {
         let unpriced = GenerationSummary {
@@ -352,8 +347,8 @@ mod tests {
         assert_eq!(figure(&fields, "pause_mean_ns"), None);
     }
 
-    /// A figure that is not finite is not a figure, and JSON cannot spell one. Dropping the key
-    /// keeps the document parseable and says what absence says everywhere else here.
+    /// JSON cannot spell a non-finite figure. Dropping the key keeps the document parseable
+    /// and says what absence says everywhere else here.
     #[test]
     fn a_figure_json_cannot_spell_is_absent_rather_than_invalid() {
         let broken = GenerationSummary {

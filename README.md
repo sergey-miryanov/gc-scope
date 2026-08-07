@@ -18,8 +18,7 @@ Cross-platform CLI tool for reading and analyzing CPython process memory.
 
 `gcscope monitor <PID>` and `gcscope run` write a Chrome trace of the target's GC activity,
 and with `--summary` or `--summary-json` an end-of-run account of what each generation did.
-[`docs/summary-json.md`](docs/summary-json.md) documents the JSON form and the consumer it is
-shaped for.
+[`docs/summary-json.md`](docs/summary-json.md) carries the JSON schema and its consumer.
 
 ## The Probe (`gcscope_probe/`)
 

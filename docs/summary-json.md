@@ -1,18 +1,16 @@
 # The JSON summary
 
 `--summary-json` writes what `--summary` prints, as one JSON document, so a CI job can
-threshold on GC behaviour and another tool can read the run without parsing a table.
+threshold on GC behaviour and another tool can read the run without parsing a table. Pass both
+flags to get the table and the document.
 
 ```powershell
 gcscope run -s bench.py --summary-json gc-summary.json
 gcscope monitor 12345 --summary-json -     # `-` is stdout
 ```
 
-`monitor` keeps stdout to itself, so `-` there gives a consumer the document and nothing
-else. `run` forwards the target's own stdout to gcscope's, so it refuses `-` and asks for a
-path instead.
-
-The two flags are independent: pass both to watch the table and keep the document.
+`monitor` keeps stdout to itself, so `-` there gives a consumer the document and nothing else.
+`run` forwards the target's own stdout to gcscope's, so it refuses `-` and asks for a path.
 
 ## The document
 
@@ -32,14 +30,13 @@ The two flags are independent: pass both to watch the table and keep the documen
 }
 ```
 
-Each entry of `interpreters` covers one interpreter of one process over the span gcscope
-watched it. A process running sub-interpreters gets one entry each, and a monitored process
-tree one per interpreter per process, so no figure is a tree-wide total. Two entries can
-share a `pid`.
+Each entry of `interpreters` covers one interpreter of one process. Sub-interpreters get one
+each and a monitored tree one per interpreter per process, so no figure is a tree-wide total,
+and two entries can share a `pid`.
 
-Every figure covers the **accounted span**: from the first Record gcscope read of that
-generation to the last. Collections that ran before the attach are outside it.
-[ADR 0019](adr/0019-loss-is-accounted-over-the-observed-span.md) has the reasoning.
+Every figure covers the **accounted span**, from the first Record gcscope read of that
+generation to the last. Collections that ran before the attach sit outside it, for the reasons
+in [ADR 0019](adr/0019-loss-is-accounted-over-the-observed-span.md).
 
 ## Fields
 
@@ -50,24 +47,22 @@ generation to the last. Collections that ran before the attach are outside it.
 | `collected` | Objects collected. Excludes the opening Record, whose predecessor was never read |
 | `uncollectable` | Uncollectable objects, on the same basis |
 | `records` | Records gcscope read |
-| `observed` | Collections a Record was read for. `0` on a build whose Entries describe no single Collection |
+| `observed` | Collections a Record was read for. `0` where an Entry describes no single Collection |
 | `lost` | Collections no Record was read for. `collections` is always `observed + lost` |
-| `coverage` | `observed / collections`, in `[0, 1]`. Says whether a figure derived from the Records describes the run or a biased sample of it |
+| `coverage` | `observed / collections`, in `[0, 1]`. Says whether the figures beside it describe the run or a biased sample of it |
 | `pause_total_ns` | Pause over the span, from the target's cumulative accumulator: what ran, not what was read |
-| `pause_measured_ns` | Pause summed over the Records read: as much of the total as gcscope watched |
+| `pause_measured_ns` | Pause summed over the Records read |
 | `pause_mean_ns` | `pause_total_ns / collections` |
-| `scale_factor` | `pause_total_ns / pause_measured_ns`. Multiply a measured figure that partitions the pause to estimate its exact counterpart. Never a percentile — the sample behind one is biased, and scaling it makes the bias look like a measurement |
+| `scale_factor` | `pause_total_ns / pause_measured_ns`. Scales a measured figure that partitions the pause, never a percentile: the sample behind one is biased, and scaling it makes the bias look like a measurement |
 
 Timestamps are nanoseconds, as CPython publishes them.
 
-## Absence is the schema's load-bearing rule
+## Absent keys
 
 **A figure the build cannot supply has no key.** Below 3.15 CPython publishes no GC
-timestamps, so those targets carry no `pause_*` key and no `scale_factor`. A check
-thresholding on pause time fails to find the field rather than passing against a zero it
-would read as "this process spends no time in GC".
-
-Test the key's presence, never its value:
+timestamps, so those targets carry no `pause_*` and no `scale_factor`. A check thresholding on
+pause time fails to find the field rather than passing against a zero it reads as "this
+process spends no time in GC".
 
 ```python
 pause = generation.get("pause_total_ns")
@@ -75,14 +70,11 @@ if pause is None:
     raise SystemExit("this build publishes no pause timing; the threshold cannot be checked")
 ```
 
-`coverage` is present on both tiers. Its `0` on a pre-3.15 target is an answer, not a
-placeholder: the counts are exact and nothing behind them describes a single Collection.
-
-Only the `pause_*` keys and `scale_factor` vary with the build. The rest are in every
-generation object, behind one backstop: the encoder drops any figure that is not a finite
-number rather than writing something no JSON parser accepts. Nothing gcscope reconstructs can
-produce one today, so reading `coverage` directly is safe; `.get` is what makes a consumer
-certain.
+Only the `pause_*` keys and `scale_factor` vary with the build. `coverage` rides both tiers,
+and its `0` on a pre-3.15 target is an answer: the counts are exact and nothing behind them
+describes a single Collection. One backstop covers the rest, the encoder dropping any figure
+that is not a finite number rather than writing something no parser accepts, so `.get` is what
+makes a consumer certain.
 
 ## What reads it
 
@@ -111,24 +103,22 @@ def gc_metadata(path):
         / max(sum(g["collections"] for g in generations), 1),
     }
 
-    # Absent on a build with no timing, and a metric this run cannot supply is one the
-    # benchmark record should not carry.
+    # A metric this run cannot supply is one the benchmark record should not carry.
     if all("pause_total_ns" in g for g in generations):
         metadata["gc_pause_total_ns"] = sum(g["pause_total_ns"] for g in generations)
 
     return metadata
 ```
 
-Summing across generations is this consumer's choice, not the schema's: the document keeps
-them apart because they collect at wildly different rates.
+Summing across generations is this consumer's choice. The document keeps them apart because
+they collect at wildly different rates.
 
 ## Versioning
 
-`schema` names the document and its version. Coverage and the exact counts are in version
-`1` rather than arriving in a later one, so a consumer that pins `1` gets the reconstruction
-rather than the observed counts alone.
+`schema` names the document and its version. Coverage and the exact counts are in version `1`
+rather than a later one, so a consumer pinning `1` gets the reconstruction rather than the
+observed counts alone.
 
-Adding a key is not a new version; a consumer must ignore keys it does not know, and must
-not treat a missing key as an error unless it needs that figure. Renaming or removing one
-is, and the byte-for-byte test at the bottom of `src/monitor/summary_json.rs` is what makes
-either deliberate.
+Adding a key is not a new version: ignore keys you do not know, and treat a missing one as an
+error only where you need that figure. Renaming or removing a key is, and the byte-for-byte
+test in `src/monitor/summary_json.rs` is what makes either deliberate.

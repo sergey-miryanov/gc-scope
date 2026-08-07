@@ -124,8 +124,8 @@ pub fn run(
     if opts.summary_json.as_deref() == Some(summary_json::STDOUT) {
         anyhow::bail!(
             "`run` forwards the target's own stdout to gcscope's, so `--summary-json -` would \
-             hand its consumer the document with the program's output mixed into it. Name a \
-             path, or attach with `monitor`, whose stdout is gcscope's alone."
+             mix the program's output into the document. Name a path, or attach with \
+             `monitor`, whose stdout is gcscope's alone."
         );
     }
     let mut runner = ChildProcessRunner::new(python, script, module, script_args)?;
@@ -166,9 +166,9 @@ fn run_monitoring_loop(runner: &mut impl ProcessRunner, opts: &MonitorOptions) -
         }
     }
 
-    // The trace is finished before the summary is written. `close` is what terminates the
-    // JSON array, so a mistyped `--summary-json` path returning early here used to truncate
-    // the trace the whole run was for — and the operator only finds out afterwards.
+    // The trace is finished before the summary is written: `close` terminates the JSON array,
+    // so a mistyped `--summary-json` path returning early here truncated the trace the whole
+    // run was for.
     ctx.close()?;
     eprintln!("Trace written to {}", opts.output);
 
@@ -177,8 +177,8 @@ fn run_monitoring_loop(runner: &mut impl ProcessRunner, opts: &MonitorOptions) -
         None => Ok(()),
     };
 
-    // Reaped either way, so a failed write does not leave the child unwaited. The error still
-    // decides what gcscope exits with.
+    // Reaped either way, so a failed write leaves no unwaited child. The error still decides
+    // the exit code.
     let code = runner.returncode();
     written.and(code)
 }
@@ -197,9 +197,8 @@ mod tests {
     }
 
     /// `run` forwards the target's stdout to gcscope's, so a document written there arrives
-    /// with the program's own output around it. Refused up front, before the spawn: an
-    /// operator who asked for a machine-readable summary and got an unparseable stream would
-    /// only find out after the run they were monitoring.
+    /// with the program's output around it. Refused before the spawn, since an operator would
+    /// otherwise learn about it only after the run they were monitoring.
     #[test]
     fn run_refuses_to_share_stdout_with_the_program_it_watches() {
         let error = run(
