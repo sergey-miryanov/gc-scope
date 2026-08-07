@@ -168,9 +168,9 @@ impl<'a> MonitorContext<'a> {
     /// across a reused PID. No lifecycle event if the PID was never reported as
     /// started or was already marked dead.
     ///
-    /// What the PID's rings *did* survives, retired inside the cursor: run_loop marks the
-    /// target dead before the run ends, so a summary read after eviction would otherwise be
-    /// empty for every completed run.
+    /// What the PID's rings *did* survives, retired inside the cursor. `run_loop` marks the
+    /// target dead before the run ends, so without that every completed run would summarize
+    /// to nothing.
     pub fn mark_died(&mut self, pid: u32) {
         self.sessions.remove(&pid);
         self.cursor.forget(pid);
@@ -183,7 +183,7 @@ impl<'a> MonitorContext<'a> {
     /// What the run read, per interpreter per generation.
     ///
     /// Folded as the Records were polled, so this reads the accumulator rather than the trace
-    /// it wrote — the same figures a replayed stream of Records would give.
+    /// it wrote: the same figures a replayed stream of Records gives.
     pub fn summary(&self) -> Vec<InterpreterSummary> {
         summarize(&self.cursor)
     }
@@ -338,8 +338,8 @@ mod tests {
         assert_eq!(kinds(&events), ["M", "M", "C"]);
     }
 
-    /// The summary is folded from the same polls that fed the exporter, so a run's figures are
-    /// available at the seam without a live interpreter or a written trace.
+    /// The summary is folded from the same polls that fed the exporter, so a run's figures
+    /// reach the seam without a live interpreter or a written trace.
     #[test]
     fn the_summary_reports_what_the_polls_admitted() {
         let mut exporter = ChromeTraceExporter::new();
@@ -353,8 +353,8 @@ mod tests {
         let generations = &summary[0].generations;
         assert_eq!(generations[0].collections, 5);
         assert_eq!(generations[0].collected, 80);
-        // Tier follows each ring's own layout, so one interpreter can hold both here even
-        // though a real build never does.
+        // Tier follows each ring's own layout, so one interpreter holds both here even though
+        // no real build does.
         assert_eq!(generations[0].pause_total_ns, None);
         assert_eq!(generations[1].pause_total_ns, Some(1_000));
     }

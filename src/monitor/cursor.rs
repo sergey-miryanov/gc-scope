@@ -18,9 +18,9 @@ pub struct RingKey {
 
 /// The totals CPython keeps for the life of a generation, as of one Record.
 ///
-/// All four are cumulative on both shapes of Entry: an inline Entry holds nothing else, and a
-/// ring Entry adds per-Collection detail beside them (`docs/version-support.md` §6). What a
-/// run did is therefore a difference between two of these, never a sum over Records.
+/// All four are cumulative on both shapes of Entry: an inline Entry holds nothing else, a ring
+/// Entry adds per-Collection detail beside them (`docs/version-support.md` §6). What a run did
+/// is a difference between two of these, never a sum over Records.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Lifetime {
     pub collections: i64,
@@ -46,7 +46,7 @@ impl Lifetime {
 /// [`first`](Self::first) and [`last`](Self::last) come from CPython and describe the ring;
 /// [`sampled`](Self::sampled) and [`measured_pause_ns`](Self::measured_pause_ns) describe the
 /// reading. Every summary figure is a difference between the two, so nothing derived is stored
-/// here. Ticket 06 computes exact count, exact pause, Coverage and scale factor from these.
+/// here. Ticket 06 computes exact count, exact pause, Coverage and scale factor from them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RingObservation {
     first: Lifetime,
@@ -84,8 +84,8 @@ impl RingObservation {
         self.measured_pause_ns
     }
 
-    /// Whether the Records this ring published bound their Collections with timestamps — the
-    /// tier, carried here because the summary is built after the last Record is gone.
+    /// Whether this ring's Records bound their Collections with timestamps. The tier, carried
+    /// here because the summary is built after the last Record is gone.
     pub fn has_timing(&self) -> bool {
         self.timed
     }
@@ -125,8 +125,8 @@ pub struct Cursor {
     rings: BTreeMap<RingKey, RingObservation>,
     /// Rings whose process has gone. Dedup state must not outlive a PID the OS can recycle,
     /// but what the dead process did is still part of the run, so [`forget`](Self::forget)
-    /// retires an accumulator instead of dropping it. Every worker of a multiprocessing pool
-    /// ends up here, and so does the target of any run that outlives its process.
+    /// retires an accumulator instead of dropping it. Every pool worker ends up here, and so
+    /// does any target that exits before the run does.
     retired: Vec<(RingKey, RingObservation)>,
     /// Per `(pid, interpreter)`, the latest moment the Observer has proof the interpreter
     /// reached: the newest `ts_start` of a Collection caught running, and the newest `ts_stop`
@@ -213,8 +213,8 @@ impl Cursor {
     /// died, so a recycled PID cannot read its predecessor's counters as already-seen.
     ///
     /// Its accumulators are retired rather than destroyed: nothing selects against them again,
-    /// and they stay in the run's summary. A recycled PID therefore contributes a second set
-    /// of figures under the same key, which is what it is — a different process.
+    /// and they stay in the run's summary. A recycled PID contributes a second set of figures
+    /// under the same key, which is what it is: a different process.
     pub fn forget(&mut self, pid: u32) {
         let doomed: Vec<RingKey> = self
             .rings
@@ -239,7 +239,7 @@ impl Cursor {
     /// Every ring a Record has been read from this run, retired ones included, in
     /// `(pid, interpreter, generation)` order. The end-of-run summary's whole input.
     ///
-    /// The sort is stable and the retired rings go in first, so a recycled PID's two sets of
+    /// The sort is stable and retired rings go in first, so a recycled PID's two sets of
     /// figures come out in the order they were observed.
     pub fn observations(&self) -> impl Iterator<Item = (RingKey, &RingObservation)> {
         let mut all: Vec<(RingKey, &RingObservation)> = self
@@ -540,7 +540,7 @@ mod tests {
 
     /// The accumulator holds what its ring did against what was read of it: the Lifetime
     /// totals at the first and last Record seen, how many were sampled, and the pause measured
-    /// across them. Every summary and Loss figure comes from these.
+    /// across them. Every summary and Loss figure comes from those.
     #[test]
     fn an_accumulator_records_the_span_it_observed() {
         let mut c = Cursor::new();
@@ -574,9 +574,8 @@ mod tests {
     }
 
     /// `collected` and `uncollectable` are Lifetime totals like `collections`, on both shapes
-    /// of Entry. The accumulator holds each at both ends of the span it watched, so the
-    /// summary can report what moved during the run rather than a total that has been running
-    /// since the interpreter started.
+    /// of Entry. Holding each at both ends of the watched span is what lets the summary report
+    /// what moved during the run instead of a total running since interpreter startup.
     #[test]
     fn an_accumulator_records_both_ends_of_every_lifetime_total() {
         let mut c = Cursor::new();
@@ -604,8 +603,8 @@ mod tests {
         assert_eq!(obs.last().uncollectable, 7);
     }
 
-    /// The tier is a property of the Records a ring published, and the summary needs it after
-    /// the last poll, when no Record is left to ask. The accumulator carries it.
+    /// The summary needs the tier after the last poll, when no Record is left to ask. The
+    /// accumulator carries it.
     #[test]
     fn an_accumulator_records_whether_its_ring_publishes_timing() {
         let mut c = Cursor::new();
@@ -617,7 +616,7 @@ mod tests {
     }
 
     /// A run's summary is read after its target has exited, by which point `forget` has run.
-    /// The dedup state has to go — a recycled PID must not inherit it — but the figures do
+    /// The dedup state has to go, since a recycled PID must not inherit it. The figures must
     /// not, or every completed run summarizes to nothing.
     #[test]
     fn a_forgotten_pid_keeps_its_figures_out_of_selection_and_in_the_summary() {
@@ -639,7 +638,7 @@ mod tests {
     }
 
     /// The summary walks every ring the run touched, so the cursor hands them over in a stable
-    /// order rather than a hash order that would shuffle the table between runs.
+    /// order rather than a hash order that reshuffles the table each run.
     #[test]
     fn observations_come_out_in_process_interpreter_generation_order() {
         let mut c = Cursor::new();

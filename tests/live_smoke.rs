@@ -409,9 +409,8 @@ fn live_monitor_writes_the_tier_the_build_supports() {
 /// build's Entry layout sits in.
 ///
 /// Worth a live leg rather than only the poll seam: the summary is folded from accumulators
-/// the run's own eviction path touches when the target exits, and a unit test driving the
-/// seam directly never reaches that path. Adding no flag must leave the run's output alone,
-/// which is the second half of the assertion.
+/// that the eviction path touches when the target exits, and a unit test driving the seam
+/// never reaches that path. The second half asserts that adding no flag prints no table.
 #[test]
 #[ignore = "spawns and attaches to a live interpreter; needs ptrace/taskport — run with --ignored"]
 fn live_monitor_summarizes_every_generation_in_the_builds_tier() {

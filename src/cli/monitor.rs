@@ -146,9 +146,9 @@ fn run_monitoring_loop(runner: &mut impl ProcessRunner, opts: &MonitorOptions) -
     })?;
 
     if opts.summary {
-        // On stderr, beside the other run messages: `run` forwards the target's own stdout to
-        // ours, and the summary is gcscope talking, not the program being watched. Ticket 07's
-        // JSON is what a consumer reads, and it gets stdout to itself.
+        // On stderr, beside the other run messages: `run` forwards the target's stdout to
+        // ours, and this is gcscope talking, not the program being watched. Ticket 07's JSON
+        // gets stdout to itself.
         for line in statistics::render(&ctx.summary()) {
             eprintln!("{}", line);
         }
