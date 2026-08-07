@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::monitor::convert::convert_record;
-use crate::monitor::cursor::{Cursor, MAX_INTERPRETERS_PER_PROCESS};
+use crate::monitor::cursor::{Cursor, MAX_RETAINED_INTERPRETERS};
 use crate::monitor::exporters::{EventsExporter, ProcessLifecycle};
 use crate::monitor::run_loop::PollStatus;
 use crate::monitor::statistics::{InterpreterSummary, summarize};
@@ -31,10 +31,10 @@ pub struct MonitorContext<'a> {
     /// did against what was read of it, which is what makes Loss recoverable.
     cursor: Cursor,
     alive_pids: HashSet<u32>,
-    /// Processes already told about for running past the interpreter cap. Evicted with the
-    /// rest of a PID's state, since the cursor's own count restarts there: left behind, a
-    /// recycled PID's overflow would go unannounced, which is what the warning exists to
-    /// prevent.
+    /// Processes already told about for outrunning the retained-interpreter bound. Evicted
+    /// with the rest of a PID's state, since the cursor's own count restarts there: left
+    /// behind, a recycled PID's overflow would go unannounced, which is what the warning
+    /// exists to prevent.
     overflowed_pids: HashSet<u32>,
     /// When monitoring began: the origin of the Observer's clock, read only for builds that
     /// publish no timestamps of their own. See [`observed_at_ns`](Self::observed_at_ns).
@@ -158,9 +158,10 @@ impl<'a> MonitorContext<'a> {
         events
     }
 
-    /// Say once, per process, that it has run more interpreters than gcscope accounts for.
+    /// Say once, per process, that it has run more interpreters than gcscope keeps figures
+    /// for.
     ///
-    /// The cap keeps a long run's memory flat (`cursor::MAX_INTERPRETERS_PER_PROCESS`), and
+    /// The bound keeps a long run's memory flat (`cursor::MAX_RETAINED_INTERPRETERS`), and
     /// what it costs is that an interpreter which stopped collecting long ago drops out of
     /// the summary. Unannounced, a missing interpreter reads as one that never collected.
     fn warn_if_interpreters_dropped(&mut self, pid: u32) {
@@ -168,10 +169,10 @@ impl<'a> MonitorContext<'a> {
             return;
         }
         eprintln!(
-            "warning: process {pid} has run more than {MAX_INTERPRETERS_PER_PROCESS} \
-             interpreters. gcscope accounts for that many at a time, dropping whichever it \
-             has seen least recently, so an interpreter that stopped collecting early in the \
-             run may be missing from the summary. Every interpreter still running is kept."
+            "warning: process {pid} has run more than {MAX_RETAINED_INTERPRETERS} \
+             interpreters. gcscope keeps figures for that many at a time, dropping whichever \
+             it has seen least recently, so an interpreter that stopped collecting early in \
+             the run may be missing from the summary. Every interpreter still running is kept."
         );
     }
 
