@@ -3,35 +3,57 @@
 //! Read from the poll-time accumulator in [`super::cursor`], never from the written trace, so
 //! a replayed stream of Records gives the same figures.
 //!
-//! Every figure is observed. Where Entries are overwritten between polls, the Records read are
-//! a sample of what ran and the `records` column is what shows it.
+//! Counts and pause totals are what ran: [`super::loss`] reconstructs them from CPython's own
+//! cumulative counters, so they stay exact however many Records a poll missed. Coverage is the
+//! share gcscope holds a Record for, and says whether a figure derived from those Records
+//! describes the run or a biased sample of it.
 
 use crate::monitor::cursor::Cursor;
+use crate::monitor::loss::account;
 
 /// What one generation of one interpreter did over the span the Observer watched it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerationSummary {
     pub generation: u32,
-    /// The Lifetime counter's rise, plus the opening Record where that is a Collection in its
-    /// own right. See [`summarize`].
+    /// Collections that ran over the span, from the target's counter rather than the Records
+    /// read: exact under any amount of Loss.
     pub collections: i64,
     /// Objects collected across the span. Never counts the opening Record: CPython publishes a
     /// running total, and the total before it was never read.
     pub collected: i64,
     /// Uncollectable objects across the span, on the same basis as `collected`.
     pub uncollectable: i64,
-    /// Records read. Below `collections` where Entries were overwritten between polls.
+    /// Records read. Below `collections` where Entries were overwritten between polls, and a
+    /// different quantity from [`observed`](Self::observed) on the counter-only tier, where two
+    /// snapshots witness no Collection between them.
     pub records: u64,
-    /// Pause summed over the Records read. `None` where the Entry layout carries no
-    /// timestamps: absent, never zero (ADR 0017).
+    /// Collections a Record was read for. `collections` is this plus [`lost`](Self::lost), the
+    /// identity an auditor checks the reconstruction against.
+    pub observed: i64,
+    /// Collections no Record was read for. Overwritten unread on the ring tier, and every
+    /// Collection in the span on the counter-only tier, where nothing describes one.
+    pub lost: i64,
+    /// The share of `collections` a Record was read for, in `[0, 1]`. Zero on a build whose
+    /// Entries describe no Collection.
+    pub coverage: f64,
+    /// Pause over the span, from the target's cumulative accumulator. `None` where the layout
+    /// carries no `duration`: absent, never zero (ADR 0017).
     pub pause_total_ns: Option<i64>,
+    /// Pause summed over the Records read: as much of the total as gcscope watched.
+    pub pause_measured_ns: Option<i64>,
+    /// The multiplier taking a measured figure to its exact counterpart. For figures that
+    /// partition the pause, never for a percentile. See [`super::loss::LossAccount`].
+    pub scale_factor: Option<f64>,
 }
 
 impl GenerationSummary {
-    /// Mean pause over the Records read, in nanoseconds.
+    /// Mean pause per Collection, in nanoseconds. Exact over exact, so Loss moves neither
+    /// side of the division.
     pub fn pause_mean_ns(&self) -> Option<f64> {
-        match (self.pause_total_ns, self.records) {
-            (Some(total), records) if records > 0 => Some(total as f64 / records as f64),
+        match (self.pause_total_ns, self.collections) {
+            (Some(total), collections) if collections > 0 => {
+                Some(total as f64 / collections as f64)
+            }
             _ => None,
         }
     }
@@ -47,10 +69,16 @@ pub struct InterpreterSummary {
 }
 
 impl InterpreterSummary {
-    /// Whether this build publishes the timestamps a pause figure needs. One answer per
-    /// interpreter: its generations share a build.
+    /// Whether this build bounds its Collections with timestamps. One answer per interpreter:
+    /// its generations share a build.
+    ///
+    /// Read off the measured figure, not the exact one, which a timed build can lack. Keying on
+    /// the exact figure would drop `records` and `coverage` from such a build's table over a
+    /// pause it cannot reconstruct.
     pub fn has_timing(&self) -> bool {
-        self.generations.iter().any(|g| g.pause_total_ns.is_some())
+        self.generations
+            .iter()
+            .any(|g| g.pause_measured_ns.is_some())
     }
 }
 
@@ -59,29 +87,32 @@ impl InterpreterSummary {
 /// They arrive ordered, so this walks them once and starts a block where the process or
 /// interpreter changes.
 ///
-/// Whether the opening Record counts as a Collection follows the tier: a ring Entry describes
-/// one, an inline Entry is a snapshot of running totals and describes none. A lone snapshot
-/// therefore reports nothing.
+/// The counts and the pause come from [`super::loss::account`]. What is left here is the two
+/// Lifetime totals it does not carry, and the grouping.
 pub fn summarize(cursor: &Cursor) -> Vec<InterpreterSummary> {
     let mut blocks: Vec<InterpreterSummary> = Vec::new();
 
     for (key, observation) in cursor.observations() {
-        if observation.is_empty() {
-            continue;
-        }
+        // The cursor folds a Record into every accumulator it creates, so a block never covers
+        // a ring nothing is known about. Asserted rather than skipped: silently dropping the
+        // row would hide the day that stops being true.
+        debug_assert!(!observation.is_empty(), "a ring with no Record behind it");
         let (first, last) = (observation.first(), observation.last());
-        // On the ring tier this makes the count equal the Records read when nothing was lost,
-        // the identity ticket 06 reads Coverage 1.0 off.
-        let opening_record = i64::from(observation.has_timing());
+        let reconstructed = account(observation);
         let generation = GenerationSummary {
             generation: key.generation,
-            collections: last.collections - first.collections + opening_record,
+            collections: reconstructed.exact_collections,
+            // Neither total takes the opening Record: CPython publishes each as a running
+            // total, and the total before that Record was never read.
             collected: last.collected - first.collected,
             uncollectable: last.uncollectable - first.uncollectable,
             records: observation.sampled(),
-            pause_total_ns: observation
-                .has_timing()
-                .then(|| observation.measured_pause_ns()),
+            observed: reconstructed.observed_collections,
+            lost: reconstructed.lost_collections,
+            coverage: reconstructed.coverage,
+            pause_total_ns: reconstructed.exact_pause_ns,
+            pause_measured_ns: reconstructed.measured_pause_ns,
+            scale_factor: reconstructed.scale_factor,
         };
 
         // A repeated generation closes the block. A PID forgotten and then observed again
@@ -114,6 +145,7 @@ pub fn summarize(cursor: &Cursor) -> Vec<InterpreterSummary> {
 /// Each block names the process and interpreter it covers, so no figure reads as a tree-wide
 /// total. Its column set follows the tier: a build with no timing shows no pause, and no
 /// `records` either, since a counter snapshot is not a Collection to compare a count against.
+/// Coverage appears on both, being what says which of the two a reader is looking at.
 pub fn render(summary: &[InterpreterSummary]) -> Vec<String> {
     if summary.is_empty() {
         return vec!["No GC collections were observed.".to_string()];
@@ -140,38 +172,67 @@ pub fn render(summary: &[InterpreterSummary]) -> Vec<String> {
     lines
 }
 
+/// The columns a tier shows, each with the width its heading and its figures share.
+fn columns(timed: bool) -> Vec<(&'static str, usize)> {
+    let mut columns = vec![
+        ("gen", 3),
+        ("collections", 12),
+        ("collected", 12),
+        ("uncollectable", 14),
+    ];
+    if timed {
+        columns.push(("records", 8));
+    }
+    columns.push(("coverage", 9));
+    if timed {
+        columns.extend([("pause total", 14), ("pause mean", 14)]);
+    }
+    columns
+}
+
 /// The column header, matched to the set the tier selects.
 fn format_header(timed: bool) -> String {
-    let counts = format!(
-        "{:>3} {:>12} {:>12} {:>14}",
-        "gen", "collections", "collected", "uncollectable"
-    );
-    if timed {
-        format!(
-            "{counts} {:>8} {:>14} {:>14}",
-            "records", "pause total", "pause mean"
-        )
-    } else {
-        counts
-    }
+    let headings: Vec<String> = columns(timed)
+        .iter()
+        .map(|&(name, _)| name.to_string())
+        .collect();
+    lay_out(&headings, timed)
 }
 
 fn format_row(g: &GenerationSummary, timed: bool) -> String {
-    let counts = format!(
-        "{:>3} {:>12} {:>12} {:>14}",
-        g.generation, g.collections, g.collected, g.uncollectable
-    );
+    let mut cells = vec![
+        g.generation.to_string(),
+        g.collections.to_string(),
+        g.collected.to_string(),
+        g.uncollectable.to_string(),
+    ];
     if timed {
-        format!(
-            "{counts} {:>8} {:>14} {:>14}",
-            g.records,
+        cells.push(g.records.to_string());
+    }
+    cells.push(format!("{:.3}", g.coverage));
+    if timed {
+        cells.push(
             g.pause_total_ns
                 .map_or_else(String::new, |ns| duration(ns as f64)),
-            g.pause_mean_ns().map_or_else(String::new, duration),
-        )
-    } else {
-        counts
+        );
+        cells.push(g.pause_mean_ns().map_or_else(String::new, duration));
     }
+    lay_out(&cells, timed)
+}
+
+/// Right-align each cell under its column.
+fn lay_out(cells: &[String], timed: bool) -> String {
+    let columns = columns(timed);
+    // `zip` yields the shorter side, so a column added to one and not the other slides every
+    // figure past it one heading left, under a rule still cut to the header's width. Nothing
+    // about the output would look wrong.
+    debug_assert_eq!(cells.len(), columns.len(), "a column lost its cell");
+    columns
+        .iter()
+        .zip(cells)
+        .map(|(&(_, width), cell)| format!("{cell:>width$}"))
+        .collect::<Vec<String>>()
+        .join(" ")
 }
 
 /// A nanosecond figure at a readable scale, three decimals throughout so a column lines up.
@@ -192,7 +253,8 @@ mod tests {
     use crate::remote_debugging::offsets::offset_table::{GcItemLayout, seq_layout};
     use std::sync::LazyLock;
 
-    /// A build that bounds each Collection with timestamps, so its Records carry a pause.
+    /// A build that bounds each Collection with timestamps and keeps the generation's
+    /// cumulative pause total beside them.
     static TIMED: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
         seq_layout(&[
             "ts_start",
@@ -200,6 +262,7 @@ mod tests {
             "collections",
             "collected",
             "uncollectable",
+            "duration",
         ])
     });
 
@@ -229,6 +292,28 @@ mod tests {
                 ("uncollectable", uncollectable),
                 ("ts_start", ts_start),
                 ("ts_stop", ts_stop),
+            ],
+        )
+    }
+
+    /// A timed Record from generation 0 of interpreter 0, carrying the running pause total the
+    /// exact figures are reconstructed from.
+    fn with_duration(
+        collections: i64,
+        ts_start: i64,
+        ts_stop: i64,
+        cumulative_secs: f64,
+    ) -> GcStat {
+        GcStat::from_fields(
+            0,
+            0,
+            0,
+            *TIMED,
+            &[
+                ("collections", collections),
+                ("ts_start", ts_start),
+                ("ts_stop", ts_stop),
+                ("duration", f64::to_bits(cumulative_secs) as i64),
             ],
         )
     }
@@ -311,6 +396,125 @@ mod tests {
         let gen0 = &many[0].generations[0];
         assert_eq!(gen0.collections, 3);
         assert_eq!(gen0.records, 3, "nothing was lost, so the two agree");
+    }
+
+    /// The headline of the surface. A ring that ran 100 Collections while two polls caught two
+    /// reports 100, with Coverage saying how much of that was watched rather than counted.
+    #[test]
+    fn the_counts_are_what_ran_not_what_was_read() {
+        let summary = run(&[
+            (7, vec![timed(0, 0, 1, 10, 0, 1_000, 1_400)]),
+            (7, vec![timed(0, 0, 100, 5_000, 0, 900_000, 900_600)]),
+        ]);
+
+        let gen0 = &summary[0].generations[0];
+        assert_eq!(gen0.collections, 100);
+        assert_eq!(gen0.records, 2);
+        assert_eq!(gen0.lost, 98);
+        assert!((gen0.coverage - 0.02).abs() < 1e-12, "{}", gen0.coverage);
+    }
+
+    /// Nothing an inline build publishes describes a Collection, so its counts stand alone
+    /// with no distribution behind them and Coverage says so (ADR 0017).
+    #[test]
+    fn the_counter_only_tier_reports_zero_coverage() {
+        let summary = run(&[
+            (7, vec![counted(0, 0, 10, 100, 0)]),
+            (7, vec![counted(0, 0, 30, 900, 0)]),
+        ]);
+
+        let gen0 = &summary[0].generations[0];
+        assert_eq!(gen0.collections, 20);
+        assert_eq!(gen0.coverage, 0.0);
+        assert_eq!(gen0.lost, 20);
+        // Two Records were read and they witness no Collection between them, which is why
+        // `records` is not the term that reconciles against the count.
+        assert_eq!(gen0.records, 2);
+        assert_eq!(gen0.observed, 0);
+    }
+
+    /// What ran is what was read plus what was lost, on both tiers. Spec 0011's story 19, and
+    /// the three figures the JSON form publishes to make it checkable.
+    #[test]
+    fn the_counts_reconcile_on_both_tiers() {
+        let summary = run(&[
+            (
+                7,
+                vec![
+                    counted(0, 0, 10, 100, 0),
+                    timed(1, 0, 1, 10, 0, 1_000, 1_400),
+                ],
+            ),
+            (
+                7,
+                vec![
+                    counted(0, 0, 30, 900, 0),
+                    timed(1, 0, 100, 5_000, 0, 900_000, 900_600),
+                ],
+            ),
+        ]);
+
+        for g in &summary[0].generations {
+            assert_eq!(g.collections, g.observed + g.lost, "gen {}", g.generation);
+        }
+    }
+
+    /// The pause is the target's own cumulative figure over the span, not the share the polls
+    /// caught. Under Loss the two differ by the pause of everything overwritten.
+    #[test]
+    fn the_pause_total_is_the_targets_figure_not_the_sum_of_what_was_read() {
+        let summary = run(&[
+            (7, vec![with_duration(1, 1_000, 1_400, 0.000_000_400)]),
+            (7, vec![with_duration(100, 900_000, 900_600, 0.000_500_000)]),
+        ]);
+
+        let gen0 = &summary[0].generations[0];
+        assert_eq!(gen0.pause_total_ns, Some(500_000));
+        assert_eq!(gen0.pause_measured_ns, Some(1_000));
+        assert_eq!(gen0.scale_factor, Some(500.0));
+        // The mean is exact over exact: 500 us across the 100 Collections that ran, not the
+        // 500 ns average of the two that happened to be caught.
+        assert_eq!(gen0.pause_mean_ns(), Some(5_000.0));
+    }
+
+    /// A build can bound its Collections without publishing the total the exact pause is
+    /// differenced from. Its rows keep the columns describing what was read and leave the pause
+    /// blank, rather than losing `records` and `coverage` over a figure it cannot reconstruct.
+    #[test]
+    fn a_build_that_prices_no_pause_total_keeps_the_columns_it_can_fill() {
+        static UNPRICED: LazyLock<&'static GcItemLayout> =
+            LazyLock::new(|| seq_layout(&["ts_start", "ts_stop", "collections"]));
+        let unpriced = |counter: i64, ts_start: i64, ts_stop: i64| {
+            GcStat::from_fields(
+                0,
+                0,
+                0,
+                *UNPRICED,
+                &[
+                    ("collections", counter),
+                    ("ts_start", ts_start),
+                    ("ts_stop", ts_stop),
+                ],
+            )
+        };
+
+        let summary = run(&[
+            (7, vec![unpriced(1, 1_000, 1_400)]),
+            (7, vec![unpriced(100, 900_000, 900_600)]),
+        ]);
+        assert!(summary[0].has_timing(), "its Collections are still spans");
+
+        let gen0 = &summary[0].generations[0];
+        assert_eq!(gen0.pause_total_ns, None);
+        assert_eq!(gen0.pause_mean_ns(), None);
+        assert_eq!(gen0.pause_measured_ns, Some(1_000));
+
+        let row = render(&summary).last().unwrap().clone();
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            ["0", "100", "0", "0", "2", "0.020"],
+            "the pause cells are empty, not zero"
+        );
     }
 
     /// A layout with no timestamps cannot say how long it spent collecting, so the figure is
@@ -513,13 +717,14 @@ mod tests {
         assert!(header.contains("records"), "{header}");
     }
 
-    /// The figures reach the table intact and under the right headings. Splitting on
-    /// whitespace pins the column contents, as the `gc-stats` table's own test does.
+    /// The figures reach the table intact and under the right headings, pinned by splitting on
+    /// whitespace as the `gc-stats` table's own test does. Four Collections ran against two
+    /// Records read, so the row carries Loss too.
     #[test]
     fn a_row_carries_its_generations_figures_in_column_order() {
         let summary = run(&[
             (7, vec![timed(1, 0, 10, 100, 1, 1_000, 1_400)]),
-            (7, vec![timed(1, 0, 11, 150, 4, 2_000, 2_600)]),
+            (7, vec![timed(1, 0, 13, 150, 4, 2_000, 2_600)]),
         ]);
 
         let lines = render(&summary);
@@ -527,13 +732,16 @@ mod tests {
         let cols: Vec<&str> = row.split_whitespace().collect();
         assert_eq!(
             cols,
-            ["1", "2", "50", "3", "2", "1.000", "us", "500.000", "ns"]
+            [
+                "1", "4", "50", "3", "2", "0.500", "1.000", "us", "250.000", "ns"
+            ]
         );
     }
 
-    /// A build with no timing renders the counts and stops there.
+    /// A build with no timing renders the counts and the Coverage saying nothing sits behind
+    /// them.
     #[test]
-    fn an_untimed_row_carries_only_the_counts() {
+    fn an_untimed_row_carries_the_counts_and_no_distribution() {
         let summary = run(&[
             (7, vec![counted(2, 0, 10, 100, 0)]),
             (7, vec![counted(2, 0, 30, 900, 6)]),
@@ -542,7 +750,7 @@ mod tests {
         let row = render(&summary).last().unwrap().clone();
         assert_eq!(
             row.split_whitespace().collect::<Vec<_>>(),
-            ["2", "20", "800", "6"]
+            ["2", "20", "800", "6", "0.000"]
         );
     }
 }

@@ -46,14 +46,17 @@ impl Lifetime {
 /// [`first`](Self::first) and [`last`](Self::last) come from CPython and describe the ring;
 /// [`sampled`](Self::sampled) and [`measured_pause_ns`](Self::measured_pause_ns) describe the
 /// reading. Every summary figure is a difference between the two, so nothing derived is stored
-/// here. Ticket 06 computes exact count, exact pause, Coverage and scale factor from them.
+/// here: [`crate::monitor::loss::account`] derives exact count, exact pause, Coverage and
+/// scale factor.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RingObservation {
     first: Lifetime,
+    first_pause_ns: i64,
     last: Lifetime,
     sampled: u64,
     measured_pause_ns: i64,
     timed: bool,
+    prices_pause: bool,
 }
 
 impl RingObservation {
@@ -66,6 +69,13 @@ impl RingObservation {
     /// The Lifetime totals on the first Record read.
     pub fn first(&self) -> Lifetime {
         self.first
+    }
+
+    /// The first Record's own pause, in nanoseconds. Its Collection is inside the span but
+    /// its duration is already inside [`first`](Self::first), so a delta between the two ends
+    /// leaves it out and this puts it back.
+    pub fn first_pause_ns(&self) -> i64 {
+        self.first_pause_ns
     }
 
     /// The Lifetime totals on the most recent Record read.
@@ -90,6 +100,13 @@ impl RingObservation {
         self.timed
     }
 
+    /// Whether this ring's Records carry the generation's cumulative pause total. Asked
+    /// separately from [`has_timing`](Self::has_timing): timestamps say what one Collection
+    /// cost, and only this says what every Collection cost.
+    pub fn has_pause_total(&self) -> bool {
+        self.prices_pause
+    }
+
     /// Whether `counter` is past this ring's cursor. The first Record of a ring is always
     /// past it; afterwards the counter must have advanced.
     fn admits(&self, counter: i64) -> bool {
@@ -99,7 +116,9 @@ impl RingObservation {
     fn fold(&mut self, record: &GcStat) {
         if self.is_empty() {
             self.first = Lifetime::of(record);
+            self.first_pause_ns = pause_ns(record);
             self.timed = record.has_timing();
+            self.prices_pause = record.has("duration");
         }
         self.last = Lifetime::of(record);
         self.sampled += 1;
@@ -609,6 +628,24 @@ mod tests {
         assert_eq!(obs.last().collected, 9_500);
         assert_eq!(obs.first().uncollectable, 2);
         assert_eq!(obs.last().uncollectable, 7);
+    }
+
+    /// The cumulative duration at the first Record already covers that Record's own
+    /// Collection, so a delta between the two ends starts after it. Keeping its pause is what
+    /// makes the exact figure cover the Collections the exact count counts.
+    #[test]
+    fn an_accumulator_keeps_the_opening_records_own_pause() {
+        let mut c = Cursor::new();
+        c.admit(1, &[done(10, 1_000, 1_400)]);
+        c.admit(1, &[done(11, 2_000, 2_600)]);
+
+        let obs = c.observation(key(1, 0, 0)).expect("an observed ring");
+        assert_eq!(obs.first_pause_ns(), 400);
+        assert_eq!(
+            obs.measured_pause_ns(),
+            1_000,
+            "both Records, the first included"
+        );
     }
 
     /// The summary needs the tier after the last poll, when no Record is left to ask. The
