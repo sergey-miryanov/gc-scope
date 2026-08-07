@@ -15,18 +15,17 @@ Rust repository.
 
 3.14 only. On every pull request that reaches the layout contract, CI builds a Probe from
 source on Linux, Windows and macOS, attaches to each, and decodes the Records out of the
-process. `macos-latest` is Apple Silicon, so that leg is native arm64 — which matters more than
-one more OS: arm64 is the only configuration where the release store on `ts_stop` does work
-x86-64's TSO would have done anyway. Emulation would not settle it, since it may serialise the
-writes and hide the defect entirely, so the workflow fails rather than lets that leg quietly
-become Intel.
+process. `macos-latest` is Apple Silicon, so that leg runs on native arm64. That is the only
+configuration where the release store on `ts_stop` does work x86-64's TSO would have done
+anyway. Emulation would not settle it, since it may serialise the writes and hide the defect,
+so the workflow fails if that runner ever stops being arm64.
 
-Three toolchains, three interpreters, three binary formats. The offsets come from each
-interpreter's own internal headers, and the header lookup reads PE exports, ELF `.dynsym` and
-the Mach-O export trie through one path.
+Each leg compiles against its own interpreter's internal headers, under gcc, MSVC or Apple
+clang. The header lookup reads PE exports, ELF `.dynsym` and the Mach-O export trie through one
+path.
 
-What no leg covers yet: 3.13, musllinux, 32-bit, debug builds, and any arm64 that is not
-macOS. `specs/0015` owns wheels and the rest of the matrix.
+No leg covers 3.13, musllinux, 32-bit, debug builds, or arm64 outside macOS. `specs/0015` owns
+wheels and the rest of the matrix.
 
 The behaviour otherwise matches the prototype that proved the approach works
 (`docs/research/cpython-314-gc-hook-points.md` §11–§12).

@@ -140,10 +140,10 @@ pub fn probe_python() -> Option<PathBuf> {
 
 /// The file `python` would load for `import gcscope_probe`, or `None` if it has no Probe.
 ///
-/// The interpreter is asked rather than the filesystem searched: it resolves the same
-/// `sys.path` the fixture will, so the file inspected is the file that gets mapped. `-P` for
-/// the reason [`probe_python`] gives — without it the source directory in the crate root
-/// answers, and it is not a built module.
+/// This asks the interpreter rather than searching the filesystem, so it resolves the same
+/// `sys.path` the fixture will and inspects the file that gets mapped. `-P` for the reason
+/// [`probe_python`] gives: without it the source directory in the crate root answers, and that
+/// is not a built module.
 pub fn probe_module_path(python: &Path) -> Option<PathBuf> {
     let out = Command::new(python)
         .args([

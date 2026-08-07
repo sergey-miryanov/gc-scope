@@ -50,9 +50,9 @@ const MODULE_SUFFIX: &str = ".so";
 /// The exported discovery anchor.
 const HEADER_SYMBOL: &str = "gcscope_probe_header";
 
-/// The slot array. Not part of the discovery contract — the header publishes `slots_addr`, so a
-/// reader never looks this up — but it carries the same export macro, and it losing default
-/// visibility is the same regression one step earlier.
+/// The slot array. No reader looks this up, since the header publishes `slots_addr`, but it
+/// carries the same export macro, and losing default visibility here is the same regression one
+/// step earlier.
 const SLOTS_SYMBOL: &str = "gcscope_probe_slots";
 
 /// Samples across the run, and the gap between them. Three samples check a counter sequence
@@ -62,9 +62,14 @@ const SAMPLES: usize = 3;
 const SAMPLE_GAP: Duration = Duration::from_millis(700);
 
 /// The sustained-churn window and its polling gap. Five seconds spans ~100 gen-0 Collections at
-/// the fixture's ~50 ms cadence, ~20 gen-1 and ~4 gen-2. A 2 ms gap puts ~25 samples inside
-/// each gen-0 Collection, so a reader crosses every publication boundary several times over and
-/// an 11-entry young Ring cannot lap between two samples.
+/// the fixture's ~50 ms cadence, ~20 gen-1 and ~4 gen-2. A 2 ms gap puts ~25 samples inside each
+/// gen-0 Collection, so every Record is read several times over and an 11-entry young Ring
+/// cannot lap between two samples.
+///
+/// A 2 ms gap still rarely catches the *publication* window. Writing a Record takes tens of
+/// nanoseconds against a 50 ms cadence, so measured runs on Windows x86-64 sample ~2000 times
+/// and observe zero entries mid-publication. Treat the in-flight checks below as guards on what
+/// a reader could meet rather than as something this schedule produces.
 const CHURN_WINDOW: Duration = Duration::from_secs(5);
 const CHURN_GAP: Duration = Duration::from_millis(2);
 
@@ -159,9 +164,9 @@ fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
             continue;
         }
         // On macOS the kernel attributes several low no-access reservations to an image's
-        // path, so its lowest mapping sits well below the Mach-O header and every address
-        // derived from it lands inside *some* mapped range — a successful read of garbage
-        // rather than a clean failure. The header sits at the start of `__TEXT`, which is the
+        // path, so its lowest mapping sits well below the Mach-O header. An address derived
+        // from that base still lands inside *some* mapped range, which reads garbage
+        // successfully instead of failing. The header sits at the start of `__TEXT`, the
         // executable mapping. gcscope's `find_python_modules` filters the same way.
         if cfg!(target_os = "macos") && !r.is_exec() {
             continue;
@@ -193,13 +198,13 @@ fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
     Ok((path, addr))
 }
 
-/// Resolve `symbol` in the **dynamic** symbol table of an image, rebased onto `base`.
+/// Resolve `symbol` in an image's dynamic symbol table, rebased onto `base`.
 ///
-/// Dynamic on every format, never the static table: `.symtab`, and a Mach-O `nlist` marked
-/// private-extern, carry the symbol whatever its visibility, so a fallback there would let a
-/// `-fvisibility=hidden` regression pass while breaking discovery in the field. gcscope's
-/// `resolve_symbol_elf` does fall back, for a different question. This asks whether the symbol
-/// sits where a remote reader will look, so it consults only that table.
+/// This reads every format through its dynamic table rather than its static one. `.symtab`, and
+/// a Mach-O `nlist` marked private-extern, carry the symbol whatever its visibility, so falling
+/// back to them would let a `-fvisibility=hidden` regression pass here while breaking discovery
+/// in the field. gcscope's `resolve_symbol_elf` does fall back, for a different question. This
+/// asks whether the symbol sits where a remote reader will look.
 ///
 /// `Ok(None)` means the image parsed and does not export the symbol. `Err` means the image
 /// could not be read as one of the three formats.
@@ -225,10 +230,10 @@ fn dynamic_symbol(bytes: &[u8], base: u64, symbol: &str) -> Result<Option<u64>, 
             // on a fat header. Virtual addresses only below, so the slice offset goes unused.
             let (macho, _) = parse_macho(bytes)
                 .ok_or_else(|| "Mach-O image did not parse for this architecture".to_string())?;
-            // The export trie, which is what `-exported_symbols_list` and visibility control
-            // and therefore the counterpart of `.dynsym` above. Its offsets are already
-            // relative to the mach header, which is what `base` addresses on macOS once the
-            // caller has skipped the non-executable reservations below `__TEXT`.
+            // The export trie: what `-exported_symbols_list` and visibility control, so it
+            // answers the same question `.dynsym` does above. Its offsets are relative to the
+            // mach header, which is where `base` points on macOS once the caller has skipped
+            // the non-executable reservations below `__TEXT`.
             let exports = macho
                 .exports()
                 .map_err(|e| format!("reading the Mach-O export trie: {e}"))?;
@@ -345,12 +350,12 @@ fn ring_table(h: &ProbeHeader) -> OffsetTable {
 /// counters, and storing `ts_stop` last. Between those two acts the entry carries this
 /// Collection's `ts_start` beside the previous occupant's `ts_stop`, and gcscope's
 /// `is_complete()` calls it in-flight. A reader skips it and reports the newest entry that did
-/// finish, which is what this models.
+/// finish. The fields below are that split.
 struct Head<'a> {
     /// The newest finished Collection: largest `collections`, since Records are cumulative and
     /// the Ring wraps.
     newest: Option<&'a GcStat>,
-    /// Written but unfinished. At most one — the Record being published right now.
+    /// Written but unfinished. At most one, the Record being published right now.
     in_flight: Vec<&'a GcStat>,
     /// Entries carrying a Collection at all. Unwritten ones are zeroed.
     written: usize,
@@ -376,12 +381,10 @@ fn head_of<'a>(stats: &'a [GcStat], generation: u32) -> Head<'a> {
     }
 }
 
-/// The message for a generation whose every written entry reads as unfinished. One is the
-/// publication window; all of them means `ts_stop` never lands after `ts_start` — the field is
-/// not being written, or is being read at the wrong offset.
-fn describe_all_in_flight(head: &Head<'_>, generation: u32) -> String {
-    let detail: Vec<String> = head
-        .in_flight
+/// The unfinished entries, listed. Two callers want different counts around the same list, so
+/// the count stays with each of them rather than being guessed here.
+fn describe_in_flight(head: &Head<'_>) -> String {
+    head.in_flight
         .iter()
         .map(|s| {
             format!(
@@ -391,11 +394,18 @@ fn describe_all_in_flight(head: &Head<'_>, generation: u32) -> String {
                 s.ts_stop()
             )
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The message for a generation whose every written entry reads as unfinished. One is the
+/// publication window. All of them means `ts_stop` never lands after `ts_start`, so nothing is
+/// writing the field or this is reading it at the wrong offset.
+fn describe_all_in_flight(head: &Head<'_>, generation: u32) -> String {
     format!(
         "gen {generation}: all {} written entries read as unfinished ({})",
         head.written,
-        detail.join(", ")
+        describe_in_flight(head)
     )
 }
 
@@ -410,6 +420,7 @@ struct Newest {
     uncollectable: i64,
     duration: f64,
     ts_start: i64,
+    ts_stop: i64,
 }
 
 impl Newest {
@@ -421,6 +432,7 @@ impl Newest {
             uncollectable: s.uncollectable(),
             duration: s.duration(),
             ts_start: s.ts_start(),
+            ts_stop: s.ts_stop(),
         }
     }
 }
@@ -494,10 +506,10 @@ fn check_shape(stats: &[GcStat], entries: [usize; 3]) -> Result<(), String> {
 
 /// An interpreter with a Probe, or `None` after logging a skip.
 ///
-/// "Installed", not "importable": the source directory in the crate root imports as a namespace
-/// package on any interpreter, so [`probe_python`] calls into the module. `GCSCOPE_REQUIRE_PROBE=1`
-/// turns the skip into a failure, since a leg that just built a Probe must not pass by not
-/// finding one.
+/// [`probe_python`] calls into the module rather than importing it: the source directory in the
+/// crate root imports as a namespace package on any interpreter, so an import proves nothing.
+/// `GCSCOPE_REQUIRE_PROBE=1` turns the skip into a failure, since a leg that just built a Probe
+/// should find one.
 fn probe_python_or_skip(test: &str) -> Option<PathBuf> {
     if let Some(python) = probe_python() {
         return Some(python);
@@ -512,7 +524,7 @@ fn probe_python_or_skip(test: &str) -> Option<PathBuf> {
     None
 }
 
-/// A running fixture with its Ring located — the preamble both live tests share.
+/// A running fixture with its Ring located: the preamble both live tests share.
 struct Attached {
     /// Kept alive rather than read: dropping it kills the interpreter.
     _proc: SpawnedPython,
@@ -568,17 +580,17 @@ fn attach(python: &Path) -> Attached {
     }
 }
 
-/// The discovery anchor is genuinely in the table a remote reader consults.
+/// The discovery anchor sits in the table a remote reader consults.
 ///
-/// Off disk, not out of a live process: no ptrace and no fixture, so the failure ADR 0014 §2
-/// calls silent — a module that loads, installs its callback, publishes a valid region and
-/// exports nothing to find it by — goes red in any job that builds a Probe rather than only
-/// where an attach is possible. `PyMODINIT_FUNC` carries default visibility on its own and
-/// these two do not, so a build that picked up `-fvisibility=hidden` would import fine and
-/// vanish from discovery.
+/// This reads the built module off disk, with no ptrace and no fixture, so it goes red in any
+/// job that builds a Probe rather than only where an attach is possible. ADR 0014 §2 calls that
+/// failure silent: the module loads, installs its callback, publishes a valid region, and
+/// exports nothing to find it by. `PyMODINIT_FUNC` carries default visibility on its own. These
+/// two do not, so a build that picked up `-fvisibility=hidden` would import fine and vanish
+/// from discovery.
 ///
-/// Through the same [`dynamic_symbol`] the live test resolves the region address with, so what
-/// passes here is what discovery performs.
+/// It resolves through the same [`dynamic_symbol`] the live test locates the region with, so a
+/// pass here covers the lookup discovery performs.
 #[test]
 fn probe_module_exports_its_discovery_anchor() {
     let Some(python) = probe_python_or_skip("probe_module_exports_its_discovery_anchor") else {
@@ -696,10 +708,10 @@ fn probe_ring_decodes_out_of_process() {
                 head.written > 0,
                 "sample {round}: gen {generation} carries no Record; the fixture collects all three"
             );
-            // Invariants 1 and 2, as a reader applies them: at most the entry being published
-            // right now is unfinished, and the newest finished one is what gets reported. See
-            // `Head` for why one incomplete entry is expected rather than a defect, and
-            // `probe_ring_survives_sustained_churn` for the check that keeps it to one.
+            // Invariants 1 and 2, as a reader applies them: only the entry being published now
+            // may be unfinished, and the newest finished one gets reported. `Head` explains why
+            // one incomplete entry is expected here, and
+            // `probe_ring_survives_sustained_churn` bounds it to one.
             let s = head.newest.unwrap_or_else(|| {
                 panic!(
                     "sample {round}: {}",
@@ -759,22 +771,26 @@ fn probe_ring_decodes_out_of_process() {
 /// Poll the Ring far faster than it is written and hold every sample to what a reader is
 /// entitled to assume about the entry it picks as newest.
 ///
-/// This is the publication-ordering guard `specs/0013-probe-portable-core.md` §5 case 3 asks
-/// for. `gcscope_probe_add_stats` copies the previous entry forward, overwrites the counters
-/// and publishes `ts_stop` with `memory_order_release`; a reader that sees a Record's `ts_stop`
-/// is thereby entitled to see the payload it describes. The three-sample test above visits that
-/// boundary a handful of times, which is not enough to call it exercised.
+/// `specs/0013-probe-portable-core.md` §5 case 3 asks for this guard on publication ordering.
+/// `gcscope_probe_add_stats` copies the previous entry forward, overwrites the counters and
+/// publishes `ts_stop` with `memory_order_release`, so a reader that sees a Record's `ts_stop`
+/// can expect the payload it describes. The three-sample test above crosses that boundary a
+/// handful of times, too few to call it exercised.
 ///
-/// **On x86-64 this cannot go red from a missing release store.** TSO orders the stores whether
-/// or not the code asks it to, so the Linux and Windows legs prove the invariants hold and not
-/// that the release is what holds them. The `probe-contract` leg on `macos-latest` runs this on
-/// native Apple Silicon, which is the one runner that can tell the difference. Emulation could
-/// not: it may serialise the writes and mask the defect entirely, which is why the workflow
-/// asserts that leg is really arm64 rather than trusting the label.
+/// On x86-64 a missing release store cannot turn this red. TSO orders the stores regardless, so
+/// the Linux and Windows legs show the invariants hold without showing that the release holds
+/// them. Only the `probe-contract` leg on `macos-latest` separates the two, running on native
+/// Apple Silicon. Emulation could serialise the writes and mask the defect, so the workflow
+/// asserts that leg is arm64 instead of trusting the label.
 ///
-/// The one check that would fire on a reordering anywhere is the `ts_start` clause below: it
-/// asks whether an entry whose counters have not moved has quietly taken on a newer
-/// Collection's start time, which is precisely what an early-visible `ts_stop` exposes.
+/// Two `ts_start` clauses below could fire on a reordering on any machine. They ask whether the
+/// counters and the interval in the selected entry describe the same Collection, covering the
+/// two directions those fields come apart in. Neither implies the other: an earlier version
+/// carried only the second and passed on the more likely case.
+///
+/// None of this observes the publication window itself. A healthy run catches zero entries
+/// mid-publication (see `CHURN_GAP`), so the `in_flight` assertions bound that state from above
+/// and never witness it.
 #[test]
 #[ignore = "attaches to a live process; needs ptrace/taskport and an installed Probe — run with --ignored"]
 fn probe_ring_survives_sustained_churn() {
@@ -812,8 +828,10 @@ fn probe_ring_survives_sustained_churn() {
             in_flight_seen += head.in_flight.len();
             assert!(
                 head.in_flight.len() <= 1,
-                "sample {samples}: {}",
-                describe_all_in_flight(&head, generation)
+                "sample {samples}: gen {generation} has {} entries mid-publication at once ({}); \
+                 the writer publishes one Record at a time, so at most one can be torn",
+                head.in_flight.len(),
+                describe_in_flight(&head)
             );
 
             let s = head.newest.unwrap_or_else(|| {
@@ -868,20 +886,40 @@ fn probe_ring_survives_sustained_churn() {
                     before.duration,
                     now.duration
                 );
-                // The payload and `ts_stop` belong to the same Collection. Counters that have
-                // not moved beside a start time that has means a reader was handed this
-                // Collection's timestamps over the previous one's totals — an entry published
-                // before it was finished being written. A partly-copied entry moves ts_start
-                // the other way, backwards to the occupant a full lap ago, so this asks only
-                // that it not run ahead.
-                assert!(
-                    now.collections > before.collections || now.ts_start <= before.ts_start,
-                    "sample {samples}: gen {generation} still reports {} collections while its \
-                     ts_start advanced {} -> {}; the Record was visible before its payload was",
-                    now.collections,
-                    before.ts_start,
-                    now.ts_start
-                );
+                // The counters and the timestamps have to describe the same Collection, and a
+                // partly-visible entry is where they come apart. Two clauses, for the two
+                // orders that can happen, since neither implies the other:
+                //
+                //  - `collections` moved but the clock did not. A generation cannot collect
+                //    concurrently with itself, so Collection N starts no earlier than
+                //    Collection N-1 stopped. An entry whose count advanced while its ts_start
+                //    still sits before the previous entry's ts_stop is carrying one
+                //    Collection's total beside another's interval.
+                //  - The clock moved but `collections` did not: this Collection's start time
+                //    over the previous one's totals. A partly-copied entry moves ts_start the
+                //    other way, back to the occupant a full lap ago, so this asks only that it
+                //    not run ahead.
+                if now.collections > before.collections {
+                    assert!(
+                        now.ts_start >= before.ts_stop,
+                        "sample {samples}: gen {generation} advanced to {} collections but \
+                         starts at {}, before the {} its previous Record stopped at; the \
+                         counters and the interval belong to different Collections",
+                        now.collections,
+                        now.ts_start,
+                        before.ts_stop
+                    );
+                } else {
+                    assert!(
+                        now.ts_start <= before.ts_start,
+                        "sample {samples}: gen {generation} still reports {} collections while \
+                         its ts_start advanced {} -> {}; the Record was visible before its \
+                         payload was",
+                        now.collections,
+                        before.ts_start,
+                        now.ts_start
+                    );
+                }
             }
 
             if generation == 0 {
@@ -892,7 +930,7 @@ fn probe_ring_survives_sustained_churn() {
         }
     }
 
-    // Both a floor on the polling this actually did and the frozen-region check: a reader
+    // Both a floor on the polling this did and the frozen-region check: a reader
     // latched onto a stale copy satisfies every invariant above.
     let first = first_gen0.expect("the churn window fits at least one sample");
     assert!(

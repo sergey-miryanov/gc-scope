@@ -471,11 +471,11 @@ jobs:
   # `specs/0015-publish-probe-wheels.md` owns wheels, musllinux and publishing. This builds one
   # module from source on each OS and throws it away.
   #
-  # The macOS runner is where the release store on `ts_stop` earns its keep. `macos-latest` is
-  # Apple Silicon from macos-14 on, so this leg is native arm64 — the only configuration that
-  # can order those writes differently from x86-64's TSO, and the one spec 0013 section 5 case 3
-  # says emulation cannot stand in for. `Assert the macOS leg is arm64` below fails rather than
-  # lets that coverage disappear if GitHub ever moves the label back to Intel.
+  # The release store on `ts_stop` earns its keep on the macOS runner. `macos-latest` is Apple
+  # Silicon from macos-14 on, so this leg runs native arm64, the only configuration that can
+  # order those writes differently from x86-64's TSO. Spec 0013 section 5 case 3 rules out
+  # emulation as a stand-in. `Assert the macOS leg is arm64` below fails if GitHub ever moves
+  # the label back to Intel, so that coverage cannot disappear unnoticed.
   probe-contract:
     name: Probe contract (${{ matrix.os }} py${{ matrix.python }})
     needs: probe-scope
@@ -484,8 +484,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Every OS gcscope claims. Each builds the Probe with its own toolchain — gcc, MSVC and
-        # Apple clang — against its own interpreter's internal headers, so a construct only one
+        # Every OS gcscope claims. Each builds the Probe with its own toolchain (gcc, MSVC or
+        # Apple clang) against its own interpreter's internal headers, so a construct only one
         # of them rejects goes red here instead of at a user.
         os: [ubuntu-latest, windows-latest, macos-latest]
         # The one place the leg's interpreter is named. The Probe refuses to load on any minor
@@ -535,10 +535,10 @@ jobs:
           sudo security authorizationdb write system.privilege.taskport is-developer
           sudo security authorizationdb read system.privilege.taskport
 
-      # This leg is the project's only arm64 coverage, and it is arm64 by virtue of a label
-      # rather than anything declared. A silent move back to Intel would leave every assertion
-      # passing and prove nothing about publication ordering, which is the one defect class
-      # x86-64 cannot exhibit. Fail loudly instead.
+      # This leg carries the project's only arm64 coverage, and it is arm64 because of a label
+      # rather than anything the workflow states. A move back to Intel would leave every
+      # assertion passing while proving nothing about publication ordering, the one defect
+      # class x86-64 cannot exhibit.
       - name: Assert the macOS leg is arm64
         if: runner.os == 'macOS'
         run: |
@@ -550,9 +550,9 @@ jobs:
             exit 1
           }
 
-      # No compiler or interpreter path appears here; setuptools finds the toolchain — gcc,
-      # MSVC and Apple clang in turn. A compile error fails the leg at this step, named, rather
-      # than downstream as a test that found no module.
+      # No compiler or interpreter path appears here; setuptools finds the toolchain (gcc, MSVC
+      # or Apple clang). A compile error fails the leg at this step, named, rather than
+      # downstream as a test that found no module.
       #
       # This needs the interpreter's *internal* headers, which belong to the runner's Python
       # rather than to anything in this repository. Both `make install` and the standalone
