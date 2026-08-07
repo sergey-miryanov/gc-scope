@@ -14,4 +14,9 @@ pub struct MonitorOptions {
     /// Print a per-generation summary of what was observed when the run ends
     #[arg(long)]
     pub summary: bool,
+
+    /// Write that summary as JSON to PATH. `-` means stdout, which `monitor` accepts and
+    /// `run` refuses, since `run` forwards the target's own output there
+    #[arg(long, value_name = "PATH")]
+    pub summary_json: Option<String>,
 }

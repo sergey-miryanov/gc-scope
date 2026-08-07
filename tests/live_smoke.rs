@@ -45,6 +45,16 @@ struct Row {
 /// Run the gcscope binary, returning `(exit code, stdout+stderr merged)`. Bounded by
 /// [`CMD_TIMEOUT`]: on timeout the child is killed and the code is reported as 124.
 fn gcscope(args: &[&str]) -> (i32, String) {
+    let (code, mut out, err) = gcscope_streams(args);
+    if !err.trim().is_empty() {
+        out.push_str(&err);
+    }
+    (code, out)
+}
+
+/// As [`gcscope`], keeping the two streams apart. Only a test asserting what lands on stdout
+/// needs them separate, and merging is what every other caller wants.
+fn gcscope_streams(args: &[&str]) -> (i32, String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_gcscope"))
         .args(args)
         .stdout(Stdio::piped())
@@ -81,12 +91,11 @@ fn gcscope(args: &[&str]) -> (i32, String) {
         }
     };
 
-    let mut combined = out_h.join().unwrap_or_default();
-    let e = err_h.join().unwrap_or_default();
-    if !e.trim().is_empty() {
-        combined.push_str(&e);
-    }
-    (code, combined)
+    (
+        code,
+        out_h.join().unwrap_or_default(),
+        err_h.join().unwrap_or_default(),
+    )
 }
 
 /// `(kind, entries-per-generation)` gcscope should decode for this interpreter. Mirrors
@@ -539,5 +548,201 @@ fn live_monitor_summarizes_every_generation_in_the_builds_tier() {
     assert!(
         !quiet.lines().any(|l| l.starts_with("python ")),
         "the summary printed without being asked for\n{quiet}"
+    );
+}
+
+/// `--summary-json` writes the same account as a document, and the target's own `json` module
+/// is what says it parses.
+///
+/// Live rather than at the poll seam, whose tests read the writer's output with a splitter
+/// that shares the writer's assumptions. A real parser on a real run is what catches a
+/// document gcscope can write and a consumer cannot read.
+#[test]
+#[ignore = "spawns and attaches to a live interpreter; needs ptrace/taskport — run with --ignored"]
+fn live_monitor_writes_a_summary_a_json_parser_can_read() {
+    let Some(python) = test_python() else {
+        eprintln!("SKIP live_monitor_summary_json: no Python found (set GCSCOPE_TEST_PYTHON)");
+        return;
+    };
+    let Some(expect_spans) = expects_spans(python_version(&python)) else {
+        eprintln!("WARN: could not determine the target version; skipping the JSON check");
+        return;
+    };
+
+    let spin = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("spin.py");
+    let trace: PathBuf = std::env::temp_dir().join(format!(
+        "gcscope_live_json_trace_{}.json",
+        std::process::id()
+    ));
+    let summary: PathBuf =
+        std::env::temp_dir().join(format!("gcscope_live_json_{}.json", std::process::id()));
+
+    let (rc, out) = gcscope(&[
+        "run",
+        "-p",
+        python.to_str().unwrap(),
+        "-s",
+        spin.to_str().unwrap(),
+        "-o",
+        trace.to_str().unwrap(),
+        "-r",
+        "50",
+        "--summary-json",
+        summary.to_str().unwrap(),
+        "4",
+    ]);
+    std::fs::remove_file(&trace).ok();
+    assert_eq!(rc, 0, "gcscope run exited {rc}\n{out}");
+
+    // The target reads its own summary. One line per generation: the figures asserted below,
+    // and `-` for a key this build supplies no figure for.
+    let probe = r#"
+import json, sys
+document = json.load(open(sys.argv[1]))
+assert document["schema"] == "gcscope.gc-summary/1", document["schema"]
+block, = document["interpreters"]
+for g in block["generations"]:
+    print(g["generation"], g["collections"], g["observed"], g["lost"],
+          g["coverage"], g.get("pause_total_ns", "-"), g.get("scale_factor", "-"))
+"#;
+    let read = Command::new(&python)
+        .args(["-c", probe])
+        .arg(&summary)
+        .output()
+        .expect("the target reads the summary back");
+    std::fs::remove_file(&summary).ok();
+    assert!(
+        read.status.success(),
+        "the target's json module could not read the summary: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+
+    let rows: Vec<Vec<String>> = String::from_utf8_lossy(&read.stdout)
+        .lines()
+        .map(|line| line.split_whitespace().map(str::to_string).collect())
+        .collect();
+    assert_eq!(
+        rows.iter().map(|r| r[0].as_str()).collect::<Vec<&str>>(),
+        ["0", "1", "2"],
+        "every generation gets an object\n{rows:#?}"
+    );
+
+    for row in &rows {
+        let count = |i: usize| -> i64 {
+            row[i]
+                .parse()
+                .unwrap_or_else(|e| panic!("{:?}: {e}\n{rows:#?}", row[i]))
+        };
+        assert!(
+            count(1) > 0 && count(1) < SANE_COUNTER_MAX as i64,
+            "implausible collection count in {row:?}"
+        );
+        // The identity a consumer audits the reconstruction with, on both tiers.
+        assert_eq!(count(1), count(2) + count(3), "{row:?}");
+
+        let coverage: f64 = row[4].parse().expect("coverage is a number");
+        assert!((0.0..=1.0).contains(&coverage), "{row:?}");
+
+        // A build that publishes no timing publishes no pause, and the key is absent rather
+        // than zero — the whole reason a CI check can threshold on this document.
+        let priced = row[5] != "-" && row[6] != "-";
+        assert_eq!(priced, expect_spans, "{row:?}");
+    }
+}
+
+/// `monitor --summary-json -` puts the document on stdout and nothing else.
+///
+/// The promise `docs/summary-json.md` makes to a consumer that pipes gcscope into a parser,
+/// and the reason `run` refuses `-`. Only a live attach reaches it: `monitor` needs a real
+/// interpreter, and the stream a unit test would inspect is the process's own stdout.
+#[test]
+#[ignore = "spawns and attaches to a live interpreter; needs ptrace/taskport — run with --ignored"]
+fn live_monitor_puts_only_the_document_on_stdout() {
+    let Some(python) = test_python() else {
+        eprintln!("SKIP live_monitor_stdout: no Python found (set GCSCOPE_TEST_PYTHON)");
+        return;
+    };
+
+    // Spun for a few seconds rather than through `common::SpawnedPython`, whose two-minute
+    // lifetime suits an attach-and-read test: `monitor` runs until the target exits.
+    let spin = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("spin.py");
+    let mut target = Command::new(&python)
+        .arg(&spin)
+        .arg("5")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the target");
+
+    let mut marker = String::new();
+    let mut stdout = target.stdout.take().expect("stdout piped");
+    let pid = loop {
+        let mut byte = [0u8; 1];
+        match stdout.read(&mut byte) {
+            Ok(1) => {
+                if byte[0] == b'\n' {
+                    break marker
+                        .trim()
+                        .strip_prefix("READY ")
+                        .unwrap_or_else(|| panic!("no READY marker in {marker:?}"))
+                        .to_string();
+                }
+                marker.push(byte[0] as char);
+            }
+            _ => panic!("the target died before reporting READY: {marker:?}"),
+        }
+    };
+
+    let trace: PathBuf =
+        std::env::temp_dir().join(format!("gcscope_live_stdout_{}.json", std::process::id()));
+    let (rc, out, err) = gcscope_streams(&[
+        "monitor",
+        &pid,
+        "-o",
+        trace.to_str().unwrap(),
+        "-r",
+        "100",
+        "--summary-json",
+        "-",
+    ]);
+    let _ = target.wait();
+    std::fs::remove_file(&trace).ok();
+    assert_eq!(rc, 0, "gcscope monitor exited {rc}\n{out}{err}");
+
+    // Everything gcscope says about the run went to stderr, so the parser gets the document
+    // with nothing wrapped around it.
+    assert!(err.contains("Monitoring PID"), "{err}");
+    let read = Command::new(&python)
+        .args([
+            "-c",
+            "import json,sys; d=json.load(sys.stdin); print(d['schema'], len(d['interpreters']))",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .and_then(|mut parser| {
+            use std::io::Write;
+            parser
+                .stdin
+                .take()
+                .expect("stdin piped")
+                .write_all(out.as_bytes())?;
+            parser.wait_with_output()
+        })
+        .expect("the target parses gcscope's stdout");
+
+    assert!(
+        read.status.success(),
+        "stdout is not one JSON document:\n{out}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&read.stdout).trim(),
+        "gcscope.gc-summary/1 1"
     );
 }

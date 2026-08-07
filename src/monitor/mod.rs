@@ -16,6 +16,7 @@ pub mod exporters;
 pub mod loss;
 pub mod run_loop;
 pub mod statistics;
+pub mod summary_json;
 pub mod trace_event;
 
 pub use context::MonitorContext;
