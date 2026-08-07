@@ -29,7 +29,8 @@ A layered gate, each layer matched to what it can actually prove:
    process (version encoding, the `LAYOUTS` registry, GC-shape selection, ring/inline
    geometry, stat decode, monitor dedup). Two seams were extracted to make the
    version-dependent logic reachable off a live target: `OffsetTable::decode_gc_stats`
-   (pure, takes `&[u8]`) and `monitor::select_fresh`. Runs in <1s with no Python; catches
+   (pure, takes `&[u8]`) and `monitor::cursor::Cursor::admit`. Runs in <1s with no Python;
+   catches
    logic regressions, never offset errors.
 2. **Live-smoke matrix — the correctness gate.** For each `(OS, version)` it spawns a real
    interpreter, attaches, decodes, and asserts **shape**: the expected `(kind, entries)`

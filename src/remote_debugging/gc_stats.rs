@@ -76,18 +76,28 @@ impl GcStat {
         self.layout.has_field(name)
     }
 
+    /// Whether this build publishes the timestamps that bound a collection.
+    ///
+    /// The tier selector, decided here and nowhere else: a build with these fields describes
+    /// each collection as a span and can report a pause; one without publishes cumulative
+    /// counts, so any pause figure from it would be fabricated. Keyed on the layout, never on
+    /// a version (ADR 0003, ADR 0007, ADR 0017).
+    pub fn has_timing(&self) -> bool {
+        self.has("ts_start") && self.has("ts_stop")
+    }
+
     /// Whether this entry describes a finished collection: `ts_start < ts_stop`.
     ///
     /// CPython publishes `ts_start` when a collection begins and `ts_stop` when it ends, so an
     /// entry read in between carries a fresh `ts_start` beside a `ts_stop` that is either zero
     /// or the stale value of the entry's previous occupant. Both read back as `ts_stop <=
-    /// ts_start`, and so does a zero-width entry. The monitor's `select_fresh` and the TUI's
+    /// ts_start`, and so does a zero-width entry. The monitor's cursor and the TUI's
     /// `parse_gc_entries` share this one predicate.
     ///
     /// Gated on the layout, not the values: builds with no timestamp fields (inline, 3.8–3.14)
     /// cannot answer the question, so their entries all count as complete.
     pub fn is_complete(&self) -> bool {
-        if !(self.has("ts_start") && self.has("ts_stop")) {
+        if !self.has_timing() {
             return true;
         }
         self.ts_start() < self.ts_stop()

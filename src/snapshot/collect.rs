@@ -383,7 +383,7 @@ impl CollectedData {
 /// table geometry. Torn and still-running entries are dropped here, so a half-written entry
 /// never reaches the renderer; the test is
 /// [`GcStat::is_complete`](crate::remote_debugging::gc_stats::GcStat::is_complete), the same
-/// predicate `select_fresh` holds entries back on. The monitor applies it later, at dedup,
+/// predicate the monitor's cursor holds entries back on. It applies the predicate later,
 /// where the entry stays selectable once it finishes. Inline layouts (3.13/3.14) carry no
 /// timestamps, so the predicate can't fire and every entry is kept.
 fn parse_gc_entries(raw: &[u8], table: &offsets::offset_table::OffsetTable) -> Vec<GcEntry> {
@@ -928,7 +928,7 @@ mod tests {
         assert_eq!((g1.start_ts, g1.stop_ts), (100, 200));
     }
 
-    /// The predicate is `start_ts < stop_ts`, the same form `select_fresh` uses, so it also
+    /// The predicate is `start_ts < stop_ts`, the same form the monitor's cursor uses, so it also
     /// rejects zero-width entries: a ring position nothing has written yet (all-zero bytes),
     /// and one whose two timestamps landed on the same tick.
     #[test]
@@ -982,7 +982,7 @@ mod tests {
     /// One source of truth: the diagram and the monitor decode the same bytes into the
     /// same numbers because they share one decoder (`OffsetTable::decode_gc_stats`). The
     /// decoder itself filters nothing — the diagram drops incomplete entries here at parse,
-    /// the monitor holds them back later in `select_fresh`, on the same predicate. Everything
+    /// the monitor holds them back later, in its cursor, on the same predicate. Everything
     /// else agrees field-for-field, and the diagram's `byte_offset` matches the table geometry
     /// the decoder walked.
     #[test]
@@ -1019,7 +1019,7 @@ mod tests {
         }
 
         // Tear gen0's entry (stop_ts < start_ts). The decoder keeps every entry — the
-        // monitor filters downstream, in `select_fresh`; the diagram drops the torn one here
+        // monitor filters downstream, in its cursor; the diagram drops the torn one here
         // so it never renders garbage.
         put_i64(&mut raw, bases[0] as usize + 8, 0);
         let monitor_torn = table.decode_gc_stats(&raw, 0);
