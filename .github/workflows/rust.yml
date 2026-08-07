@@ -136,21 +136,31 @@ jobs:
 
 
   matrix-unpinned:
-    name: Smoke matrix stays unpinned
+    name: Python matrices stay unpinned
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      # The live matrix only guards against a patch-release struct change because
+      # A python matrix only guards against a patch-release struct change because
       # setup-python floats each entry to the newest patch. Pin one and that guard dies
       # silently — the leg still passes, it just stops testing anything new. This is the
       # constraint ADR 0010 section 2 states; nothing enforced it until now.
-      - name: Reject pinned patch versions in the live-smoke matrix
+      #
+      # Every `python:` matrix in the file, not the first one: the Probe leg added a second,
+      # and a guard that stops at `head -1` would have left it unguarded while still
+      # reporting green.
+      - name: Reject pinned patch versions in any python matrix
         run: |
-          LINE=$(grep -oE "^ *python: \[.*\]" .github/workflows/rust.yml | head -1)
-          echo "matrix: $LINE"
-          PINNED=$(printf '%s' "$LINE" | grep -oE "'[0-9]+\.[0-9]+\.[0-9]+t?'" || true)
+          LINES=$(grep -nE "^ *python: \[.*\]" .github/workflows/rust.yml || true)
+          echo "$LINES"
+          # A grep-based guard is worthless once the thing it greps for is renamed, and that
+          # rename would look like a pass. Find nothing, fail loudly.
+          if [ -z "$LINES" ]; then
+            echo "::error::no python matrix found in rust.yml; this guard has drifted"
+            exit 1
+          fi
+          PINNED=$(printf '%s' "$LINES" | grep -oE "'[0-9]+\.[0-9]+\.[0-9]+t?'" || true)
           if [ -n "$PINNED" ]; then
-            echo "::error::live-smoke matrix pins a patch version: $PINNED"
+            echo "::error::a python matrix pins a patch version: $PINNED"
             echo "Entries must be bare '3.x' so setup-python floats to the newest patch."
             echo "See ADR 0010 section 2 — the float IS the patch-drift guard."
             exit 1
@@ -403,6 +413,117 @@ jobs:
           files: lcov.info
           flags: integration,ubuntu-latest
           name: integration-ubuntu-latest
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+
+  # Decides whether the Probe contract leg below runs, so a docs-only pull request keeps its
+  # current turnaround. Done here with `git diff` rather than a `paths:` filter, because
+  # `paths:` gates the whole workflow file and every other job in it must keep running.
+  #
+  # The list below is deliberately wide. ADR 0016 section 4 makes this leg the price of path
+  # filtering: the Probe and gcscope's decoder share a layout contract, and a pull request that
+  # breaks it from the *reader* side must go red on that pull request rather than on whichever
+  # later one happens to touch C. So anything under `src/` counts, not just the reader modules.
+  probe-scope:
+    name: Does this change reach the Probe contract?
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - id: decide
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          # A push to main and a manual dispatch have no base to diff against, and both are
+          # places where guessing wrong costs more than the four minutes the leg takes.
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "event is ${{ github.event_name }}; the contract leg always runs."
+            exit 0
+          fi
+          # Fetch the base explicitly rather than trusting `origin/$BASE` to exist. What
+          # actions/checkout leaves in refs/remotes depends on its version and inputs, and the
+          # failure would be a `git diff` error that skips the leg — the exact outcome this
+          # gate must never produce by accident.
+          git fetch --no-tags --quiet origin "$BASE"
+          CHANGED=$(git diff --name-only FETCH_HEAD...HEAD)
+          echo "::group::changed files"; echo "$CHANGED"; echo "::endgroup::"
+          if printf '%s\n' "$CHANGED" | grep -qE '^(gcscope_probe/|src/|tests/|scripts/gen-offsets\.py$|Cargo\.(toml|lock)$|\.github/workflows/rust\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Reaches the Probe contract; the leg runs."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Touches neither the Probe nor gcscope's reader; skipping the leg."
+          fi
+
+  # The contract leg ADR 0016 section 4 calls non-optional: build a Probe on a machine that is
+  # not the maintainer's Windows box, attach to it, and assert the Records decode. Without it,
+  # "the Probe works on Linux" rests on nobody having checked.
+  #
+  # `specs/0015-publish-probe-wheels.md` owns wheels, musllinux, native arm64 and publishing.
+  # This builds one module from source and throws it away.
+  probe-contract:
+    name: Probe contract (ubuntu py${{ matrix.python }})
+    needs: probe-scope
+    if: needs.probe-scope.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The one place the leg's interpreter is named. The Probe refuses to load on any minor
+        # it was not built for, so ticket 05 adding 3.13 is one more entry here and nothing
+        # else. Bare minor, floated by setup-python, and `matrix-unpinned` enforces that —
+        # the float is what catches a patch release moving the offsets this build transcribes.
+        python: ['3.14']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: cargo-llvm-cov
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+
+      - name: Allow ptrace (best-effort)
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+
+      # No compiler or interpreter path appears here: setuptools finds the toolchain, which is
+      # the whole point of `pip install`. A compile error fails the leg here, named, rather
+      # than downstream as a test that found no module.
+      - name: Build and install the Probe
+        run: python -m pip install --verbose ./gcscope_probe
+
+      # GCSCOPE_REQUIRE_PROBE=1 is what stops a skip reading as a pass. The test skips when no
+      # Probe is installed, which is right on a laptop and would turn a Probe that failed to
+      # compile into a green leg here.
+      - name: Attach and assert the Ring decodes
+        env:
+          GCSCOPE_REQUIRE_PROBE: '1'
+        run: |
+          export GCSCOPE_TEST_PYTHON="$(command -v python)"
+          "$GCSCOPE_TEST_PYTHON" -c "import gcscope_probe; print(gcscope_probe.geometry())"
+          cargo llvm-cov --test probe --lcov --output-path lcov.info --fail-under-lines 1 -- --ignored --nocapture
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: lcov.info
+          flags: probe,ubuntu-latest
+          name: probe-ubuntu-latest-py${{ matrix.python }}
           disable_search: true
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}

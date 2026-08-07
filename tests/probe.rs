@@ -19,6 +19,7 @@
 mod common;
 
 use common::{SpawnedPython, full_python_version, is_free_threaded, probe_python, probe_required};
+use gcscope::memory::binary::elf_load_bias;
 use gcscope::memory::reader::{open_handle, read_memory_h};
 use gcscope::memory::regions::list_regions;
 use gcscope::remote_debugging::gc_stats::GcStat;
@@ -33,10 +34,12 @@ use std::time::Duration;
 /// discovery matches on it (ADR 0014), and the module name in `gcscope_probe/src` fixes it.
 const MODULE_PREFIX: &str = "gcscope_probe";
 
-/// Windows only, matching what the Probe builds on. `specs/0013-probe-portable-core.md`
-/// carries this to ELF and Mach-O, generalising both this suffix and the PE parse in
-/// [`find_header_addr`].
+/// What CPython names a built extension module. `.so` covers macOS too — extensions there are
+/// `.so`, not `.dylib`.
+#[cfg(windows)]
 const MODULE_SUFFIX: &str = ".pyd";
+#[cfg(not(windows))]
+const MODULE_SUFFIX: &str = ".so";
 
 /// The exported discovery anchor.
 const HEADER_SYMBOL: &str = "gcscope_probe_header";
@@ -100,8 +103,11 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 }
 
 /// Locate `gcscope_probe_header` in a live process from what the OS and the on-disk image say:
-/// find the mapped Probe module, parse its export table, add the export's RVA to the module
-/// base. No scanning and no hardcoded address, which is the chain ADR 0014 specifies.
+/// find the mapped Probe module, parse its symbol table, rebase the symbol onto the module's
+/// load address. No scanning and no hardcoded address, which is the chain ADR 0014 specifies.
+///
+/// One goblin match covers PE and ELF, so this reads the same fact on both platforms the leg
+/// runs on rather than diverging into two lookups.
 fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
     let regions = list_regions(pid).map_err(|e| format!("listing target regions: {e}"))?;
 
@@ -118,7 +124,8 @@ fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
         if !(name.starts_with(MODULE_PREFIX) && name.ends_with(MODULE_SUFFIX)) {
             continue;
         }
-        // The lowest mapping of a PE image is its load base.
+        // An image's lowest mapping is where its first loadable segment landed, on every
+        // format here. What that address is relative to differs, which is the load bias below.
         let entry = (path.to_string(), r.start() as u64);
         if module.as_ref().is_none_or(|(_, base)| entry.1 < *base) {
             module = Some(entry);
@@ -129,22 +136,56 @@ fn find_header_addr(pid: u32) -> Result<(String, u64), String> {
     })?;
 
     let bytes = std::fs::read(&path).map_err(|e| format!("reading {path}: {e}"))?;
-    let pe = goblin::pe::PE::parse(&bytes).map_err(|e| format!("parsing {path} as PE: {e}"))?;
-    let rva = pe
-        .exports
-        .iter()
-        .find(|e| e.name == Some(HEADER_SYMBOL))
-        .map(|e| e.rva)
-        .ok_or_else(|| {
-            // ADR 0014 §2 names this failure: a module that works and is invisible to
-            // discovery. Say which of the two happened.
-            format!(
-                "{path} does not export {HEADER_SYMBOL}; the module built but its discovery \
-                 anchor is not in the export table"
-            )
-        })?;
+    let addr = match goblin::Object::parse(&bytes) {
+        Ok(goblin::Object::PE(pe)) => pe
+            .exports
+            .iter()
+            .find(|e| e.name == Some(HEADER_SYMBOL))
+            .map(|e| base + e.rva as u64),
+        Ok(goblin::Object::Elf(elf)) => {
+            // `dynsyms` only. The static `.symtab` carries the symbol whatever its visibility,
+            // so falling back to it — as gcscope's own `resolve_symbol_elf` does, correctly,
+            // for a different question — would let a `-fvisibility=hidden` regression pass
+            // here while breaking discovery in the field. This lookup asserts the symbol is
+            // where a remote reader will look for it.
+            let bias = elf_load_bias(&elf)
+                .ok_or_else(|| format!("{path} has no PT_LOAD segment to take a load bias from"))?;
+            elf.dynsyms
+                .iter()
+                .find(|s| elf.dynstrtab.get_at(s.st_name) == Some(HEADER_SYMBOL))
+                .map(|s| base.wrapping_add(s.st_value.wrapping_sub(bias)))
+        }
+        // Mach-O is spec 0013's port, not this leg's: nothing here has run on macOS, and an
+        // untested arm reads as support. Ticket 04 adds it against a leg that can prove it.
+        Ok(other) => {
+            return Err(format!(
+                "{path} parses as {}, which this lookup does not handle yet",
+                object_kind(&other)
+            ));
+        }
+        Err(e) => return Err(format!("parsing {path}: {e}")),
+    };
 
-    Ok((path, base + rva as u64))
+    // ADR 0014 §2 names this failure: a module that works and is invisible to discovery. Say
+    // which of the two happened.
+    let addr = addr.ok_or_else(|| {
+        format!(
+            "{path} does not export {HEADER_SYMBOL}; the module built but its discovery anchor \
+             is not in the table a remote reader consults"
+        )
+    })?;
+
+    Ok((path, addr))
+}
+
+/// Names the format goblin found, for the error above.
+fn object_kind(obj: &goblin::Object) -> &'static str {
+    match obj {
+        goblin::Object::Mach(_) => "Mach-O",
+        goblin::Object::Archive(_) => "an archive",
+        goblin::Object::COFF(_) => "COFF",
+        _ => "a format goblin does not recognise",
+    }
 }
 
 /// Decode the header, refusing rather than clamping on anything implausible (ADR 0012).

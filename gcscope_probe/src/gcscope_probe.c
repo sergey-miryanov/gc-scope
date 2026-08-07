@@ -6,14 +6,26 @@
  * `struct gc_stats` byte-for-byte (3.15/Include/internal/pycore_interp_structs.h:180-222),
  * which gcscope's ring decoder reads unmodified.
  *
- * Scope today: 3.14 only, Windows only, x86-64 only, offsets transcribed rather than
- * compiled in. `specs/0013-probe-portable-core.md` covers what each becomes.
+ * Scope today: 3.14 only, x86-64 only, offsets transcribed rather than compiled in.
+ * `specs/0013-probe-portable-core.md` covers what each becomes.
  */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
-#include <windows.h>
+#include <stdatomic.h>
+#include <stddef.h>   /* offsetof -- came in via <windows.h> before the port */
 #include <stdint.h>
 #include <string.h>
+
+/* Default visibility for the two symbols an out-of-process reader looks up. `PyMODINIT_FUNC`
+ * already carries it; `gcscope_probe_header` and the slot array do not, and drop out of the
+ * dynamic symbol table under `-fvisibility=hidden` with no diagnostic at all -- discovery just
+ * finds nothing. `tests/probe.rs` looks the symbol up in `.dynsym` alone, never the static
+ * symbol table, so a regression here fails a test instead of shipping. */
+#ifdef _WIN32
+#  define GCSCOPE_PROBE_EXPORT __declspec(dllexport)
+#else
+#  define GCSCOPE_PROBE_EXPORT __attribute__((visibility("default")))
+#endif
 
 /* `heap_size` lives in the internal `_gc_runtime_state` and has no accessor. Including the
  * internal headers directly requires Py_BUILD_CORE, which flips PyAPI_DATA from dllimport to
@@ -113,7 +125,7 @@ struct gcscope_probe_stats {                /* :219-222 */
 #define GCSCOPE_PROBE_MAX_INTERP 8
 
 typedef struct {
-    volatile LONG               claimed;    /* 0 = free, 1 = owned by interp_id */
+    atomic_int                  claimed;    /* 0 = free, 1 = owned by interp_id */
     int64_t                     interp_id;
     struct gcscope_probe_stats  stats;
     /* scratch carried from the "start" callback to the "stop" callback */
@@ -122,9 +134,9 @@ typedef struct {
     int                         pending_valid;
 } gcscope_probe_slot;
 
-/* Exported so an out-of-process reader can locate the regions from this module's own export
- * table -- this module's exports, not python314.dll's. */
-__declspec(dllexport) gcscope_probe_slot gcscope_probe_slots[GCSCOPE_PROBE_MAX_INTERP];
+/* Exported so an out-of-process reader can locate the regions from this module's own symbol
+ * table -- this module's, not the interpreter's. */
+GCSCOPE_PROBE_EXPORT gcscope_probe_slot gcscope_probe_slots[GCSCOPE_PROBE_MAX_INTERP];
 
 /* The discovery anchor. Everything an out-of-process reader needs to walk the slots and decode
  * a region lives here, so nothing has to be passed in out of band and no struct layout is
@@ -144,7 +156,7 @@ __declspec(dllexport) gcscope_probe_slot gcscope_probe_slots[GCSCOPE_PROBE_MAX_I
  *
  * Not const: `slots_addr` and `header_size` are filled at module init. An address is not
  * portably a static initializer once cast to an integer. */
-__declspec(dllexport) struct gcscope_probe_header_t {
+GCSCOPE_PROBE_EXPORT struct gcscope_probe_header_t {
     char     magic[8];             /* "GCPRB015", no NUL -- exactly 8 bytes */
     uint32_t header_size;          /* sizeof(this struct); lets the reader version-check */
     uint32_t version;              /* bump on any layout change below */
@@ -194,7 +206,8 @@ gcscope_probe_slot_for_current_interp(void)
     /* Claim a free slot. Atomic because two interpreters with separate GILs can reach here
      * concurrently -- the GIL does not serialise them. */
     for (int i = 0; i < GCSCOPE_PROBE_MAX_INTERP; i++) {
-        if (InterlockedCompareExchange(&gcscope_probe_slots[i].claimed, 1, 0) == 0) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&gcscope_probe_slots[i].claimed, &expected, 1)) {
             gcscope_probe_slots[i].interp_id = id;
             return &gcscope_probe_slots[i];
         }
@@ -252,14 +265,17 @@ gcscope_probe_add_stats(struct gcscope_probe_stats *s, int gen,
     cur->heap_size      = heap_size;
 
     /* Publish ts_stop last so a remote reader never selects a torn Record as newest
-     * (3.15/Python/gc.c:1415-1417). MemoryBarrier keeps the compiler and CPU from hoisting
-     * this store above the field writes above.
+     * (3.15/Python/gc.c:1415-1417). The fence keeps the compiler and CPU from hoisting this
+     * store above the field writes above.
      *
      * A release FENCE followed by a plain store establishes this on x86-64's TSO and NOT on
-     * aarch64. That is a correctness defect the only supported platform cannot exhibit;
-     * `specs/0013-probe-portable-core.md` §4 replaces it with an explicit release store
-     * before any arm64 build ships. */
-    MemoryBarrier();
+     * aarch64. That is a correctness defect no supported platform can exhibit yet, and the
+     * port kept its shape deliberately rather than fixing it in passing:
+     * `specs/0013-probe-portable-core.md` §4 replaces it with an explicit release store on
+     * `ts_stop`, which the same spec pairs with the native arm64 leg that would fail without
+     * it. Fixing it here would land the change on the one architecture that cannot show it
+     * working. */
+    atomic_thread_fence(memory_order_release);
     cur->ts_stop = ts_stop;
 
     gcscope_probe_records_written++;
@@ -523,6 +539,12 @@ PyInit_gcscope_probe(void)
 #define GCSCOPE_PROBE_YOUNG_BYTES (GC_YOUNG_STATS_SIZE * GCSCOPE_PROBE_ITEM + 8)
 #define GCSCOPE_PROBE_OLD_BYTES   (GC_OLD_STATS_SIZE * GCSCOPE_PROBE_ITEM + 8)
     Py_BUILD_ASSERT(GC_YOUNG_STATS_SIZE >= 1 && GC_OLD_STATS_SIZE >= 1);
+    /* `claimed` is a field an out-of-process reader inspects at the offset the header
+     * publishes, so it has to be a plain int in memory. An implementation whose atomic_int
+     * carried a lock alongside the value would keep every offsetof here correct and hand that
+     * reader a different field. Size is the property that matters, not ATOMIC_INT_LOCK_FREE:
+     * MSVC reports a lower value there than gcc while laying the type out identically. */
+    Py_BUILD_ASSERT(sizeof(atomic_int) == sizeof(int));
     Py_BUILD_ASSERT(sizeof(struct gcscope_probe_young_stats_buffer)
                     == GCSCOPE_PROBE_YOUNG_BYTES);
     Py_BUILD_ASSERT(sizeof(struct gcscope_probe_old_stats_buffer)

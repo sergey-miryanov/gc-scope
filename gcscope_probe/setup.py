@@ -9,8 +9,33 @@ locates the toolchain, so `pip install .` is the build.
 """
 
 from setuptools import Extension, setup
+from setuptools.command.build_ext import build_ext
+
+
+class BuildExt(build_ext):
+    """Give MSVC the two flags it needs for `<stdatomic.h>`.
+
+    MSVC compiles `.c` in a legacy dialect unless told otherwise, and gates C11 atomics behind
+    an opt-in on top of that. Without them its own `vcruntime_c11_stdatomic.h` stops the build:
+    `"C atomics require C11 or later"` for the missing `/std:c11`, then `"C atomic support is
+    not enabled"` for the missing `/experimental:c11atomics`. The second flag is how VS 2022
+    ships C11 atomics from 17.5 on; the name is the shipping name, not a preview channel.
+
+    gcc and clang already default to a gnu1x mode that has the header, so pinning a standard
+    there would cap the dialect Python.h is compiled under and buy nothing.
+    """
+
+    MSVC_C11_ATOMICS = ["/std:c11", "/experimental:c11atomics"]
+
+    def build_extensions(self):
+        if self.compiler.compiler_type == "msvc":
+            for ext in self.extensions:
+                ext.extra_compile_args = [*ext.extra_compile_args, *self.MSVC_C11_ATOMICS]
+        super().build_extensions()
+
 
 setup(
+    cmdclass={"build_ext": BuildExt},
     ext_modules=[
         Extension(
             name="gcscope_probe",
