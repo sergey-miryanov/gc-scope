@@ -503,13 +503,13 @@ jobs:
         # `heap_size` to clear the fixture's live-object count, so a wrong offset fails the leg
         # instead of publishing 0.
         #
-        # 3.13 has no such field to check, which leaves `offsets_ok` as the only thing holding
+        # 3.13 has no such field, which leaves `offsets_ok` as the only thing holding
         # `offsetof(PyInterpreterState, gc)` up there. The header's capability word carries it
         # now, so `tests/probe.rs` asserts it from outside the process on both minors.
         #
-        # The 3.14 entry is also the only one that can fail the `heap_size` check on purpose:
+        # Only the 3.14 entry can fail the `heap_size` check on purpose:
         # `probe_reports_a_suppressed_heap_size` displaces the offset and asserts the Probe
-        # suppresses the field, and there is nothing to displace on 3.13, where it skips.
+        # suppresses the field. There is nothing to displace on 3.13, where it skips.
         python: ['3.13', '3.14']
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -585,16 +585,15 @@ jobs:
           GCSCOPE_TEST_PYTHON="$(python -c 'import sys; print(sys.executable)')"
           export GCSCOPE_TEST_PYTHON
           echo "interpreter: $GCSCOPE_TEST_PYTHON"
-          # The self-check, in process. `tests/probe.rs` now asserts the same fact from the
-          # region header's capability word, which is where a real consumer reads it; this stays
-          # because it needs no attach. A leg whose ptrace or taskport permissions are wrong
-          # fails every test below for that reason and would leave the offsets unexamined,
-          # whereas this says plainly which of the two happened.
+          # The self-check, in process. `tests/probe.rs` asserts the same fact from the region
+          # header, which is where a real consumer reads it; this stays because it needs no
+          # attach. A leg whose ptrace or taskport permissions are wrong fails every test below
+          # and leaves the offsets unexamined, while this says which of the two happened.
           #
           # It compares `gcstate->collecting` against the 1 it must be inside a gc callback, so it
           # validates `offsetof(PyInterpreterState, gc)` and `collecting` together. `heap_size`
-          # answers separately, through the causal check in `gcscope_probe_validate_heap_size`,
-          # and reports separately in the same word.
+          # answers separately, through `gcscope_probe_validate_heap_size`, and reports separately
+          # in the same word.
           #
           # `offsets_ok` reads 0 until a Collection has run with the callback installed, so this
           # installs and collects rather than calling geometry() straight after import. `-P` keeps

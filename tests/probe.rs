@@ -65,35 +65,33 @@ const COLLECTOR_INCREMENTAL: u32 = 0;
 const COLLECTOR_GENERATIONAL: u32 = 1;
 
 /// The region header version this reader decodes. Version 4 added `capabilities` and
-/// `layout_digest`; there are no external consumers to negotiate with yet, so a mismatch is a
-/// disagreement between this repository's two halves rather than a compatibility question.
+/// `layout_digest`. Nothing outside this repository consumes the header yet, so a mismatch means
+/// its two halves disagree.
 const HEADER_VERSION: u32 = 4;
 
 /// Bits of the header's `capability` word, mirroring `GCSCOPE_PROBE_CAP_*` in
-/// `gcscope_probe/src/gcscope_probe.c`. A set bit means the Probe stands behind the field; the
-/// word is fail-closed, so a reader that finds it zero concludes nothing is meaningful rather
-/// than that everything is.
+/// `gcscope_probe/src/gcscope_probe.c`. A set bit is a claim, so a reader finding the word zero
+/// concludes nothing is meaningful.
 const CAP_OFFSETS_OK: u32 = 1 << 0;
 const CAP_HEAP_SIZE_PRESENT: u32 = 1 << 1;
 const CAP_HEAP_SIZE_VALID: u32 = 1 << 2;
 const CAP_CANDIDATES_VALID: u32 = 1 << 3;
 const CAP_COUNTERS_SEEDED: u32 = 1 << 4;
 
-/// Every bit this reader knows the meaning of. A Probe setting one outside it is claiming
-/// something this side cannot interpret, which a version bump is for.
+/// Every bit this reader knows the meaning of. A Probe setting one outside it claims something
+/// this side cannot interpret, which is what a version bump is for.
 const CAP_KNOWN: u32 = CAP_OFFSETS_OK
     | CAP_HEAP_SIZE_PRESENT
     | CAP_HEAP_SIZE_VALID
     | CAP_CANDIDATES_VALID
     | CAP_COUNTERS_SEEDED;
 
-/// The environment variable `probe_spin.py` turns into a call to the Probe's private
-/// offset-fault hook, and the displacement handed to it.
+/// The environment variable `probe_spin.py` turns into a call to the Probe's private fault hook,
+/// and the displacement it hands over.
 ///
-/// -8 rather than +8: it lands on `_gc_runtime_state.callbacks`, a `PyObject *`, so a Probe
-/// that published the value read there would publish a pointer as a heap size. What follows
-/// `heap_size` on 3.14.5 is a zeroed `dummy1`, which would be indistinguishable from the
-/// suppression this test is asserting.
+/// -8 lands on `_gc_runtime_state.callbacks`, a `PyObject *`, so a Probe publishing what it read
+/// would publish a pointer. +8 lands on a zeroed `dummy1` on 3.14.5, which reads the same as the
+/// suppression being asserted.
 const FAULT_ENV: &str = "GCSCOPE_PROBE_FAULT_HEAP_SIZE_OFF";
 const FAULT_DELTA: &str = "-8";
 
@@ -175,8 +173,8 @@ struct ProbeHeader {
     py_version: u32,
     collector: u32,
     capabilities: u32,
-    /// The registered Ring shape this Probe implements, as `specs/0012` spells it: 12 hex
-    /// characters, NUL-padded in the header. Empty until ticket 09 populates it.
+    /// The registered Ring shape this Probe implements: 12 hex characters, NUL-padded in the
+    /// header (`specs/0012`). Empty until ticket 09 fills it.
     layout_digest: String,
 }
 
@@ -318,9 +316,9 @@ fn read_header(handle: &ProcessHandle, addr: u64) -> Result<ProbeHeader, String>
             String::from_utf8_lossy(&head[0..8])
         ));
     }
-    // `version` sits inside the prefix already read, so a target older than this reader is named
-    // as that rather than as an implausible size — the two failures look identical otherwise,
-    // since every field added to the header grows it.
+    // `version` sits in the prefix already read, so a target older than this reader is named as
+    // that rather than as an implausible size. Every field added to the header grows it, so the
+    // two look identical otherwise.
     let version = u32_at(&head, 12);
     if version != HEADER_VERSION {
         return Err(format!(
@@ -329,8 +327,7 @@ fn read_header(handle: &ProcessHandle, addr: u64) -> Result<ProbeHeader, String>
     }
     let header_size = u32_at(&head, 8) as usize;
     // 88 is `sizeof(struct gcscope_probe_header_t)` at version 4 and the least this reader can
-    // decode. Larger is a header carrying fields it does not know about, which is what the
-    // declared size exists for.
+    // decode. Larger means fields it does not know about, which is what the declared size is for.
     if !(88..=512).contains(&header_size) {
         return Err(format!("implausible header_size {header_size}"));
     }
@@ -417,11 +414,10 @@ fn ring_table(h: &ProbeHeader) -> OffsetTable {
 /// offset would land on the pointer at the top of the struct. Demanding 0 asserts that absence
 /// rather than stepping around it: any other value means something read at that offset anyway.
 ///
-/// The capability word is what tells the three zeroes apart. `HEAP_SIZE_PRESENT` clear means the
-/// field is absent on this interpreter; present-but-not-`VALID` means the Probe's own check on it
-/// failed and it is publishing 0 instead of whatever sits at the offset; both set means the
-/// number came from the field, and only then is a 0 an empty heap. A reader that ignored the word
-/// would read all three as an empty heap.
+/// The capability word tells the three zeroes apart. `HEAP_SIZE_PRESENT` clear means the field is
+/// absent here. Present without `VALID` means the Probe's check on it failed and it publishes 0
+/// instead of what sits at the offset. Both set means the number came from the field, and only
+/// then is a 0 an empty heap.
 fn check_heap_size(s: &GcStat, capabilities: u32) -> Result<(), String> {
     let heap_size = s.heap_size();
     let present = capabilities & CAP_HEAP_SIZE_PRESENT != 0;
@@ -700,7 +696,7 @@ fn attach(python: &Path) -> Attached {
     attach_with(python, &[])
 }
 
-/// As [`attach`], with environment variables handed to the fixture — today the offset fault the
+/// As [`attach`], with environment variables handed to the fixture: today the offset fault the
 /// suppression test needs.
 fn attach_with(python: &Path, env: &[(&str, &str)]) -> Attached {
     // A free-threaded build never maintains `heap_size`, so the Probe refuses to load there
@@ -906,11 +902,10 @@ fn probe_ring_decodes_out_of_process() {
     );
 
     // The self-check on `gcstate->collecting`, read from outside the process. It ran in the
-    // fixture's first Collection, long before this attach, and until version 4 its result was
-    // reachable only through an in-process Python call — so a Probe whose compiled-in offsets
-    // were wrong for the interpreter it loaded into looked exactly like one whose were right.
-    // On 3.13 this is the only check standing behind `offsetof(PyInterpreterState, gc)`, since
-    // there is no `heap_size` whose magnitude would give a wrong `gc` offset away.
+    // fixture's first Collection, and until version 4 only an in-process Python call could reach
+    // the result, so a Probe with the wrong offsets looked like one with the right ones. On 3.13
+    // it is the only check behind `offsetof(PyInterpreterState, gc)`: there is no `heap_size`
+    // whose magnitude would give a wrong `gc` offset away.
     assert!(
         h.capabilities & CAP_OFFSETS_OK != 0,
         "capabilities {:#x} do not declare the offset self-check passed; the Probe published a \
@@ -918,9 +913,9 @@ fn probe_ring_decodes_out_of_process() {
         h.capabilities
     );
 
-    // `deduce_unreachable()` is `static inline` on both supported minors, so the count of
-    // candidates a Collection examined cannot be had at any price. The Probe writes 0 and has to
-    // say that 0 means nothing, or a reader averages it as a real measurement.
+    // `deduce_unreachable()` is `static inline` on both minors, so the count of candidates a
+    // Collection examined is out of reach. The Probe writes 0 and has to say that 0 means
+    // nothing, or a reader averages it as a measurement.
     assert_eq!(
         h.capabilities & CAP_CANDIDATES_VALID,
         0,
@@ -928,10 +923,9 @@ fn probe_ring_decodes_out_of_process() {
         h.capabilities
     );
 
-    // The bit this whole word exists for, and the one nothing sets yet: `collections` and its
-    // two neighbours are counts since install until ticket 07 seeds them from CPython's own
-    // `generation_stats`. A build that set it early would tell a reader they are Lifetime
-    // totals, and `duration` in the same entry would still be Install-relative.
+    // Nothing sets this yet: `collections` and its two neighbours count from install until
+    // ticket 07 seeds them from CPython's `generation_stats`. A build setting it early would tell
+    // a reader they are Lifetime totals while `duration` in the same entry still is not.
     assert_eq!(
         h.capabilities & CAP_COUNTERS_SEEDED,
         0,
@@ -939,8 +933,8 @@ fn probe_ring_decodes_out_of_process() {
         h.capabilities
     );
 
-    // Everything else. Without this the two assertions above pin two bits and leave the other
-    // thirty saying whatever they like, which is the same silence the word was added to end.
+    // Everything else. Without it the assertions above pin two bits and leave the other thirty
+    // free to say anything.
     assert_eq!(
         h.capabilities & !CAP_KNOWN,
         0,
@@ -949,9 +943,9 @@ fn probe_ring_decodes_out_of_process() {
         h.capabilities
     );
 
-    // `heap_size` is present exactly where `_gc_runtime_state` has the field: 3.14 and up. The
-    // header claiming otherwise means the compile-time branch in `internals.c` and the runtime
-    // it loaded into disagree, which is the condition the whole capability word exists to expose.
+    // `heap_size` is present where `_gc_runtime_state` has the field, which is 3.14 and up. A
+    // header claiming otherwise means the compile-time branch in `internals.c` and the runtime it
+    // loaded into disagree.
     let heap_size_expected = h.py_version >> 16 >= 0x030E;
     assert_eq!(
         h.capabilities & CAP_HEAP_SIZE_PRESENT != 0,
@@ -961,8 +955,8 @@ fn probe_ring_decodes_out_of_process() {
         h.capabilities,
         h.py_version
     );
-    // Where the field exists, its own validation has to have passed — this fixture injects no
-    // fault. `probe_reports_a_suppressed_heap_size` covers the other side.
+    // Where the field exists, its own check has to have passed: this fixture injects no fault.
+    // `probe_reports_a_suppressed_heap_size` covers the other side.
     if heap_size_expected {
         assert!(
             h.capabilities & CAP_HEAP_SIZE_VALID != 0,
@@ -971,9 +965,8 @@ fn probe_ring_decodes_out_of_process() {
         );
     }
 
-    // Ticket 09 of `specs/0013-probe-portable-core.md` fills this from the generated header, so
-    // an unpopulated field is expected today. What is asserted is that the slot holds either
-    // nothing or a digest in the form `specs/0012` defines, never something in between.
+    // Ticket 09 fills this from the generated header, so an empty field is expected today. The
+    // slot has to hold either nothing or a digest in the form `specs/0012` defines.
     assert!(
         h.layout_digest.is_empty()
             || (h.layout_digest.len() == 12
@@ -1080,19 +1073,15 @@ fn probe_ring_decodes_out_of_process() {
 /// A Probe whose `heap_size` check failed says so where a reader can see it, and publishes 0
 /// rather than the number it read.
 ///
-/// Without this the failure path is written and never executed. The Probe's own check is a causal
-/// one — allocate a known number of tracked objects, watch the field rise, drop them, watch it
-/// fall — so the only way to fail it on a healthy interpreter is to point it somewhere else,
-/// which is what the fixture's fault hook does. The displacement lands on a `PyObject *`, so a
-/// Probe that published what it read would publish a pointer, a number no bound on plausibility
-/// would question.
+/// Without this the failure path is written and never run. The Probe's check is causal: allocate
+/// a known number of tracked objects, watch the field rise, drop them, watch it fall. Nothing
+/// fails that on a healthy interpreter except pointing it elsewhere, which the fixture's fault
+/// hook does. The displacement lands on a `PyObject *`, so a Probe publishing what it read would
+/// publish a pointer, and no plausibility bound would question it.
 ///
-/// The suppressed field then reads 0, the same 0 an empty heap and an absent field give. Telling
-/// those apart from outside the process is the whole of ticket 06, and the capability word is
-/// where the difference lives.
-///
-/// A second, unfaulted fixture runs as the control. Everything asserted here is also true of a
-/// Probe whose check fails on every input, and that Probe would be broken rather than careful.
+/// The suppressed field reads 0, the same 0 an empty heap and an absent field give. A second,
+/// unfaulted fixture runs as the control: everything asserted here also holds of a Probe whose
+/// check fails on every input, and that Probe is broken rather than careful.
 #[test]
 #[ignore = "attaches to a live process; needs ptrace/taskport and an installed Probe — run with --ignored"]
 fn probe_reports_a_suppressed_heap_size() {
@@ -1102,9 +1091,9 @@ fn probe_reports_a_suppressed_heap_size() {
     let t = attach_with(&python, &[(FAULT_ENV, FAULT_DELTA)]);
     let h = &t.header;
 
-    // 3.13's `_gc_runtime_state` has no `heap_size` to point anywhere, so there is no check to
-    // fail. Read from the header rather than from the interpreter's version, since the header is
-    // what a reader has. `probe_ring_decodes_out_of_process` holds the two to each other.
+    // 3.13 has no `heap_size` to point anywhere, so there is no check to fail. Taken from the
+    // header rather than the interpreter's version, since the header is what a reader has;
+    // `probe_ring_decodes_out_of_process` holds the two to each other.
     if h.capabilities & CAP_HEAP_SIZE_PRESENT == 0 {
         eprintln!(
             "SKIP probe_reports_a_suppressed_heap_size: {:#010x} has no heap_size field to fault",
@@ -1121,9 +1110,8 @@ fn probe_reports_a_suppressed_heap_size() {
         h.capabilities
     );
 
-    // The control, without which every assertion here passes on a Probe whose `heap_size` check
-    // fails unconditionally — the same fixture with nothing displaced has to reach the opposite
-    // answer, or the fault is not what produced this one.
+    // The control. The same fixture with nothing displaced has to reach the opposite answer, or
+    // the fault is not what produced the one above.
     let control = attach_with(&python, &[]);
     assert_eq!(
         control.header.capabilities & (CAP_HEAP_SIZE_PRESENT | CAP_HEAP_SIZE_VALID),
@@ -1134,9 +1122,9 @@ fn probe_reports_a_suppressed_heap_size() {
         control.header.capabilities
     );
     drop(control);
-    // The other bits are untouched by the fault, so a reader learns which field went bad rather
-    // than that the Probe is unusable. A fault that cleared the word wholesale would pass the
-    // assertion above and say nothing.
+    // The fault leaves the other bits alone, so a reader learns which field went bad rather than
+    // that the Probe is unusable. One that cleared the word wholesale would pass the assertion
+    // above and say nothing.
     assert!(
         h.capabilities & CAP_OFFSETS_OK != 0,
         "capabilities {:#x} lost the offset self-check to a heap_size fault; the two checks are \

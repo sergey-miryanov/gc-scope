@@ -207,8 +207,8 @@ impl SpawnedPython {
 
     /// As [`Self::spawn_fixture`], with environment variables set on the child.
     ///
-    /// The fault hooks a fixture reads are environment-driven, since a fixture takes one
-    /// positional argument and both fixtures have to keep taking the same one.
+    /// A fixture reads its fault hooks from the environment: both take one positional argument
+    /// and have to keep taking the same one.
     pub fn spawn_fixture_env(
         python: &Path,
         fixture_name: &str,

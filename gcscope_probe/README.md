@@ -60,10 +60,9 @@ has no version word to take.
 
 ## What the capability word says
 
-Every field a Probe cannot fill publishes 0, and so does a field that is genuinely 0, and so
-does a field whose offset turned out to be wrong. The header's `capabilities` separates them.
-It is fail-closed — a set bit is a claim — so a reader finding it zero concludes nothing is
-meaningful rather than that everything is.
+A field the Probe cannot fill publishes 0, so does a genuinely empty one, and so does one whose
+offset is wrong. The header's `capabilities` separates the three. A set bit is a claim, so a
+reader finding the word zero concludes nothing is meaningful.
 
 | Bit | Set when |
 |---|---|
@@ -71,23 +70,22 @@ meaningful rather than that everything is.
 | `HEAP_SIZE_PRESENT` | This interpreter's `_gc_runtime_state` has the field at all. Clear on 3.13. |
 | `HEAP_SIZE_VALID` | ...and the check below reached it. Present without this is a field the Probe suppressed. |
 | `CANDIDATES_VALID` | Never. `deduce_unreachable()` is `static inline` and the count is reachable nowhere else. |
-| `COUNTERS_SEEDED` | Not yet on any build. Will mean `collections`, `collected` and `uncollectable` are Lifetime totals rather than counts since install (spec 0013 §4); until then they are counts since install. |
+| `COUNTERS_SEEDED` | Nothing sets it yet. It will mean `collections`, `collected` and `uncollectable` are Lifetime totals rather than counts since install (spec 0013 §4). |
 
-`duration` has no bit because it could never earn one: CPython never recorded it, so there is
-nothing to seed from and it stays Install-relative on every build. That is the trap the word
-exists for — a Lifetime-total `collections` and an Install-relative `duration` sit in the same
-64-byte entry, and dividing one by the other is silently wrong.
+`duration` gets no bit. CPython never recorded it, so there is nothing to seed from and it stays
+Install-relative on every build. That is what the word guards: a Lifetime-total `collections` and
+an Install-relative `duration` share a 64-byte entry, and dividing one by the other is wrong with
+nothing to say so.
 
-**`heap_size` is checked causally, not for plausibility.** The Probe allocates 1024 tracked
-objects at import, watches the field rise by at least that many, drops them, and watches it fall
-by at least that many. A one-sided rise is also what `generations[0].count` does; nothing else
-in the struct does both. This is a separate answer from `OFFSETS_OK`, which validates
-`offsetof(PyInterpreterState, gc)` and `collecting` against *each other* and so passes a
-`heap_size` that moved on its own — as it would have between 3.14.4 and 3.14.5, where
-`sizeof(_gc_runtime_state)` moved 24 bytes.
+**`heap_size` is checked causally, not for plausibility.** At import the Probe allocates 1024
+tracked objects, watches the field rise by at least that many, drops them, and watches it fall by
+at least that many. `generations[0].count` also rises; nothing else in the struct does both. This
+answers separately from `OFFSETS_OK`, which validates `offsetof(PyInterpreterState, gc)` and
+`collecting` against *each other* and lets through a `heap_size` that moved on its own, as it did
+between 3.14.4 and 3.14.5 when `sizeof(_gc_runtime_state)` moved 24 bytes.
 
-A failed check suppresses the field rather than publishing what it found.
-`_fault_heap_size_offset` exists to execute that path: it displaces the offset so
+A failed check suppresses the field instead of publishing what it found.
+`_fault_heap_size_offset` runs that path: it displaces the offset so
 `probe_reports_a_suppressed_heap_size` can read the consequences out of the process.
 
 ## Install

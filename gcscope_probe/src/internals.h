@@ -58,9 +58,8 @@ extern const size_t gcscope_probe_gc_heap_size_off;
 extern const size_t gcscope_probe_gc_collecting_off;
 
 /* `sizeof(struct _gc_runtime_state)`, so a read displaced from one of the offsets above can be
- * bounded against the struct it is supposed to stay inside. Only `internals.c` can see the type,
- * and 264 bytes on 3.14.5 against 240 on 3.14.4 is exactly the kind of movement this whole
- * mechanism exists to survive, so it cannot be a constant here. */
+ * bounded against the struct it has to stay inside. Only `internals.c` sees the type, and the
+ * size went 240 to 264 between 3.14.4 and 3.14.5, so it cannot be a constant here. */
 extern const size_t gcscope_probe_gc_state_size;
 
 /* Whether `_gc_runtime_state` has a `heap_size` field at all: 1 on 3.14, 0 on 3.13, where the
