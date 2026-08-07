@@ -63,6 +63,26 @@ at the moment it was decided.
    it, path filters would leave the shared contract breakable from the reader's side with no
    leg going red on the pull request that broke it. That leg is the price of the filters and
    is not optional.
+
+   > **Amended 2026-08-07, building the leg** (`rust.yml: probe-contract`). A `probe-scope` job
+   > diffs the pull request and skips the leg when nothing under `gcscope_probe/`, `src/`,
+   > `tests/`, `scripts/gen-offsets.py`, the manifests or `rust.yml` itself changed, so
+   > "unconditional" above is now approximate. The force survives: the gate opens on all of
+   > `src/`, so a change breaking the layout contract from the reader's side cannot reach main
+   > without this leg having run. In exchange a docs-only or spec-only pull request keeps its
+   > current turnaround. `paths:` in the `on:` block cannot do this, since it gates the whole
+   > workflow file and every other job in `rust.yml` has to keep running.
+
+   > **Also amended: how the leg gets a Probe that compiles.** We sequenced the leg before the
+   > port to Linux it depends on, so the port landed with it. `<windows.h>` gave way to C11
+   > `<stdatomic.h>`, `__declspec(dllexport)` to a visibility macro, and the integration test's
+   > hand-written PE export parse to one goblin match over PE and ELF. The aarch64
+   > publication-ordering fix stayed behind on purpose: it wants the native arm64 leg
+   > `specs/0015-publish-probe-wheels.md` adds, and an x86-64 leg cannot show it working.
+   >
+   > The leg is Linux only. Nothing in CI compiles the Probe on Windows, so the platform that
+   > was its only proven one now rests on someone building it by hand. Spec 0015's wheel matrix
+   > closes that.
 5. **gcscope is not published as a library** to satisfy this. The move removed the only
    forcing reason; whether gcscope wants library consumers is a separate decision that should
    be made on its own merits.

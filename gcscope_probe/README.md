@@ -13,15 +13,17 @@ Rust repository.
 
 ## Status
 
-3.14 only, Windows only, x86-64 only. This is the prototype, moved here and packaged; the
-behaviour matches the version that proved the approach works
-(`docs/research/cpython-314-gc-hook-points.md` §11–§12).
+3.14 only, x86-64 only. CI builds a Linux Probe, attaches to it and decodes it on every pull
+request that reaches the layout contract. Windows passes the same test when someone runs it by
+hand; no CI leg compiles this on Windows, so a Windows-only break merges green until
+`specs/0015` adds one. macOS is written for and unproven. The behaviour matches the prototype
+that proved the approach works (`docs/research/cpython-314-gc-hook-points.md` §11–§12).
 
 | Today | Becomes | Where |
 |---|---|---|
 | Offsets transcribed from one build | Compiled from the interpreter's own headers | spec 0013 §4 |
 | A release fence before a plain `ts_stop` store | An explicit release store, which aarch64 needs | spec 0013 §4 |
-| `__declspec(dllexport)`, MSVC, PE | Portable visibility, Linux and macOS | spec 0013 §4 |
+| Mach-O untested, no arm64 anywhere | macOS and arm64 proven by a leg, not by compiling | spec 0013 §4, spec 0015 |
 | Counters starting at zero on install | Seeded from CPython's own, so they stay Lifetime totals | spec 0013 §4 |
 | `heap_size` 0 meaning absent, failed and empty alike | A capability word that tells the three apart | spec 0013 §4 |
 | Read by an integration test | Discovered and validated by gcscope | spec 0014 |
@@ -38,7 +40,13 @@ pip install .
 
 That is the whole build. No Visual Studio path, no SDK path and no interpreter path appears in
 this directory; setuptools finds the toolchain. You need a C compiler and the CPython headers
-for your interpreter, which the python.org installer ships on Windows.
+for your interpreter. The python.org installer ships them on Windows; on Debian and Ubuntu
+they are in `pythonX.Y-dev`.
+
+MSVC needs `/std:c11 /experimental:c11atomics` for `<stdatomic.h>`; `setup.py` adds both when
+it sees MSVC. That puts a floor under the Windows toolchain at **Visual Studio 2022 17.5**,
+where the second flag first exists. Older toolchains fail at `"C atomic support is not
+enabled"`, and no CI leg catches it. gcc and clang need no flags.
 
 Ring depths default to 11 young and 3 old, making the region byte-identical to a Native 3.15
 one. Override at build time:
