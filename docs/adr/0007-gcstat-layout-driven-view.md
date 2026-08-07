@@ -63,6 +63,6 @@ table are **unchanged** — the view refactor is confined to the exporter/right-
   hot, and the monitor's dedup calls `ts_start()` once per entry per tick — the syscall/flush
   cost dominates, not the scan (see the perf reasoning that declined a benchmark here).
 - `print_stats` keeps its two column sets, selected by `s.has("increment_size")` rather than
-  by a struct field — the same open/closed logic, now layout-driven. (The `gc-stats` table
-  later moved to `cli::gc_stats`, where presentation belongs under
-  [ADR 0008](0008-reader-consumer-package-layering.md); the selection rule is unchanged.)
+  by a struct field — the same open/closed logic, now layout-driven. (The table later moved
+  to the `cli` layer under [ADR 0008](0008-reader-consumer-package-layering.md). The
+  selection rule did not change.)

@@ -1,9 +1,9 @@
-//! The `gc-stats` table: how a slice of decoded [`GcStat`] entries looks as text.
+//! The `gc-stats` table: a slice of decoded [`GcStat`] entries as text.
 //!
-//! Presentation, so it lives here rather than beside the decode primitive it consumes —
+//! Presentation lives here, not beside the decode primitive it consumes.
 //! [ADR 0008](../../docs/adr/0008-reader-consumer-package-layering.md) keeps
-//! `remote_debugging` free of consumer-shaped types. A second rendering of the same numbers
-//! is therefore written as a peer consumer of that primitive, not against this printer.
+//! `remote_debugging` free of consumer-shaped types, so a second output format consumes
+//! that primitive as a peer of this module.
 
 use crate::remote_debugging::gc_stats::GcStat;
 
@@ -94,9 +94,8 @@ fn format_row(s: &GcStat, has_extended: bool) -> String {
 }
 
 /// The whole table as lines, ready to print. Pure for the same reason the row and header
-/// formatters are: it puts the parts of the table that are not a single row — the
-/// empty-slice message, the separator's width, the order the lines come in — behind an
-/// assertion instead of behind stdout, which no test can read back.
+/// formatters are: it puts the empty-slice message, the separator's width and the line
+/// order behind an assertion rather than behind stdout, which no test can read back.
 fn render(stats: &[GcStat]) -> Vec<String> {
     if stats.is_empty() {
         return vec!["No GC stats found.".to_string()];
@@ -242,19 +241,18 @@ mod tests {
         );
     }
 
-    /// An empty slice — the ordinary answer from a target that has not collected yet, and
-    /// from every 3.8 build — renders the message and nothing else. No header, no separator,
-    /// no blank trailing line: a bare ruler under a bare header would read as "the table is
-    /// there but the values failed to decode", which is a different diagnosis.
+    /// An empty slice renders the message and nothing else. A target that has not collected
+    /// yet returns one, so an operator sees this often. Printing a header and ruler over no
+    /// rows would suggest the table decoded to nothing, which is a different diagnosis.
     #[test]
     fn an_empty_slice_renders_only_the_not_found_message() {
         assert_eq!(render(&[]), ["No GC stats found."]);
     }
 
-    /// The table's non-row parts, which no per-row test reaches: a header, then a separator
-    /// exactly as wide as that header, then one row per entry in the order given. The width
-    /// tie is the assertion that matters — the ruler is built from `header.len()`, so a
-    /// header change that forgot it would print a rule that stops short of the columns.
+    /// The table's non-row parts, which no per-row test reaches: a header, a separator as
+    /// wide as that header, then one row per entry in the order given. The width tie is the
+    /// assertion that earns its place, since the ruler is built from `header.len()` and a
+    /// header change that dropped it would print a rule stopping short of the columns.
     #[test]
     fn the_table_is_a_header_then_a_matching_rule_then_one_row_per_entry() {
         let stats = [

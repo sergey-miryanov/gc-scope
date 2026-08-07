@@ -173,9 +173,9 @@ mod tests {
     static REGULAR: LazyLock<&'static GcItemLayout> =
         LazyLock::new(|| seq_layout(&["ts_start", "collections", "collected"]));
 
-    /// An extended (`+inc`) build's entry layout — the core counters plus the `increment_size`
-    /// set a custom build adds. The full set, so a decode test can assert that every field
-    /// such a build publishes reads back.
+    /// An extended (`+inc`) build's entry layout: the core counters plus the `increment_size`
+    /// set a custom build adds. Carries the full set, so a decode test can assert that each
+    /// field such a build publishes reads back.
     static EXTENDED: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
         seq_layout(&[
             "ts_start",
