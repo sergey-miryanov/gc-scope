@@ -11,8 +11,9 @@ license = "MIT"
 authors = [{ name = "Sergey Miryanov", email = "sergey.miryanov@gmail.com" }]
 keywords = ["gc", "garbage-collection", "profiling", "gcscope"]
 
-# 3.14 only. PyInit repeats the gate at import, because a wheel tag is a hint and the
-# transcribed offsets hold for the builds someone checked. Spec 0013 widens this to 3.13.
+# 3.14 only. PyInit repeats the gate at import, because a wheel tag is a hint: the offsets
+# `src/internals.c` compiles in describe one interpreter minor, and another lays
+# `PyInterpreterState` out differently. Spec 0013 widens this to 3.13.
 requires-python = ">=3.14,<3.15"
 
 # No license classifier: PEP 639 supersedes it, and setuptools refuses both together.

@@ -6,10 +6,7 @@
  * `struct gc_stats` byte-for-byte (3.15/Include/internal/pycore_interp_structs.h:180-222),
  * which gcscope's ring decoder reads unmodified.
  *
- * Scope today: 3.14 only, x86-64 only, and the interpreter offsets below come from a WINDOWS
- * build. The code compiles and runs on Linux, but nobody has re-derived that constant there
- * and `PyInterpreterState` differs in layout across platforms. Expect the self-check to fail
- * on Linux and `heap_size` to read 0 until ticket 03 compiles the offsets in.
+ * Scope today: 3.14 only, x86-64 only, Windows and Linux.
  * `specs/0013-probe-portable-core.md` covers what each becomes.
  */
 #define PY_SSIZE_T_CLEAN
@@ -18,6 +15,8 @@
 #include <stddef.h>   /* offsetof -- came in via <windows.h> before the port */
 #include <stdint.h>
 #include <string.h>
+
+#include "internals.h"
 
 /* Default visibility for the two symbols an out-of-process reader looks up. `PyMODINIT_FUNC`
  * carries it; `gcscope_probe_header` and the slot array do not, and drop out of the dynamic
@@ -30,24 +29,6 @@
 #  define GCSCOPE_PROBE_EXPORT __attribute__((visibility("default")))
 #endif
 
-/* `heap_size` lives in the internal `_gc_runtime_state` and has no accessor. Including the
- * internal headers directly requires Py_BUILD_CORE, which flips PyAPI_DATA from dllimport to
- * dllexport and breaks linking against python314.lib (_Py_NoneStruct). So the offsets are
- * transcribed here.
- *
- * Verified IDENTICAL across 3.14.0, 3.14.4 and 3.14.5 (x64, GIL build) by compiling a
- * throwaway translation unit WITH Py_BUILD_CORE against each source tree:
- *     offsetof(PyInterpreterState, gc)              = 7400
- *     offsetof(struct _gc_runtime_state, heap_size) = 216
- *     offsetof(struct _gc_runtime_state, collecting)= 192
- * Only sizeof(_gc_runtime_state) moved (240 on 3.14.0-3.14.4, 264 on 3.14.5), and nothing
- * here depends on it. 3.14.1-3.14.3 were not checked (no source tree available), but they sit
- * between two agreeing endpoints.
- *
- * `specs/0013-probe-portable-core.md` §4 makes that throwaway TU permanent, compiled with
- * Py_BUILD_CORE, turning these three constants into compile-time facts of the interpreter
- * being built against. Until then the module stays 3.14-only: PyInit refuses any other minor
- * version, and `collecting` self-checks the other two against a live collection. */
 /* What Ring index 1 means, which is NOT the same across the 3.14 line.
  *
  * 3.14.0-3.14.4 run the incremental collector: `_PyGC_Collect` dispatches on the
@@ -62,10 +43,6 @@
  * the header publishes which one this is. */
 #define GCSCOPE_PROBE_COLLECTOR_INCREMENTAL  0
 #define GCSCOPE_PROBE_COLLECTOR_GENERATIONAL 1
-
-#define GCSCOPE_PROBE_INTERP_GC_OFF        7400
-#define GCSCOPE_PROBE_GC_HEAP_SIZE_OFF     216
-#define GCSCOPE_PROBE_GC_COLLECTING_OFF    192
 
 /* ---- 3.15 region layout, reproduced exactly ----------------------------- */
 
@@ -285,6 +262,12 @@ gcscope_probe_add_stats(struct gcscope_probe_stats *s, int gen,
 
 /* ---- heap_size ---------------------------------------------------------- */
 
+/* `heap_size` sits in the internal `_gc_runtime_state` with no accessor, so the Probe reaches
+ * it by offset. `internals.c` supplies the three offsets as compile-time facts of the
+ * interpreter this module was built against. The self-check below covers what that leaves: a
+ * wheel built against one 3.14 patch release and loaded into another that moved a field the
+ * ABI never promised to hold still (ADR 0013). */
+
 /* Set to 1 once the offsets have been confirmed against a live collection; -1 if the
  * self-check failed, in which case heap_size reports 0 rather than garbage.
  *
@@ -300,13 +283,13 @@ gcscope_probe_gcstate(void)
     if (interp == NULL) {
         return NULL;
     }
-    return (char *)interp + GCSCOPE_PROBE_INTERP_GC_OFF;
+    return (char *)interp + gcscope_probe_interp_gc_off;
 }
 
 /* Called from inside a gc callback, where gcstate->collecting is necessarily 1 (set at
  * 3.14.5/Python/gc.c:1332, cleared at :1531 -- both callbacks fire between those points). If
- * it doesn't read 1, GCSCOPE_PROBE_INTERP_GC_OFF is wrong for this build and every other
- * offset-derived read is garbage.
+ * it doesn't read 1, `gcscope_probe_interp_gc_off` is wrong for the interpreter this module
+ * was loaded INTO rather than built against, and every other offset-derived read is garbage.
  *
  * This validates the `gc` and `collecting` offsets JOINTLY, so a heap_size-only move passes
  * it and then publishes plausible garbage. Spec 0013 §4 gives heap_size its own check. */
@@ -320,14 +303,14 @@ gcscope_probe_check_offsets(void)
     if (gcstate == NULL) {
         return;
     }
-    int collecting = *(int *)(gcstate + GCSCOPE_PROBE_GC_COLLECTING_OFF);
+    int collecting = *(int *)(gcstate + gcscope_probe_gc_collecting_off);
     gcscope_probe_offsets_ok = (collecting == 1) ? 1 : -1;
 }
 
 static Py_ssize_t
 gcscope_probe_heap_size(void)
 {
-    /* 3.14 GIL build only -- the free-threaded build never maintains heap_size. */
+    /* GIL builds only; PyInit refuses a free-threaded one, where nothing maintains heap_size. */
     if (gcscope_probe_offsets_ok != 1) {
         return 0;
     }
@@ -335,7 +318,7 @@ gcscope_probe_heap_size(void)
     if (gcstate == NULL) {
         return 0;
     }
-    return *(Py_ssize_t *)(gcstate + GCSCOPE_PROBE_GC_HEAP_SIZE_OFF);
+    return *(Py_ssize_t *)(gcstate + gcscope_probe_gc_heap_size_off);
 }
 
 /* ---- the gc.callbacks entry point --------------------------------------- */
@@ -555,9 +538,31 @@ PyInit_gcscope_probe(void)
     Py_BUILD_ASSERT(sizeof(struct gcscope_probe_stats)
                     == GCSCOPE_PROBE_YOUNG_BYTES + 2 * GCSCOPE_PROBE_OLD_BYTES);
 
-    /* Version gate. The transcribed offsets were verified against 3.14.0/3.14.4/3.14.5 only;
-     * on any other minor version they would read whatever happens to sit at those addresses.
-     * Refuse at import rather than publish plausible garbage.
+    /* Free-threaded gate. `_gc_runtime_state.heap_size` exists in a Py_GIL_DISABLED build and
+     * nothing writes it: `Python/gc_free_threading.c` never names the field, while the GIL
+     * collector decrements it at 3.14.5/Python/gc.c:1985. Every Record would carry heap_size 0.
+     *
+     * The gate is load-bearing BECAUSE the offsets are now right. Until ticket 03 a
+     * free-threaded build got a GIL build's transcribed offsets, `collecting` did not read 1,
+     * and the failing self-check made the Probe look broken for the wrong reason. Correct
+     * offsets remove that accident: the self-check passes and the Probe publishes a plausible
+     * table with one dead column. ADR 0013 decision 5 says refuse rather than degrade.
+     *
+     * Compile-time, not runtime: an extension built for cp314 cannot load into cp314t, so the
+     * build's configuration is the runtime's. */
+#ifdef Py_GIL_DISABLED
+    PyErr_SetString(PyExc_ImportError,
+                    "gcscope_probe does not support free-threaded CPython: the interpreter "
+                    "never maintains gc heap_size there, so every Collection would report 0. "
+                    "Install it into a build with the GIL");
+    return NULL;
+#endif
+
+    /* Version gate. `internals.c` compiled the offsets against ONE interpreter; another minor
+     * lays `PyInterpreterState` out differently, so they would point at whatever sits there.
+     * Refuse at import rather than publish plausible garbage. Spec 0013 §4 adds the
+     * patch-level gate; until it lands the self-check catches a moved field on the first
+     * collection.
      *
      * Py_Version is the RUNTIME version (pylifecycle.h:64), not PY_VERSION_HEX, which is what
      * this was compiled against. They differ exactly in the case that matters: one module

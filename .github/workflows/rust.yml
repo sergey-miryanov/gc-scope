@@ -486,12 +486,16 @@ jobs:
         # else. Bare minor, floated by setup-python, and `matrix-unpinned` enforces that, for
         # the reason ADR 0010 section 2 gives: a pinned entry stops testing anything new.
         #
-        # The float does not yet catch a patch release moving the interpreter offsets this
-        # build transcribes. `offsets_ok` sits behind a Python call an out-of-process reader
-        # cannot make, so the test never sees it, and a failed self-check reads as
-        # `heap_size = 0`, which passes the sane-magnitude check. Spec 0013 tickets 03 and 06
-        # close that: offsets compiled from the interpreter's own headers, and the self-check
-        # result published in the region header where this test can assert on it.
+        # This leg compiles the Probe against whatever patch release setup-python hands it, and
+        # the offsets come from that interpreter's own internal headers (ADR 0013), so a moved
+        # offset never reaches the test. The leg catches the other failure: a field that moved
+        # out from under the mechanism. `tests/probe.rs` requires a written entry's `heap_size`
+        # to clear the fixture's live-object count, so a wrong offset fails the leg instead of
+        # publishing 0. Guarding a wheel whose build and runtime disagree needs the patch gate
+        # and the header's `capabilities` word from ticket 06.
+        #
+        # `offsets_ok` itself still sits behind a Python call no out-of-process reader can
+        # make. Ticket 06 publishes it in the region header.
         python: ['3.14']
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -516,6 +520,11 @@ jobs:
       # No compiler or interpreter path appears here; setuptools finds the toolchain. A compile
       # error fails the leg at this step, named, rather than downstream as a test that found no
       # module.
+      #
+      # This needs the interpreter's *internal* headers, which belong to the runner's Python
+      # rather than to anything in this repository. Both `make install` and the standalone
+      # builds setup-python uses carry them; a Python without them stops here with the
+      # diagnostic `src/internals.c` raises.
       - name: Build and install the Probe
         run: python -m pip install --verbose ./gcscope_probe
 
