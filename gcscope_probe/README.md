@@ -13,19 +13,19 @@ Rust repository.
 
 ## Status
 
-3.14 only. On every pull request that reaches the layout contract, CI builds a Probe from
-source on Linux, Windows and macOS, attaches to each, and decodes the Records out of the
-process. `macos-latest` is Apple Silicon, so that leg runs on native arm64. That is the only
-configuration where the release store on `ts_stop` does work x86-64's TSO would have done
-anyway. Emulation would not settle it, since it may serialise the writes and hide the defect,
-so the workflow fails if that runner ever stops being arm64.
+3.13 and 3.14, with the GIL. On every pull request that reaches the layout contract, CI builds a
+Probe from source on Linux, Windows and macOS against each of those minors, attaches to it, and
+decodes the Records out of the process. `macos-latest` is Apple Silicon, so those legs run on
+native arm64. That is the only configuration where the release store on `ts_stop` does work
+x86-64's TSO would have done anyway. Emulation would not settle it, since it may serialise the
+writes and hide the defect, so the workflow fails if that runner ever stops being arm64.
 
 Each leg compiles against its own interpreter's internal headers, under gcc, MSVC or Apple
 clang. The header lookup reads PE exports, ELF `.dynsym` and the Mach-O export trie through one
 path.
 
-No leg covers 3.13, musllinux, 32-bit, debug builds, or arm64 outside macOS. `specs/0015` owns
-wheels and the rest of the matrix.
+No leg covers musllinux, 32-bit, debug builds, or arm64 outside macOS. `specs/0015` owns wheels
+and the rest of the matrix.
 
 The behaviour otherwise matches the prototype that proved the approach works
 (`docs/research/cpython-314-gc-hook-points.md` §11–§12).
@@ -37,10 +37,28 @@ The behaviour otherwise matches the prototype that proved the approach works
 | Read by an integration test | Discovered and validated by gcscope | spec 0014 |
 | Built from source | Wheels | spec 0015 |
 
-On anything but 3.14 it refuses to import, naming the reason, rather than publishing numbers
-read at offsets it was not built for. Free-threaded builds are refused too: `heap_size` sits in
-the struct and nothing in `gc_free_threading.c` writes it, so a Probe would report 0 for every
-Collection and its self-check would call that healthy.
+Three gates decide whether it loads, each naming what it refused and why, rather than publishing
+numbers read at offsets it was not built for:
+
+- **The minor.** 3.12 and below have no public `PyTime_PerfCounterRaw` to time a Collection
+  with, so a source build there stops at compile time. From 3.15 CPython publishes these
+  statistics itself, and a Probe would be a second source for the same numbers.
+- **The patch release.** A module built against 3.14.5 refuses to load into 3.14.6, naming both.
+  A wheel tag pins the minor and the stable ABI, and neither covers the internal struct layout
+  `src/internals.c` takes its offsets from: `sizeof(_gc_runtime_state)` moved 24 bytes between
+  3.14.4 and 3.14.5.
+- **The GIL.** `heap_size` sits in the struct of a free-threaded build and nothing in
+  `gc_free_threading.c` writes it, so a Probe would report 0 for every Collection and its
+  self-check would call that healthy.
+
+`gcscope_probe.version_refusal(hex)` answers what any `PY_VERSION_HEX` word would get, so the
+first two are testable from an interpreter that loads. The third is decided at compile time and
+has no version word to take.
+
+**`heap_size` is absent on 3.13**, not zero: the field arrived with 3.14's collector rework, and
+3.13's `_gc_runtime_state` ends before it. The Probe reads nothing there and publishes 0, which
+a reader cannot yet tell from a failed self-check or an empty heap. Spec 0013 §4's capability
+word separates the three.
 
 ## Install
 
@@ -52,12 +70,15 @@ That is the whole build. No Visual Studio path, no SDK path and no interpreter p
 this directory; setuptools finds the toolchain.
 
 You need a C compiler and the CPython headers for your interpreter, **including the internal
-ones** in `include/pythonX.Y/internal/`. `heap_size` lives in a struct CPython does not expose,
-so `src/internals.c` takes its offset from those headers at compile time rather than carrying a
-transcribed number ([ADR 0013](../docs/adr/0013-probe-offsets-are-compiled-in.md)): the same
-3.14 puts that struct at a different offset on Windows and on Linux. The python.org installers
-ship the internal headers; on Debian and Ubuntu they come with `pythonX.Y-dev`. Without them
-the build stops and says so.
+ones** in `include/pythonX.Y/internal/`. `heap_size` and `collecting` live in a struct CPython
+does not expose, so `src/internals.c` takes their offsets from those headers at compile time
+rather than carrying transcribed numbers
+([ADR 0013](../docs/adr/0013-probe-offsets-are-compiled-in.md)): the same 3.14 puts that struct
+at a different offset on Windows and on Linux. Which headers it reaches for depends on the
+minor, since 3.14 consolidated `PyInterpreterState` and `_gc_runtime_state` into
+`pycore_interp_structs.h` while 3.13 splits them. The python.org installers ship the internal
+headers; on Debian and Ubuntu they come with `pythonX.Y-dev`. Without them the build stops and
+says so.
 
 MSVC needs `/std:c11 /experimental:c11atomics` for `<stdatomic.h>`; `setup.py` adds both when
 it sees MSVC. That puts a floor under the Windows toolchain at **Visual Studio 2022 17.5**,
@@ -122,8 +143,9 @@ nothing can find.
 
 **Ring index 1 means different things across the 3.14 line.** On 3.14.0–3.14.4, running the
 incremental collector, index 1 counts increments of the old space; on 3.14.5 it counts gen-1
-Collections. The header publishes `collector` and `py_version` so you can tell. Pool data
-across the two without checking and you compare unlike quantities, with nothing to warn you.
+Collections, as it does on 3.13, which never shipped that collector. The header publishes
+`collector` and `py_version` so you can tell. Pool data across the two without checking and you
+compare unlike quantities, with nothing to warn you.
 
 **Counters are Install-relative today.** They start at zero when you install the Probe, while
 the region is byte-identical to a Native one whose same fields are Lifetime totals. Seeding

@@ -12,9 +12,10 @@
 //! `gc.generation_stats` for gcscope's discovery path, and nothing in the interpreter points
 //! at a Probe region. `specs/0014-read-probe-regions.md` moves that lookup into gcscope.
 //!
-//! The two tests that attach are `#[ignore]`d like the other live-attach tests (ADR 0005 §3);
-//! `probe_module_exports_its_discovery_anchor` only reads the built module off disk and is not.
-//! To run all three:
+//! The two tests that attach are `#[ignore]`d like the other live-attach tests (ADR 0005 §3).
+//! The other two are not: one reads the built module off disk and one asks its load gate what it
+//! would refuse, so both run wherever a Probe was built even if nothing can attach there. To run
+//! the lot:
 //!   cargo test --test probe -- --include-ignored
 //! With no Probe installed each skips; see `common::probe_python`.
 
@@ -33,6 +34,7 @@ use gcscope::remote_debugging::offsets::offset_table::{
 };
 use read_process_memory::ProcessHandle;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -54,6 +56,13 @@ const HEADER_SYMBOL: &str = "gcscope_probe_header";
 /// carries the same export macro, and losing default visibility here is the same regression one
 /// step earlier.
 const SLOTS_SYMBOL: &str = "gcscope_probe_slots";
+
+/// What the header's `collector` says Ring index 1 counts. On 3.14.0-3.14.4, running the
+/// incremental collector, it counts increments of the old space; everywhere else the Probe
+/// supports it counts gen-1 Collections. Average across the two and you compare unlike
+/// quantities, which is why the Probe publishes which one it is.
+const COLLECTOR_INCREMENTAL: u32 = 0;
+const COLLECTOR_GENERATIONAL: u32 = 1;
 
 /// Samples across the run, and the gap between them. Three samples check a counter sequence
 /// rather than a pair; the fixture collects gen 0 every ~50 ms, so this gap guarantees
@@ -77,8 +86,8 @@ const CHURN_GAP: Duration = Duration::from_millis(2);
 /// the live-smoke shape check.
 const SANE_COUNTER_MAX: i64 = 1_000_000_000_000; // 1e12
 
-/// Floor for a written entry's `heap_size`, the count of GC-tracked objects the Probe snapshots
-/// when a Collection starts.
+/// Floor for a written entry's `heap_size` on the minors that have the field, being the count of
+/// GC-tracked objects the Probe snapshots when a Collection starts.
 ///
 /// The interpreter's own baseline holds this up, not the fixture's garbage. Only generation 0
 /// snapshots the fresh burst: `probe_spin.py` collects generations 1 and 2 immediately after
@@ -344,6 +353,39 @@ fn ring_table(h: &ProbeHeader) -> OffsetTable {
     }
 }
 
+/// `heap_size` as the minor the target runs has to report it.
+///
+/// On 3.14 this is the one field the Probe reaches by raw byte offset into a struct with no
+/// accessor, so it is what ADR 0013's compiled-in offsets exist for. A wheel carrying another
+/// platform's offsets reads 0 here, which this test tolerated before those offsets came from the
+/// interpreter's own headers.
+///
+/// 3.13's `_gc_runtime_state` ends before `heap_size`, so there is nothing to snapshot and the
+/// offset would land on the pointer at the top of the struct. Demanding 0 asserts that absence
+/// rather than stepping around it: any other value means something read at that offset anyway.
+/// A reader cannot yet tell that 0 from a failed self-check or an empty heap, which is what
+/// ticket 06's capability word is for.
+fn check_heap_size(s: &GcStat, py_version: u32) -> Result<(), String> {
+    let heap_size = s.heap_size();
+    if py_version >> 16 >= 0x030E {
+        if heap_size < MIN_TRACKED_OBJECTS {
+            return Err(format!(
+                "gen {} entry {} reports heap_size {heap_size}, below the {MIN_TRACKED_OBJECTS} \
+                 tracked objects the fixture holds at every Collection; the interpreter offsets \
+                 look wrong for this build",
+                s.generation, s.index
+            ));
+        }
+    } else if heap_size != 0 {
+        return Err(format!(
+            "gen {} entry {} reports heap_size {heap_size} on an interpreter whose \
+             _gc_runtime_state has no such field; the Probe read something at that offset",
+            s.generation, s.index
+        ));
+    }
+    Ok(())
+}
+
 /// One generation's entries, split the way a reader consuming this Ring has to split them.
 ///
 /// The writer publishes a Record by copying the previous entry forward, overwriting the
@@ -524,6 +566,52 @@ fn probe_python_or_skip(test: &str) -> Option<PathBuf> {
     None
 }
 
+/// `PY_VERSION_HEX` for a `(major, minor, micro, level, serial)` tuple: the encoding the Probe
+/// publishes in its header and compares its gates against.
+fn version_hex((major, minor, micro, level, serial): (u8, u8, u8, u8, u8)) -> u32 {
+    ((major as u32) << 24)
+        | ((minor as u32) << 16)
+        | ((micro as u32) << 8)
+        | ((level as u32) << 4)
+        | serial as u32
+}
+
+/// Run `code` under `python` and hand back its stdout, trimmed. `-P` for the reason
+/// [`probe_python`] gives: without it the source directory in the crate root imports as a
+/// namespace package and answers in place of the built module.
+fn python_stdout(python: &Path, code: &str) -> String {
+    let out = Command::new(python)
+        .args(["-P", "-c", code])
+        .output()
+        .unwrap_or_else(|e| panic!("running {}: {e}", python.display()));
+    assert!(
+        out.status.success(),
+        "{} exited {} on `{code}`: {}",
+        python.display(),
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// What the Probe's load gate says about `version`: `Some(reason)`, or `None` when it would let
+/// that interpreter through.
+///
+/// The gate takes a version word rather than reading `Py_Version`, and the module exposes it,
+/// so every refusal is reachable from a supported interpreter. Proving them by importing into a
+/// refused build instead would need one interpreter per case, and would still leave the
+/// free-threaded arm untested, since that one is decided at compile time.
+fn refusal(python: &Path, version: u32) -> Option<String> {
+    let out = python_stdout(
+        python,
+        &format!(
+            "import gcscope_probe as p; r = p.version_refusal({version}); \
+             print('' if r is None else r)"
+        ),
+    );
+    (!out.is_empty()).then_some(out)
+}
+
 /// A running fixture with its Ring located: the preamble both live tests share.
 struct Attached {
     /// Kept alive rather than read: dropping it kills the interpreter.
@@ -623,6 +711,60 @@ fn probe_module_exports_its_discovery_anchor() {
     );
 }
 
+/// The load gate lets through the interpreter the module compiled its offsets against and
+/// refuses everything else, saying which gate refused and why.
+///
+/// `internals.c` takes `offsetof(PyInterpreterState, gc)` from one interpreter's internal
+/// headers, and CPython promises nothing about where that lands in the next build. A Probe
+/// that loaded anyway would publish a full table of plausible numbers read from whatever sits
+/// at those addresses, so ADR 0012's posture applies: refuse rather than approximate.
+///
+/// No attach and no fixture, so this runs in every leg that builds a Probe.
+#[test]
+fn probe_refuses_versions_it_was_not_built_for() {
+    let Some(python) = probe_python_or_skip("probe_refuses_versions_it_was_not_built_for") else {
+        return;
+    };
+    let running = full_python_version(&python).expect("the interpreter reports its own version");
+    let (major, minor, micro) = (running.0, running.1, running.2 as u32);
+    let hex = version_hex(running);
+
+    assert_eq!(
+        refusal(&python, hex),
+        None,
+        "the gate refuses {major}.{minor}.{micro}, the interpreter this module was built \
+         against and imported into"
+    );
+
+    // Each bound gets its own reason, so a message naming the wrong one is a failure rather
+    // than a wording difference.
+    for (version, name, why) in [
+        (0x030C_00F0u32, "3.12.0", "PyTime_PerfCounterRaw"),
+        (0x030F_00F0u32, "3.15.0", "publish"),
+    ] {
+        let m = refusal(&python, version)
+            .unwrap_or_else(|| panic!("{name} is outside 3.13-3.14 and has to be refused"));
+        assert!(
+            m.contains(name) && m.contains(why),
+            "the refusal of {name} names neither the version nor `{why}`: {m}"
+        );
+    }
+
+    // Same minor, the neighbouring patch release. ADR 0013 decision 3 asks for this gate
+    // because a wheel tag pins only the minor, while `sizeof(_gc_runtime_state)` moved 240 ->
+    // 264 bytes between 3.14.4 and 3.14.5.
+    let m = refusal(&python, hex + (1 << 8))
+        .expect("a patch release other than the one this was built against has to be refused");
+    let (built, other) = (
+        format!("{major}.{minor}.{micro}"),
+        format!("{major}.{minor}.{}", micro + 1),
+    );
+    assert!(
+        m.contains(&built) && m.contains(&other),
+        "the patch refusal has to name both {built} and {other}: {m}"
+    );
+}
+
 /// The four invariants the prototype's verifier established, asserted against Records read
 /// out of the process: every generation decodes an entry a reader can report, that entry is a
 /// finished Collection, it carries a positive duration, and cumulative counters never regress
@@ -645,17 +787,30 @@ fn probe_ring_decodes_out_of_process() {
     // Ask the target rather than hardcode the answer: the header's py_version must match what
     // the interpreter reports about itself. A Probe loaded into the wrong runtime is what the
     // load gate exists to prevent, and this is where that shows.
-    if let Some((major, minor, micro, level, serial)) = full_python_version(&python) {
-        let expected = ((major as u32) << 24)
-            | ((minor as u32) << 16)
-            | ((micro as u32) << 8)
-            | ((level as u32) << 4)
-            | serial as u32;
+    if let Some(running) = full_python_version(&python) {
+        let expected = version_hex(running);
         assert_eq!(
             h.py_version, expected,
             "header py_version {:#010x} disagrees with the interpreter's own {expected:#010x} \
              ({module})",
             h.py_version
+        );
+
+        // Ring index 1 counts increments of the old space on 3.14.0-3.14.4 and gen-1
+        // Collections on every other build the Probe loads into, 3.13 included, where the
+        // incremental collector was reverted before release. A consumer averaging one against
+        // the other compares unlike quantities with nothing to warn it, so the header has to
+        // say which — and say the right one per minor, which a `collector <= 1` bound could not.
+        let (_, minor, micro, ..) = running;
+        let want = if minor == 14 && micro < 5 {
+            COLLECTOR_INCREMENTAL
+        } else {
+            COLLECTOR_GENERATIONAL
+        };
+        assert_eq!(
+            h.collector, want,
+            "header declares collector {} for {minor}.{micro}, which counts the other thing",
+            h.collector
         );
     }
     assert_eq!(h.version, 3, "unexpected region header version");
@@ -663,11 +818,6 @@ fn probe_ring_decodes_out_of_process() {
         h.item_size as usize, LAYOUT.item_size,
         "target item size {} disagrees with this reader's layout {}",
         h.item_size, LAYOUT.item_size
-    );
-    assert!(
-        h.collector <= 1,
-        "header declares collector {}, a value this build does not define",
-        h.collector
     );
 
     // gcscope's `stats_buffer_len` stops at the end of gen 2's entries, while the producer's
@@ -727,19 +877,10 @@ fn probe_ring_decodes_out_of_process() {
                 s.duration()
             );
             // Invariant 5: `heap_size` came from the interpreter rather than from an offset
-            // pointing elsewhere. It is the one field the Probe reaches by byte offset into a
-            // struct with no accessor, so it is what ADR 0013's compiled-in offsets exist for.
-            // A wheel carrying another platform's offsets reads 0 here, which this test
-            // tolerated before those offsets came from the interpreter's own headers.
-            assert!(
-                s.heap_size() >= MIN_TRACKED_OBJECTS,
-                "sample {round}: gen {generation} entry {} reports heap_size {}, below the {} tracked \
-                 objects the fixture holds at every Collection; the interpreter offsets look \
-                 wrong for this build",
-                s.index,
-                s.heap_size(),
-                MIN_TRACKED_OBJECTS
-            );
+            // pointing elsewhere, or is absent because this minor has no such field.
+            if let Err(e) = check_heap_size(s, h.py_version) {
+                panic!("sample {round}: {e}");
+            }
             totals.push(s.collections());
         }
 
@@ -860,14 +1001,9 @@ fn probe_ring_survives_sustained_churn() {
                 now.index,
                 now.duration
             );
-            assert!(
-                s.heap_size() >= MIN_TRACKED_OBJECTS,
-                "sample {samples}: gen {generation} entry {} reports heap_size {}, below the {} \
-                 tracked objects the fixture holds at every Collection",
-                now.index,
-                s.heap_size(),
-                MIN_TRACKED_OBJECTS
-            );
+            if let Err(e) = check_heap_size(s, t.header.py_version) {
+                panic!("sample {samples}: {e}");
+            }
 
             if let Some(before) = prev[generation as usize] {
                 for (name, was, is) in [

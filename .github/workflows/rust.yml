@@ -488,22 +488,27 @@ jobs:
         # Apple clang) against its own interpreter's internal headers, so a construct only one
         # of them rejects goes red here instead of at a user.
         os: [ubuntu-latest, windows-latest, macos-latest]
-        # The one place the leg's interpreter is named. The Probe refuses to load on any minor
-        # it was not built for, so ticket 05 adding 3.13 is one more entry here and nothing
-        # else. Bare minor, floated by setup-python, and `matrix-unpinned` enforces that, for
-        # the reason ADR 0010 section 2 gives: a pinned entry stops testing anything new.
+        # Both minors the Probe supports, and the one place the leg's interpreter is named. They
+        # differ in more than a number: 3.13 takes the other arm of the include split in
+        # `src/internals.c`, and its `_gc_runtime_state` has no `heap_size` at all, so only this
+        # entry proves the Probe reports that field as absent rather than reading whatever sits
+        # at the offset. Bare minor, floated by setup-python, and `matrix-unpinned` enforces
+        # that, for the reason ADR 0010 section 2 gives: a pinned entry stops testing anything
+        # new.
         #
         # This leg compiles the Probe against whatever patch release setup-python hands it, and
         # the offsets come from that interpreter's own internal headers (ADR 0013), so a moved
         # offset never reaches the test. The leg catches the other failure: a field that moved
-        # out from under the mechanism. `tests/probe.rs` requires a written entry's `heap_size`
-        # to clear the fixture's live-object count, so a wrong offset fails the leg instead of
-        # publishing 0. Guarding a wheel whose build and runtime disagree needs the patch gate
-        # and the header's `capabilities` word from ticket 06.
+        # out from under the mechanism. On 3.14 `tests/probe.rs` requires a written entry's
+        # `heap_size` to clear the fixture's live-object count, so a wrong offset fails the leg
+        # instead of publishing 0.
         #
-        # `offsets_ok` itself still sits behind a Python call no out-of-process reader can
-        # make. Ticket 06 publishes it in the region header.
-        python: ['3.14']
+        # 3.13 has no such field to check, which leaves `offsets_ok` as the only thing holding
+        # `offsetof(PyInterpreterState, gc)` up there — and it sits behind a Python call no
+        # out-of-process reader can make, so the build step below asserts it rather than the
+        # test. Ticket 06 publishes it in the region header and moves the check to where it
+        # belongs.
+        python: ['3.13', '3.14']
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -525,10 +530,10 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      # 3.14 attaches unprivileged on macOS through PEP 768's get-task-allow, so this leg needs
-      # only the authorization database change and none of the sudo-plus-coverage dance the
-      # `live-smoke` 3.8-3.12 legs carry. Ticket 05 adding 3.13 stays on this path; anything
-      # older would not.
+      # Both minors attach unprivileged on macOS through PEP 768's get-task-allow, which arrived
+      # in 3.13, so this leg needs only the authorization database change and none of the
+      # sudo-plus-coverage dance the `live-smoke` 3.8-3.12 legs carry. Anything older would not,
+      # and the Probe does not build there anyway.
       - name: Configure macOS taskport permissions
         if: runner.os == 'macOS'
         run: |
@@ -582,7 +587,30 @@ jobs:
           GCSCOPE_TEST_PYTHON="$(python -c 'import sys; print(sys.executable)')"
           export GCSCOPE_TEST_PYTHON
           echo "interpreter: $GCSCOPE_TEST_PYTHON"
-          "$GCSCOPE_TEST_PYTHON" -c "import gcscope_probe; print(gcscope_probe.geometry())"
+          # The self-check, which nothing outside the process can read yet. It compares
+          # `gcstate->collecting` against the 1 it must be inside a gc callback, so it validates
+          # `offsetof(PyInterpreterState, gc)` and `collecting` together. On 3.14 a wrong `gc`
+          # offset also drags `heap_size` down and the test below catches it; on 3.13 there is no
+          # `heap_size` to catch it with, and this is the only check standing. Ticket 06 moves it
+          # into the region header, where the test can own it.
+          #
+          # It reads 0 until a Collection has run with the callback installed, so this installs
+          # and collects rather than calling geometry() straight after import. `-P` keeps the
+          # checkout off sys.path, where the source directory `gcscope_probe/` would otherwise
+          # be a candidate for the import.
+          "$GCSCOPE_TEST_PYTHON" -P - <<'PY'
+          import gc, gcscope_probe
+          gcscope_probe.install()
+          gc.collect(0)
+          geometry = gcscope_probe.geometry()
+          print(geometry)
+          if not geometry["offsets_ok"]:
+              raise SystemExit(
+                  "::error::the Probe's self-check failed: gcstate->collecting did not read 1 "
+                  "inside a gc callback, so the compiled-in interpreter offsets are wrong for "
+                  "this build and every read through them is garbage"
+              )
+          PY
           cargo llvm-cov --test probe --lcov --output-path lcov.info --fail-under-lines 1 -- --include-ignored --nocapture
 
       - name: Upload coverage to Codecov
