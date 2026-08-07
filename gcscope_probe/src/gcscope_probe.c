@@ -378,7 +378,12 @@ static ptrdiff_t gcscope_probe_heap_size_fault = 0;
  * would need the header's word to be the state, and the state lives in the statics above.
  *
  * Called at import and again from the first Collection, which is when the offset self-check
- * answers. A remote reader polls the word and sees bits appear; none is ever withdrawn. */
+ * answers. A remote reader polls the word and sees bits appear.
+ *
+ * They are withdrawn in exactly one case: `_fault_heap_size_offset` clears `HEAP_SIZE_VALID`
+ * after it has been published, and clears it again on the way back if the offset is restored.
+ * That hook is compiled into every build, so a consumer must re-read the word rather than cache
+ * the first non-zero value it sees. Nothing on the path a real process takes withdraws a bit. */
 static void
 gcscope_probe_publish_capabilities(void)
 {
@@ -430,12 +435,17 @@ gcscope_probe_check_offsets(void)
     gcscope_probe_publish_capabilities();
 }
 
-/* `heap_size` read with no gate on it, for the validation below and for nothing else. */
+/* `heap_size` read with no gate on it, for the validation below and for nothing else.
+ *
+ * The offset is widened to `ptrdiff_t` before the fault is added to it. Left as `size_t` the
+ * sum is computed unsigned, so a negative fault produces a huge value that only lands back on
+ * the right address by wrapping. `gcscope_probe_fault_heap_size_offset` has already bounded the
+ * result into the struct. */
 static Py_ssize_t
 gcscope_probe_read_heap_size(char *gcstate)
 {
-    return *(Py_ssize_t *)(gcstate + gcscope_probe_gc_heap_size_off
-                           + gcscope_probe_heap_size_fault);
+    return *(Py_ssize_t *)(gcstate + ((ptrdiff_t)gcscope_probe_gc_heap_size_off
+                                      + gcscope_probe_heap_size_fault));
 }
 
 /* How many tracked objects the check below allocates and drops. Large enough that no other
@@ -819,9 +829,12 @@ gcscope_probe_geometry(PyObject *self, PyObject *noargs)
  * to see the Probe suppress a field is to make the field wrong, which is what this does.
  * `tests/probe.rs` then reads the consequences out of the process, which is where a reader would.
  *
- * `delta` is bounded and 8-aligned so the displaced read stays inside `_gc_runtime_state` and
- * stays aligned; a misaligned `Py_ssize_t` load is undefined on the architectures this builds
- * for, and would be a crash rather than the wrong answer this is asking for. */
+ * `delta` has to leave the displaced read wholly inside `_gc_runtime_state` and aligned. Both
+ * bounds are computed from the struct rather than written down: `heap_size` sits 216 bytes into
+ * 264 on 3.14.5, so a fixed window of +-64 would run off the end and be caught only by whatever
+ * happens to follow `gc` in `PyInterpreterState`. A misaligned `Py_ssize_t` load is undefined on
+ * the architectures this builds for, and would be a crash rather than the wrong answer being
+ * asked for. */
 static PyObject *
 gcscope_probe_fault_heap_size_offset(PyObject *self, PyObject *arg)
 {
@@ -830,10 +843,20 @@ gcscope_probe_fault_heap_size_offset(PyObject *self, PyObject *arg)
     if (delta == -1 && PyErr_Occurred()) {
         return NULL;
     }
-    if (delta % (long)sizeof(Py_ssize_t) != 0 || delta < -64 || delta > 64) {
+    /* Nothing to displace on 3.13, where the field is absent and the offset is a placeholder 0.
+     * Answer with the word unchanged, so a fixture can call this without knowing the minor. */
+    if (!gcscope_probe_has_heap_size) {
+        return PyLong_FromUnsignedLong(
+            atomic_load_explicit(&gcscope_probe_header.capabilities, memory_order_acquire));
+    }
+    ptrdiff_t off = (ptrdiff_t)gcscope_probe_gc_heap_size_off + (ptrdiff_t)delta;
+    if (delta % (long)sizeof(Py_ssize_t) != 0 || off < 0
+        || (size_t)off + sizeof(Py_ssize_t) > gcscope_probe_gc_state_size) {
         PyErr_Format(PyExc_ValueError,
-                     "heap_size offset fault must be a multiple of %zu within [-64, 64], not %ld",
-                     sizeof(Py_ssize_t), delta);
+                     "heap_size offset fault must be a multiple of %zu leaving the read inside "
+                     "_gc_runtime_state, whose heap_size is at %zu of %zu bytes; %ld is not",
+                     sizeof(Py_ssize_t), gcscope_probe_gc_heap_size_off,
+                     gcscope_probe_gc_state_size, delta);
         return NULL;
     }
     gcscope_probe_heap_size_fault = (ptrdiff_t)delta;

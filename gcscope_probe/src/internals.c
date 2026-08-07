@@ -78,6 +78,7 @@ Install the development headers for the interpreter you are building against, th
 
 const size_t gcscope_probe_interp_gc_off = offsetof(PyInterpreterState, gc);
 const size_t gcscope_probe_gc_collecting_off = offsetof(struct _gc_runtime_state, collecting);
+const size_t gcscope_probe_gc_state_size = sizeof(struct _gc_runtime_state);
 const int gcscope_probe_has_heap_size = GCSCOPE_PROBE_HAS_HEAP_SIZE;
 
 /* The offsets do not say what sits at them. `gcscope_probe.c` reads one field as `Py_ssize_t`

@@ -71,7 +71,7 @@ meaningful rather than that everything is.
 | `HEAP_SIZE_PRESENT` | This interpreter's `_gc_runtime_state` has the field at all. Clear on 3.13. |
 | `HEAP_SIZE_VALID` | ...and the check below reached it. Present without this is a field the Probe suppressed. |
 | `CANDIDATES_VALID` | Never. `deduce_unreachable()` is `static inline` and the count is reachable nowhere else. |
-| `COUNTERS_SEEDED` | `collections`, `collected` and `uncollectable` are Lifetime totals rather than counts since install. Spec 0013 §4. |
+| `COUNTERS_SEEDED` | Not yet on any build. Will mean `collections`, `collected` and `uncollectable` are Lifetime totals rather than counts since install (spec 0013 §4); until then they are counts since install. |
 
 `duration` has no bit because it could never earn one: CPython never recorded it, so there is
 nothing to seed from and it stays Install-relative on every build. That is the trap the word

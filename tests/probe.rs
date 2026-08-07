@@ -77,6 +77,15 @@ const CAP_OFFSETS_OK: u32 = 1 << 0;
 const CAP_HEAP_SIZE_PRESENT: u32 = 1 << 1;
 const CAP_HEAP_SIZE_VALID: u32 = 1 << 2;
 const CAP_CANDIDATES_VALID: u32 = 1 << 3;
+const CAP_COUNTERS_SEEDED: u32 = 1 << 4;
+
+/// Every bit this reader knows the meaning of. A Probe setting one outside it is claiming
+/// something this side cannot interpret, which a version bump is for.
+const CAP_KNOWN: u32 = CAP_OFFSETS_OK
+    | CAP_HEAP_SIZE_PRESENT
+    | CAP_HEAP_SIZE_VALID
+    | CAP_CANDIDATES_VALID
+    | CAP_COUNTERS_SEEDED;
 
 /// The environment variable `probe_spin.py` turns into a call to the Probe's private
 /// offset-fault hook, and the displacement handed to it.
@@ -919,6 +928,27 @@ fn probe_ring_decodes_out_of_process() {
         h.capabilities
     );
 
+    // The bit this whole word exists for, and the one nothing sets yet: `collections` and its
+    // two neighbours are counts since install until ticket 07 seeds them from CPython's own
+    // `generation_stats`. A build that set it early would tell a reader they are Lifetime
+    // totals, and `duration` in the same entry would still be Install-relative.
+    assert_eq!(
+        h.capabilities & CAP_COUNTERS_SEEDED,
+        0,
+        "capabilities {:#x} declare the counters seeded; nothing seeds them yet",
+        h.capabilities
+    );
+
+    // Everything else. Without this the two assertions above pin two bits and leave the other
+    // thirty saying whatever they like, which is the same silence the word was added to end.
+    assert_eq!(
+        h.capabilities & !CAP_KNOWN,
+        0,
+        "capabilities {:#x} set bits outside {CAP_KNOWN:#x}, which this reader has no meaning \
+         for; a Probe claiming more than the header version covers is what the version is for",
+        h.capabilities
+    );
+
     // `heap_size` is present exactly where `_gc_runtime_state` has the field: 3.14 and up. The
     // header claiming otherwise means the compile-time branch in `internals.c` and the runtime
     // it loaded into disagree, which is the condition the whole capability word exists to expose.
@@ -1060,6 +1090,9 @@ fn probe_ring_decodes_out_of_process() {
 /// The suppressed field then reads 0, the same 0 an empty heap and an absent field give. Telling
 /// those apart from outside the process is the whole of ticket 06, and the capability word is
 /// where the difference lives.
+///
+/// A second, unfaulted fixture runs as the control. Everything asserted here is also true of a
+/// Probe whose check fails on every input, and that Probe would be broken rather than careful.
 #[test]
 #[ignore = "attaches to a live process; needs ptrace/taskport and an installed Probe — run with --ignored"]
 fn probe_reports_a_suppressed_heap_size() {
@@ -1087,6 +1120,20 @@ fn probe_reports_a_suppressed_heap_size() {
          {FAULT_DELTA} bytes; the check passes on a field it is not reading",
         h.capabilities
     );
+
+    // The control, without which every assertion here passes on a Probe whose `heap_size` check
+    // fails unconditionally — the same fixture with nothing displaced has to reach the opposite
+    // answer, or the fault is not what produced this one.
+    let control = attach_with(&python, &[]);
+    assert_eq!(
+        control.header.capabilities & (CAP_HEAP_SIZE_PRESENT | CAP_HEAP_SIZE_VALID),
+        CAP_HEAP_SIZE_PRESENT | CAP_HEAP_SIZE_VALID,
+        "capabilities {:#x} withhold heap_size from an unfaulted fixture on the same \
+         interpreter; the check answers no whatever it is pointed at, so clearing the bit above \
+         proves nothing about the fault",
+        control.header.capabilities
+    );
+    drop(control);
     // The other bits are untouched by the fault, so a reader learns which field went bad rather
     // than that the Probe is unusable. A fault that cleared the word wholesale would pass the
     // assertion above and say nothing.
