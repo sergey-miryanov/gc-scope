@@ -174,9 +174,8 @@ mod tests {
         LazyLock::new(|| seq_layout(&["ts_start", "collections", "collected"]));
 
     /// An extended (`+inc`) build's entry layout — the core counters plus the `increment_size`
-    /// set a custom build adds. Exactly the field names the CLI table (`cli::gc_stats`) reads
-    /// on its extended path, so a decode test here and a column test there share one fixture
-    /// shape.
+    /// set a custom build adds. The full set, so a decode test can assert that every field
+    /// such a build publishes reads back.
     static EXTENDED: LazyLock<&'static GcItemLayout> = LazyLock::new(|| {
         seq_layout(&[
             "ts_start",
@@ -341,9 +340,8 @@ mod tests {
             ],
         );
 
-        // The build is recognized as extended, and each `+inc` field the CLI table
-        // (`cli::gc_stats`) prints decodes to its set value — Some(v), never None or a
-        // zero fallback.
+        // The build is recognized as extended, and every `+inc` field decodes to its set
+        // value — Some(v), never None or a zero fallback.
         assert!(s.has("increment_size"));
         assert_eq!(s.get("increment_size"), Some(100));
         assert_eq!(s.get("alive_size"), Some(200));
