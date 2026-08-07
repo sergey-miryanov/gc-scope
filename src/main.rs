@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use gcscope::cli::{Cli, Command, monitor as cli_monitor};
+use gcscope::cli::{Cli, Command, gc_stats as cli_gc_stats, monitor as cli_monitor};
 use gcscope::{list_pids, memory, remote_debugging, tui};
 
 fn resolve_pid(pid: i32) -> u32 {
@@ -100,7 +100,7 @@ fn main() -> Result<()> {
             let pid = resolve_pid(pid);
             let session = remote_debugging::session::PySession::attach(pid)?;
             let stats = session.gc_stats(all)?;
-            remote_debugging::gc_stats::print_stats(&stats);
+            cli_gc_stats::print_stats(&stats);
         }
         Command::Monitor { pid, opts } => {
             let pid = resolve_pid(pid);

@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+pub mod gc_stats;
 pub mod monitor;
 pub mod monitor_options;
 

@@ -480,9 +480,6 @@ mod tests {
     }
 
     /// A field the build does not have must stay `None`, not become `Some(0)`.
-    /// `gc_stats::print_stats` keys its whole column set on
-    /// `increment_size.is_some()`, so blurring the two changes the CLI's output for
-    /// every pre-3.13 target.
     #[test]
     fn absent_fields_decode_to_none_not_zero() {
         let mut table = pre_3_13::table_for_version(3, 12).unwrap();
