@@ -156,25 +156,31 @@ fn run_monitoring_loop(runner: &mut impl ProcessRunner, opts: &MonitorOptions) -
 
     // One folded summary behind both renderings, so the table and the document cannot
     // disagree about what the run did.
-    if opts.summary || opts.summary_json.is_some() {
-        let summary = ctx.summary();
-        if opts.summary {
-            // On stderr, beside the other run messages: `run` forwards the target's stdout to
-            // ours, and this is gcscope talking, not the program being watched. That leaves
-            // stdout free for the JSON.
-            for line in statistics::render(&summary) {
-                eprintln!("{}", line);
-            }
-        }
-        if let Some(destination) = &opts.summary_json {
-            summary_json::write(destination, &summary)?;
+    let summary = ctx.summary();
+    if opts.summary {
+        // On stderr, beside the other run messages: `run` forwards the target's stdout to
+        // ours, and this is gcscope talking, not the program being watched. That leaves
+        // stdout free for the JSON.
+        for line in statistics::render(&summary) {
+            eprintln!("{}", line);
         }
     }
 
+    // The trace is finished before the summary is written. `close` is what terminates the
+    // JSON array, so a mistyped `--summary-json` path returning early here used to truncate
+    // the trace the whole run was for — and the operator only finds out afterwards.
     ctx.close()?;
     eprintln!("Trace written to {}", opts.output);
 
-    runner.returncode()
+    let written = match &opts.summary_json {
+        Some(destination) => summary_json::write(destination, &summary),
+        None => Ok(()),
+    };
+
+    // Reaped either way, so a failed write does not leave the child unwaited. The error still
+    // decides what gcscope exits with.
+    let code = runner.returncode();
+    written.and(code)
 }
 
 #[cfg(test)]

@@ -15,8 +15,8 @@ pub struct MonitorOptions {
     #[arg(long)]
     pub summary: bool,
 
-    /// Write that summary as JSON to PATH, or to stdout for `-`. Under `run`, stdout also
-    /// carries the target's own output, so a path is the one a script should read
+    /// Write that summary as JSON to PATH. `-` means stdout, which `monitor` accepts and
+    /// `run` refuses, since `run` forwards the target's own output there
     #[arg(long, value_name = "PATH")]
     pub summary_json: Option<String>,
 }
