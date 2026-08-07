@@ -21,7 +21,6 @@ that proved the approach works (`docs/research/cpython-314-gc-hook-points.md` §
 
 | Today | Becomes | Where |
 |---|---|---|
-| Offsets transcribed from one build | Compiled from the interpreter's own headers | spec 0013 §4 |
 | A release fence before a plain `ts_stop` store | An explicit release store, which aarch64 needs | spec 0013 §4 |
 | Mach-O untested, no arm64 anywhere | macOS and arm64 proven by a leg, not by compiling | spec 0013 §4, spec 0015 |
 | Counters starting at zero on install | Seeded from CPython's own, so they stay Lifetime totals | spec 0013 §4 |
@@ -39,9 +38,15 @@ pip install .
 ```
 
 That is the whole build. No Visual Studio path, no SDK path and no interpreter path appears in
-this directory; setuptools finds the toolchain. You need a C compiler and the CPython headers
-for your interpreter. The python.org installer ships them on Windows; on Debian and Ubuntu
-they are in `pythonX.Y-dev`.
+this directory; setuptools finds the toolchain.
+
+You need a C compiler and the CPython headers for your interpreter, **including the internal
+ones** in `include/pythonX.Y/internal/`. `heap_size` lives in a struct CPython does not expose,
+so `src/internals.c` takes its offset from those headers at compile time rather than carrying a
+number somebody transcribed ([ADR 0013](../docs/adr/0013-probe-offsets-are-compiled-in.md)) —
+the same 3.14 puts that struct at a different offset on Windows and on Linux. The python.org
+installers ship the internal headers; on Debian and Ubuntu they come with `pythonX.Y-dev`. If
+they are absent the build stops and says so.
 
 MSVC needs `/std:c11 /experimental:c11atomics` for `<stdatomic.h>`; `setup.py` adds both when
 it sees MSVC. That puts a floor under the Windows toolchain at **Visual Studio 2022 17.5**,

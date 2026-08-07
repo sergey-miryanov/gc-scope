@@ -64,6 +64,21 @@ dllimport/dllexport conflict".
    compiled with `Py_BUILD_CORE`, includes the internal headers, references no Python data
    symbols, and exposes the offsets to a main TU compiled without it. Nothing is executed at
    build time, so cross-compilation is unaffected.
+
+   > **Amended 2026-08-07, building it.** The `7400` this replaced was a Windows number, and
+   > the same 3.14 puts `gc` at **7408** on Linux. Every Linux Probe built before this read
+   > `collecting` from the wrong address, failed its own self-check and published `heap_size =
+   > 0` — which the integration test accepted, because 0 passes a magnitude check. So the first
+   > thing compiled-in offsets bought was not patch-release safety but a working Linux Probe.
+   >
+   > `internals.c` also asserts that `heap_size` is still a `Py_ssize_t` and `collecting` still
+   > an `int`. An offset survives a retype; the read does not, and transcribed constants had no
+   > way to notice.
+   >
+   > Decision 3 is only partly delivered here: the self-check still validates `gc` and
+   > `collecting` jointly, and its result is still reachable only from inside the process.
+   > `heap_size` gained an out-of-process floor in `tests/probe.rs` rather than its own
+   > in-process validation. The patch gate and `capabilities` remain ahead.
 2. **The registry is not extended to serve the Probe.** [ADR 0010](0010-pre-3-13-offsets-stay-hand-maintained.md)
    and [ADR 0011](0011-layout-equivalence-sweep.md) continue to describe the reader's needs
    only. The asymmetry is intrinsic to the two positions and is recorded here rather than

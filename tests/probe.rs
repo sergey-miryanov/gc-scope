@@ -54,6 +54,15 @@ const SAMPLE_GAP: Duration = Duration::from_millis(700);
 /// the live-smoke shape check.
 const SANE_COUNTER_MAX: i64 = 1_000_000_000_000; // 1e12
 
+/// Floor for a written entry's `heap_size`, the count of GC-tracked objects the Probe snapshots
+/// when a Collection starts. `probe_spin.py` allocates 2000 reference cycles — 6000 tracked
+/// objects — immediately before every `gc.collect()`, so any real snapshot clears this by a
+/// wide margin. The margin is what makes the check worth having: everything following
+/// `heap_size` in `_gc_runtime_state` is a near-zero counter — `work_to_do` and `phase` on
+/// 3.14.4, the `dummy` placeholders that replaced them on 3.14.5 — so an offset one field out
+/// reads a small number that a bare positivity check waves through.
+const MIN_TRACKED_OBJECTS: i64 = 1_000;
+
 /// The 3.15 `gc_generation_stats` field layout the Probe writes.
 ///
 /// Restated rather than imported: gcscope's generated `v_3_15_0b4::GC_LAYOUT` is private, and
@@ -353,7 +362,8 @@ fn check_shape(stats: &[GcStat], entries: [usize; 3]) -> Result<(), String> {
 
 /// The four invariants the prototype's verifier established, asserted against Records read
 /// out of the process: every written entry decodes, passes `is_complete()`, carries a
-/// positive duration, and cumulative counters never regress between samples.
+/// positive duration, and cumulative counters never regress between samples. A fifth checks
+/// `heap_size`, the one field the Probe reaches by raw offset into an internal struct.
 #[test]
 #[ignore = "attaches to a live process; needs ptrace/taskport and an installed Probe — run with --ignored"]
 fn probe_ring_decodes_out_of_process() {
@@ -479,6 +489,22 @@ fn probe_ring_decodes_out_of_process() {
                 s.generation,
                 s.index,
                 s.duration()
+            );
+            // Invariant 5: `heap_size` came from the interpreter rather than from an offset
+            // pointing at something else. This is the field the Probe reaches by byte offset
+            // into a struct with no accessor, so it is the one the compiled-in offsets of
+            // ADR 0013 exist for. Reading 0 here is what a wheel carrying another platform's
+            // offsets produces, and it is what this test tolerated before those offsets came
+            // from the interpreter's own headers.
+            assert!(
+                s.heap_size() >= MIN_TRACKED_OBJECTS,
+                "sample {round}: gen {} entry {} reports heap_size {}, below the {} tracked \
+                 objects the fixture holds at every Collection; the interpreter offsets look \
+                 wrong for this build",
+                s.generation,
+                s.index,
+                s.heap_size(),
+                MIN_TRACKED_OBJECTS
             );
         }
 
