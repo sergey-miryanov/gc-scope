@@ -549,6 +549,12 @@ impl PySession {
     /// region (the shape difference is absorbed by [`gc_stats_region_addr`](Self::gc_stats_region_addr)).
     /// Stops after the first interpreter unless `all_interpreters`. Always advances the walk
     /// even for an interpreter with no readable stats, so a NULL region never hangs it (C1).
+    ///
+    /// Linear in the number of interpreters, which is what makes the monitor's per-tick walk
+    /// affordable: the layout, the version and the runtime address are resolved once at
+    /// attach, and each interpreter costs its id, its `next` link, its stats region (one more
+    /// pointer read on a ring build) and one read of the region itself. The per-interpreter
+    /// table is a stride-and-offsets copy taken once for the whole walk, not per interpreter.
     fn gc_stats_per_interpreter(
         &self,
         head_addr: u64,
@@ -557,6 +563,9 @@ impl PySession {
         let table = self.resolved.table();
         let next_off = table.interp_next();
         let id_off = table.interp_id();
+        // The walk's own copy: everything but `gc_stats_addr` is the same for every
+        // interpreter, and that field is the one thing each iteration sets.
+        let mut interp_table = table.clone();
 
         let mut stats = Vec::new();
         let mut current = head_addr;
@@ -565,7 +574,6 @@ impl PySession {
             let iid = self.read_i64(current + id_off)?;
             let gc_addr = table.gc_state_addr(self.runtime_addr, current);
             if let Some(addr) = self.gc_stats_region_addr(gc_addr)? {
-                let mut interp_table = table.clone();
                 interp_table.gc_stats_addr = Some(addr);
                 stats.extend(interp_table.read_gc_stats(&self.handle, iid)?);
             }

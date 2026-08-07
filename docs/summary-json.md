@@ -32,7 +32,9 @@ gcscope monitor 12345 --summary-json -     # `-` is stdout
 
 Each entry of `interpreters` covers one interpreter of one process. Sub-interpreters get one
 each and a monitored tree one per interpreter per process, so no figure is a tree-wide total,
-and two entries can share a `pid`.
+and two entries can share a `pid`. A process that has run more than 1024 interpreters is
+covered for the first 1024; gcscope warns on stderr when that happens, and never for a
+workload that is not creating them by the thousand.
 
 Every figure covers the **accounted span**, from the first Record gcscope read of that
 generation to the last. Collections that ran before the attach sit outside it, for the reasons

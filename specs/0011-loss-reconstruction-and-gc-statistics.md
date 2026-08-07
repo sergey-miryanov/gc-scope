@@ -1,10 +1,12 @@
 # 0011 — Reconstruct lost collections and report exact GC statistics
 
 - **Status:** In progress. The `TraceEvent` extraction, the counter-keyed cursor, the
-  counter-only tier, the `--summary` table, the Loss arithmetic and the JSON form have landed
+  counter-only tier, the `--summary` table, the Loss arithmetic, the JSON form and reading
+  every interpreter have all landed
   ([ADR 0017](../docs/adr/0017-monitoring-tiers-follow-the-entry-layout.md),
   [ADR 0019](../docs/adr/0019-loss-is-accounted-over-the-observed-span.md),
-  [`docs/summary-json.md`](../docs/summary-json.md)). Reading every interpreter has not.
+  [`docs/summary-json.md`](../docs/summary-json.md)). Percentiles and drawn Loss spans have
+  not; §7's two open questions are still open.
 - **Kind:** feature — enhancement
 - **Effort:** L
 - **Origin:** Grilling session 2026-08-05 on porting gcmon's consumer stack into gcscope.
@@ -152,7 +154,17 @@ and the pause time measured across them. From those, `exact_count`, `exact_pause
 `lost_count`, `coverage` and `scale_factor` are derived rather than stored.
 
 The monitor reads **all** interpreters rather than only the first, since the interpreter is
-part of the key.
+part of the key. Cheap enough to do every tick: the layout, the version and the runtime
+address are resolved once at attach, so a tick costs each interpreter its id, its `next` link
+and one read of its stats region.
+
+CPython links a new interpreter at the *head* of the chain and never reuses an id. Both facts
+shape this. The first is why a head-only read looks like it works — the head changes, so
+several interpreters do reach a long capture, each in a window of its own — and so the live
+check is that every interpreter is read *throughout* the run rather than merely present. The
+second is why the accumulators are capped per process: without one, a workload creating and
+destroying sub-interpreters holds an accumulator per `(interpreter, generation)` until the
+process exits. Records past the cap are refused whole and counted, and the run says so once.
 
 ### Completeness is a producer-side filter, and the excluded Entry is evidence
 

@@ -653,6 +653,142 @@ for g in block["generations"]:
     }
 }
 
+/// A process running a sub-interpreter has both of them in the account.
+///
+/// The one check that can catch reading only the head of the interpreter chain: the wrong
+/// walk and the right one produce the same shape, the same figures and the same clean exit
+/// against every single-interpreter target, and differ only in what is missing. No unit test
+/// reaches it, since the chain is a target's memory.
+#[test]
+#[ignore = "spawns and attaches to a live interpreter; needs ptrace/taskport — run with --ignored"]
+fn live_monitor_records_every_interpreter_not_only_the_first() {
+    let Some(python) = test_python() else {
+        eprintln!("SKIP live_monitor_interpreters: no Python found (set GCSCOPE_TEST_PYTHON)");
+        return;
+    };
+    let Some(version) = python_version(&python) else {
+        eprintln!("WARN: could not determine the target version; skipping the interpreter check");
+        return;
+    };
+    if version < (3, 12) {
+        eprintln!("SKIP live_monitor_interpreters: {version:?} cannot create a sub-interpreter");
+        return;
+    }
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("subinterp_spin.py");
+    let trace: PathBuf = std::env::temp_dir().join(format!(
+        "gcscope_live_interp_trace_{}.json",
+        std::process::id()
+    ));
+    let summary: PathBuf =
+        std::env::temp_dir().join(format!("gcscope_live_interp_{}.json", std::process::id()));
+
+    // Six seconds rather than four: the fixture holds READY until its sub-interpreter has
+    // seeded every generation, and that start-up is inside the run.
+    let (rc, out) = gcscope(&[
+        "run",
+        "-p",
+        python.to_str().unwrap(),
+        "-s",
+        fixture.to_str().unwrap(),
+        "-o",
+        trace.to_str().unwrap(),
+        "-r",
+        "50",
+        "--summary-json",
+        summary.to_str().unwrap(),
+        "6",
+    ]);
+    let written = std::fs::read_to_string(&trace).unwrap_or_default();
+    std::fs::remove_file(&trace).ok();
+    assert_eq!(rc, 0, "gcscope run exited {rc}\n{out}");
+
+    // One line per block: its pid, its interpreter, and what generation 0 did.
+    let probe = r#"
+import json, sys
+document = json.load(open(sys.argv[1]))
+for block in document["interpreters"]:
+    gen0, = [g for g in block["generations"] if g["generation"] == 0]
+    print(block["pid"], block["interpreter"], gen0["collections"], gen0["records"])
+"#;
+    let read = Command::new(&python)
+        .args(["-c", probe])
+        .arg(&summary)
+        .output()
+        .expect("the target reads the summary back");
+    std::fs::remove_file(&summary).ok();
+    assert!(
+        read.status.success(),
+        "the target's json module could not read the summary: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+
+    let blocks: Vec<Vec<String>> = String::from_utf8_lossy(&read.stdout)
+        .lines()
+        .map(|line| line.split_whitespace().map(str::to_string).collect())
+        .collect();
+    assert!(
+        blocks.len() >= 2,
+        "the fixture runs two interpreters and the account holds {}\n{blocks:#?}\n{out}",
+        blocks.len()
+    );
+
+    // Both are the same process, under distinct ids, and each collected on its own.
+    let pids: HashSet<&str> = blocks.iter().map(|b| b[0].as_str()).collect();
+    assert_eq!(pids.len(), 1, "one target process\n{blocks:#?}");
+    let interpreters: HashSet<&str> = blocks.iter().map(|b| b[1].as_str()).collect();
+    assert_eq!(
+        interpreters.len(),
+        blocks.len(),
+        "each block is its own interpreter\n{blocks:#?}"
+    );
+    let figure = |block: &[String], column: usize| -> i64 {
+        block[column]
+            .parse()
+            .unwrap_or_else(|e| panic!("{:?}: {e}\n{blocks:#?}", block[column]))
+    };
+    for block in &blocks {
+        let collections = figure(block, 2);
+        assert!(
+            collections > 0 && collections < SANE_COUNTER_MAX as i64,
+            "an interpreter accounted for no work of its own: {block:?}\n{out}"
+        );
+    }
+
+    // The assertion that actually catches a walk stopping at the head of the interpreter
+    // chain. Such a walk still produces two blocks: CPython links a new interpreter at the
+    // *head*, so interpreter zero is what gets read for the moments before the fixture's
+    // sub-interpreter exists, and its account then stops there. What it cannot produce is
+    // two interpreters read all through the run. The fixture collects in both from READY to
+    // exit, at one Collection per burst each, so a poll that reads both hands them Records
+    // at the same rate.
+    let records: Vec<i64> = blocks.iter().map(|b| figure(b, 3)).collect();
+    let busiest = *records.iter().max().expect("a block");
+    assert!(
+        records.iter().all(|&read| read * 4 > busiest),
+        "an interpreter was read for a fraction of the run rather than all of it: \
+         records {records:?}\n{blocks:#?}\n{out}"
+    );
+
+    // And each reaches the trace on a track of its own — the metadata dedup keyed on the
+    // interpreter id alone left every one after the first nameless.
+    let pid = &blocks[0][0];
+    for block in &blocks {
+        let track = format!(
+            r#""name":"thread_name","args":{{"name":"{pid}:{}"}}"#,
+            block[1]
+        );
+        assert!(
+            written.contains(&track),
+            "no named track for interpreter {}\n{out}",
+            block[1]
+        );
+    }
+}
+
 /// `monitor --summary-json -` puts the document on stdout and nothing else.
 ///
 /// The promise `docs/summary-json.md` makes to a consumer that pipes gcscope into a parser,

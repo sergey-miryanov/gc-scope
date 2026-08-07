@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::monitor::convert::convert_record;
-use crate::monitor::cursor::Cursor;
+use crate::monitor::cursor::{Cursor, MAX_INTERPRETERS_PER_PROCESS};
 use crate::monitor::exporters::{EventsExporter, ProcessLifecycle};
 use crate::monitor::run_loop::PollStatus;
 use crate::monitor::statistics::{InterpreterSummary, summarize};
@@ -31,6 +31,10 @@ pub struct MonitorContext<'a> {
     /// did against what was read of it, which is what makes Loss recoverable.
     cursor: Cursor,
     alive_pids: HashSet<u32>,
+    /// Processes already told about for running past the interpreter cap. Not per-PID state
+    /// `mark_died` evicts: a PID warned about once should not warn again on the next tick,
+    /// and the set is bounded by the process tree either way.
+    overflowed_pids: HashSet<u32>,
     /// When monitoring began: the origin of the Observer's clock, read only for builds that
     /// publish no timestamps of their own. See [`observed_at_ns`](Self::observed_at_ns).
     started: Instant,
@@ -43,6 +47,7 @@ impl<'a> MonitorContext<'a> {
             sessions: HashMap::new(),
             cursor: Cursor::new(),
             alive_pids: HashSet::new(),
+            overflowed_pids: HashSet::new(),
             started: Instant::now(),
         }
     }
@@ -79,7 +84,10 @@ impl<'a> MonitorContext<'a> {
             }
         }
 
-        let stats = match self.sessions.get(&pid).unwrap().gc_stats(false) {
+        // Every interpreter, not just the head: the accumulator is keyed on one, and a
+        // process's sub-interpreters were otherwise absent from the trace with nothing
+        // saying so. See [`events_for`](Self::events_for) for what a poll costs.
+        let stats = match self.sessions.get(&pid).unwrap().gc_stats(true) {
             Ok(stats) => stats,
             Err(_) => {
                 // The read failed. Distinguish a stale/reused PID from a dead one
@@ -87,7 +95,7 @@ impl<'a> MonitorContext<'a> {
                 match self.sessions.get_mut(&pid).unwrap().revalidate() {
                     Revalidated::Fresh => {
                         // Soft re-attached (fresh handle + runtime addr): retry once.
-                        match self.sessions.get(&pid).unwrap().gc_stats(false) {
+                        match self.sessions.get(&pid).unwrap().gc_stats(true) {
                             Ok(stats) => stats,
                             Err(_) => return self.on_invalid(pid),
                         }
@@ -129,12 +137,40 @@ impl<'a> MonitorContext<'a> {
     /// `observed_at_ns` is the Observer's clock for this poll, shared by every Record it
     /// returns. A build publishing no timestamps has nothing else to place a sample on the
     /// timeline with; one that does ignores it.
+    ///
+    /// **What a poll of N interpreters costs.** Linear in N, and nothing per-interpreter is
+    /// resolved twice: the layout, the version and the runtime address are settled once at
+    /// attach and reused every tick. Per interpreter a tick reads its id, its `next` link,
+    /// its stats region (one extra pointer read on a ring build, which reaches its ring
+    /// through a pointer) and folds one Entry per generation. The walk cannot be cached
+    /// across ticks — an interpreter created or destroyed between them changes the chain,
+    /// which is the whole reason to re-read it.
     fn events_for(&mut self, pid: u32, stats: &[GcStat], observed_at_ns: i64) -> Vec<TraceEvent> {
-        self.cursor
+        let events = self
+            .cursor
             .admit(pid, stats)
             .into_iter()
             .flat_map(|record| convert_record(pid, record, observed_at_ns))
-            .collect()
+            .collect();
+        self.warn_if_interpreters_refused(pid);
+        events
+    }
+
+    /// Say once, per process, that it runs more interpreters than gcscope accounts for.
+    ///
+    /// The cap keeps a long run's memory flat (`cursor::MAX_INTERPRETERS_PER_PROCESS`), and
+    /// what it costs is that some interpreters reach neither the trace nor the summary.
+    /// Unannounced, that reads as a process that had stopped collecting.
+    fn warn_if_interpreters_refused(&mut self, pid: u32) {
+        if self.cursor.refused(pid) == 0 || !self.overflowed_pids.insert(pid) {
+            return;
+        }
+        eprintln!(
+            "warning: process {pid} has run more than {} interpreters. gcscope accounts for \
+             the first {} and no more, so Collections from the rest appear in neither the \
+             trace nor the summary.",
+            MAX_INTERPRETERS_PER_PROCESS, MAX_INTERPRETERS_PER_PROCESS
+        );
     }
 
     /// The Observer's own clock, in nanoseconds since monitoring began. Not the wall clock: a
@@ -238,6 +274,22 @@ mod tests {
         )
     }
 
+    /// A Record from a build with timing, in `interpreter`'s generation 0. The pause is a
+    /// fixed width, since these are about which interpreter a Record belongs to.
+    fn timed_in(interpreter: i64, counter: i64, ts_start: i64) -> GcStat {
+        GcStat::from_fields(
+            0,
+            0,
+            interpreter,
+            *TIMED,
+            &[
+                ("collections", counter),
+                ("ts_start", ts_start),
+                ("ts_stop", ts_start + 100),
+            ],
+        )
+    }
+
     /// A Record from a build with no timing.
     fn counted(generation: u32, counter: i64, collected: i64) -> GcStat {
         GcStat::from_fields(
@@ -336,6 +388,60 @@ mod tests {
         let advanced = [counted(0, 41, 950)];
         let events = context.events_for(1, &advanced, 7_000);
         assert_eq!(kinds(&events), ["M", "M", "C"]);
+    }
+
+    /// A poll now hands over every interpreter's rings, and each Record reaches the exporter
+    /// on the track of the interpreter that produced it. Two interpreters collecting at
+    /// different rates keep their own cursors: neither one's counter advances past the other.
+    #[test]
+    fn every_interpreter_in_a_poll_reaches_the_exporter_on_its_own_track() {
+        let mut exporter = ChromeTraceExporter::new();
+        let mut context = MonitorContext::new(&mut exporter);
+        // The head interpreter has collected 400 times to the sub-interpreter's 3.
+        let poll = [timed_in(0, 400, 1_000), timed_in(2, 3, 2_000)];
+        let tracks: Vec<i64> = context
+            .events_for(1, &poll, 5_000)
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::Begin { tid, .. } => Some(*tid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tracks, [0, 2], "one span per interpreter, on its own track");
+
+        // The sub-interpreter's next Collection is new for its own ring, however far behind
+        // the head interpreter's counter it is; the head's re-read Entry is not.
+        let tracks: Vec<i64> = context
+            .events_for(1, &[timed_in(0, 400, 1_000), timed_in(2, 4, 3_000)], 6_000)
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::Begin { tid, .. } => Some(*tid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tracks, [2]);
+    }
+
+    /// Each interpreter is summarized against its own accumulator, so a busy one's Loss is
+    /// never charged to a quiet one.
+    #[test]
+    fn each_interpreter_is_accounted_against_its_own_accumulator() {
+        let mut exporter = ChromeTraceExporter::new();
+        let mut context = MonitorContext::new(&mut exporter);
+        context.events_for(1, &[timed_in(0, 1, 1_000), timed_in(2, 1, 1_500)], 5_000);
+        // The head interpreter collected 99 more times between polls; the sub-interpreter
+        // collected once.
+        context.events_for(1, &[timed_in(0, 100, 9_000), timed_in(2, 2, 9_500)], 6_000);
+
+        let summary = context.summary();
+        assert_eq!(
+            summary
+                .iter()
+                .map(|block| (block.interpreter, block.generations[0].lost))
+                .collect::<Vec<(i64, i64)>>(),
+            [(0, 98), (2, 0)],
+            "the busy interpreter's Loss stays with it"
+        );
     }
 
     /// The summary is folded from the same polls that fed the exporter, so a run's figures
