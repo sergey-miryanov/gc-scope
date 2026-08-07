@@ -57,17 +57,17 @@ const SANE_COUNTER_MAX: i64 = 1_000_000_000_000; // 1e12
 /// Floor for a written entry's `heap_size`, the count of GC-tracked objects the Probe snapshots
 /// when a Collection starts.
 ///
-/// What holds it up is the interpreter's own baseline, not the fixture's garbage. Only
-/// generation 0 snapshots the fresh burst: `probe_spin.py` collects generations 1 and 2
-/// immediately after `gc.collect(0)` has already reclaimed it, so those entries see roughly
-/// what a started interpreter tracks. Measured on 3.14, that is ~6800 for generations 1 and 2
-/// against ~8500 for generation 0. The floor sits below both by a factor of five, and is not
-/// a number to raise on the assumption that 6000 fresh objects are always in view.
+/// The interpreter's own baseline holds this up, not the fixture's garbage. Only generation 0
+/// snapshots the fresh burst: `probe_spin.py` collects generations 1 and 2 immediately after
+/// `gc.collect(0)` has reclaimed it, so those entries see roughly what a started interpreter
+/// tracks. Measured on 3.14 that is ~6800 for generations 1 and 2 against ~8500 for generation
+/// 0. The floor sits a factor of five below both, and is not a number to raise on the
+/// assumption that 6000 fresh objects are always in view.
 ///
-/// The margin is what makes the check worth having: everything following `heap_size` in
-/// `_gc_runtime_state` is a near-zero counter — `work_to_do` and `phase` on 3.14.4, the `dummy`
-/// placeholders that replaced them on 3.14.5 — so an offset one field out reads a small number
-/// that a bare positivity check waves through.
+/// Without that margin the check would catch nothing. Everything following `heap_size` in
+/// `_gc_runtime_state` is a near-zero counter: `work_to_do` and `phase` on 3.14.4, the `dummy`
+/// placeholders that replaced them on 3.14.5. An offset one field out reads a small number that
+/// a bare positivity check waves through.
 const MIN_TRACKED_OBJECTS: i64 = 1_000;
 
 /// The 3.15 `gc_generation_stats` field layout the Probe writes.
@@ -388,9 +388,8 @@ fn probe_ring_decodes_out_of_process() {
         return;
     };
     // A free-threaded build never maintains `heap_size`, so the Probe refuses to load there
-    // rather than publish a column of zeros. Reaching this assertion means it did load, which
-    // is a broken gate rather than an unsupported configuration — so it fails loudly instead
-    // of skipping.
+    // rather than publish a column of zeros. Reaching this assertion means it loaded anyway,
+    // a broken gate rather than an unsupported configuration, so it fails instead of skipping.
     assert!(
         !is_free_threaded(&python),
         "GCSCOPE_TEST_PYTHON selected a free-threaded build and the Probe imported anyway; \
@@ -499,11 +498,10 @@ fn probe_ring_decodes_out_of_process() {
                 s.duration()
             );
             // Invariant 5: `heap_size` came from the interpreter rather than from an offset
-            // pointing at something else. This is the field the Probe reaches by byte offset
-            // into a struct with no accessor, so it is the one the compiled-in offsets of
-            // ADR 0013 exist for. Reading 0 here is what a wheel carrying another platform's
-            // offsets produces, and it is what this test tolerated before those offsets came
-            // from the interpreter's own headers.
+            // pointing elsewhere. It is the one field the Probe reaches by byte offset into a
+            // struct with no accessor, so it is what ADR 0013's compiled-in offsets exist for.
+            // A wheel carrying another platform's offsets reads 0 here, which this test
+            // tolerated before those offsets came from the interpreter's own headers.
             assert!(
                 s.heap_size() >= MIN_TRACKED_OBJECTS,
                 "sample {round}: gen {} entry {} reports heap_size {}, below the {} tracked \

@@ -264,9 +264,9 @@ gcscope_probe_add_stats(struct gcscope_probe_stats *s, int gen,
 
 /* `heap_size` sits in the internal `_gc_runtime_state` with no accessor, so the Probe reaches
  * it by offset. `internals.c` supplies the three offsets as compile-time facts of the
- * interpreter this module was built against, and the self-check below is what catches the case
- * that survives: a wheel built against one 3.14 patch release, loaded into another that moved
- * a field the ABI never promised to hold still (ADR 0013). */
+ * interpreter this module was built against. The self-check below covers what that leaves: a
+ * wheel built against one 3.14 patch release and loaded into another that moved a field the
+ * ABI never promised to hold still (ADR 0013). */
 
 /* Set to 1 once the offsets have been confirmed against a live collection; -1 if the
  * self-check failed, in which case heap_size reports 0 rather than garbage.
@@ -539,17 +539,14 @@ PyInit_gcscope_probe(void)
                     == GCSCOPE_PROBE_YOUNG_BYTES + 2 * GCSCOPE_PROBE_OLD_BYTES);
 
     /* Free-threaded gate. `_gc_runtime_state.heap_size` exists in a Py_GIL_DISABLED build and
-     * nothing ever writes it: `Python/gc_free_threading.c` never names the field, while the GIL
-     * collector decrements it at 3.14.5/Python/gc.c:1985. So every Record would carry
-     * heap_size 0.
+     * nothing writes it: `Python/gc_free_threading.c` never names the field, while the GIL
+     * collector decrements it at 3.14.5/Python/gc.c:1985. Every Record would carry heap_size 0.
      *
-     * This gate is load-bearing precisely BECAUSE the offsets are now right. Until ticket 03 a
+     * The gate is load-bearing BECAUSE the offsets are now right. Until ticket 03 a
      * free-threaded build got a GIL build's transcribed offsets, `collecting` did not read 1,
-     * and the self-check failed -- which made the Probe look broken for the wrong reason, but
-     * did make it look broken. Correct offsets remove that accident: the self-check would pass
-     * and the Probe would publish a plausible table with one silently dead column. ADR 0013
-     * decision 5 says refuse rather than degrade, and this is where that becomes necessary
-     * rather than tidy.
+     * and the failing self-check made the Probe look broken for the wrong reason. Correct
+     * offsets remove that accident: the self-check passes and the Probe publishes a plausible
+     * table with one dead column. ADR 0013 decision 5 says refuse rather than degrade.
      *
      * Compile-time, not runtime: an extension built for cp314 cannot load into cp314t, so the
      * build's configuration is the runtime's. */
@@ -561,10 +558,10 @@ PyInit_gcscope_probe(void)
     return NULL;
 #endif
 
-    /* Version gate. `internals.c` compiled the offsets against ONE interpreter; a different
-     * minor lays `PyInterpreterState` out differently, so they would point at whatever happens
-     * to sit there. Refuse at import rather than publish plausible garbage. Spec 0013 §4 adds
-     * the patch-level gate; until it lands the self-check catches a moved field on the first
+    /* Version gate. `internals.c` compiled the offsets against ONE interpreter; another minor
+     * lays `PyInterpreterState` out differently, so they would point at whatever sits there.
+     * Refuse at import rather than publish plausible garbage. Spec 0013 §4 adds the
+     * patch-level gate; until it lands the self-check catches a moved field on the first
      * collection.
      *
      * Py_Version is the RUNTIME version (pylifecycle.h:64), not PY_VERSION_HEX, which is what

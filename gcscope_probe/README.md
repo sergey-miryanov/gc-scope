@@ -29,9 +29,9 @@ that proved the approach works (`docs/research/cpython-314-gc-hook-points.md` §
 | Built from source | Wheels | spec 0015 |
 
 On anything but 3.14 it refuses to import, naming the reason, rather than publishing numbers
-read at offsets it was not built for. Free-threaded builds are refused too: `heap_size` is
-there in the struct and nothing in `gc_free_threading.c` ever writes it, so a Probe would
-report 0 for every Collection and its self-check would call that healthy.
+read at offsets it was not built for. Free-threaded builds are refused too: `heap_size` sits in
+the struct and nothing in `gc_free_threading.c` writes it, so a Probe would report 0 for every
+Collection and its self-check would call that healthy.
 
 ## Install
 
@@ -45,10 +45,10 @@ this directory; setuptools finds the toolchain.
 You need a C compiler and the CPython headers for your interpreter, **including the internal
 ones** in `include/pythonX.Y/internal/`. `heap_size` lives in a struct CPython does not expose,
 so `src/internals.c` takes its offset from those headers at compile time rather than carrying a
-number somebody transcribed ([ADR 0013](../docs/adr/0013-probe-offsets-are-compiled-in.md)) —
-the same 3.14 puts that struct at a different offset on Windows and on Linux. The python.org
-installers ship the internal headers; on Debian and Ubuntu they come with `pythonX.Y-dev`. If
-they are absent the build stops and says so.
+transcribed number ([ADR 0013](../docs/adr/0013-probe-offsets-are-compiled-in.md)): the same
+3.14 puts that struct at a different offset on Windows and on Linux. The python.org installers
+ship the internal headers; on Debian and Ubuntu they come with `pythonX.Y-dev`. Without them
+the build stops and says so.
 
 MSVC needs `/std:c11 /experimental:c11atomics` for `<stdatomic.h>`; `setup.py` adds both when
 it sees MSVC. That puts a floor under the Windows toolchain at **Visual Studio 2022 17.5**,

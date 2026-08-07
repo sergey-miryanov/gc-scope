@@ -40,10 +40,9 @@ setup(
         Extension(
             name="gcscope_probe",
             # Two translation units, one module. `internals.c` is the one compiled with
-            # Py_BUILD_CORE; it exists so the interpreter offsets are computed from the headers
-            # of the interpreter being built against rather than transcribed (ADR 0013). It
-            # takes no flags of its own -- the macro is defined in the file, so a reader of
-            # this list is not told half the story.
+            # Py_BUILD_CORE, so the interpreter offsets come from the headers of the
+            # interpreter being built against rather than from a transcription (ADR 0013). It
+            # takes no flags of its own: the macro is defined in the file.
             sources=["src/gcscope_probe.c", "src/internals.c"],
             depends=["src/internals.h"],
         )
