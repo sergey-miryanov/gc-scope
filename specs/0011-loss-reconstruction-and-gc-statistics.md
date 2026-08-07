@@ -1,10 +1,10 @@
 # 0011 — Reconstruct lost collections and report exact GC statistics
 
 - **Status:** In progress. The `TraceEvent` extraction, the counter-keyed cursor, the
-  counter-only tier, the `--summary` table and the Loss arithmetic have landed
+  counter-only tier, the `--summary` table, the Loss arithmetic and the JSON form have landed
   ([ADR 0017](../docs/adr/0017-monitoring-tiers-follow-the-entry-layout.md),
-  [ADR 0019](../docs/adr/0019-loss-is-accounted-over-the-observed-span.md)). Reading every
-  interpreter and the JSON form have not.
+  [ADR 0019](../docs/adr/0019-loss-is-accounted-over-the-observed-span.md),
+  [`docs/summary-json.md`](../docs/summary-json.md)). Reading every interpreter has not.
 - **Kind:** feature — enhancement
 - **Effort:** L
 - **Origin:** Grilling session 2026-08-05 on porting gcmon's consumer stack into gcscope.
@@ -202,10 +202,15 @@ A streaming accumulator folds Records as they are polled, producing per-generati
 collected, uncollectable, Coverage, and, where the build has timing, pause total and mean with
 their scale factor. Absent fields are omitted rather than defaulted.
 
-The table shipped behind `--summary`. **Percentiles and the JSON form have not**, and neither
-has the replay-from-file path: reconstructing this from a written trace is what the pyperf hook
-needs, and it arrives with the JSONL exporter. The accumulator takes a stream of Records from
-either source, which is the only concession made to that future.
+The table shipped behind `--summary` and the JSON document behind `--summary-json`, both
+rendering one folded summary so they cannot disagree. Its schema is in
+[`docs/summary-json.md`](../docs/summary-json.md), whose load-bearing rule is that a figure
+the build cannot supply has no key (story 11).
+
+**Percentiles have not shipped**, and neither has the replay-from-file path: reconstructing
+this from a written trace is what the pyperf hook needs, and it arrives with the JSONL
+exporter. The accumulator takes a stream of Records from either source, which is the only
+concession made to that future.
 
 ## 5. Seams and testing decisions
 

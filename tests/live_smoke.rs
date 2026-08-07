@@ -541,3 +541,105 @@ fn live_monitor_summarizes_every_generation_in_the_builds_tier() {
         "the summary printed without being asked for\n{quiet}"
     );
 }
+
+/// `--summary-json` writes the same account as a document, and the target's own `json` module
+/// is what says it parses.
+///
+/// Live rather than at the poll seam because the seam's tests read the writer's output with a
+/// splitter that shares the writer's assumptions. A real parser on a real run is the only
+/// thing that catches a document gcscope can write and a consumer cannot read.
+#[test]
+#[ignore = "spawns and attaches to a live interpreter; needs ptrace/taskport — run with --ignored"]
+fn live_monitor_writes_a_summary_a_json_parser_can_read() {
+    let Some(python) = test_python() else {
+        eprintln!("SKIP live_monitor_summary_json: no Python found (set GCSCOPE_TEST_PYTHON)");
+        return;
+    };
+    let Some(expect_spans) = expects_spans(python_version(&python)) else {
+        eprintln!("WARN: could not determine the target version; skipping the JSON check");
+        return;
+    };
+
+    let spin = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("spin.py");
+    let trace: PathBuf = std::env::temp_dir().join(format!(
+        "gcscope_live_json_trace_{}.json",
+        std::process::id()
+    ));
+    let summary: PathBuf =
+        std::env::temp_dir().join(format!("gcscope_live_json_{}.json", std::process::id()));
+
+    let (rc, out) = gcscope(&[
+        "run",
+        "-p",
+        python.to_str().unwrap(),
+        "-s",
+        spin.to_str().unwrap(),
+        "-o",
+        trace.to_str().unwrap(),
+        "-r",
+        "50",
+        "--summary-json",
+        summary.to_str().unwrap(),
+        "4",
+    ]);
+    std::fs::remove_file(&trace).ok();
+    assert_eq!(rc, 0, "gcscope run exited {rc}\n{out}");
+
+    // The target reads its own summary. One line per generation: the figures asserted below,
+    // and `-` for a key this build supplies no figure for.
+    let probe = r#"
+import json, sys
+document = json.load(open(sys.argv[1]))
+assert document["schema"] == "gcscope.gc-summary/1", document["schema"]
+block, = document["interpreters"]
+for g in block["generations"]:
+    print(g["generation"], g["collections"], g["observed"], g["lost"],
+          g["coverage"], g.get("pause_total_ns", "-"), g.get("scale_factor", "-"))
+"#;
+    let read = Command::new(&python)
+        .args(["-c", probe])
+        .arg(&summary)
+        .output()
+        .expect("the target reads the summary back");
+    std::fs::remove_file(&summary).ok();
+    assert!(
+        read.status.success(),
+        "the target's json module could not read the summary: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+
+    let rows: Vec<Vec<String>> = String::from_utf8_lossy(&read.stdout)
+        .lines()
+        .map(|line| line.split_whitespace().map(str::to_string).collect())
+        .collect();
+    assert_eq!(
+        rows.iter().map(|r| r[0].as_str()).collect::<Vec<&str>>(),
+        ["0", "1", "2"],
+        "every generation gets an object\n{rows:#?}"
+    );
+
+    for row in &rows {
+        let count = |i: usize| -> i64 {
+            row[i]
+                .parse()
+                .unwrap_or_else(|e| panic!("{:?}: {e}\n{rows:#?}", row[i]))
+        };
+        assert!(
+            count(1) > 0 && count(1) < SANE_COUNTER_MAX as i64,
+            "implausible collection count in {row:?}"
+        );
+        // The identity a consumer audits the reconstruction with, on both tiers.
+        assert_eq!(count(1), count(2) + count(3), "{row:?}");
+
+        let coverage: f64 = row[4].parse().expect("coverage is a number");
+        assert!((0.0..=1.0).contains(&coverage), "{row:?}");
+
+        // A build that publishes no timing publishes no pause, and the key is absent rather
+        // than zero — the whole reason a CI check can threshold on this document.
+        let priced = row[5] != "-" && row[6] != "-";
+        assert_eq!(priced, expect_spans, "{row:?}");
+    }
+}

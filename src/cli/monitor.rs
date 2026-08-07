@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use crate::cli::monitor_options::MonitorOptions;
 use crate::monitor::exporters::EventsExporter;
 use crate::monitor::exporters::chrome::ChromeTraceExporter;
-use crate::monitor::{MonitorContext, StartupTimeoutPolicy, run_loop, statistics};
+use crate::monitor::{MonitorContext, StartupTimeoutPolicy, run_loop, statistics, summary_json};
 
 // ---------------------------------------------------------------------------
 // ProcessRunner — abstracts attach-vs-spawn
@@ -119,6 +119,15 @@ pub fn run(
     script_args: &[String],
     opts: &MonitorOptions,
 ) -> Result<i32> {
+    // Checked before the spawn, so an operator hears about it now rather than after the run
+    // they were monitoring.
+    if opts.summary_json.as_deref() == Some(summary_json::STDOUT) {
+        anyhow::bail!(
+            "`run` forwards the target's own stdout to gcscope's, so `--summary-json -` would \
+             hand its consumer the document with the program's output mixed into it. Name a \
+             path, or attach with `monitor`, whose stdout is gcscope's alone."
+        );
+    }
     let mut runner = ChildProcessRunner::new(python, script, module, script_args)?;
     run_monitoring_loop(&mut runner, opts)
 }
@@ -145,12 +154,20 @@ fn run_monitoring_loop(runner: &mut impl ProcessRunner, opts: &MonitorOptions) -
         StartupTimeoutPolicy::new(Duration::from_secs(2))
     })?;
 
-    if opts.summary {
-        // On stderr, beside the other run messages: `run` forwards the target's stdout to
-        // ours, and this is gcscope talking, not the program being watched. Ticket 07's JSON
-        // gets stdout to itself.
-        for line in statistics::render(&ctx.summary()) {
-            eprintln!("{}", line);
+    // One folded summary behind both renderings, so the table and the document cannot
+    // disagree about what the run did.
+    if opts.summary || opts.summary_json.is_some() {
+        let summary = ctx.summary();
+        if opts.summary {
+            // On stderr, beside the other run messages: `run` forwards the target's stdout to
+            // ours, and this is gcscope talking, not the program being watched. That leaves
+            // stdout free for the JSON.
+            for line in statistics::render(&summary) {
+                eprintln!("{}", line);
+            }
+        }
+        if let Some(destination) = &opts.summary_json {
+            summary_json::write(destination, &summary)?;
         }
     }
 
@@ -158,4 +175,38 @@ fn run_monitoring_loop(runner: &mut impl ProcessRunner, opts: &MonitorOptions) -
     eprintln!("Trace written to {}", opts.output);
 
     runner.returncode()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(summary_json: Option<&str>) -> MonitorOptions {
+        MonitorOptions {
+            rate: 100,
+            output: "gcmon_trace.json".to_string(),
+            summary: false,
+            summary_json: summary_json.map(str::to_string),
+        }
+    }
+
+    /// `run` forwards the target's stdout to gcscope's, so a document written there arrives
+    /// with the program's own output around it. Refused up front, before the spawn: an
+    /// operator who asked for a machine-readable summary and got an unparseable stream would
+    /// only find out after the run they were monitoring.
+    #[test]
+    fn run_refuses_to_share_stdout_with_the_program_it_watches() {
+        let error = run(
+            "python",
+            Some("spin.py"),
+            None,
+            &[],
+            &options(Some(summary_json::STDOUT)),
+        )
+        .expect_err("stdout is not gcscope's alone here");
+
+        let message = format!("{error}");
+        assert!(message.contains("--summary-json -"), "{message}");
+        assert!(message.contains("monitor"), "{message}");
+    }
 }
