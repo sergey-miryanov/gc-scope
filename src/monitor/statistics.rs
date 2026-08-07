@@ -12,10 +12,11 @@ use crate::monitor::cursor::Cursor;
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerationSummary {
     pub generation: u32,
-    /// The Lifetime counter's rise, plus the Record that opened the span.
+    /// The Lifetime counter's rise, plus the opening Record where that is a Collection in its
+    /// own right. See [`summarize`].
     pub collections: i64,
-    /// Objects collected across the span. This one cannot include the opening Record's own
-    /// contribution: CPython publishes a running total, and the total before it was never read.
+    /// Objects collected across the span. Never counts the opening Record: CPython publishes a
+    /// running total, and the total before it was never read.
     pub collected: i64,
     /// Uncollectable objects across the span, on the same basis as `collected`.
     pub uncollectable: i64,
@@ -55,8 +56,12 @@ impl InterpreterSummary {
 
 /// Fold the run's accumulators into one summary per interpreter.
 ///
-/// They arrive in `(pid, interpreter, generation)` order, so this walks them once and starts a
-/// block wherever the process or interpreter changes.
+/// They arrive ordered, so this walks them once and starts a block where the process or
+/// interpreter changes.
+///
+/// Whether the opening Record counts as a Collection follows the tier: a ring Entry describes
+/// one, an inline Entry is a snapshot of running totals and describes none. A lone snapshot
+/// therefore reports nothing.
 pub fn summarize(cursor: &Cursor) -> Vec<InterpreterSummary> {
     let mut blocks: Vec<InterpreterSummary> = Vec::new();
 
@@ -65,11 +70,12 @@ pub fn summarize(cursor: &Cursor) -> Vec<InterpreterSummary> {
             continue;
         }
         let (first, last) = (observation.first(), observation.last());
+        // On the ring tier this makes the count equal the Records read when nothing was lost,
+        // the identity ticket 06 reads Coverage 1.0 off.
+        let opening_record = i64::from(observation.has_timing());
         let generation = GenerationSummary {
             generation: key.generation,
-            // With nothing lost this equals the Records read, which is what makes Coverage
-            // 1.0 in ticket 06.
-            collections: last.collections - first.collections + 1,
+            collections: last.collections - first.collections + opening_record,
             collected: last.collected - first.collected,
             uncollectable: last.uncollectable - first.uncollectable,
             records: observation.sampled(),
@@ -78,8 +84,18 @@ pub fn summarize(cursor: &Cursor) -> Vec<InterpreterSummary> {
                 .then(|| observation.measured_pause_ns()),
         };
 
+        // A repeated generation closes the block. A PID forgotten and then observed again
+        // holds two spans under one key, and one table with two `gen 0` rows says nothing
+        // about which observation each belongs to.
         match blocks.last_mut() {
-            Some(block) if block.pid == key.pid && block.interpreter == key.interpreter => {
+            Some(block)
+                if block.pid == key.pid
+                    && block.interpreter == key.interpreter
+                    && !block
+                        .generations
+                        .iter()
+                        .any(|g| g.generation == key.generation) =>
+            {
                 block.generations.push(generation);
             }
             _ => blocks.push(InterpreterSummary {
@@ -257,24 +273,44 @@ mod tests {
         ]);
 
         let gen0 = &summary[0].generations[0];
-        // 40 the counter rose, plus the Record that opened the span.
-        assert_eq!(gen0.collections, 41);
+        assert_eq!(gen0.collections, 40);
         assert_eq!(gen0.collected, 5_500);
         assert_eq!(gen0.uncollectable, 5);
         assert_eq!(gen0.records, 2);
     }
 
-    /// One Record leaves nothing to difference against, so the object counts stay at zero
-    /// instead of reporting the interpreter's whole history.
+    /// One snapshot leaves nothing to difference against, so an inline build reports nothing
+    /// rather than the interpreter's history or a Collection it merely witnessed. This is what
+    /// a script calling `gc.disable()` reads back; crediting the opening Record put one
+    /// collection on every generation of every such run.
     #[test]
-    fn a_single_record_reports_one_collection_and_no_object_counts() {
+    fn a_lone_snapshot_from_an_inline_build_reports_nothing() {
         let summary = run(&[(7, vec![counted(0, 0, 900, 40_000, 3)])]);
 
         let gen0 = &summary[0].generations[0];
-        assert_eq!(gen0.collections, 1);
+        assert_eq!(gen0.collections, 0);
         assert_eq!(gen0.collected, 0);
         assert_eq!(gen0.uncollectable, 0);
         assert_eq!(gen0.records, 1);
+    }
+
+    /// A ring Entry *is* a Collection, so the opening Record counts as one. That makes the
+    /// count equal the Records read when nothing was overwritten, which is where ticket 06
+    /// reads Coverage from.
+    #[test]
+    fn a_ring_build_counts_the_record_that_opened_the_span() {
+        let one = run(&[(7, vec![timed(0, 0, 900, 40_000, 0, 1_000, 1_400)])]);
+        assert_eq!(one[0].generations[0].collections, 1);
+        assert_eq!(one[0].generations[0].records, 1);
+
+        let many = run(&[
+            (7, vec![timed(0, 0, 10, 100, 0, 1_000, 1_400)]),
+            (7, vec![timed(0, 0, 11, 150, 0, 2_000, 2_600)]),
+            (7, vec![timed(0, 0, 12, 190, 0, 3_000, 3_100)]),
+        ]);
+        let gen0 = &many[0].generations[0];
+        assert_eq!(gen0.collections, 3);
+        assert_eq!(gen0.records, 3, "nothing was lost, so the two agree");
     }
 
     /// A layout with no timestamps cannot say how long it spent collecting, so the figure is
@@ -347,8 +383,41 @@ mod tests {
         assert_eq!(summary.len(), 2);
         assert_eq!((summary[0].pid, summary[0].interpreter), (7, 0));
         assert_eq!((summary[1].pid, summary[1].interpreter), (7, 3));
-        assert_eq!(summary[0].generations[0].collections, 3);
-        assert_eq!(summary[1].generations[0].collections, 401);
+        assert_eq!(summary[0].generations[0].collections, 2);
+        assert_eq!(summary[1].generations[0].collections, 400);
+    }
+
+    /// A worker whose read failed for a tick and was re-discovered on the next, or a PID the
+    /// OS recycled, holds two spans under one ring key. Each gets its own block: interleaved,
+    /// they leave two `gen 0` rows in one table with nothing telling them apart.
+    #[test]
+    fn a_pid_observed_twice_keeps_its_two_spans_in_separate_blocks() {
+        let mut cursor = Cursor::new();
+        cursor.admit(7, &[counted(0, 0, 10, 100, 0), counted(1, 0, 4, 20, 0)]);
+        cursor.admit(7, &[counted(0, 0, 30, 500, 0), counted(1, 0, 9, 80, 0)]);
+        cursor.forget(7);
+        cursor.admit(7, &[counted(0, 0, 1, 5, 0)]);
+        cursor.admit(7, &[counted(0, 0, 6, 55, 0)]);
+
+        let summary = summarize(&cursor);
+        assert_eq!(summary.len(), 2, "{summary:#?}");
+        assert_eq!(
+            summary[0]
+                .generations
+                .iter()
+                .map(|g| (g.generation, g.collections))
+                .collect::<Vec<(u32, i64)>>(),
+            [(0, 20), (1, 5)]
+        );
+        // The second span starts from the re-attach, not from the first span's counters.
+        assert_eq!(
+            summary[1]
+                .generations
+                .iter()
+                .map(|g| (g.generation, g.collections))
+                .collect::<Vec<(u32, i64)>>(),
+            [(0, 5)]
+        );
     }
 
     /// One monitoring run covers a process tree, so each process gets its own block too.
@@ -473,7 +542,7 @@ mod tests {
         let row = render(&summary).last().unwrap().clone();
         assert_eq!(
             row.split_whitespace().collect::<Vec<_>>(),
-            ["2", "21", "800", "6"]
+            ["2", "20", "800", "6"]
         );
     }
 }

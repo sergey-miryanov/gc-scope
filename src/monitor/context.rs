@@ -351,7 +351,9 @@ mod tests {
         let summary = context.summary();
         assert_eq!(summary.len(), 1);
         let generations = &summary[0].generations;
-        assert_eq!(generations[0].collections, 5);
+        // The counter's rise alone: this ring publishes no timestamps, so its Entries are
+        // snapshots and the one that opened the span is no Collection of its own.
+        assert_eq!(generations[0].collections, 4);
         assert_eq!(generations[0].collected, 80);
         // Tier follows each ring's own layout, so one interpreter holds both here even though
         // no real build does.

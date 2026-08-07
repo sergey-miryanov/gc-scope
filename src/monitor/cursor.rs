@@ -123,11 +123,17 @@ pub struct Cursor {
     /// Ordered, so the end-of-run summary walks processes, interpreters and generations in a
     /// stable order instead of whatever order a hash gave this run.
     rings: BTreeMap<RingKey, RingObservation>,
-    /// Rings whose process has gone. Dedup state must not outlive a PID the OS can recycle,
-    /// but what the dead process did is still part of the run, so [`forget`](Self::forget)
-    /// retires an accumulator instead of dropping it. Every pool worker ends up here, and so
-    /// does any target that exits before the run does.
-    retired: Vec<(RingKey, RingObservation)>,
+    /// Rings whose process has gone, each tagged with the eviction that retired it. Dedup state
+    /// must not outlive a PID the OS can recycle, but what the dead process did is still part
+    /// of the run, so [`forget`](Self::forget) retires an accumulator instead of dropping it.
+    /// Every pool worker ends up here, and so does any target that exits before the run.
+    ///
+    /// The tag keeps a span's rings together in [`observations`](Self::observations). A PID
+    /// observed, forgotten and observed again holds two spans under one key, and sorting on the
+    /// key alone shuffles their generations into each other.
+    retired: Vec<(RingKey, u64, RingObservation)>,
+    /// Evictions so far, numbering the retired spans. Live rings sort after all of them.
+    evictions: u64,
     /// Per `(pid, interpreter)`, the latest moment the Observer has proof the interpreter
     /// reached: the newest `ts_start` of a Collection caught running, and the newest `ts_stop`
     /// of one read finished.
@@ -224,9 +230,10 @@ impl Cursor {
             .collect();
         for key in doomed {
             if let Some(observation) = self.rings.remove(&key) {
-                self.retired.push((key, observation));
+                self.retired.push((key, self.evictions, observation));
             }
         }
+        self.evictions += 1;
         self.last_certainty.retain(|&(p, _), _| p != pid);
     }
 
@@ -236,20 +243,21 @@ impl Cursor {
         self.rings.get(&key)
     }
 
-    /// Every ring a Record has been read from this run, retired ones included, in
-    /// `(pid, interpreter, generation)` order. The end-of-run summary's whole input.
+    /// Every ring a Record has been read from this run, retired ones included. The end-of-run
+    /// summary's whole input.
     ///
-    /// The sort is stable and retired rings go in first, so a recycled PID's two sets of
-    /// figures come out in the order they were observed.
+    /// Ordered by process, interpreter, observation span, generation. The span outranks the
+    /// generation so a PID observed twice yields two runs of generations rather than one
+    /// interleaved sequence, and the live rings sort last, being the newest span.
     pub fn observations(&self) -> impl Iterator<Item = (RingKey, &RingObservation)> {
-        let mut all: Vec<(RingKey, &RingObservation)> = self
+        let mut all: Vec<(RingKey, u64, &RingObservation)> = self
             .retired
             .iter()
-            .map(|(key, obs)| (*key, obs))
-            .chain(self.rings.iter().map(|(&key, obs)| (key, obs)))
+            .map(|(key, span, obs)| (*key, *span, obs))
+            .chain(self.rings.iter().map(|(&key, obs)| (key, u64::MAX, obs)))
             .collect();
-        all.sort_by_key(|&(key, _)| key);
-        all.into_iter()
+        all.sort_by_key(|&(key, span, _)| (key.pid, key.interpreter, span, key.generation));
+        all.into_iter().map(|(key, _, obs)| (key, obs))
     }
 
     /// The latest moment the Observer has proof this interpreter reached. `None` on a build
