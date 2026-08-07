@@ -784,6 +784,16 @@ fn probe_ring_decodes_out_of_process() {
     let t = attach(&python);
     let (h, module, handle) = (&t.header, &t.module, &t.handle);
 
+    // Outside the block below, which the exact check lives in: `full_python_version` answers
+    // None on a spawn failure, unparseable output, or a release level outside the four
+    // `patchlevel.h` names, and a header carrying a collector this build never defined should
+    // still fail there rather than go unexamined.
+    assert!(
+        h.collector <= COLLECTOR_GENERATIONAL,
+        "header declares collector {}, a value this build does not define",
+        h.collector
+    );
+
     // Ask the target rather than hardcode the answer: the header's py_version must match what
     // the interpreter reports about itself. A Probe loaded into the wrong runtime is what the
     // load gate exists to prevent, and this is where that shows.

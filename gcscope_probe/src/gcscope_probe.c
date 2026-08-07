@@ -453,13 +453,12 @@ gcscope_probe_noop(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
 
 /* ---- the load gates ----------------------------------------------------- */
 
-/* The minors `internals.c` can compile offsets for. Widening this is not a constant change:
- * every minor lays `PyInterpreterState` out differently, so a new entry needs that file to
- * compile against the new headers and a CI leg that reads a Ring out of that interpreter. */
-#define GCSCOPE_PROBE_MIN_MINOR 13
-#define GCSCOPE_PROBE_MAX_MINOR 14
-
-/* Room for the longest message below. PyOS_snprintf truncates rather than overruns, so a
+/* `GCSCOPE_PROBE_MIN_MINOR` and `GCSCOPE_PROBE_MAX_MINOR` come from `internals.h`, which also
+ * derives the compile-time floor from them. Every message below is formatted from those two
+ * rather than spelling the range out, so widening the gate cannot leave a refusal claiming the
+ * old range while letting the new one through.
+ *
+ * Room for the longest message below. PyOS_snprintf truncates rather than overruns, so a
  * sentence added later that outgrows this loses its tail instead of the stack. */
 #define GCSCOPE_PROBE_REFUSAL_MAX 512
 
@@ -510,27 +509,27 @@ gcscope_probe_version_refusal(unsigned long runtime, char *buf, size_t n)
 
     if (major < 3 || (major == 3 && minor < GCSCOPE_PROBE_MIN_MINOR)) {
         PyOS_snprintf(buf, n,
-                      "gcscope_probe supports CPython 3.13 and 3.14; this interpreter is %s. "
-                      "Below 3.13 there is no public PyTime_PerfCounterRaw to time a Collection "
-                      "with, so a Probe there would hand-roll a clock per platform and have to "
-                      "prove it matches CPython's own", running);
+                      "gcscope_probe supports CPython 3.%u to 3.%u; this interpreter is %s. ",
+                      (unsigned int)GCSCOPE_PROBE_MIN_MINOR,
+                      (unsigned int)GCSCOPE_PROBE_MAX_MINOR, running);
         return 1;
     }
     if (major > 3 || minor > GCSCOPE_PROBE_MAX_MINOR) {
         PyOS_snprintf(buf, n,
-                      "gcscope_probe supports CPython 3.13 and 3.14; this interpreter is %s. "
-                      "From 3.15 CPython publishes these statistics itself, so a Probe would be "
-                      "a second source for numbers the interpreter already keeps; point gcscope "
-                      "at the native ring instead", running);
+                      "gcscope_probe supports CPython 3.%u to 3.%u; this interpreter is %s. "
+                      "From 3.%u no need to use Probe since CPython publishes "
+                      "these statistics itself",
+                      (unsigned int)GCSCOPE_PROBE_MIN_MINOR,
+                      (unsigned int)GCSCOPE_PROBE_MAX_MINOR, running,
+                      (unsigned int)GCSCOPE_PROBE_MAX_MINOR + 1);
         return 1;
     }
     if (runtime != (unsigned long)PY_VERSION_HEX) {
         gcscope_probe_format_version((unsigned long)PY_VERSION_HEX, built, sizeof(built));
         PyOS_snprintf(buf, n,
                       "gcscope_probe was built against CPython %s and this interpreter is %s. "
-                      "It reads gc statistics through offsets taken from %s's internal headers, "
-                      "which CPython's ABI promise does not cover: sizeof(_gc_runtime_state) "
-                      "moved by 24 bytes between 3.14.4 and 3.14.5 alone. Rebuild it against %s",
+                      "It reads gc statistics through offsets taken from %s's internal headers. "
+                      "Rebuild it against %s",
                       built, running, built, running);
         return 1;
     }

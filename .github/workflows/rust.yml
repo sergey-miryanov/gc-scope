@@ -530,10 +530,6 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      # Both minors attach unprivileged on macOS through PEP 768's get-task-allow, which arrived
-      # in 3.13, so this leg needs only the authorization database change and none of the
-      # sudo-plus-coverage dance the `live-smoke` 3.8-3.12 legs carry. Anything older would not,
-      # and the Probe does not build there anyway.
       - name: Configure macOS taskport permissions
         if: runner.os == 'macOS'
         run: |

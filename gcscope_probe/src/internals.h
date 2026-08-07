@@ -12,6 +12,17 @@
 #ifndef GCSCOPE_PROBE_INTERNALS_H
 #define GCSCOPE_PROBE_INTERNALS_H
 
+/* The minors this module supports, and the one place they are stated in C. The floor below and
+ * `gcscope_probe.c`'s runtime gate both derive from these, so bumping either cannot leave the
+ * other saying something else.
+ *
+ * Widening is not a constant change: every minor lays `PyInterpreterState` out differently, so
+ * a new entry needs `internals.c` compiling against that minor's headers and a CI leg reading a
+ * Ring out of that interpreter. `pyproject.toml`'s requires-python states the same range in a
+ * language that cannot see these, and moves by hand. */
+#define GCSCOPE_PROBE_MIN_MINOR 13
+#define GCSCOPE_PROBE_MAX_MINOR 14
+
 /* The version floor, stated where both translation units see it: each includes this after
  * Python.h, so whichever the toolchain reaches first stops with this rather than with a cascade.
  *
@@ -23,11 +34,14 @@
  * No matching ceiling: a 3.15 build compiles and refuses at import, which says more than a
  * compiler diagnostic can, and pyproject's requires-python stops pip before either.
  *
+ * The condition derives from the macro above; the message cannot, since `#error` takes a
+ * literal. Change the floor and this sentence needs changing with it.
+ *
  * `patchlevel.h` rather than `Python.h`, which this header must not pull in: `internals.c`
  * defines `Py_BUILD_CORE` before including it, and a translation unit that reached Python.h
  * through here first would get the non-core spelling and no warning about it. */
 #include <patchlevel.h>
-#if PY_VERSION_HEX < 0x030D0000
+#if PY_VERSION_HEX < ((3 << 24) | (GCSCOPE_PROBE_MIN_MINOR << 16))
 #  error "gcscope_probe supports CPython 3.13 and 3.14. Below 3.13 there is no public \
 PyTime_PerfCounterRaw to time a Collection with, so a Probe there would hand-roll a clock per \
 platform and have to prove it matches CPython's own."
