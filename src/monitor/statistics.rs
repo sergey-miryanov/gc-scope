@@ -93,9 +93,10 @@ pub fn summarize(cursor: &Cursor) -> Vec<InterpreterSummary> {
     let mut blocks: Vec<InterpreterSummary> = Vec::new();
 
     for (key, observation) in cursor.observations() {
-        if observation.is_empty() {
-            continue;
-        }
+        // The cursor folds a Record into every accumulator it creates, so a block never covers
+        // a ring nothing is known about. Asserted rather than skipped: silently dropping the
+        // row would hide the day that stops being true.
+        debug_assert!(!observation.is_empty(), "a ring with no Record behind it");
         let (first, last) = (observation.first(), observation.last());
         let reconstructed = account(observation);
         let generation = GenerationSummary {

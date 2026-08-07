@@ -75,17 +75,16 @@ pub fn account(observation: &RingObservation) -> LossAccount {
         0
     };
 
-    let coverage = if !timed {
-        // The tier's constant, idle generations included. One whose counter never moved would
-        // take `1.0` from the empty-accumulator rule, and a `1.000` under a column of `0.000`
-        // siblings reads as the generation gcscope watched properly.
-        0.0
-    } else if exact_collections == 0 {
-        // Guarding the division, not describing a case: `admits` keeps counters increasing, so
-        // a timed span holds at least the Record that opened it.
-        1.0
-    } else {
+    // Zero is the counter-only tier's constant, idle generations included. One whose counter
+    // never moved would take `1.0` from the empty-accumulator rule, and a `1.000` under a column
+    // of `0.000` siblings reads as the generation gcscope watched properly.
+    //
+    // The divisor cannot be zero: `admits` keeps counters increasing, so a non-empty timed span
+    // holds at least the Record that opened it.
+    let coverage = if timed {
         observed_collections as f64 / exact_collections as f64
+    } else {
+        0.0
     };
 
     let mut account = LossAccount {
@@ -126,11 +125,9 @@ pub fn account(observation: &RingObservation) -> LossAccount {
         let exact = spanned.max(measured);
         account.exact_pause_ns = Some(exact);
         account.lost_pause_ns = Some(exact - measured);
-        account.scale_factor = Some(if measured == 0 {
-            1.0
-        } else {
-            exact as f64 / measured as f64
-        });
+        // `measured` cannot be zero either: a timed Record reaches the accumulator only through
+        // `is_complete`, which is `ts_start < ts_stop`.
+        account.scale_factor = Some(exact as f64 / measured as f64);
     }
 
     account
@@ -193,7 +190,7 @@ mod tests {
         for poll in polls {
             cursor.admit(1, poll);
         }
-        cursor.observation(GEN0).map_or(UNOBSERVED, account)
+        account(cursor.observation(GEN0).expect("the ring was read"))
     }
 
     /// Polled fast enough to catch every Collection, the counter agrees with the Records read
@@ -287,9 +284,11 @@ mod tests {
     }
 
     /// A ring nobody read has lost none of the nothing it covers: Coverage `1.0`, not `0/0`.
+    /// Accounted directly, since the cursor never hands out an accumulator it did not fold a
+    /// Record into.
     #[test]
     fn an_unobserved_ring_reports_full_coverage_and_no_loss() {
-        let a = observe(&[]);
+        let a = account(&RingObservation::default());
 
         assert_eq!(a.exact_collections, 0);
         assert_eq!(a.lost_collections, 0);
@@ -476,12 +475,12 @@ mod tests {
                 let case = format!("seed {seed:#x}, burst {burst}");
 
                 let truth: i64 = pauses[first as usize..=last as usize].iter().sum();
+                let exact = a.exact_pause_ns.unwrap();
                 // Two conversions through a cumulative float of seconds, so a nanosecond or
                 // two of rounding is expected and anything more is arithmetic.
                 assert!(
-                    (a.exact_pause_ns.unwrap() - truth).abs() <= 16,
-                    "{case}: {} against {truth}",
-                    a.exact_pause_ns.unwrap()
+                    (exact - truth).abs() <= 16,
+                    "{case}: {exact} against {truth}"
                 );
                 assert!(
                     a.measured_pause_ns.unwrap() <= truth,
