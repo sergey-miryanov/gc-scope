@@ -14,6 +14,7 @@ pub mod convert;
 pub mod cursor;
 pub mod exporters;
 pub mod run_loop;
+pub mod statistics;
 pub mod trace_event;
 
 pub use context::MonitorContext;

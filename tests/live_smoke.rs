@@ -404,3 +404,113 @@ fn live_monitor_writes_the_tier_the_build_supports() {
         "counter samples share one timestamp, so they show no rate: {stamps:?}\n{head}"
     );
 }
+
+/// `--summary` prints what the run read, per interpreter per generation, in the tier the
+/// build's Entry layout sits in.
+///
+/// Worth a live leg rather than only the poll seam: the summary is folded from accumulators
+/// the run's own eviction path touches when the target exits, and a unit test driving the
+/// seam directly never reaches that path. Adding no flag must leave the run's output alone,
+/// which is the second half of the assertion.
+#[test]
+#[ignore = "spawns and attaches to a live interpreter; needs ptrace/taskport — run with --ignored"]
+fn live_monitor_summarizes_every_generation_in_the_builds_tier() {
+    let Some(python) = test_python() else {
+        eprintln!("SKIP live_monitor_summary: no Python found (set GCSCOPE_TEST_PYTHON)");
+        return;
+    };
+    let Some(expect_spans) = expects_spans(python_version(&python)) else {
+        eprintln!("WARN: could not determine the target version; skipping the summary check");
+        return;
+    };
+
+    let spin = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("spin.py");
+    let trace: PathBuf =
+        std::env::temp_dir().join(format!("gcscope_live_summary_{}.json", std::process::id()));
+
+    let run = |extra: &[&str]| -> String {
+        let mut args = vec![
+            "run",
+            "-p",
+            &python.to_str().unwrap(),
+            "-s",
+            &spin.to_str().unwrap(),
+            "-o",
+            &trace.to_str().unwrap(),
+            "-r",
+            "50",
+        ];
+        args.extend_from_slice(extra);
+        args.push("4");
+        let (rc, out) = gcscope(&args);
+        std::fs::remove_file(&trace).ok();
+        assert_eq!(rc, 0, "gcscope run exited {rc}\n{out}");
+        out
+    };
+
+    let out = run(&["--summary"]);
+    let start = out
+        .lines()
+        .position(|l| l.starts_with("python ") && l.contains(", interpreter "))
+        .unwrap_or_else(|| panic!("no summary block in the output\n{out}"));
+    let block: Vec<&str> = out.lines().skip(start).collect();
+
+    let header = block
+        .iter()
+        .find(|l| l.contains("collections"))
+        .unwrap_or_else(|| panic!("the summary block has no header\n{out}"));
+
+    // A row starts with its generation number, which is what tells it from the header, the
+    // rules and the run's own log lines.
+    let rows: Vec<Vec<&str>> = block
+        .iter()
+        .map(|l| l.split_whitespace().collect::<Vec<&str>>())
+        .filter(|cols| cols.len() >= 4 && cols[0].parse::<u32>().is_ok())
+        .collect();
+    assert_eq!(
+        rows.iter().map(|c| c[0]).collect::<Vec<&str>>(),
+        ["0", "1", "2"],
+        "every generation gets a row\n{out}"
+    );
+
+    for row in &rows {
+        let collections: i64 = row[1]
+            .parse()
+            .unwrap_or_else(|e| panic!("collections {:?}: {e}\n{out}", row[1]));
+        assert!(
+            collections > 0 && collections < SANE_COUNTER_MAX as i64,
+            "implausible collection count in {row:?}\n{out}"
+        );
+    }
+
+    if expect_spans {
+        assert!(
+            header.contains("pause total") && header.contains("records"),
+            "this build publishes pause timestamps, so the summary reports them\n{out}"
+        );
+        // The last two columns are a scaled figure and its unit, so a row splits into nine.
+        assert!(
+            rows.iter().all(|r| r.len() == 9),
+            "a timed row carries counts, records and both pause figures\n{out}"
+        );
+    } else {
+        assert!(
+            !header.contains("pause"),
+            "a pause figure this build never published belongs absent, not at zero\n{out}"
+        );
+        assert!(
+            rows.iter().all(|r| r.len() == 4),
+            "an untimed row carries the counts and nothing else\n{out}"
+        );
+    }
+
+    // The flag is the only thing that puts the table on the run's output.
+    let quiet = run(&[]);
+    assert!(
+        !quiet.lines().any(|l| l.starts_with("python ")),
+        "the summary printed without being asked for\n{quiet}"
+    );
+}
