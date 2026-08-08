@@ -21,21 +21,29 @@ Complements the two backward-looking docs:
 | [0008](0008-shared-formatters-and-pid-table.md) | Feature — cleanup | M | Two hex formatters; PID-row assembly duplicated across the CLI table and the TUI picker |
 | [0009](0009-venv-launcher-child-retarget.md) | Feature — ergonomics | M | Windows venv shim PIDs fail single-shot commands; `attach` should re-target to the child |
 | [0010](0010-tree-last-child-connector.md) | Bug — cosmetic | S | `tree_prefixes` never emits the last-child connector its doc comment promises |
-| [0011](0011-loss-reconstruction-and-gc-statistics.md) | Feature — enhancement | L | `monitor` writes an empty trace below 3.15 and silently under-reports above it; reconstruct Loss from CPython's cumulative counters and report Coverage |
 | [0012](0012-gen-offsets-serves-the-probe.md) | Feature — enhancement | S | The Probe transcribes the Ring layout instead of sharing it, and the interpreter fields it compiles in are unswept |
 | [0013](0013-probe-portable-core.md) | Feature — enhancement | L | The Probe is Windows-only, hardcoded to one patch release, and publishes counters that do not mean what a reader assumes |
 | [0014](0014-read-probe-regions.md) | Feature — enhancement | L | gcscope ignores a Probe region entirely, and never tells an operator on 3.13/3.14 that per-Collection timing is obtainable |
 | [0015](0015-publish-probe-wheels.md) | Feature — ergonomics | M | There is no way to get a Probe except to build one on Windows with MSVC |
+| [0017](0017-pause-distribution-percentiles.md) | Feature — enhancement | M | `--summary` reports total and mean pause and no distribution, so one 27 ms Collection hides inside 205 of them |
+| [0018](0018-perfetto-exporter.md) | Feature — enhancement | L | One output format, and it is the one that cannot express a track belonging to anything but a process or a thread |
+| [0019](0019-loss-spans-in-the-trace.md) | Feature — enhancement | M | The summary reports 117 Collections nobody read; the trace shows a quiet stretch instead |
+| [0020](0020-detect-a-torn-stats-read.md) | Feature — enhancement | S | Nothing checks whether the stats region moved under the read, and a half-written Entry reads as a long pause |
 
 **Suggested order:** 0001 (the only crash) → 0002 (one line, unblocks embedders) → 0003 →
 0004 (smallest user-visible wrongness) → then the cosmetic and efficiency tail in any
 order.
 
-0011 is a larger, independent track rather than a step in that queue: it is the first
-increment of porting gcmon's consumer stack, and it carries its own increments behind it
-(Perfetto, then the control plane and pyperf hook, then `convert` and the option surface).
-It is blocked by one local issue, `.scratch/monitor-inflight-entries/issues/01-…`, which
-ships on its own first.
+**0017–0020 are a second track — the consumer stack ported from gcmon.** Its first increment
+landed as spec 0011, now deleted: reading every interpreter, the counter-only tier, the Loss
+arithmetic, and the `--summary` table and JSON document
+([ADR 0017](../docs/adr/0017-monitoring-tiers-follow-the-entry-layout.md),
+[ADR 0019](../docs/adr/0019-loss-is-accounted-over-the-observed-span.md),
+[ADR 0020](../docs/adr/0020-monitor-reads-every-interpreter.md)). What it deferred is these
+four, and 0018 is the one to do first: 0019 is blocked on it, and the increments behind the
+track (the `Processes` liveness track, RSS, JSONL, `convert`/`combine`, then the control plane
+and the pyperf hook) mostly want it too. 0017 and 0020 are independent of all of that and can
+go in any gap.
 
 **0012–0015 are a third track — the Probe**, and they run in that order: 0012 (the generated
 layout header the rest asserts against) → 0013 (the port, and the move into this tree) → 0014
@@ -43,13 +51,14 @@ layout header the rest asserts against) → 0013 (the port, and the move into th
 useful to review; 0012 is small and unblocks both. The decisions behind the track are recorded
 in [ADR 0013–0016](../docs/adr/README.md); the specs carry only the work.
 
-**0011 and the Probe track collide, deliberately and in one place.** 0011 states that below
-3.15 there are no spans, Coverage is `0`, and pause figures are absent. A Probe falsifies all
-three on 3.13 and 3.14. The two are compatible in substance — 0011's reconstruction arithmetic
-works on a Probe ring precisely because
-[ADR 0015](../docs/adr/0015-probe-counters-are-seeded.md) seeds the counters — but whichever
-lands second must amend the other's sub-3.15 branch rather than leave two accounts of the same
-behaviour standing.
+**The Probe track collides with what the second track already landed, deliberately and in one
+place.** [ADR 0017](../docs/adr/0017-monitoring-tiers-follow-the-entry-layout.md) gives a build
+with no timing fields counter tracks rather than spans, Coverage `0`, and absent pause figures,
+which below 3.15 is every build. A Probe falsifies all three on 3.13 and 3.14. The two are
+compatible in substance — the reconstruction arithmetic works on a Probe ring precisely because
+[ADR 0015](../docs/adr/0015-probe-counters-are-seeded.md) seeds the counters — and 0013/0014
+amend that ADR's sub-3.15 branch rather than leaving two accounts of the same behaviour
+standing.
 
 ## Templates
 

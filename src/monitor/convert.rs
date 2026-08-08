@@ -141,8 +141,8 @@ pub fn convert_record(pid: u32, record: &GcStat, observed_at_ns: i64) -> Vec<Tra
 /// Entry carries nothing per-Collection.
 ///
 /// Nothing pause-derived appears, down to the zero-width span. A `duration` of `0` reads as
-/// "this process spends no time in GC" when the truth is that the build cannot say (spec 0011
-/// §2). The sample sits on the Observer's clock, the only timeline available.
+/// "this process spends no time in GC" when the truth is that the build cannot say (ADR 0017).
+/// The sample sits on the Observer's clock, the only timeline available.
 fn count_events(pid: u32, record: &GcStat, observed_at_ns: i64) -> Vec<TraceEvent> {
     let mut counts: Vec<Arg> = Vec::new();
     for name in ["collections", "collected"] {
@@ -752,8 +752,7 @@ mod tests {
     }
 
     /// Everything a pause would have supplied is absent rather than zero. An operator reading
-    /// `duration: 0` off such a trace concludes the process spends no time in GC (spec 0011
-    /// §2).
+    /// `duration: 0` off such a trace concludes the process spends no time in GC (ADR 0017).
     #[test]
     fn a_build_without_timing_reports_no_pause_derived_value() {
         let events = convert_record(9, &counted(0, 3, 4, 5), OBSERVER_CLOCK);

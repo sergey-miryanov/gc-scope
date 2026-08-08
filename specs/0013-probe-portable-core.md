@@ -162,8 +162,9 @@ a compatibility negotiation after the first wheel ships.
 
 At install, the Probe reads CPython's own inline `generation_stats` and initialises
 `collections`, `collected` and `uncollectable` from them. Those counters then *are* Lifetime
-totals, and Coverage, Loss and every figure [0011](0011-loss-reconstruction-and-gc-statistics.md)
-derives keep their existing meanings with no new concept in the reader.
+totals, and Coverage, Loss and every figure
+[ADR 0019](../docs/adr/0019-loss-is-accounted-over-the-observed-span.md) derives keep their
+existing meanings with no new concept in the reader.
 
 `duration` and `candidates` cannot be seeded — CPython never recorded the first and
 `deduce_unreachable` is `static inline`, putting the second out of reach. They stay
@@ -261,11 +262,13 @@ declaration, not just a line in a spec.
 
 ## 7. Further notes
 
-**Interaction with [0011](0011-loss-reconstruction-and-gc-statistics.md).** That spec states
-that below 3.15 there are no spans, Coverage is `0`, and pause figures are reported as *absent*.
-A Probe makes that false on 3.13 and 3.14: there are Records, there is timing, and Coverage is
-computable. The two tracks must be sequenced deliberately — whichever lands second amends the
-other's sub-3.15 branch. This is the single largest cross-spec interaction in the set.
+**Interaction with the monitoring tiers, which landed first.**
+[ADR 0017](../docs/adr/0017-monitoring-tiers-follow-the-entry-layout.md) gives a build with no
+timing fields counter tracks rather than spans, Coverage `0`, and pause figures reported as
+*absent*. A Probe makes that false on 3.13 and 3.14: there are Records, there is timing, and
+Coverage is computable. The Probe track amends that ADR's sub-3.15 branch rather than leaving
+two accounts of the same behaviour standing. This is the largest cross-track interaction in the
+set.
 
 **Untested paths carried over from the prototype**, none of which this spec closes: more than
 eight concurrent interpreters (the ninth is dropped rather than corrupting, but that path has

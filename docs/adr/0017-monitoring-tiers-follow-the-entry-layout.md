@@ -3,8 +3,7 @@
 **Status:** Accepted — implemented 2026-08-07. Applies
 [ADR 0003](0003-layout-driven-gc-stats-decode.md) and
 [ADR 0007](0007-gcstat-layout-driven-view.md) to the monitor, which assumed every build
-published what a ring build publishes. Delivers §4 of
-[spec 0011](../../specs/0011-loss-reconstruction-and-gc-statistics.md).
+published what a ring build publishes. Delivers §4 of spec 0011, now deleted.
 
 ## Context
 
@@ -62,7 +61,8 @@ Two ways to draw the line:
   these builds publish is per-Collection. The statistics surface reports that when it lands.
 - Pause time on these builds stays unavailable rather than estimated. Sampling the
   `collecting` flag yields an aggregate duty cycle, and splitting one per generation by count
-  is fabrication (spec 0011 §4).
+  is fabrication. Worth revisiting as a separately-named feature, never as a backfill for
+  absent data.
 - One file mixing tiers, a 3.12 parent spawning a 3.15 child, carries two timelines: one tier
   rides the Observer's clock and the other the target's. Tiers are per Record, so each track
   holds together, and nothing aligns them across the split.

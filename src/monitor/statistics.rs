@@ -518,7 +518,7 @@ mod tests {
     }
 
     /// A layout with no timestamps cannot say how long it spent collecting, so the figure is
-    /// absent. A `0` there reads as "this process spends no time in GC" (spec 0011 §2).
+    /// absent. A `0` there reads as "this process spends no time in GC" (ADR 0017).
     #[test]
     fn a_build_without_timing_reports_no_pause_figures() {
         let summary = run(&[

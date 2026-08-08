@@ -269,7 +269,7 @@ mod tests {
     }
 
     /// Nothing an inline build publishes is per-Collection, so its counts stand alone with no
-    /// distribution behind them and Coverage is `0` (spec 0011 §2, ADR 0017).
+    /// distribution behind them and Coverage is `0` (ADR 0017).
     #[test]
     fn the_counter_only_tier_covers_nothing_it_counts() {
         let a = observe(&[&[counted(10)], &[counted(30)]]);

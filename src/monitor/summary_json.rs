@@ -2,7 +2,7 @@
 //!
 //! One rule shapes the schema: a figure the build cannot supply has no key, so a check
 //! thresholding on pause time fails to find the field against a 3.12 target rather than
-//! passing against a zero (spec 0011 §2).
+//! passing against a zero (ADR 0017).
 //!
 //! The figures arrive folded from [`super::statistics`], the same values the table prints,
 //! and nothing here computes one. Two renderings each doing their own arithmetic is how gcmon

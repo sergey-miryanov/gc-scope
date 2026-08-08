@@ -2,7 +2,7 @@
 
 **Status:** Accepted — decided 2026-08-06. (Preserves the meaning of **Lifetime total** and
 **Coverage** as `CONTEXT.md` defines them, and keeps
-[spec 0011](../../specs/0011-loss-reconstruction-and-gc-statistics.md)'s reconstruction valid on
+[ADR 0019](0019-loss-is-accounted-over-the-observed-span.md)'s reconstruction valid on
 Probe rings. Complements [ADR 0014](0014-probe-regions-discovered-by-module-export.md).)
 
 ## Context
@@ -37,7 +37,7 @@ Three options:
 - **(c) Keep them install-relative** and introduce a distinct concept for pre-install activity.
 
 (b) is the only one where the reader needs no new vocabulary and
-[spec 0011](../../specs/0011-loss-reconstruction-and-gc-statistics.md)'s arithmetic keeps
+[ADR 0019](0019-loss-is-accounted-over-the-observed-span.md)'s arithmetic keeps
 working unchanged. The offset needed to read CPython's inline array is already computed by
 `compute_inline_stats_off`, so the ingredient exists.
 
@@ -77,8 +77,9 @@ Install-relative `duration` is wrong, and looks entirely reasonable.
   running between the read and the first callback is counted by CPython and not by the Probe,
   or the reverse. The error is bounded by one Collection per generation and is not worth
   eliminating, but it should not be discovered as a mystery later.
-- [Spec 0011](../../specs/0011-loss-reconstruction-and-gc-statistics.md) states that below 3.15
-  Coverage is `0` and pause figures are absent. With a Probe on 3.13/3.14 that is false, and
+- [ADR 0017](0017-monitoring-tiers-follow-the-entry-layout.md) gives a build with no timing
+  fields Coverage `0` and absent pause figures, which below 3.15 is every build. With a Probe
+  on 3.13/3.14 that is false, and
   its reconstruction arithmetic works there *because* of this decision. Whichever of the two
   lands second amends the other.
 - `Install-relative` becomes a term the output surface has to be able to express, not merely a

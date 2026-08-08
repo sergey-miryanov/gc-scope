@@ -358,6 +358,11 @@ impl Cursor {
 
     /// The latest moment the Observer has proof this interpreter reached. `None` on a build
     /// that publishes no timestamps, and until the first Record is read.
+    ///
+    /// No caller yet: it bounds the Loss intervals `specs/0019-loss-spans-in-the-trace.md`
+    /// draws, and is kept ahead of them because the bound exists only at the poll that catches
+    /// an Entry in flight. The ring overwrites that Entry within a few polls, and no trace file
+    /// or replay path carries it.
     pub fn last_certainty(&self, pid: u32, interpreter: i64) -> Option<i64> {
         self.last_certainty.get(&(pid, interpreter)).copied()
     }

@@ -1,8 +1,8 @@
 # 0019 — Loss is accounted over the observed span
 
-**Status:** Accepted — implemented 2026-08-07. Delivers the Loss arithmetic of
-[spec 0011](../../specs/0011-loss-reconstruction-and-gc-statistics.md) §4, on top of the
-tiers [ADR 0017](0017-monitoring-tiers-follow-the-entry-layout.md) draws.
+**Status:** Accepted — implemented 2026-08-07. Delivers the Loss arithmetic of §4 of
+spec 0011, now deleted, on top of the tiers
+[ADR 0017](0017-monitoring-tiers-follow-the-entry-layout.md) draws.
 
 ## Context
 
@@ -86,4 +86,4 @@ overwritten unread or simply predates the Observer.
   0005's trigger: a total over a large input space with stated invariants).
 - The geometry that draws Loss as intervals stays out: window bounding, merging across
   generations, splitting around observed Collections. Those wait for the exporter that can give
-  them a track of their own (spec 0011 §6).
+  them a track of their own ([spec 0019](../../specs/0019-loss-spans-in-the-trace.md)).

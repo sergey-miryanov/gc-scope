@@ -81,8 +81,8 @@ makes a consumer certain.
 
 ## What reads it
 
-The pyperf hook of [spec 0011](../specs/0011-loss-reconstruction-and-gc-statistics.md) reads
-this document to put GC metrics into a benchmark's metadata. It runs the benchmark under
+A pyperf hook, the last increment of the ported consumer stack, reads this document to put GC
+metrics into a benchmark's metadata. It runs the benchmark under
 `gcscope run`, then folds the summary:
 
 ```python

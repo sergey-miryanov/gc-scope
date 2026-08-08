@@ -210,9 +210,10 @@ shipped decoder rather than a parallel one.
 - **The Probe itself** — [0013](0013-probe-portable-core.md).
 - **Wheel building, publishing, CI matrix** — [0015](0015-publish-probe-wheels.md), except the
   single always-on contract leg, which this spec's §5 cases define and that spec wires up.
-- **Loss and Coverage reporting.** [0011](0011-loss-reconstruction-and-gc-statistics.md) owns
-  those surfaces. This spec makes the inputs correct and labelled on 3.13/3.14; it does not build
-  the reporting on top. See §7.
+- **Loss and Coverage reporting.** The monitoring subsystem owns those surfaces and they have
+  shipped ([ADR 0017](../docs/adr/0017-monitoring-tiers-follow-the-entry-layout.md),
+  [ADR 0019](../docs/adr/0019-loss-is-accounted-over-the-observed-span.md)). This spec makes the
+  inputs correct and labelled on 3.13/3.14; it does not rework the reporting on top. See §7.
 - **gcscope installing, injecting or launching a Probe.** Explicitly rejected during the design
   session: it would turn an opt-in import into remote code injection and change the product.
 - **Reading a Probe on 3.15+.** The Native ring wins; no lookup is attempted.
@@ -221,14 +222,15 @@ shipped decoder rather than a parallel one.
 
 ## 7. Further notes
 
-**Interaction with [0011](0011-loss-reconstruction-and-gc-statistics.md), which is the important
-one.** 0011 states that below 3.15 "there are no spans", Coverage is `0`, and pause figures are
-reported as **absent**. A Probe falsifies all three on 3.13 and 3.14. The specs are compatible in
-substance — 0011's reconstruction math works on a Probe ring precisely because
-[0013](0013-probe-portable-core.md) seeds the counters, so the difference between what the
-counters say ran and what was read is still exact — but whichever lands second must amend the
-other's sub-3.15 branch rather than leaving two accounts of the same behaviour. If 0011 lands
-first, its "Coverage is 0 below 3.15" becomes "Coverage is 0 below 3.15 **without a Probe**".
+**Interaction with the monitoring tiers, which is the important one, and which landed first.**
+[ADR 0017](../docs/adr/0017-monitoring-tiers-follow-the-entry-layout.md) gives a build with no
+timing fields counter tracks rather than spans, Coverage `0`, and pause figures reported as
+**absent**. A Probe falsifies all three on 3.13 and 3.14. The two are compatible in substance —
+[ADR 0019](../docs/adr/0019-loss-is-accounted-over-the-observed-span.md)'s reconstruction works
+on a Probe ring precisely because [0013](0013-probe-portable-core.md) seeds the counters, so the
+difference between what the counters say ran and what was read is still exact. This spec amends
+that branch: "Coverage is 0 below 3.15" becomes "Coverage is 0 below 3.15 **without a Probe**",
+in the ADR and in `docs/summary-json.md`.
 
 **Open question for when this is picked up.** Whether a rejected Probe should suppress the
 capability hint. Both firing at once ("a Probe was rejected" + "install a Probe") is clearly
