@@ -194,7 +194,15 @@ per-tick cost matter, or restructuring tree discovery and dedup.
    more than the body asserts has slipped through twice here.
 2. **Prefer an independent oracle to a constant.** Ask the interpreter, invert the
    function, or assert a relationship. A literal copied from the implementation tests
-   nothing.
+   nothing. Two outputs are the deliberate exception, because their consumers sit outside
+   this repo and a renamed key has to fail here rather than in someone's dashboard: the
+   Chrome trace and the `--summary-json` document are pinned byte for byte, by
+   `exporters::chrome`'s `golden_matrix_bytes_are_unchanged` and `summary_json`'s
+   `the_document_is_this_shape`. Those pins are constants, and pasting fresh bytes in to
+   make a build pass is the only way to defeat them, so the oracle sits beside them instead
+   of inside: `live_monitor_writes_a_summary_a_json_parser_can_read` hands the written
+   document to the target's own `json` module, a reader that knows nothing about how the
+   bytes were produced.
 3. **Say what a test does not prove**, and where the rest of the coverage lives. The
    adversarial tiers assert that the scan returns something representable, and nothing
    about which version is right.
