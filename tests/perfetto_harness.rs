@@ -14,8 +14,7 @@ mod common;
 
 use std::path::PathBuf;
 
-use common::perfetto::{Dump, dump, dump_wire_only, harness_python_or_skip, reference_trace};
-use serde_json::Value;
+use common::perfetto::{Dump, dump, dump_wire_only, harness_python_or_skip, keys, reference_trace};
 
 fn trace_path(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -23,18 +22,6 @@ fn trace_path(tag: &str) -> PathBuf {
         std::process::id(),
         tag
     ))
-}
-
-/// The keys of one JSON object, sorted. What an "and nothing else" assertion compares.
-fn keys(value: &Value) -> Vec<&str> {
-    let mut names: Vec<&str> = value
-        .as_object()
-        .unwrap_or_else(|| panic!("not an object: {value}"))
-        .keys()
-        .map(String::as_str)
-        .collect();
-    names.sort_unstable();
-    names
 }
 
 #[test]

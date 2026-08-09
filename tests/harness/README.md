@@ -24,8 +24,12 @@ python -m pytest tests/harness -m "not trace_processor"   # skip the query engin
 python tests/harness/perfetto_dump.py trace.perfetto-trace
 python tests/harness/perfetto_dump.py trace.perfetto-trace --skip-trace-processor
 
+# on a table of field numbers
+python tests/harness/proto_constants.py claims.json
+
 # from Rust
-cargo test --test perfetto_harness -- --ignored
+cargo test --test perfetto_harness -- --ignored     # the seam
+cargo test --test perfetto_encoder -- --ignored     # gcscope's encoder through it
 ```
 
 Rust reaches it through `tests/common/perfetto.rs`, which runs the script and hands back the
@@ -53,16 +57,28 @@ The failure is in the document, so nobody mistakes a missing view for an empty o
 Exit codes: **0** the trace is structurally valid, **1** it is not, **2** the harness could not
 run. A rejection is data either way, printed with its problems listed.
 
-## Two decoders
+## Three readers
 
-| view | from | answers |
+| reader | from | answers |
 |---|---|---|
 | `wire` | `perfetto_trace_pb2` | is this the field I meant to write |
 | `trace_processor` | the binary the Perfetto UI runs | does a wire-valid trace *mean* what it should |
+| `proto_constants.py` | the same generated descriptors | is this the number that field actually has |
 
-Fields the trace processor does not expose as columns — `sibling_order_rank` always,
-`y_axis_share_key` before trace-processor 0.57 — come from the wire view. Do not "fix" a
-missing column by asserting on something else that happens to exist.
+Fields the trace processor does not expose as columns — `sibling_order_rank` among them — come
+from the wire view. Do not "fix" a missing column by asserting on something else that happens
+to exist.
+
+`proto_constants.py` is the narrowest of the three, and the only one that reads no trace. It
+takes claims — `(message, field, number)` and `(message, enum, value, number)` — from a file or
+stdin, and answers whether the schema agrees, so a table of field numbers transcribed by hand
+in another language is re-derived from the descriptors on every run. It knows nothing about who
+is asking or what they intend to write into those fields. Same exit codes: **0** every claim
+holds, **1** at least one does not, **2** it could not run.
+
+Its answer is only as current as the pinned `perfetto`. A field added or moved upstream is
+invisible here until someone bumps `requirements.txt` — the guarantee is against the schema
+someone checked in, not against the world.
 
 ## Three rendering decisions
 

@@ -11,7 +11,7 @@
 //! `process_name`, and a combiner that dropped the second would leave the second format's
 //! track unnamed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{EventsExporter, ProcessLifecycle};
 use crate::monitor::trace_event::TraceEvent;
@@ -31,28 +31,50 @@ use crate::monitor::trace_event::TraceEvent;
 ///   there, so returning early on the first error would corrupt the very traces the run was
 ///   for.
 ///
+/// ## One `--output`, one file per member
+///
+/// Every member is asked where it writes ([`EventsExporter::output_path`]) before it is
+/// opened, so two formats given one `--output` land in two files rather than truncating each
+/// other into one. The rule is applied here rather than inside each encoder, because it is a
+/// property of the composition: an encoder used alone still writes exactly where it is told.
+///
 /// No `Default`. An empty fan-out opens, closes and swallows every batch without error, so a
 /// run would report a trace written to a file that was never created. The only constructor
 /// takes its members.
 pub struct CombiningExporter {
     members: Vec<Box<dyn EventsExporter>>,
+    /// What the last [`open`](EventsExporter::open) resolved to, in member order. Recorded on
+    /// the way through rather than recomputed, so the run reports the files it opened.
+    opened: Vec<PathBuf>,
 }
 
 impl CombiningExporter {
     pub fn new(members: Vec<Box<dyn EventsExporter>>) -> Self {
-        Self { members }
+        Self {
+            members,
+            opened: Vec::new(),
+        }
+    }
+
+    /// The files this fan-out opened, in member order. Empty before the first `open`.
+    pub fn opened_paths(&self) -> &[PathBuf] {
+        &self.opened
     }
 }
 
 impl EventsExporter for CombiningExporter {
     fn open(&mut self, path: &Path) -> std::io::Result<()> {
+        self.opened.clear();
         for index in 0..self.members.len() {
-            if let Err(error) = self.members[index].open(path) {
+            let resolved = self.members[index].output_path(path);
+            if let Err(error) = self.members[index].open(&resolved) {
                 for opened in &mut self.members[..index] {
                     let _ = opened.close();
                 }
+                self.opened.clear();
                 return Err(error);
             }
+            self.opened.push(resolved);
         }
         Ok(())
     }
@@ -110,6 +132,9 @@ mod tests {
         log: Rc<RefCell<Log>>,
         open_error: bool,
         close_error: Option<&'static str>,
+        /// Set to make this member resolve `--output` to its own extension, as a real second
+        /// format does.
+        extension: Option<&'static str>,
     }
 
     impl Double {
@@ -120,9 +145,16 @@ mod tests {
                     log: log.clone(),
                     open_error: false,
                     close_error: None,
+                    extension: None,
                 },
                 log,
             )
+        }
+
+        fn writing(extension: &'static str) -> (Self, Rc<RefCell<Log>>) {
+            let (mut double, log) = Self::new();
+            double.extension = Some(extension);
+            (double, log)
         }
 
         fn failing_open() -> (Self, Rc<RefCell<Log>>) {
@@ -139,6 +171,17 @@ mod tests {
     }
 
     impl EventsExporter for Double {
+        fn output_path(&self, requested: &Path) -> PathBuf {
+            match self.extension {
+                Some(extension) => {
+                    let mut path = requested.to_path_buf();
+                    path.set_extension(extension);
+                    path
+                }
+                None => requested.to_path_buf(),
+            }
+        }
+
         fn open(&mut self, path: &Path) -> std::io::Result<()> {
             if self.open_error {
                 return Err(Error::new(ErrorKind::PermissionDenied, "open refused"));
@@ -231,6 +274,51 @@ mod tests {
         assert_eq!(second_log.borrow().opened, vec![path]);
         assert_eq!(first_log.borrow().closed, 1);
         assert_eq!(second_log.borrow().closed, 1);
+    }
+
+    /// One `--output`, two formats, two files. A member that resolves its own path is opened
+    /// on that path, and the one that does not is opened on what the operator typed — so a
+    /// second format cannot truncate the first's file and interleave into it.
+    #[test]
+    fn each_member_is_opened_on_the_path_it_resolved_for_itself() {
+        let (first, first_log) = Double::new();
+        let (second, second_log) = Double::writing("perfetto-trace");
+        let mut combined = CombiningExporter::new(vec![Box::new(first), Box::new(second)]);
+
+        combined
+            .open(Path::new("gcmon_trace.json"))
+            .expect("both doubles open cleanly");
+
+        assert_eq!(
+            first_log.borrow().opened,
+            vec![PathBuf::from("gcmon_trace.json")]
+        );
+        assert_eq!(
+            second_log.borrow().opened,
+            vec![PathBuf::from("gcmon_trace.perfetto-trace")]
+        );
+        assert_eq!(
+            combined.opened_paths(),
+            [
+                PathBuf::from("gcmon_trace.json"),
+                PathBuf::from("gcmon_trace.perfetto-trace")
+            ]
+        );
+    }
+
+    /// The run reports the files it opened, so a failed `open` must not leave it claiming any.
+    /// Reporting a path for a trace that was never created is what this clears.
+    #[test]
+    fn a_failed_open_leaves_no_path_claimed() {
+        let (first, _) = Double::new();
+        let (second, _) = Double::failing_open();
+        let mut combined = CombiningExporter::new(vec![Box::new(first), Box::new(second)]);
+
+        combined
+            .open(Path::new("gcmon_trace.json"))
+            .expect_err("the second member refuses to open");
+
+        assert!(combined.opened_paths().is_empty());
     }
 
     #[test]

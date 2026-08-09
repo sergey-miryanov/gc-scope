@@ -97,3 +97,23 @@ fn help_documents_the_flag_its_default_and_its_values() {
         assert!(help.contains("[default: chrome]"), "{subcommand}: {help}");
     }
 }
+
+/// One `--output`, and a format whose bytes are not what that path's extension claims. Where
+/// the file actually lands is the operator's to know before the run, not after it, so `--help`
+/// carries the rule and this asserts the sentence is still there.
+///
+/// Compared against the help with its whitespace collapsed: clap wraps to the terminal width,
+/// so the sentence is one line here and two on a narrower one.
+#[test]
+fn help_says_where_a_perfetto_trace_lands() {
+    for subcommand in ["monitor", "run"] {
+        let (code, help, stderr) = gcscope(&[subcommand, "--help"]);
+        assert_eq!(code, 0, "{stderr}");
+
+        let unwrapped = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            unwrapped.contains("`--format perfetto -o run.json` writes `run.perfetto-trace`"),
+            "{subcommand}: {help}"
+        );
+    }
+}

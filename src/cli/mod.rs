@@ -44,7 +44,7 @@ pub enum Command {
         #[arg(short, long)]
         all: bool,
     },
-    /// Monitor GC activity in real-time and export to Chrome Trace
+    /// Monitor GC activity in real-time and export it as a trace
     Monitor {
         #[arg(allow_hyphen_values = true)]
         pid: i32,

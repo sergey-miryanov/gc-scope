@@ -83,6 +83,13 @@ say no might only ever say yes.
 *should* contain is an expectation and belongs in Rust beside the encoder. A harness carrying
 domain knowledge starts agreeing with the encoder for the wrong reasons.
 
+**A constant transcribed from a schema is checked against that schema, not against a copy.**
+A hand-maintained table of field numbers has the same failure mode one layer up, and a test
+asserting it against anything inside this repo agrees with it by construction.
+`tests/harness/proto_constants.py` answers from the official descriptors, and the table it
+checks is emitted by the same macro that declares the constants — so a constant nothing asserts
+cannot be written ([ADR 0021](adr/0021-hand-rolled-perfetto-encoder.md)).
+
 **Cost:** a Python environment with the decoder installed, and one CI leg
 (`perfetto-harness`). Mark the Rust side `#[ignore]` so the default `cargo test` stays green
 without the package, and set the leg's `GCSCOPE_REQUIRE_*` gate so a skip cannot read as a pass.

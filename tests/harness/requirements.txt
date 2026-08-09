@@ -8,6 +8,11 @@
 # This is NOT gcscope_probe's dependency list. That package is a distributable C extension
 # whose `requires-python = ">=3.13,<3.15"` is an ABI gate on internal struct layout; the
 # harness reads a file format and has no business inheriting an interpreter bound from it.
-perfetto==0.56.0
+# 0.57.2 rather than 0.56.0, and the two fields that force it are `TrackDescriptor`'s
+# `process_ordering` and `thread_ordering`. They are absent from 0.56.0's schema, so a
+# constant naming either one has nothing to be checked against, and gcscope writes both on the
+# root descriptor. 0.57 is also where trace-processor starts exposing `y_axis_share_key` as a
+# column.
+perfetto==0.57.2
 protobuf==7.35.1
 pytest==8.3.5

@@ -11,6 +11,7 @@ use crate::cli::monitor_options::{MonitorOptions, TraceFormat};
 use crate::monitor::exporters::EventsExporter;
 use crate::monitor::exporters::chrome::ChromeTraceExporter;
 use crate::monitor::exporters::combining::CombiningExporter;
+use crate::monitor::exporters::perfetto::PerfettoExporter;
 use crate::monitor::{MonitorContext, StartupTimeoutPolicy, run_loop, statistics, summary_json};
 
 // ---------------------------------------------------------------------------
@@ -142,11 +143,24 @@ pub fn run(
 /// Always a [`CombiningExporter`], even holding one member. The single-member case is then
 /// the path production takes on every run, rather than a branch that only wakes up the day a
 /// second format is asked for.
-fn exporter_for(format: TraceFormat) -> Box<dyn EventsExporter> {
+fn exporter_for(format: TraceFormat) -> CombiningExporter {
     let members: Vec<Box<dyn EventsExporter>> = match format {
         TraceFormat::Chrome => vec![Box::new(ChromeTraceExporter::new())],
+        TraceFormat::Perfetto => vec![Box::new(PerfettoExporter::new())],
     };
-    Box::new(CombiningExporter::new(members))
+    CombiningExporter::new(members)
+}
+
+/// The files a run wrote, for the line that tells the operator where they are. One `--output`
+/// can resolve to more than one path, so the message names what was opened rather than what
+/// was typed.
+fn written_to(exporter: &CombiningExporter) -> String {
+    exporter
+        .opened_paths()
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Create exporter, set up ctrlc, run monitor loop, close, return exit code.
@@ -162,7 +176,7 @@ fn run_monitoring_loop(runner: &mut impl ProcessRunner, opts: &MonitorOptions) -
     let r = running.clone();
     ctrlc::set_handler(move || r.store(false, Ordering::SeqCst))?;
 
-    let mut ctx = MonitorContext::new(&mut *exporter);
+    let mut ctx = MonitorContext::new(&mut exporter);
     run_loop(&mut ctx, pid, opts.rate, &running, || {
         StartupTimeoutPolicy::new(Duration::from_secs(2))
     })?;
@@ -183,7 +197,7 @@ fn run_monitoring_loop(runner: &mut impl ProcessRunner, opts: &MonitorOptions) -
     // so a mistyped `--summary-json` path returning early here truncated the trace the whole
     // run was for.
     ctx.close()?;
-    eprintln!("Trace written to {}", opts.output);
+    eprintln!("Trace written to {}", written_to(&exporter));
 
     let written = match &opts.summary_json {
         Some(destination) => summary_json::write(destination, &summary),
@@ -227,5 +241,45 @@ mod tests {
         let message = format!("{error}");
         assert!(message.contains("--summary-json -"), "{message}");
         assert!(message.contains("monitor"), "{message}");
+    }
+
+    /// Open and close whichever format `--output` asked for, and give back the line the run
+    /// prints plus whether the requested path itself now exists.
+    fn opened(format: TraceFormat, tag: &str) -> (String, bool) {
+        let requested = std::env::temp_dir().join(format!(
+            "gcscope_format_{}_{}.json",
+            std::process::id(),
+            tag
+        ));
+        let mut exporter = exporter_for(format);
+        exporter.open(&requested).unwrap();
+        exporter.close().unwrap();
+
+        let line = written_to(&exporter);
+        let created = requested.exists();
+        for path in exporter.opened_paths() {
+            std::fs::remove_file(path).ok();
+        }
+        std::fs::remove_file(&requested).ok();
+        (line, created)
+    }
+
+    /// What `--output` means for a format whose bytes are not JSON. The `.json` the operator
+    /// typed is neither written nor created — a file holding protobuf under that name is one
+    /// nobody opens twice — and the run says where the trace actually went.
+    #[test]
+    fn perfetto_writes_beside_the_requested_path_and_says_so() {
+        let (line, created_the_json) = opened(TraceFormat::Perfetto, "perfetto");
+        assert!(line.ends_with(".perfetto-trace"), "{line}");
+        assert!(!created_the_json, "the `.json` path was created anyway");
+    }
+
+    /// Chrome keeps the path it was given, so every script that reads `gcmon_trace.json` still
+    /// finds it there.
+    #[test]
+    fn chrome_writes_exactly_where_it_was_asked_to() {
+        let (line, created_the_json) = opened(TraceFormat::Chrome, "chrome");
+        assert!(line.ends_with(".json"), "{line}");
+        assert!(created_the_json);
     }
 }

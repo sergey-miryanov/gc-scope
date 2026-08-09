@@ -13,8 +13,9 @@
 // unused in the others.
 #![allow(dead_code)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
@@ -23,6 +24,9 @@ use super::test_python;
 /// The document version this helper reads. `perfetto_dump.py` publishes it under `schema`, and
 /// bumping it there without bumping it here is meant to fail loudly.
 const SCHEMA: &str = "gcscope.perfetto-dump/1";
+
+/// The same, for the field-number checker, which speaks a document of its own.
+const CONSTANTS_SCHEMA: &str = "gcscope.proto-constants/1";
 
 /// What the harness printed and what it concluded.
 pub struct Dump {
@@ -66,6 +70,19 @@ impl Dump {
             _ => "  (none)".to_string(),
         }
     }
+}
+
+/// The keys of one JSON object, sorted. What an "and nothing else" assertion compares — the
+/// question a text dump cannot answer, since an unexpected field is a token nobody read.
+pub fn keys(value: &Value) -> Vec<&str> {
+    let mut names: Vec<&str> = value
+        .as_object()
+        .unwrap_or_else(|| panic!("not an object: {value}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 fn harness_dir() -> PathBuf {
@@ -136,6 +153,46 @@ pub fn harness_python_or_skip(test: &str) -> Option<PathBuf> {
     );
     eprintln!("SKIP {test}: {msg}");
     None
+}
+
+/// Hand a claims document to `proto_constants.py` and give back the verdict it printed.
+///
+/// The claims go over stdin rather than through a file: the table being checked is compiled
+/// into this test binary, so writing it out somewhere would only add a path to clean up.
+pub fn check_constants(python: &Path, claims: &str) -> Value {
+    let mut child = Command::new(python)
+        .arg(harness_dir().join("proto_constants.py"))
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the constants checker");
+    child
+        .stdin
+        .take()
+        .expect("the checker reads stdin")
+        .write_all(claims.as_bytes())
+        .expect("hand over the claims");
+
+    let out = child.wait_with_output().expect("the checker finishes");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(
+        out.status.code().unwrap_or(-1),
+        2,
+        "the checker could not run: {stderr}"
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let verdict: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("the checker printed something that is not JSON: {e}\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert_eq!(
+        verdict["schema"], CONSTANTS_SCHEMA,
+        "the checker speaks a document version this helper does not: {}",
+        verdict["schema"]
+    );
+    verdict
 }
 
 /// Both views of `trace`. Starts the query engine, which downloads its binary on first use.

@@ -11,6 +11,9 @@ pub enum TraceFormat {
     /// Chrome Trace JSON, readable by `chrome://tracing` and ui.perfetto.dev
     #[default]
     Chrome,
+    /// Perfetto's binary trace, written beside `--output` with a `.perfetto-trace` extension.
+    /// Carries the process tracks; GC activity is still being added to it
+    Perfetto,
 }
 
 /// Shared monitoring options for run and monitor commands.
@@ -24,11 +27,12 @@ pub struct MonitorOptions {
     #[arg(short, long, default_value = "100")]
     pub rate: u64,
 
-    /// Output trace file path
+    /// Output trace file path. Each format takes the extension its readers expect, so
+    /// `--format perfetto -o run.json` writes `run.perfetto-trace`
     #[arg(short = 'o', long, default_value = "gcmon_trace.json")]
     pub output: String,
 
-    /// Trace format to write to that path
+    /// Which encoder writes the trace
     #[arg(long, value_enum, default_value_t = TraceFormat::Chrome)]
     pub format: TraceFormat,
 

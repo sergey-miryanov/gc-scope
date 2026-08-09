@@ -683,3 +683,15 @@ jobs:
           export GCSCOPE_TEST_PYTHON
           echo "interpreter: $GCSCOPE_TEST_PYTHON"
           cargo test --test perfetto_harness -- --ignored --nocapture
+
+      # The encoder's own leg, run after the harness has proved itself against traces it did
+      # not write: the field-number table against the official descriptors, every wire
+      # primitive decoded back, and a trace the exporter wrote read by both views. A step of
+      # its own so a red run names which half broke.
+      - name: Check the encoder against the schema and the decoder
+        env:
+          GCSCOPE_REQUIRE_PERFETTO: '1'
+        run: |
+          GCSCOPE_TEST_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+          export GCSCOPE_TEST_PYTHON
+          cargo test --test perfetto_encoder -- --ignored --nocapture
