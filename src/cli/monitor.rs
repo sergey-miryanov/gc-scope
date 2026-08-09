@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::cli::monitor_options::MonitorOptions;
+use crate::cli::monitor_options::{MonitorOptions, TraceFormat};
 use crate::monitor::exporters::EventsExporter;
 use crate::monitor::exporters::chrome::ChromeTraceExporter;
+use crate::monitor::exporters::combining::CombiningExporter;
 use crate::monitor::{MonitorContext, StartupTimeoutPolicy, run_loop, statistics, summary_json};
 
 // ---------------------------------------------------------------------------
@@ -136,12 +137,24 @@ pub fn run(
 // Shared monitoring loop
 // ---------------------------------------------------------------------------
 
+/// The encoders one `--format` asks for, behind the fan-out that will carry a second.
+///
+/// Always a [`CombiningExporter`], even holding one member. The single-member case is then
+/// the path production takes on every run, rather than a branch that only wakes up the day a
+/// second format is asked for.
+fn exporter_for(format: TraceFormat) -> Box<dyn EventsExporter> {
+    let members: Vec<Box<dyn EventsExporter>> = match format {
+        TraceFormat::Chrome => vec![Box::new(ChromeTraceExporter::new())],
+    };
+    Box::new(CombiningExporter::new(members))
+}
+
 /// Create exporter, set up ctrlc, run monitor loop, close, return exit code.
 fn run_monitoring_loop(runner: &mut impl ProcessRunner, opts: &MonitorOptions) -> Result<i32> {
     let pid = runner.start()?;
     eprintln!("Monitoring PID: {}", pid);
 
-    let mut exporter = ChromeTraceExporter::new();
+    let mut exporter = exporter_for(opts.format);
     let path = PathBuf::from(&opts.output);
     exporter.open(&path)?;
 
@@ -149,7 +162,7 @@ fn run_monitoring_loop(runner: &mut impl ProcessRunner, opts: &MonitorOptions) -
     let r = running.clone();
     ctrlc::set_handler(move || r.store(false, Ordering::SeqCst))?;
 
-    let mut ctx = MonitorContext::new(&mut exporter);
+    let mut ctx = MonitorContext::new(&mut *exporter);
     run_loop(&mut ctx, pid, opts.rate, &running, || {
         StartupTimeoutPolicy::new(Duration::from_secs(2))
     })?;
@@ -191,6 +204,7 @@ mod tests {
         MonitorOptions {
             rate: 100,
             output: "gcmon_trace.json".to_string(),
+            format: TraceFormat::Chrome,
             summary: false,
             summary_json: summary_json.map(str::to_string),
         }

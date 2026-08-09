@@ -2,11 +2,15 @@
 //! like in a trace is decided once, in [`crate::monitor::convert`].
 
 pub mod chrome;
+pub mod combining;
 pub mod timing;
 
 use crate::monitor::trace_event::TraceEvent;
 use std::path::Path;
 
+/// `Copy` so a fan-out can hand the same mark to each of its members
+/// ([`combining::CombiningExporter`]); the enum carries nothing to clone.
+#[derive(Clone, Copy)]
 pub enum ProcessLifecycle {
     Started,
     Died,

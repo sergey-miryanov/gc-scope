@@ -62,7 +62,9 @@ pub enum Command {
         /// Module name to run (like python -m)
         #[arg(short, long, conflicts_with = "script")]
         module: Option<String>,
-        /// Arguments passed to the script/module
+        /// Arguments passed to the script/module. gcscope claims its own options first, so
+        /// put them after `--` if the program takes a flag gcscope also has (`--format`,
+        /// `--output`, `--rate`, `--summary`)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         script_args: Vec<String>,
         #[command(flatten)]
@@ -96,4 +98,61 @@ pub enum Command {
         #[arg(short, long, value_name = "FILE")]
         output: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::monitor_options::TraceFormat;
+    use clap::Parser;
+
+    fn monitoring_options(args: &[&str]) -> MonitorOptions {
+        let parsed = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        match parsed.command {
+            Command::Monitor { opts, .. } | Command::Run { opts, .. } => opts,
+            _ => panic!("{args:?} is not a monitoring command"),
+        }
+    }
+
+    /// The flag exists so a second format has somewhere to arrive, so an operator who never
+    /// types it gets the run they got before it existed. Omitting `--format` and spelling out
+    /// the default are the same invocation — compared whole, so a field added later is
+    /// covered without anyone remembering to add it here.
+    #[test]
+    fn omitting_the_format_flag_asks_for_the_same_thing_as_naming_chrome() {
+        for (flagless, explicit) in [
+            (
+                vec!["gcscope", "monitor", "1234"],
+                vec!["gcscope", "monitor", "1234", "--format", "chrome"],
+            ),
+            (
+                vec!["gcscope", "run", "-s", "spin.py"],
+                vec!["gcscope", "run", "-s", "spin.py", "--format", "chrome"],
+            ),
+        ] {
+            let default = monitoring_options(&flagless);
+            assert_eq!(default.format, TraceFormat::Chrome);
+            assert_eq!(monitoring_options(&explicit), default);
+        }
+    }
+
+    /// `run` forwards `script_args` to the target, but a gcscope flag is claimed by gcscope
+    /// first — so a program taking its own `--format` needs the `--` separator. True of every
+    /// option `MonitorOptions` owns, and `--format` is a common enough name to make it worth
+    /// pinning: the separator has to keep working.
+    #[test]
+    fn a_scripts_own_format_flag_reaches_it_after_the_separator() {
+        let parsed =
+            Cli::try_parse_from(["gcscope", "run", "-s", "app.py", "--", "--format", "json"])
+                .expect("`--` ends gcscope's own options");
+        let Command::Run {
+            opts, script_args, ..
+        } = parsed.command
+        else {
+            panic!("expected the run subcommand");
+        };
+
+        assert_eq!(script_args, vec!["--format", "json"]);
+        assert_eq!(opts.format, TraceFormat::Chrome);
+    }
 }
