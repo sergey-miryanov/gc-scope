@@ -19,6 +19,11 @@ sysinfo = "0.39"
 goblin = "0.10.7"
 sysinfo = "0.39"
 criterion = { version = "5.0.1", package = "codspeed-criterion-compat" }
+# Tests only, and only for *reading*. gcscope writes its JSON by hand (see
+# `monitor/exporters/chrome.rs`), which stays true — but a test asserting that a trace carries
+# exactly these keys and no others needs a parser, and hand-rolling one to avoid a
+# dev-dependency is the failure mode `tests/harness/` exists to prevent.
+serde_json = "1.0"
 
 [features]
 # Compiles the test-only fault-injection seam (PySession::inject_gc_stats_faults,

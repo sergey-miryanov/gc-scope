@@ -623,3 +623,63 @@ jobs:
           disable_search: true
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
+
+
+  perfetto-harness:
+    name: Perfetto verification harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1 (master)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # One interpreter, and a `python-version:` rather than a `python:` matrix — deliberately,
+      # for two reasons. The trace bytes gcscope writes do not depend on which CPython a target
+      # runs, so a matrix here would buy nothing the live legs do not already cover. And
+      # `matrix-unpinned` scans matrix keys only: adding one here would put this leg under a
+      # rule (float to the newest patch) written for a guard this leg is not part of.
+      #
+      # A bare minor, not an exact patch. What has to be reproducible on this leg is the
+      # *decoder*, and `requirements.txt` pins that exactly; the interpreter running it reads a
+      # file format and has no bearing on the bytes.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: tests/harness/requirements.txt
+
+      - name: Install the harness's dependencies
+        run: python -m pip install -r tests/harness/requirements.txt
+
+      # Two files, and only one of them is worth caching. The `perfetto` package downloads a
+      # ~10 KB launcher script into the temp directory (re-fetching it after seven days by its
+      # own rule), and *that* script fetches the actual query engine — tens of megabytes — into
+      # `~/.local/share/perfetto/prebuilts`. Caching the temp file saves the 10 KB and none of
+      # the download. The prebuilts are content-addressed by sha256 and never expire, so the
+      # key needs no rotation. A miss costs one download, not a failure.
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: ~/.local/share/perfetto/prebuilts
+          key: trace-processor-${{ runner.os }}-${{ hashFiles('tests/harness/requirements.txt') }}
+
+      # The harness proves itself first, against traces built with the protobuf bindings. If
+      # this is red, nothing the Rust side concludes about a gcscope trace is worth reading.
+      - name: Check the harness against traces it did not write
+        run: python -m pytest tests/harness -v
+
+      # GCSCOPE_REQUIRE_PERFETTO=1 stops a skip reading as a pass, the way probe-contract uses
+      # GCSCOPE_REQUIRE_PROBE. These tests skip when the package is absent, which is right on a
+      # laptop and would turn a failed install into a green leg here.
+      #
+      # `sys.executable` rather than `command -v python`, for the reason probe-contract gives:
+      # under bash on a runner that can resolve to a path Rust's Command cannot open.
+      - name: Assert the document reaches Rust
+        env:
+          GCSCOPE_REQUIRE_PERFETTO: '1'
+        run: |
+          GCSCOPE_TEST_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+          export GCSCOPE_TEST_PYTHON
+          echo "interpreter: $GCSCOPE_TEST_PYTHON"
+          cargo test --test perfetto_harness -- --ignored --nocapture

@@ -1,0 +1,13 @@
+# The verification harness's dependencies, declared here rather than installed by a bare
+# `pip install` in a workflow step, so a laptop and CI can reach the same state.
+#
+# Pinned exactly. The trace bytes gcscope writes do not depend on which interpreter a target
+# runs, so this leg gains nothing from a range and loses reproducibility: a decoder that
+# changes underneath a byte-for-byte assertion should be a commit someone made, not a Tuesday.
+#
+# This is NOT gcscope_probe's dependency list. That package is a distributable C extension
+# whose `requires-python = ">=3.13,<3.15"` is an ABI gate on internal struct layout; the
+# harness reads a file format and has no business inheriting an interpreter bound from it.
+perfetto==0.56.0
+protobuf==7.35.1
+pytest==8.3.5

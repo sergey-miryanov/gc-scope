@@ -646,6 +646,7 @@ dependencies = [
  "ratatui",
  "read-process-memory",
  "remoteprocess",
+ "serde_json",
  "sysinfo",
 ]
 
