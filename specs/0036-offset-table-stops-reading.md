@@ -16,8 +16,8 @@ stated once and decoded from bytes, and it also reads a process.
 
 `OffsetTable::read_gc_stats(&self, handle: &ProcessHandle, iid: i64)` is the only reason
 `offset_table.rs` names any of `read_process_memory::ProcessHandle`, `crate::memory::reader`,
-`anyhow::Context` or `anyhow::Result`. Each is used **exactly once** in a 900-line file, all
-four inside that one method. Delete it and the module is pure.
+`anyhow::Context` or `anyhow::Result`. Each is used **exactly once** in an 829-line file,
+all four inside that one method. Delete it and the module is pure.
 
 It earns very little for that. Its body is two shape guards, one read, and a call to
 `decode_gc_stats`, which is already `pub`, already pure, and documented as such ("Pure — no

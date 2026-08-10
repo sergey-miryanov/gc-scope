@@ -42,8 +42,9 @@ image" — and calls down for both primitives. `memory::process` stops importing
 1. As a gcscope maintainer, I want the per-format image walks in one module, so that a
    platform fact learned the hard way (Mach-O's underscore prefix, the fat-slice rebase, the
    `PyRuntim` truncation on PE) is recorded once where the next walk will find it.
-2. As a gcscope maintainer, I want `memory` to compile without `remote_debugging`, so that
-   ADR 0008's layering is enforced by the imports rather than believed.
+2. As a gcscope maintainer, I want `memory::process` to stop importing `version`, so that the
+   one plainly inverted import ADR 0008 forbids is gone from the pre-3.13 path. Two L2 imports
+   remain and §4 says why; this story is not "`memory` compiles without `remote_debugging`".
 3. As a maintainer writing tests for symbol resolution, I want the resolvers in the module
    that owns the image builders, so that testing them does not require making a test helper
    public across a layer boundary.
@@ -112,7 +113,7 @@ and judge the merge against tests that exist.
   "succeeded" would pass with a base address off by a slice offset.
 - **Prior art:** ADR 0008's own reorg, where `exporters/` moved with zero internal edits
   because its cross-references were `super::`-relative; and
-  `tests/remote_debugging.rs::detect_agrees_with_python_version`.
+  `tests/remote_debugging.rs::detect_matches_the_interpreter_version`.
 - **Cases:**
   1. `cargo build` succeeds with `src/memory/process.rs` no longer naming `version` — the
      property the spec buys, and the compiler checks it.

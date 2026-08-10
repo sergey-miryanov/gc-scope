@@ -50,8 +50,8 @@ Complements the two backward-looking docs:
 other half — the rule 0002 leaves behind in the same loop, so the two land back to back rather
 than rebasing the same six lines twice) → 0003 → 0004 (smallest user-visible wrongness) → then
 the cosmetic and efficiency tail in any order. The three tracks below each carry their own
-internal order and can be interleaved with that tail. Only one dependency crosses between
-groups: 0003 item A gates 0025.
+internal order and can be interleaved with that tail. Two dependencies cross between groups:
+0002 gates 0031, above, and 0003 item A gates 0025.
 
 **0017–0020 are a second track — the consumer stack ported from gcmon.** Its first increment
 landed as spec 0011, now deleted: reading every interpreter, the counter-only tier, the Loss
@@ -97,7 +97,9 @@ possible.
 [0031](0031-module-base-selection-is-testable.md) is pinned behind
 [0002](0002-pyruntime-module-discovery.md) in the top-level suggested order above, and 0033 and
 the 0034 → 0035 pair depend on nothing in the chain and fit any gap — the last two bullets
-below are theirs. Eight constraints hold the whole set together, and only two are hard:
+below are theirs. Eight constraints hold the whole set together, and three of them are hard
+blocks, each marked *hard* where it appears: 0022 gates 0023, 0003 item A gates 0025, and 0028
+gates 0029. Everything else is a preference about diff size, including 0028 before 0036.
 
 - **0021 and 0022 first, in either order.** Both are pure moves that land in an afternoon.
   0021 lifts the version grammar into its own module; 0022 drops image parsing into
@@ -124,11 +126,11 @@ below are theirs. Eight constraints hold the whole set together, and only two ar
   then puts the corrected assembly where a unit test can pin its byte order. 0030 is a one-word
   narrowing in `memory::regions`, a file 0025 already opens — fold it in there, or land it on
   its own in a minute.
-- **0028, then 0029 and 0036, last in the chain.** 0028 gives `memory::reader` the
-  handle-owning type `PySession` already implements by hand, retiring the `_h` suffix that
-  stands in for it; it goes after 0024, 0025 and 0027 because those three fold six of its ten
-  one-shot call sites into adapters, so landing it earlier means editing sites they then
-  rewrite. 0029 is what it is for: every handle opened on macOS leaks a mach port send right,
+- **0028, then 0029 and 0036, last in the chain**, and 0028 → 0029 is *hard*. 0028
+  gives `memory::reader` the handle-owning type `PySession` already implements by hand,
+  retiring the `_h` suffix that stands in for it; it goes after 0024, 0025 and 0027 because
+  those three fold six of its ten one-shot call sites into adapters, so landing it earlier
+  means editing sites they then rewrite. 0029 is what it is for: every handle opened on macOS leaks a mach port send right,
   upstream's handle has no `Drop` and no accessor to recover the port from, and nothing in
   gcscope owns one long enough to release it. The owning type has to exist before the leak can
   be fixed. 0036 is the other thing 0028 unblocks, and is independent of 0029: 0028 ports

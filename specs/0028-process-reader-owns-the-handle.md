@@ -90,7 +90,7 @@ reviewable, and it is the one that stops a rewrite hiding inside a move
 | `remote_debugging::session` (`attach`, `soft_reattach`, the three read methods, `layout_still_valid`) | `open_handle` + `*_h` | field becomes `ProcessReader`; `layout_still_valid` takes `&ProcessReader` |
 | `check_interpreter` ×4 | per-call | absorbed by [0025](0025-interpreter-scan-takes-its-reads.md) into one adapter |
 | `version::read_version_from_process` ×2 | per-call | absorbed by [0024](0024-detect-policy-takes-its-reads.md) into one adapter |
-| `offsets::mod` ×2 (`read_offsets`, the version word) | per-call | `attach` at each |
+| `offsets::mod` ×2 (`read_struct`, and the version word in `read_offsets`) | per-call | `attach` at each |
 | `process::validate_cookie` | per-call | `attach` at the call |
 | `main.rs` (`read` subcommand) | per-call | `attach` at the call, one read and no more |
 | `offsets::offset_table::read_gc_stats` | `handle: &ProcessHandle` parameter | `reader: &ProcessReader` |

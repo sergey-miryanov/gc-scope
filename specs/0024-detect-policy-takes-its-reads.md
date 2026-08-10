@@ -24,7 +24,8 @@ The rules it applies are all policy, none of it IO:
 - a decoded word whose major is not 3 is refused, and the scan phase still runs afterwards;
 - a word that `from_hex` refuses (a zeroed read) falls through the same way;
 - a module unreadable on disk is skipped, not fatal;
-- the version word is read as 8 bytes, then as 4 if that fails;
+- the version word is read as 8 bytes, and re-read as 4 when that read fails **or** when the
+  8-byte word decodes to nothing;
 - first match wins, in module order.
 
 Not one of those has a test. `detect` takes a `u32` PID and calls `binary::find_python_modules`,
@@ -130,13 +131,16 @@ degenerate-read cases become reachable. The reads are the part worth substitutin
      image's version.
   3. A zeroed word (`from_hex` → `None`) behaves the same way.
   4. An unreadable module (`read_image` → `None`) is skipped, and a later module wins.
-  5. The 4-byte fallback: `read_mem(_, 8)` fails, `read_mem(_, 4)` returns the word, version
-     decodes.
+  5. The 4-byte fallback, **both** of its triggers. (a) `read_mem(_, 8)` fails and
+     `read_mem(_, 4)` returns the word. (b) `read_mem(_, 8)` *succeeds* and its word is one
+     `from_hex` refuses, and the 4-byte read still runs. `read_version_from_process` falls
+     through on either, and a version that only staged (a) would pass a refactor to "4 bytes
+     only when the 8-byte read errors" — the behaviour change this case exists to catch.
   6. First match wins in module order, with two modules both publishing a valid symbol.
   7. Empty modules, and all modules failing, both yield `None` — and `detect`'s message still
      names the pid.
-  8. Regression guard: `tests/remote_debugging.rs::detect_agrees_with_python_version` is
-     unchanged and still the arbiter on the live matrix.
+  8. Regression guard: `tests/remote_debugging.rs::detect_matches_the_interpreter_version`
+     is unchanged and still the arbiter on the live matrix.
 
 ## 6. Out of scope
 

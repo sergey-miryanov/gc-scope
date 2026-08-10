@@ -17,12 +17,12 @@ lines, and the file's own header already describes them as two:
 
 Four functions live there, and the two large ones share nothing but the file:
 
-| Function | Lines (approx) | Section |
+| Function | Size | Section |
 |---|---|---|
-| `section_debug_offsets` | 20–246 | 1 — the `_Py_DebugOffsets` tree + hexdump |
-| `section_interpreter_legacy` | 247–262 | 2, Legacy tier |
-| `section_interpreter` | 263–461 | 2, Full tier |
-| `debug_tree_row_color` | 462–end | 1's tree helper |
+| `section_debug_offsets` | ~225 lines | 1 — the `_Py_DebugOffsets` tree + hexdump |
+| `section_interpreter_legacy` | ~15 lines | 2, Legacy tier |
+| `section_interpreter` | ~200 lines | 2, Full tier |
+| `debug_tree_row_color` | ~10 lines | 1's tree helper |
 
 The practical cost is [0035](0035-full-tier-section-fixtures.md): that spec adds unit tests
 for the two Full-tier builders, and adding them to a file this size means a test module whose
@@ -64,16 +64,23 @@ split follows a line someone has already thought about.
 `section_debug_offsets` emits and has no other caller. Its existing test moves with it.
 
 **`mod.rs` re-exports, so no call site changes:** `pub(super) use debug_offsets::…;` and
-`pub(super) use interpreter::…;`. This is what keeps `layout.rs`'s
+`pub(super) use interpreter::…;`. That keeps `layout.rs`'s
 `use super::sections::{section_debug_offsets, section_interpreter, section_interpreter_legacy}`
-resolving untouched — the same device [0021 §4](0021-version-grammar-module.md#4-implementation-decisions)
-uses to keep `version::PythonVersion` at its path. Note the visibility shift this requires:
-`pub(super)` inside `sections/interpreter.rs` now means "visible to `sections`", so the
-re-export in `mod.rs` is what carries them back out to `tui`.
+resolving untouched, the same device [0021 §4](0021-version-grammar-module.md#4-implementation-decisions)
+uses to keep `version::PythonVersion` at its path.
+
+**The three builders become `pub(in crate::tui)`, not `pub(super)`.** This is the one edit in
+the whole spec that is not a move, and it is forced. `pub(super)` inside
+`sections/interpreter.rs` means "visible to `sections`", so a `pub(super) use` in `mod.rs`
+re-exporting it out to `tui` would be wider than the item, which rustc rejects (`E0364`, with
+`E0603` following at the `layout.rs` call site). `gc_view` already solved this and is the
+pattern to copy verbatim: `compact.rs` declares `pub(in crate::tui) fn section_gc_stats`, and
+`gc_view/mod.rs` re-exports it with `pub(super) use`. `debug_tree_row_color` stays private,
+since it does not cross the boundary.
 
 **No logic is edited.** Not a line of rendering, not a doc comment, not a test body. The only
-permitted edits are the `mod`/`use` lines, the visibility above, and whatever `use super::*`
-adjustment the two moved test modules need.
+permitted edits are the `mod`/`use` lines, the two visibility changes above, and whatever
+`use super::*` adjustment the two moved test modules need.
 
 **Rejected — moving the tests into a single `sections/tests.rs`.** The two existing tests
 belong to specific functions and the crate keeps unit tests in the file they cover. A shared

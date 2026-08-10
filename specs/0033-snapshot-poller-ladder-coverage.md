@@ -178,7 +178,7 @@ observable contract is InvalidProcess + a single Died."
   become assertions, so editing them afterwards is a deliberate act with a failing test
   attached, which is the point.
 - **`collect_data` and everything below it.** Its pure half — `parse_gc_entries`,
-  `avg_collection_time_per_gen`, `collections_rate_from_entries` — already has 26 unit tests
+  `avg_collection_time_per_gen`, `collections_rate_from_entries` — already has 23 unit tests
   and needs nothing from this.
 - **A multi-PID snapshot mode.** `poller.rs`'s doc comment sketches
   `HashMap<u32, SnapshotPoller>`; that is a feature, and it would want these tests to exist
@@ -193,6 +193,6 @@ Independent of every other open spec, and the only one in the group whose produc
 confined to `#[cfg(feature = "test-hooks")]` code — two counters and two guard lines. Nothing
 compiled into a release build changes.
 
-Worth writing case 5 first. It needs no fault seam at all — a nonexistent PID is enough — so it
-lands while the rest is still being wired, and it covers the rule whose failure mode is the
-most user-visible: a mistyped PID in the picker leaving the operator watching nothing.
+Write case 4 first. It needs no fault seam, since a nonexistent PID is enough, so it lands
+while the rest is still being wired. It also covers the rule with the most user-visible
+failure mode: a mistyped PID in the picker leaving the operator watching nothing.

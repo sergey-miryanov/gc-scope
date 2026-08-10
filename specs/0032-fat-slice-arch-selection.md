@@ -45,7 +45,7 @@ fn fat_macho(thin: &[u8], slice_at: usize) -> Vec<u8> {
 Code and fixture agree by construction, whatever either says. And because every fat fixture
 carries **one** architecture, the `cputype != want` arm never runs against a table where
 skipping matters. So **a `parse_macho` that ignored `cputype` and took the first arch would
-pass the whole suite.** Eight tests exercise fat parsing; none exercises the choice.
+pass the whole suite.** Three tests build a fat image; none of them exercises the choice.
 
 The live matrix does not close the gap either. All three legs run `macos-latest`, which on
 GitHub's current images is Apple Silicon, so CI executes the `aarch64` arm. No test and no CI
