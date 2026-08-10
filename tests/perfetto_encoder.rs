@@ -23,7 +23,6 @@ mod common;
 use std::path::PathBuf;
 
 use common::perfetto::{check_constants, dump, dump_wire_only, harness_python_or_skip, keys};
-use gcscope::monitor::exporters::EventsExporter;
 use gcscope::monitor::exporters::perfetto::PerfettoExporter;
 use gcscope::monitor::exporters::perfetto_proto::{
     ENUM_VALUES, FIELDS, trace, trace_packet, track_descriptor, track_event, track_event_type,
@@ -31,6 +30,7 @@ use gcscope::monitor::exporters::perfetto_proto::{
 use gcscope::monitor::exporters::protobuf::{
     put_double, put_int32, put_int64, put_message, put_string, put_uint64,
 };
+use gcscope::monitor::exporters::{EventsExporter, ProcessLifecycle};
 use gcscope::monitor::trace_event::TraceEvent;
 
 fn trace_path(tag: &str) -> PathBuf {
@@ -279,12 +279,28 @@ fn a_trace_the_exporter_wrote_holds_together_and_names_its_process() {
     assert_eq!(root["process_ordering"], "PROCESS_ORDERING_EXPLICIT");
     assert_eq!(root["thread_ordering"], "THREAD_ORDERING_EXPLICIT");
 
-    // The process track. Its name and its ordering rank are a later step's; what this asserts
-    // is that the descriptor exists, sits on a uuid the root does not hold, and names the pid.
+    // The process track, whole. Asserted against what the `TraceEvent` said — `process_meta`
+    // built the name above — rather than against a copy of what the encoder emitted last time.
     let process = &packets[1]["track_descriptor"];
-    assert_eq!(keys(process), ["process", "uuid"]);
+    assert_eq!(
+        keys(process),
+        ["name", "process", "sibling_order_rank", "uuid"]
+    );
     assert_ne!(process["uuid"], "0");
+    assert_eq!(process["name"], "python 4242");
+    assert_eq!(keys(&process["process"]), ["pid", "process_name"]);
     assert_eq!(process["process"]["pid"], 4242);
+    assert_eq!(process["process"]["process_name"], "python 4242");
+
+    // `sibling_order_rank` comes from the wire view because **trace-processor exposes no column
+    // for it**: it is a UI ordering hint, not a property of a track the query engine models.
+    // Reaching for some other column that happens to exist would assert something else.
+    assert_eq!(process["sibling_order_rank"], 0);
+
+    // And no `start_timestamp_ns`: it wants the moment the process began on the target's clock,
+    // which gcscope has no reading of. The key-set assertion above is what enforces the
+    // absence; this says why it is deliberate.
+    assert!(process["process"].get("start_timestamp_ns").is_none());
 
     let pids: Vec<i64> = document
         .rows("process")
@@ -295,6 +311,93 @@ fn a_trace_the_exporter_wrote_holds_together_and_names_its_process() {
         pids.contains(&4242),
         "the query engine found no such process: {pids:?}"
     );
+}
+
+/// User story 4, asserted rather than screenshotted: a process gcscope attached to but never
+/// read a Record from is in the trace, drawn, and named by the query engine.
+///
+/// The marker is what makes it drawn — Perfetto's UI hides a track with no events on it — and
+/// it is the one timestamp gcscope generates itself, so it says which clock it is on.
+#[test]
+#[ignore = "needs the `perfetto` package and downloads the query engine — run with --ignored"]
+fn a_process_that_collected_nothing_is_still_in_the_trace() {
+    let Some(python) = harness_python_or_skip("perfetto silent process") else {
+        return;
+    };
+    let path = trace_path("silent");
+    let mut exporter = PerfettoExporter::new();
+    exporter.open(&path).unwrap();
+    // Exactly what the monitor does for a process it attached to: announce it, then mark it
+    // started. No Record ever arrives.
+    exporter.add_events(&[process_meta(4242), process_meta(7)]);
+    exporter.mark_process_lifecycle(4242, ProcessLifecycle::Started, Some(1_000));
+    exporter.mark_process_lifecycle(7, ProcessLifecycle::Started, Some(2_000));
+    exporter.close().unwrap();
+
+    let document = dump(&python, &path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(document.is_valid(), "{}", document.problems());
+
+    let mut pids: Vec<i64> = document
+        .rows("process")
+        .iter()
+        .filter_map(|row| row["pid"].as_i64())
+        .filter(|pid| *pid != 0)
+        .collect();
+    pids.sort_unstable();
+    assert_eq!(pids, [7, 4242], "every process, not only the ones that ran");
+
+    // Drawn: the marker is a zero-duration slice on each process's own track.
+    let markers: Vec<(&str, i64)> = document
+        .rows("slice")
+        .iter()
+        .filter_map(|row| Some((row["name"].as_str()?, row["dur"].as_i64()?)))
+        .collect();
+    assert_eq!(markers, [("Start Process", 0), ("Start Process", 0)]);
+
+    // And it says which clock its timestamp is on, which is the Observer's — not the target's,
+    // and not one a reader should compare against a Collection's.
+    let clocks: Vec<&str> = document
+        .rows("slice_args")
+        .iter()
+        .filter(|row| row["key"] == "debug.clock")
+        .filter_map(|row| row["string_value"].as_str())
+        .collect();
+    assert_eq!(clocks.len(), 2, "one per marker: {clocks:?}");
+    assert!(clocks[0].contains("gcscope"), "{clocks:?}");
+}
+
+/// The order the tree reads in is the order gcscope met the processes, and it is stated rather
+/// than left to the reader's heuristic. Ranks come from the wire view, per the note above.
+#[test]
+#[ignore = "needs the `perfetto` package — run with --ignored"]
+fn processes_are_ranked_in_the_order_they_were_met() {
+    let Some(python) = harness_python_or_skip("perfetto process ranks") else {
+        return;
+    };
+    let path = export(
+        &[process_meta(4242), process_meta(7), process_meta(99)],
+        "ranks",
+    );
+
+    let document = dump_wire_only(&python, &path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(document.is_valid(), "{}", document.problems());
+
+    let ranked: Vec<(i64, i64)> = document
+        .packets()
+        .iter()
+        .filter_map(|packet| {
+            let descriptor = &packet["track_descriptor"];
+            Some((
+                descriptor["process"]["pid"].as_i64()?,
+                descriptor["sibling_order_rank"].as_i64()?,
+            ))
+        })
+        .collect();
+    assert_eq!(ranked, [(4242, 0), (7, 1), (99, 2)]);
 }
 
 /// Two processes and a repeat, still one trace that holds together. The structural checks are

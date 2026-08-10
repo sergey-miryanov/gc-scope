@@ -85,7 +85,7 @@ impl EventsExporter for CombiningExporter {
         }
     }
 
-    fn mark_process_lifecycle(&mut self, pid: u32, kind: ProcessLifecycle, ts_ns: i64) {
+    fn mark_process_lifecycle(&mut self, pid: u32, kind: ProcessLifecycle, ts_ns: Option<i64>) {
         for member in &mut self.members {
             member.mark_process_lifecycle(pid, kind, ts_ns);
         }
@@ -121,7 +121,7 @@ mod tests {
     struct Log {
         opened: Vec<PathBuf>,
         batches: Vec<Vec<TraceEvent>>,
-        lifecycle: Vec<(u32, &'static str, i64)>,
+        lifecycle: Vec<(u32, &'static str, Option<i64>)>,
         closed: usize,
     }
 
@@ -194,7 +194,7 @@ mod tests {
             self.log.borrow_mut().batches.push(events.to_vec());
         }
 
-        fn mark_process_lifecycle(&mut self, pid: u32, kind: ProcessLifecycle, ts_ns: i64) {
+        fn mark_process_lifecycle(&mut self, pid: u32, kind: ProcessLifecycle, ts_ns: Option<i64>) {
             let kind = match kind {
                 ProcessLifecycle::Started => "started",
                 ProcessLifecycle::Died => "died",
@@ -321,16 +321,18 @@ mod tests {
         assert!(combined.opened_paths().is_empty());
     }
 
+    /// Including an absent timestamp: a member deciding for itself what "no reading" means is
+    /// how one format writes a zero where another writes nothing.
     #[test]
     fn lifecycle_marks_reach_every_member_with_their_arguments_intact() {
         let (first, first_log) = Double::new();
         let (second, second_log) = Double::new();
         let mut combined = CombiningExporter::new(vec![Box::new(first), Box::new(second)]);
 
-        combined.mark_process_lifecycle(11, ProcessLifecycle::Started, 700);
-        combined.mark_process_lifecycle(11, ProcessLifecycle::Died, 900);
+        combined.mark_process_lifecycle(11, ProcessLifecycle::Started, Some(700));
+        combined.mark_process_lifecycle(11, ProcessLifecycle::Died, None);
 
-        let expected = vec![(11, "started", 700), (11, "died", 900)];
+        let expected = vec![(11, "started", Some(700)), (11, "died", None)];
         assert_eq!(first_log.borrow().lifecycle, expected);
         assert_eq!(second_log.borrow().lifecycle, expected);
     }

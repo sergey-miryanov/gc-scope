@@ -36,6 +36,13 @@ pub trait EventsExporter {
     /// may rely on. A batch is whatever the producer converted in one step, so batch
     /// boundaries mean nothing.
     fn add_events(&mut self, events: &[TraceEvent]);
-    fn mark_process_lifecycle(&mut self, pid: u32, kind: ProcessLifecycle, ts_ns: i64);
+    /// A process gcscope started or stopped watching, on **the Observer's clock** — this is
+    /// gcscope talking about itself, not the target talking about a Collection.
+    ///
+    /// `ts_ns` is `None` when there is no reading to give. An encoder must then write no
+    /// timestamp rather than a zero: a zero is a point on the timeline, and one at the epoch
+    /// puts the mark decades from everything around it
+    /// ([ADR 0022](../../../docs/adr/0022-every-timestamp-names-its-clock.md)).
+    fn mark_process_lifecycle(&mut self, pid: u32, kind: ProcessLifecycle, ts_ns: Option<i64>);
     fn close(&mut self) -> std::io::Result<()>;
 }

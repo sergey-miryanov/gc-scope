@@ -97,6 +97,18 @@ static PHASES: &[Phase] = &[
     },
 ];
 
+/// What a process is called in a trace.
+///
+/// Here rather than at either call site because a process is named once: the monitor announces
+/// every process it attached to, and a Record from one repeats the announcement, and the two
+/// spellings disagreeing would draw one process as two.
+pub fn process_meta(pid: u32) -> TraceEvent {
+    TraceEvent::ProcessMeta {
+        pid,
+        name: format!("python {}", pid),
+    }
+}
+
 /// Turn one decoded Record into the events that describe it.
 ///
 /// What a build produces follows from its Entry layout, not its version: one publishing the
@@ -121,10 +133,7 @@ pub fn convert_record(pid: u32, record: &GcStat, observed_at_ns: i64) -> Vec<Tra
     }
 
     let mut events = vec![
-        TraceEvent::ProcessMeta {
-            pid,
-            name: format!("python {}", pid),
-        },
+        process_meta(pid),
         TraceEvent::ThreadMeta {
             pid,
             tid,

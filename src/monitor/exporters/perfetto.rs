@@ -6,12 +6,19 @@
 //!
 //! ## What it writes today
 //!
-//! The root descriptor and one track per process, and nothing else. Spans, counters and
-//! annotations arrive with the steps that decide how a Collection should look; until then a
-//! [`TraceEvent`] that is not a [`TraceEvent::ProcessMeta`] is dropped rather than guessed at.
-//! The point of this stage is the encoding machinery, checked against a decoder gcscope did
-//! not write before any layout policy rides on it ([ADR
+//! The root descriptor, one track per process, and the marker that keeps a process visible when
+//! it never collects. Spans and counters arrive with the step that decides how a Collection
+//! should look; until then a [`TraceEvent`] that is not a [`TraceEvent::ProcessMeta`] is dropped
+//! rather than guessed at. The encoding machinery is checked against a decoder gcscope did not
+//! write before any layout policy rides on it ([ADR
 //! 0021](../../../docs/adr/0021-hand-rolled-perfetto-encoder.md)).
+//!
+//! ## Which clock
+//!
+//! Every timestamp here is the Observer's, and says so
+//! ([ADR 0022](../../../docs/adr/0022-every-timestamp-names-its-clock.md)). The target's clock
+//! arrives with the Collections, and the two cannot share a trace until one of them is declared
+//! as a clock domain Perfetto can convert.
 //!
 //! ## The shape of the file
 //!
@@ -20,15 +27,16 @@
 //! field, and an encoder can append as it goes and stop anywhere — a trace truncated by a
 //! crash is the prefix that was written, still readable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::perfetto_proto::{
-    process_descriptor, process_ordering, thread_ordering, trace, trace_packet, track_descriptor,
+    debug_annotation, process_descriptor, process_ordering, thread_ordering, trace, trace_packet,
+    track_descriptor, track_event, track_event_type,
 };
-use super::protobuf::{put_int32, put_message, put_uint64};
+use super::protobuf::{put_int32, put_message, put_string, put_uint64};
 use super::{EventsExporter, ProcessLifecycle};
 use crate::monitor::trace_event::TraceEvent;
 
@@ -48,6 +56,15 @@ const FIRST_TRACK_UUID: u64 = 1;
 /// drops packets that name no sequence at all — interning and incremental state are
 /// sequence-scoped — and a fixed value keeps two runs of the same input byte-identical.
 const SEQUENCE_ID: u64 = 1;
+
+/// What the marker that keeps a silent process visible is called.
+const START_PROCESS: &str = "Start Process";
+
+/// The annotation key naming the clock an event's timestamp is on, and the one value gcscope
+/// writes today. Every timestamp gcscope generates itself is on this clock; the ones CPython
+/// publishes are on the target's, and belong to a later step.
+const CLOCK_ANNOTATION: &str = "clock";
+const OBSERVER_CLOCK: &str = "gcscope observer, ns since the run began";
 
 /// One `TracePacket`, framed as the `Trace.packet` field that holds it.
 fn packet(body: &[u8]) -> Vec<u8> {
@@ -100,17 +117,74 @@ fn root_descriptor() -> Vec<u8> {
 
 /// A top-level track for one process.
 ///
+/// The `name` is the track's title and `process.process_name` is what the query engine reports
+/// in its `process` table. Both, because they are separate fields answering separate questions
+/// and a reader looking for one does not find the other.
+///
+/// `rank` orders this process against its siblings, honoured because the root descriptor said
+/// the ordering is explicit. Without it the tree reads in whatever order gcscope happened to
+/// see the processes in, which is a property of the poll rather than of the program.
+///
+/// **No `start_timestamp_ns`.** The field wants the moment the process began, on the target's
+/// clock, and gcscope has no reading on that clock — it attached partway through a program
+/// already running. Writing the attach instead would date a process to when it was noticed
+/// ([ADR 0022](../../../docs/adr/0022-every-timestamp-names-its-clock.md)).
+///
 /// `ProcessDescriptor.pid` is an `int32`, so a pid that does not fit one cannot be spelled in
 /// this format; the cast wraps rather than inventing a substitute. No OS gcscope attaches on
 /// issues pids that large.
-fn process_track(uuid: u64, pid: u32) -> Vec<u8> {
+fn process_track(uuid: u64, pid: u32, name: Option<&str>, rank: i32) -> Vec<u8> {
     let mut process = Vec::new();
     put_int32(&mut process, process_descriptor::PID, pid as i32);
+    if let Some(name) = name {
+        put_string(&mut process, process_descriptor::PROCESS_NAME, name);
+    }
 
     let mut descriptor = Vec::new();
     put_uint64(&mut descriptor, track_descriptor::UUID, uuid);
+    if let Some(name) = name {
+        put_string(&mut descriptor, track_descriptor::NAME, name);
+    }
     put_message(&mut descriptor, track_descriptor::PROCESS, &process);
+    put_int32(&mut descriptor, track_descriptor::SIBLING_ORDER_RANK, rank);
     descriptor_packet(&descriptor)
+}
+
+/// The zero-duration instant that makes a process's track visible.
+///
+/// **Perfetto's UI hides a track with no events on it.** A process that never collects has no
+/// events at all, so without this marker the operator's worker is missing from the trace they
+/// opened to find out whether it collected — and "it did none" is a different answer from "it
+/// is not there". One per process, on the process track itself.
+///
+/// The timestamp is the Observer's: the moment gcscope attached, not anything the target did.
+/// The annotation says so, because this is the one event in the trace on that clock and a
+/// number with no clock beside it invites being read against the ones around it
+/// ([ADR 0022](../../../docs/adr/0022-every-timestamp-names-its-clock.md)).
+fn start_process_instant(uuid: u64, ts_ns: u64) -> Vec<u8> {
+    let mut clock = Vec::new();
+    put_string(&mut clock, debug_annotation::NAME, CLOCK_ANNOTATION);
+    put_string(&mut clock, debug_annotation::STRING_VALUE, OBSERVER_CLOCK);
+
+    let mut event = Vec::new();
+    put_message(&mut event, track_event::DEBUG_ANNOTATIONS, &clock);
+    put_uint64(
+        &mut event,
+        track_event::TYPE,
+        u64::from(track_event_type::INSTANT),
+    );
+    put_uint64(&mut event, track_event::TRACK_UUID, uuid);
+    put_string(&mut event, track_event::NAME, START_PROCESS);
+
+    let mut body = Vec::new();
+    put_uint64(&mut body, trace_packet::TIMESTAMP, ts_ns);
+    put_uint64(
+        &mut body,
+        trace_packet::TRUSTED_PACKET_SEQUENCE_ID,
+        SEQUENCE_ID,
+    );
+    put_message(&mut body, trace_packet::TRACK_EVENT, &event);
+    packet(&body)
 }
 
 pub struct PerfettoExporter {
@@ -119,6 +193,17 @@ pub struct PerfettoExporter {
     /// again. Like Chrome's metadata dedup, this belongs to the output stream rather than to
     /// the conversion: a reopened file needs its descriptors written again.
     process_tracks: HashMap<u32, u64>,
+    /// What each process is called, kept apart from the track it names. The announcement that
+    /// carries a name arrives once per process, so a descriptor written *without* one — a start
+    /// mark that beat the announcement, or a first write that failed and was retried — would be
+    /// nameless for the rest of the run if the name were not held here. Survives `open`, since
+    /// a reopened file re-declares the same tracks and wants the same names.
+    process_names: HashMap<u32, String>,
+    /// Processes whose visibility marker has gone out. Idempotent per process, and kept apart
+    /// from `process_tracks` because the two are set by different signals: the announcement
+    /// declares a track without marking it, and a second start mark for one process must not
+    /// draw a second marker.
+    marked_started: HashSet<u32>,
     next_uuid: u64,
 }
 
@@ -131,6 +216,8 @@ impl Default for PerfettoExporter {
         Self {
             file: None,
             process_tracks: HashMap::new(),
+            process_names: HashMap::new(),
+            marked_started: HashSet::new(),
             next_uuid: FIRST_TRACK_UUID,
         }
     }
@@ -143,6 +230,11 @@ impl PerfettoExporter {
 
     /// Declare a track for `pid` if it has none, and return its uuid.
     ///
+    /// The name comes from whatever the announcement left in `process_names`, so a track
+    /// declared by something that does not carry one — a lifecycle mark arriving first — still
+    /// gets the name once it is known. A track declared before any announcement is nameless
+    /// rather than named a guess, and the pid still identifies it.
+    ///
     /// A pid is recorded as declared only *after* its descriptor reaches the file. Recording it
     /// first means a failed write is never retried: the run then finishes reporting a trace
     /// written, and every later event naming that uuid sits on a track nothing declared.
@@ -151,11 +243,18 @@ impl PerfettoExporter {
             return Some(*uuid);
         }
         let uuid = self.next_uuid;
-        self.file
-            .as_mut()?
-            .write_all(&process_track(uuid, pid))
-            .ok()?;
+        // The rank is the order gcscope met the processes, which for a tree is the target and
+        // then its workers as they appeared. Assigned as each is declared rather than sorted at
+        // the end, because this encoder writes as it goes and never rewrites a descriptor.
+        let rank = self.process_tracks.len() as i32;
+        let descriptor = process_track(
+            uuid,
+            pid,
+            self.process_names.get(&pid).map(String::as_str),
+            rank,
+        );
 
+        self.file.as_mut()?.write_all(&descriptor).ok()?;
         self.next_uuid += 1;
         self.process_tracks.insert(pid, uuid);
         Some(uuid)
@@ -203,19 +302,24 @@ impl EventsExporter for PerfettoExporter {
 
         self.file = Some(file);
         self.process_tracks.clear();
+        self.marked_started.clear();
         self.next_uuid = FIRST_TRACK_UUID;
         Ok(())
     }
 
+    /// No guard on the file here. `track_for` writes nothing and consumes nothing without one,
+    /// and the name below has to be recorded either way: a batch that arrives before `open` is
+    /// dropped, but the announcement it carried is the only one this process gets.
     fn add_events(&mut self, events: &[TraceEvent]) {
-        if self.file.is_none() {
-            return;
-        }
         for event in events {
             // Only the process tracks so far. The rest are dropped rather than encoded as
             // something plausible: a slice on a track nobody declared, or an annotation under
             // a field number nothing has checked, is worse than an absence a reader can see.
-            if let TraceEvent::ProcessMeta { pid, .. } = event {
+            if let TraceEvent::ProcessMeta { pid, name } = event {
+                // Remembered before the write and kept whether or not it succeeds. A descriptor
+                // that has to be written again — no file yet, or a write that failed — must not
+                // lose the name with it, because no second announcement is coming.
+                self.process_names.insert(*pid, name.clone());
                 self.track_for(*pid);
             }
         }
@@ -224,7 +328,37 @@ impl EventsExporter for PerfettoExporter {
         }
     }
 
-    fn mark_process_lifecycle(&mut self, _pid: u32, _kind: ProcessLifecycle, _ts_ns: i64) {}
+    /// `Started` draws the marker that keeps the process visible; `Died` draws nothing yet.
+    ///
+    /// Without a reading there is no marker. An instant has to sit somewhere on the timeline,
+    /// and a zero puts it at the origin — decades from the rest of the trace, and read as a
+    /// measurement by anyone who does not know it was a placeholder.
+    fn mark_process_lifecycle(&mut self, pid: u32, kind: ProcessLifecycle, ts_ns: Option<i64>) {
+        let (ProcessLifecycle::Started, Some(ts_ns)) = (kind, ts_ns) else {
+            return;
+        };
+        // `TracePacket.timestamp` is a `uint64`. A negative reading is not a point on this
+        // timeline — written out it sign-extends to roughly 584 years — so it is refused here
+        // rather than placed somewhere absurd, which is the whole of ADR 0022.
+        let Ok(ts_ns) = u64::try_from(ts_ns) else {
+            return;
+        };
+        // The track first: the mark can arrive before the announcement that names the process,
+        // and an event on a track nothing declared is what the harness's checks reject.
+        let Some(uuid) = self.track_for(pid) else {
+            return;
+        };
+        if self.marked_started.contains(&pid) {
+            return;
+        }
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if file.write_all(&start_process_instant(uuid, ts_ns)).is_ok() {
+            self.marked_started.insert(pid);
+        }
+        file.flush().ok();
+    }
 
     fn close(&mut self) -> std::io::Result<()> {
         // Nothing terminates a Perfetto trace — the file is its packets — so closing is
@@ -472,15 +606,21 @@ mod tests {
         0x0a, 0x0d, 0x50, 0x01, 0xe2, 0x03, 0x08, 0x08, 0x00, 0x98, 0x01, 0x01, 0xa0, 0x01, 0x01,
     ];
 
-    /// And one process track after it:
-    ///   0a 0c                Trace.packet, 12 bytes
+    /// And one process track after it. `python 4242` is 11 bytes and appears twice, once as
+    /// the track's title and once as the name the query engine reports:
+    ///   0a 28                Trace.packet, 40 bytes
     ///     50 01              trusted_packet_sequence_id = 1
-    ///     e2 03 07           track_descriptor, 7 bytes
+    ///     e2 03 23           track_descriptor, 35 bytes
     ///       08 01            uuid = 1
-    ///       1a 03            .process (3), 3 bytes
+    ///       12 0b …          .name (2) = "python 4242"
+    ///       1a 10            .process (3), 16 bytes
     ///         08 92 21       ProcessDescriptor.pid (1) = 4242
-    const ONE_PROCESS_BYTES: [u8; 14] = [
-        0x0a, 0x0c, 0x50, 0x01, 0xe2, 0x03, 0x07, 0x08, 0x01, 0x1a, 0x03, 0x08, 0x92, 0x21,
+    ///         32 0b …        .process_name (6) = "python 4242"
+    ///       60 00            .sibling_order_rank (12) = 0, the first process met
+    const ONE_PROCESS_BYTES: [u8; 42] = [
+        0x0a, 0x28, 0x50, 0x01, 0xe2, 0x03, 0x23, 0x08, 0x01, 0x12, 0x0b, b'p', b'y', b't', b'h',
+        b'o', b'n', b' ', b'4', b'2', b'4', b'2', 0x1a, 0x10, 0x08, 0x92, 0x21, 0x32, 0x0b, b'p',
+        b'y', b't', b'h', b'o', b'n', b' ', b'4', b'2', b'4', b'2', 0x60, 0x00,
     ];
 
     #[test]
@@ -498,21 +638,109 @@ mod tests {
         assert_eq!(export(&[process_meta(4242)]), expected);
     }
 
-    /// A Perfetto trace has no liveness track gcscope fills yet, so the mark is swallowed the
-    /// way Chrome swallows it. Pinned rather than assumed: an unexpected packet here would
-    /// carry a timestamp nothing supplies.
-    #[test]
-    fn process_lifecycle_marks_write_nothing() {
+    /// Drive the lifecycle marks alone and give back the file. What a process gcscope attached
+    /// to but never read a Record from produces — the silent worker of user story 4.
+    fn export_lifecycle(marks: &[(u32, ProcessLifecycle, Option<i64>)]) -> Vec<u8> {
         let path = temp_path();
         let mut exporter = PerfettoExporter::new();
         exporter.open(&path).unwrap();
-        exporter.mark_process_lifecycle(7, ProcessLifecycle::Started, 1_000);
-        exporter.mark_process_lifecycle(7, ProcessLifecycle::Died, 2_000);
+        for (pid, kind, ts_ns) in marks {
+            exporter.mark_process_lifecycle(*pid, *kind, *ts_ns);
+        }
+        exporter.close().unwrap();
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(&path).ok();
+        bytes
+    }
+
+    /// A process that produced no Record still reaches the trace: its track is declared and the
+    /// marker that stops the UI hiding an empty track goes on it. Without this, the answer to
+    /// "did my worker collect anything" is a missing process rather than a quiet one.
+    #[test]
+    fn a_process_that_only_ever_started_is_still_drawn() {
+        let bytes = export_lifecycle(&[(7, ProcessLifecycle::Started, Some(1_000))]);
+        // The root, the track, and the marker on it.
+        assert_eq!(packet_lengths(&bytes).expect("whole packets").len(), 3);
+    }
+
+    /// Once per process, however many marks arrive, and `Died` draws nothing of its own yet.
+    #[test]
+    fn a_second_mark_for_one_process_draws_nothing_more() {
+        let bytes = export_lifecycle(&[
+            (7, ProcessLifecycle::Started, Some(1_000)),
+            (7, ProcessLifecycle::Started, Some(1_500)),
+            (7, ProcessLifecycle::Died, Some(2_000)),
+        ]);
+        assert_eq!(packet_lengths(&bytes).expect("whole packets").len(), 3);
+    }
+
+    /// No reading, no marker. An instant has to sit somewhere on the timeline, and a zero puts
+    /// it at the origin — decades from everything else, and indistinguishable from a
+    /// measurement. The track is still declared, so the process is not lost.
+    #[test]
+    fn a_start_with_no_reading_draws_no_marker() {
+        let bytes = export_lifecycle(&[(7, ProcessLifecycle::Started, None)]);
+        assert_eq!(
+            packet_lengths(&bytes).expect("whole packets").len(),
+            1,
+            "the root alone"
+        );
+    }
+
+    /// A reading that cannot be a point on this timeline draws no marker. `TracePacket.timestamp`
+    /// is a `uint64`, so a negative sign-extends to roughly 584 years out — a number that looks
+    /// like a measurement and is not one.
+    #[test]
+    fn a_negative_reading_draws_no_marker() {
+        let bytes = export_lifecycle(&[(7, ProcessLifecycle::Started, Some(-1))]);
+        assert_eq!(
+            packet_lengths(&bytes).expect("whole packets").len(),
+            1,
+            "the root alone"
+        );
+    }
+
+    /// The announcement carries the name once per process. A descriptor written before it, or
+    /// written again after a failure, takes the name from what the announcement left behind —
+    /// otherwise a track that missed it stays nameless for the whole run.
+    #[test]
+    fn a_track_written_after_the_announcement_still_carries_the_name() {
+        let mut exporter = PerfettoExporter::new();
+        // The announcement lands while there is no file, so the descriptor is not written and
+        // the pid stays undeclared — the retry path, reached without a full disk.
+        exporter.add_events(&[process_meta(4242)]);
+        assert!(exporter.process_tracks.is_empty());
+
+        let path = temp_path();
+        exporter.open(&path).unwrap();
+        exporter.mark_process_lifecycle(4242, ProcessLifecycle::Started, Some(1_000));
         exporter.close().unwrap();
         let bytes = fs::read(&path).unwrap();
         fs::remove_file(&path).ok();
 
-        assert_eq!(packet_lengths(&bytes).expect("whole packets").len(), 1);
+        assert!(
+            bytes.windows(11).any(|w| w == b"python 4242"),
+            "the track lost its name: {bytes:?}"
+        );
+    }
+
+    /// The announcement names the process; a mark arriving first does not know the name. Either
+    /// way the track is declared once, and the pid identifies it.
+    #[test]
+    fn a_mark_before_the_announcement_declares_the_track_once() {
+        let path = temp_path();
+        let mut exporter = PerfettoExporter::new();
+        exporter.open(&path).unwrap();
+        exporter.mark_process_lifecycle(4242, ProcessLifecycle::Started, Some(1_000));
+        exporter.add_events(&[process_meta(4242)]);
+        exporter.close().unwrap();
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        // Root, the nameless track, the marker. The announcement adds nothing: the track it
+        // would declare already exists, and this encoder does not rewrite a descriptor.
+        assert_eq!(packet_lengths(&bytes).expect("whole packets").len(), 3);
+        assert_eq!(exporter.process_tracks.len(), 1);
     }
 
     /// Nothing a producer can put in a `TraceEvent` reaches the file yet except a process, and
