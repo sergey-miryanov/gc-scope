@@ -29,10 +29,29 @@ Complements the two backward-looking docs:
 | [0018](0018-perfetto-exporter.md) | Feature — enhancement | L | One output format, and it is the one that cannot express a track belonging to anything but a process or a thread |
 | [0019](0019-loss-spans-in-the-trace.md) | Feature — enhancement | M | The summary reports 117 Collections nobody read; the trace shows a quiet stretch instead |
 | [0020](0020-detect-a-torn-stats-read.md) | Feature — enhancement | S | Nothing checks whether the stats region moved under the read, and a half-written Entry reads as a long pause |
+| [0021](0021-version-grammar-module.md) | Feature — cleanup | S | `version.rs` holds the grammar, image parsing and process IO in one file; the tests reach only the first |
+| [0022](0022-image-lookup-into-memory-binary.md) | Feature — cleanup | S | `memory::process` imports `remote_debugging::version` to resolve `_PyRuntime` — L1 calling L2 to do L1's job |
+| [0023](0023-unit-test-symbol-resolution.md) | Feature — cleanup | M | The three symbol resolvers have no unit tests, and their base arithmetic fails open |
+| [0024](0024-detect-policy-takes-its-reads.md) | Feature — cleanup | M | `detect`'s phase order and its degenerate-read rules are untestable without a live interpreter, and most are unreachable with one |
+| [0025](0025-interpreter-scan-takes-its-reads.md) | Feature — cleanup | S | The pre-3.13 runtime check has no test module at all, down to a word assembly whose byte order nothing can observe |
+| [0026](0026-unit-test-section-finders.md) | Feature — cleanup | M | Each `PyRuntime` section finder is exercised on one third of the matrix, and several of their arms on none of it |
+| [0027](0027-process-tree-search-takes-its-reads.md) | Feature — cleanup | S | The child-process walk's order, depth cap and error assembly need a live process tree to observe, in shapes no test can arrange |
+| [0028](0028-process-reader-owns-the-handle.md) | Feature — cleanup | S | Holding a process handle is a naming convention and a doc comment; ten call sites take the per-call open |
+| [0029](0029-macos-task-port-lifetime.md) | Bug — resource leak | M | Every process handle opened on macOS leaks a mach port send right, and a naive `Drop` would deallocate `mach_task_self` |
+| [0030](0030-format-region-is-not-public-api.md) | Feature — cleanup | XS | `format_region` is `pub` with no caller outside its own module, in a crate where `pub` means "a test or bench needs it" |
+| [0031](0031-module-base-selection-is-testable.md) | Feature — cleanup | S | The image-base rule is a `cfg!` branch inside a maps loop, so every machine tests only its own arm and the macOS one fails open |
+| [0032](0032-fat-slice-arch-selection.md) | Feature — cleanup | S | `parse_macho` and its fixture derive the wanted cputype from the same `cfg!`, so a version that ignored it would pass the suite |
+| [0033](0033-snapshot-poller-ladder-coverage.md) | Feature — cleanup | S | The snapshot poller's `Fresh` retry is unreachable: its test seam is unused and the fault hook it was modelled on cannot reach `collect_data` |
+| [0034](0034-split-tui-sections.md) | Feature — cleanup | S | `tui::sections` is 526 lines holding two unrelated renderings its own header already describes as two |
+| [0035](0035-full-tier-section-fixtures.md) | Feature — cleanup | M | The Full-tier section builders are reachable only through one live 3.13+ frame test, on a premise a `cfg(test)` builder in `offsets` already falsifies |
+| [0036](0036-offset-table-stops-reading.md) | Feature — cleanup | S | `OffsetTable` reads a process for one method, and both callers clone the whole table to pass it an address |
 
-**Suggested order:** 0001 (the only crash) → 0002 (one line, unblocks embedders) → 0003 →
-0004 (smallest user-visible wrongness) → then the cosmetic and efficiency tail in any
-order.
+**Suggested order:** 0001 (the only crash) → 0002 (one line, unblocks embedders) → 0031 (its
+other half — the rule 0002 leaves behind in the same loop, so the two land back to back rather
+than rebasing the same six lines twice) → 0003 → 0004 (smallest user-visible wrongness) → then
+the cosmetic and efficiency tail in any order. The three tracks below each carry their own
+internal order and can be interleaved with that tail. Only one dependency crosses between
+groups: 0003 item A gates 0025.
 
 **0017–0020 are a second track — the consumer stack ported from gcmon.** Its first increment
 landed as spec 0011, now deleted: reading every interpreter, the counter-only tier, the Loss
@@ -59,6 +78,74 @@ compatible in substance — the reconstruction arithmetic works on a Probe ring 
 [ADR 0015](../docs/adr/0015-probe-counters-are-seeded.md) seeds the counters — and 0013/0014
 amend that ADR's sub-3.15 branch rather than leaving two accounts of the same behaviour
 standing.
+
+**0021–0036 are a fourth track — extractions, and the test coverage they unlock.** It runs
+across `remote_debugging::version`, `remote_debugging::check_interpreter`,
+`remote_debugging::offsets`, `memory::process`, `memory::binary`, `memory::reader`, `snapshot`
+and `tui`. One shape recurs through most of it:
+a function fuses a decision about what gcscope believes about a target to the pid it reads
+from, so its rules can only be observed against a live interpreter — and most of them cannot be
+produced by a healthy one at all. Every such split follows `session::walk_interpreter_chain`,
+which the crate already shaped this way for the same reason. The `memory::binary` pair (0031,
+0032) is the same problem in a different disguise — a `cfg!` inside a decision, so every
+machine exercises only its own arm — and the fix is the same: the platform fact becomes an
+argument. Only 0029 is a bug; the rest are cleanups whose value is the tests that become
+possible.
+
+**Order:** 0021 → 0022 → { 0023, 0026, 0032 } → 0027 → 0024 → 0025 (+0030) → 0028 →
+{ 0029, 0036 }. Four of the sixteen sit outside that chain:
+[0031](0031-module-base-selection-is-testable.md) is pinned behind
+[0002](0002-pyruntime-module-discovery.md) in the top-level suggested order above, and 0033 and
+the 0034 → 0035 pair depend on nothing in the chain and fit any gap — the last two bullets
+below are theirs. Eight constraints hold the whole set together, and only two are hard:
+
+- **0021 and 0022 first, in either order.** Both are pure moves that land in an afternoon.
+  0021 lifts the version grammar into its own module; 0022 drops image parsing into
+  `memory::binary`, where it belongs and where `memory::process` stops importing L2 to reach
+  it. Doing 0021 first makes 0022's diff smaller to read.
+- **0023, 0026 and 0032 go together, and 0023 needs 0022** — the only *hard* edge is 0023's.
+  All three extend the same Mach-O builders (an `LC_SYMTAB` and a `__cstring` section; a
+  `__DATA,PyRuntime` section; a second architecture), and the builders that exist
+  (`thin_macho`, `fat_macho`) are private to `memory::binary`'s test module. Whichever lands
+  first moves them to a shared `#[cfg(test)] pub(crate) mod testimage` in a commit that does
+  nothing else; the rest are then small. 0023 and 0026 together make the deferred merge of the
+  two per-format section walks checkable; 0032 fixes a fixture that agrees with the code under
+  test by construction. Doing them apart means rebasing the same helpers three times.
+- **0027 wherever it fits.** The smallest of the track and dependent on nothing. It shares only
+  a test module with 0026 — `memory::process` has none today, so whichever is second just adds
+  to it — and [0009](0009-venv-launcher-child-retarget.md) is the spec that will most want it
+  done.
+- **0024 after 0021 and 0022.** What it extracts is most of what those two leave behind in
+  `version/mod.rs`, and is much easier to see whole once they have emptied it.
+- **0025 after [0003](0003-remote-walk-and-read-hardening.md) item A** — *hard*, and the one
+  dependency that crosses out of this track. Moving the word assembly into the extracted
+  function deletes the unaligned `&[u64]` cast as a side effect, so landing 0025 first buries a
+  UB-and-byte-order fix inside a cleanup. Do 0003 item A alone against the live matrix; 0025
+  then puts the corrected assembly where a unit test can pin its byte order. 0030 is a one-word
+  narrowing in `memory::regions`, a file 0025 already opens — fold it in there, or land it on
+  its own in a minute.
+- **0028, then 0029 and 0036, last in the chain.** 0028 gives `memory::reader` the
+  handle-owning type `PySession` already implements by hand, retiring the `_h` suffix that
+  stands in for it; it goes after 0024, 0025 and 0027 because those three fold six of its ten
+  one-shot call sites into adapters, so landing it earlier means editing sites they then
+  rewrite. 0029 is what it is for: every handle opened on macOS leaks a mach port send right,
+  upstream's handle has no `Drop` and no accessor to recover the port from, and nothing in
+  gcscope owns one long enough to release it. The owning type has to exist before the leak can
+  be fixed. 0036 is the other thing 0028 unblocks, and is independent of 0029: 0028 ports
+  `OffsetTable::read_gc_stats`' handle parameter to `&ProcessReader`, and 0036 deletes the
+  method, taking with it the two table clones its callers make to hand it an address. Either
+  order after 0028; neither touches the other's files.
+- **0034 → 0035 are a `tui` pair on the same shape as 0023/0026**, and off the chain entirely.
+  0034 splits `tui::sections` along the section boundary its header already draws; 0035 then
+  unit-tests the Full-tier builders, whose "needs a live 3.13+ process" premise is falsified by
+  `offsets`' own `cfg(test)` variant builder. A fourth spec wanting a shared fixture module —
+  `tui::test_support` is the pattern the `memory::testimage` move should copy, not invent.
+- **0033 stands apart too.** It is the only one whose production change is confined
+  to `#[cfg(feature = "test-hooks")]` code, it depends on nothing, and it covers a different
+  module (`snapshot`) — so it fits any gap. Do it before
+  [0009](0009-venv-launcher-child-retarget.md), which changes PID retargeting and would
+  otherwise be the first thing to exercise `SnapshotPoller::retarget`'s commit-on-success rule
+  in anger.
 
 ## Templates
 

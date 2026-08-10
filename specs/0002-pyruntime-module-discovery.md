@@ -94,3 +94,9 @@ Worth a line in the README's limitations once this lands: gcscope finds an embed
 interpreter by *module name*, so an embedder that renames the library to something
 containing neither `python` nor `pyruntime` is still invisible. That is a documented
 boundary rather than a bug — but only once it is documented.
+
+**Land [0031](0031-module-base-selection-is-testable.md) immediately after.** It extracts the
+*other* rule from the same loop in `find_python_modules` — which mapping is the image base —
+and the two edits land within six lines of each other, so doing them apart means rebasing the
+same hunk twice. This spec is the bug and should not be held up for it; 0031 should simply
+follow it rather than wait.
