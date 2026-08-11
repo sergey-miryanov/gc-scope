@@ -10,6 +10,10 @@
 // uses a different subset, so some helpers look unused per binary.
 #![allow(dead_code)]
 
+/// Running `tests/harness/perfetto_dump.py` and reading what it printed. A trace decoder
+/// rather than a live target, so it shares only [`test_python`] with the rest of this module.
+pub mod perfetto;
+
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

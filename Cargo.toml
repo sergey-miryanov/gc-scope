@@ -15,10 +15,28 @@ ratatui = "0.26"
 crossterm = "0.29"
 sysinfo = "0.39"
 
+# Reading the machine's own clocks (src/monitor/clock.rs). Rust's `Instant` deliberately hides
+# its absolute value, and an absolute reading is the whole point: it is what puts gcscope's
+# timestamps in the same domain as the ones CPython published. Both crates are already in the
+# tree through `remoteprocess` and friends, so this costs a line rather than a build.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+] }
+
 [dev-dependencies]
 goblin = "0.10.7"
 sysinfo = "0.39"
 criterion = { version = "5.0.1", package = "codspeed-criterion-compat" }
+# Tests only, and only for *reading*. gcscope writes its JSON by hand (see
+# `monitor/exporters/chrome.rs`), which stays true — but a test asserting that a trace carries
+# exactly these keys and no others needs a parser, and hand-rolling one to avoid a
+# dev-dependency is the failure mode `tests/harness/` exists to prevent.
+serde_json = "1.0"
 
 [features]
 # Compiles the test-only fault-injection seam (PySession::inject_gc_stats_faults,

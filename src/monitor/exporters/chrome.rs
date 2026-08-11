@@ -174,7 +174,7 @@ impl EventsExporter for ChromeTraceExporter {
         file.flush().ok();
     }
 
-    fn mark_process_lifecycle(&mut self, _pid: u32, _kind: ProcessLifecycle, _ts_ns: i64) {}
+    fn mark_process_lifecycle(&mut self, _pid: u32, _kind: ProcessLifecycle, _ts_ns: Option<i64>) {}
 
     fn close(&mut self) -> std::io::Result<()> {
         // A never-opened (or already-closed) exporter closes cleanly: `run_loop` unwinds
@@ -581,8 +581,8 @@ mod tests {
         let path = temp_path();
         let mut ex = ChromeTraceExporter::new();
         ex.open(&path).unwrap();
-        ex.mark_process_lifecycle(7, ProcessLifecycle::Started, 1_000);
-        ex.mark_process_lifecycle(7, ProcessLifecycle::Died, 2_000);
+        ex.mark_process_lifecycle(7, ProcessLifecycle::Started, Some(1_000));
+        ex.mark_process_lifecycle(7, ProcessLifecycle::Died, None);
         ex.close().unwrap();
         let out = fs::read_to_string(&path).unwrap();
         fs::remove_file(&path).ok();

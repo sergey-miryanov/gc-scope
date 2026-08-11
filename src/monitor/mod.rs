@@ -9,6 +9,7 @@
 //! Between the poll and an output file, [`trace_event`] holds the format-independent event
 //! model and [`convert`] the single conversion from a decoded Record into it.
 
+pub mod clock;
 pub mod context;
 pub mod convert;
 pub mod cursor;

@@ -35,3 +35,8 @@ gcscope_probe/dist/
 *.lib
 *.so
 *.dylib
+
+# Traces a run leaves in the working copy. `gcmon_trace.json` is what `--output` defaults to,
+# and every Perfetto capture takes the second pattern whatever it was called.
+gcmon_trace.json
+*.perfetto-trace

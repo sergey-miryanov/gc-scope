@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
-use crate::monitor::convert::convert_record;
+use crate::monitor::clock;
+use crate::monitor::convert::{self, convert_record};
 use crate::monitor::cursor::{Cursor, MAX_RETAINED_INTERPRETERS};
 use crate::monitor::exporters::{EventsExporter, ProcessLifecycle};
 use crate::monitor::run_loop::PollStatus;
@@ -35,9 +35,6 @@ pub struct MonitorContext<'a> {
     /// with the rest of a PID's state, since the cursor's own count restarts there: left
     /// behind, a recycled PID's overflow goes unannounced.
     overflowed_pids: HashSet<u32>,
-    /// When monitoring began: the origin of the Observer's clock, read only for builds that
-    /// publish no timestamps of their own. See [`observed_at_ns`](Self::observed_at_ns).
-    started: Instant,
 }
 
 impl<'a> MonitorContext<'a> {
@@ -48,7 +45,6 @@ impl<'a> MonitorContext<'a> {
             cursor: Cursor::new(),
             alive_pids: HashSet::new(),
             overflowed_pids: HashSet::new(),
-            started: Instant::now(),
         }
     }
 
@@ -119,8 +115,19 @@ impl<'a> MonitorContext<'a> {
         };
 
         if self.alive_pids.insert(pid) {
-            self.exporter
-                .mark_process_lifecycle(pid, ProcessLifecycle::Started, 0);
+            // Announced the moment gcscope attached, rather than left to the first Record.
+            // A worker that collects nothing produces no Record, so waiting for one leaves it
+            // out of the trace entirely — and "the process I was watching did no GC" is a
+            // different thing to see than a process that is not there.
+            //
+            // Both formats deduplicate metadata, so a Record from this pid repeating the
+            // announcement writes nothing more.
+            self.exporter.add_events(&[convert::process_meta(pid)]);
+            self.exporter.mark_process_lifecycle(
+                pid,
+                ProcessLifecycle::Started,
+                Some(self.observed_at_ns()),
+            );
         }
 
         let events = self.events_for(pid, &stats, self.observed_at_ns());
@@ -172,15 +179,21 @@ impl<'a> MonitorContext<'a> {
         );
     }
 
-    /// The Observer's own clock, in nanoseconds since monitoring began. Not the wall clock: a
-    /// trace starting near zero reads more easily, and nothing correlates these samples with
-    /// anything outside the run.
+    /// The instant of this poll, on the machine's monotonic clock.
+    ///
+    /// **The same clock, and the same origin, as a Collection's own timestamps.** CPython times
+    /// one with `PyTime_PerfCounterRaw`, which is this counter
+    /// ([ADR 0023](../../docs/adr/0023-one-clock-read-per-platform.md)), so a reading gcscope
+    /// takes of itself is a point on the target's timeline rather than a number needing a
+    /// second origin to mean anything.
+    ///
+    /// It used to be counted from the attach, because small numbers read more easily. That put
+    /// the untimed tier's samples — which have no timestamp of the target's and take this one —
+    /// on a different origin from every other event, and nothing downstream could tell which of
+    /// the two a `TraceEvent` carried. A process tree holding a 3.13 target and a 3.15 one then
+    /// described them decades apart, in whichever format was asked for.
     fn observed_at_ns(&self) -> i64 {
-        self.started
-            .elapsed()
-            .as_nanos()
-            .try_into()
-            .unwrap_or(i64::MAX)
+        clock::monotonic_now_ns()
     }
 
     /// Emit `Died` (once) if the PID was alive, and return `InvalidProcess`.
@@ -189,8 +202,11 @@ impl<'a> MonitorContext<'a> {
     /// which `poll` evicts explicitly before calling this.
     fn on_invalid(&mut self, pid: u32) -> PollStatus {
         if self.alive_pids.remove(&pid) {
-            self.exporter
-                .mark_process_lifecycle(pid, ProcessLifecycle::Died, 0);
+            self.exporter.mark_process_lifecycle(
+                pid,
+                ProcessLifecycle::Died,
+                Some(self.observed_at_ns()),
+            );
         }
         PollStatus::InvalidProcess
     }
@@ -211,8 +227,11 @@ impl<'a> MonitorContext<'a> {
         self.cursor.forget(pid);
         self.overflowed_pids.remove(&pid);
         if self.alive_pids.remove(&pid) {
-            self.exporter
-                .mark_process_lifecycle(pid, ProcessLifecycle::Died, 0);
+            self.exporter.mark_process_lifecycle(
+                pid,
+                ProcessLifecycle::Died,
+                Some(self.observed_at_ns()),
+            );
         }
     }
 

@@ -43,7 +43,7 @@ impl EventsExporter for RecordingExporter {
     fn add_events(&mut self, events: &[TraceEvent]) {
         self.events += events.len();
     }
-    fn mark_process_lifecycle(&mut self, _pid: u32, kind: ProcessLifecycle, _ts_ns: i64) {
+    fn mark_process_lifecycle(&mut self, _pid: u32, kind: ProcessLifecycle, _ts_ns: Option<i64>) {
         match kind {
             ProcessLifecycle::Started => self.started += 1,
             ProcessLifecycle::Died => self.died += 1,

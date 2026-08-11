@@ -19,12 +19,13 @@ available for the property you want to hold?
 | State corrupts across calls | Lifecycle test | Single-shot CLI run |
 | Slows down as the workload grows | Op-count invariant | Wall-clock benchmark |
 | Logic error in code that needs no process | Unit test | |
+| Writes a file that parses to something else | Decoder test against a foreign reader | Round-tripping through your own encoder |
 
 ## The ladder
 
 Add the cheapest kind that has a real oracle for the property:
 
-    unit → randomized property → live → lifecycle → fuzz → mutation audit → benchmark
+    unit → randomized property → live → decoder → lifecycle → fuzz → mutation audit → benchmark
 
 Skipping a cheaper kind that would have caught the bug is a review finding, and so is
 adding an expensive kind to a property a cheaper one already pins.
@@ -64,6 +65,34 @@ is distinguishable from a correct one.
 **Cost:** an interpreter, attach permission, and a leg of the CI matrix (3 OSes × 3.8
 through 3.15 plus 3.15t). Mark it `#[ignore]` so the default `cargo test` stays green
 where attach is not permitted.
+
+## Decoder tests
+
+**Add when** gcscope writes a format some other program has to read, and getting it wrong
+produces a file that parses to *something else* rather than a file that fails to parse. That is
+the same failure mode as a wrong struct offset: it fails open, and no amount of asserting
+against gcscope's own encoder catches it, because the encoder is the thing under suspicion.
+
+**The oracle is a decoder gcscope did not write**, and it has to have been shown a document
+gcscope did not produce. `tests/harness/` is the worked example: the `perfetto` package's
+protobuf bindings and query engine, checked first against traces authored with those same
+bindings — including malformed ones it must reject, since a validity check nobody has watched
+say no might only ever say yes.
+
+**Keep the expectations out of it.** The decoder reports what a file contains; what the file
+*should* contain is an expectation and belongs in Rust beside the encoder. A harness carrying
+domain knowledge starts agreeing with the encoder for the wrong reasons.
+
+**A constant transcribed from a schema is checked against that schema, not against a copy.**
+A hand-maintained table of field numbers has the same failure mode one layer up, and a test
+asserting it against anything inside this repo agrees with it by construction.
+`tests/harness/proto_constants.py` answers from the official descriptors, and the table it
+checks is emitted by the same macro that declares the constants — so a constant nothing asserts
+cannot be written ([ADR 0021](adr/0021-hand-rolled-perfetto-encoder.md)).
+
+**Cost:** a Python environment with the decoder installed, and one CI leg
+(`perfetto-harness`). Mark the Rust side `#[ignore]` so the default `cargo test` stays green
+without the package, and set the leg's `GCSCOPE_REQUIRE_*` gate so a skip cannot read as a pass.
 
 ## Lifecycle tests
 
