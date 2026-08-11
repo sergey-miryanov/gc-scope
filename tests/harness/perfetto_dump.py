@@ -80,6 +80,13 @@ QUERIES = {
     """,
     "track": "select id, name, parent_id from track order by id",
     "counter_track": "select id, name, parent_id, unit from counter_track order by id",
+    # A view of its own, because it is the one this release cannot answer. `y_axis_share_key` is
+    # a rendering hint rather than a property the query engine models, and there is no column for
+    # it as of 0.57.2 — so this lands as `{"error": ...}` and a caller reads why. Kept beside the
+    # others rather than deleted: the day the column arrives it starts answering, and nobody has
+    # to remember to ask again. Folding it into `counter_track` above would take that view down
+    # with it. A caller wanting the value today reads the wire view.
+    "counter_track_y_axis": "select id, name, y_axis_share_key from counter_track order by id",
     "counter": "select id, ts, track_id, value from counter order by ts, track_id, id",
     "process": "select upid, pid, name from process order by pid, upid",
     "thread": "select utid, tid, name, upid from thread order by tid, utid",

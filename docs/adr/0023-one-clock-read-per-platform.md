@@ -75,8 +75,16 @@ costs to spawn an interpreter.
   matters; what moves is where the whole trace sits against another producer's.
 - gcscope takes `libc` and `windows-sys` as direct dependencies. Both were already in the tree
   through `remoteprocess` and friends, so this costs a manifest line rather than a build.
-- The Observer's clock keeps its origin at the attach, so a counter-only trace on a build with no
-  timestamps is unchanged, and the `--summary` figures are untouched. What changed is that the
-  origin is now a stated point on a clock rather than an opaque `Instant`.
+- ~~The Observer's clock keeps its origin at the attach, so a counter-only trace on a build with
+  no timestamps is unchanged.~~ **This was wrong, and the step after this one found it.** A build
+  with no timestamps places its samples on the Observer's reading and one with timestamps places
+  everything on the target's, and a reading counted from the attach makes those two different
+  origins in one event stream, which nothing downstream can tell apart. A tree holding a 3.13
+  target and a 3.15 one described them decades apart, in whichever format was asked for. So
+  decision 1 is applied all the way: `MonitorContext` reads the machine's monotonic clock and
+  hands the reading over as it is, and **every timestamp crossing the exporter boundary is in the
+  one domain** — a Collection's, a counter sample's, a lifecycle mark's alike. Nothing counts
+  nanoseconds since the run began any more, and the rebase that did (`RunClock::observer_to_monotonic`)
+  is gone. The `--summary` figures are untouched; they were always differences.
 - A fourth Unix would compile with the anchor degraded to a single clock — internally exact,
   absolutely unplaced. gcscope is built and tested on three.

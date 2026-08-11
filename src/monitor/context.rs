@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::monitor::clock::{self, RunClock};
+use crate::monitor::clock;
 use crate::monitor::convert::{self, convert_record};
 use crate::monitor::cursor::{Cursor, MAX_RETAINED_INTERPRETERS};
 use crate::monitor::exporters::{EventsExporter, ProcessLifecycle};
@@ -35,11 +35,6 @@ pub struct MonitorContext<'a> {
     /// with the rest of a PID's state, since the cursor's own count restarts there: left
     /// behind, a recycled PID's overflow goes unannounced.
     overflowed_pids: HashSet<u32>,
-    /// When monitoring began: the origin of the Observer's clock. Read for builds that
-    /// publish no timestamps of their own, and for the lifecycle marks, which are gcscope
-    /// talking about itself and have no timestamp of the target's to sit on.
-    /// See [`observed_at_ns`](Self::observed_at_ns).
-    started: RunClock,
 }
 
 impl<'a> MonitorContext<'a> {
@@ -50,7 +45,6 @@ impl<'a> MonitorContext<'a> {
             cursor: Cursor::new(),
             alive_pids: HashSet::new(),
             overflowed_pids: HashSet::new(),
-            started: clock::run_clock(),
         }
     }
 
@@ -185,16 +179,21 @@ impl<'a> MonitorContext<'a> {
         );
     }
 
-    /// The Observer's own clock, in nanoseconds since monitoring began.
+    /// The instant of this poll, on the machine's monotonic clock.
     ///
-    /// Still counted from the attach rather than from the wall clock: a trace starting near zero
-    /// reads more easily, and every counter-only trace already written is on this reading. What
-    /// changed with [`clock`](crate::monitor::clock) is that the origin is now a stated point on
-    /// the machine's monotonic clock — the one CPython times a Collection with — so a format
-    /// that needs to place this beside a Record's timestamps can, and this stays the number a
-    /// human reads.
+    /// **The same clock, and the same origin, as a Collection's own timestamps.** CPython times
+    /// one with `PyTime_PerfCounterRaw`, which is this counter
+    /// ([ADR 0023](../../docs/adr/0023-one-clock-read-per-platform.md)), so a reading gcscope
+    /// takes of itself is a point on the target's timeline rather than a number needing a
+    /// second origin to mean anything.
+    ///
+    /// It used to be counted from the attach, because small numbers read more easily. That put
+    /// the untimed tier's samples — which have no timestamp of the target's and take this one —
+    /// on a different origin from every other event, and nothing downstream could tell which of
+    /// the two a `TraceEvent` carried. A process tree holding a 3.13 target and a 3.15 one then
+    /// described them decades apart, in whichever format was asked for.
     fn observed_at_ns(&self) -> i64 {
-        clock::monotonic_now_ns().saturating_sub(self.started.monotonic_ns())
+        clock::monotonic_now_ns()
     }
 
     /// Emit `Died` (once) if the PID was alive, and return `InvalidProcess`.

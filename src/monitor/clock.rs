@@ -11,8 +11,10 @@
 //! the machine's monotonic clock: `CLOCK_MONOTONIC` on Linux, `mach_absolute_time` on macOS,
 //! `QueryPerformanceCounter` on Windows. Every one of those is **system-wide** — gcscope reads
 //! the same counter in its own process and gets a value in the same domain, exactly, with no
-//! correspondence to estimate. So the Observer's clock stops being a domain of its own and
-//! becomes an origin within the target's.
+//! correspondence to estimate. So the Observer's clock stops being a domain of its own: a reading
+//! gcscope takes of itself is a point on the target's timeline, and it is carried as one. Nothing
+//! anywhere counts nanoseconds since the run began, because a number like that needs a second
+//! origin to mean anything and this module is how the first one was removed.
 //!
 //! **Which clock a platform's CPython uses is a fact to verify, not to infer**, and it fails
 //! open exactly as the image-layout facts in
@@ -40,12 +42,12 @@
 //! spelled that way rather than as `Option`, because the alternative is a fallback branch that
 //! no test can reach and that would quietly write the trace this module exists to prevent.
 
-/// One reading of both clocks, taken back to back, and the origin the Observer counts from.
+/// One reading of both clocks, taken back to back: what ties the domain every gcscope timestamp
+/// is in to the one Perfetto measures trace time in.
 ///
-/// `monotonic_ns` is the load-bearing half: it is what turns "nanoseconds since the run began"
-/// into a point in the same domain a Record's timestamps are in. `boottime_ns` only tells
-/// Perfetto where that domain sits on its own timeline; without it a trace is still internally
-/// exact and merely floats.
+/// The pair is the point. Either reading alone says nothing — it is the two of them, at one
+/// instant, that let a reader convert. Without it a trace is still internally exact and merely
+/// floats, which trace-processor treats as unreadable rather than as unplaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunClock {
     monotonic_ns: i64,
@@ -74,8 +76,8 @@ impl RunClock {
         }
     }
 
-    /// Where the run began on the machine's monotonic clock: the origin an Observer reading is
-    /// counted from, and the value the clock snapshot publishes.
+    /// Where the run began on the machine's monotonic clock: the domain half of the pair the
+    /// clock snapshot publishes.
     pub fn monotonic_ns(&self) -> i64 {
         self.monotonic_ns
     }
@@ -84,28 +86,13 @@ impl RunClock {
     pub fn boottime_ns(&self) -> u64 {
         self.boottime_ns
     }
-
-    /// An Observer reading — nanoseconds since the run began — as a point on the machine's
-    /// monotonic clock, which is the domain a Record's timestamps are already in.
-    ///
-    /// `None` for a reading that cannot be one: a negative, which is no elapsed time, and an
-    /// addition that would overflow. A caller writes no timestamp rather than a wrong one
-    /// ([ADR 0022](../../docs/adr/0022-every-timestamp-names-its-clock.md)).
-    pub fn observer_to_monotonic(&self, observer_ns: i64) -> Option<i64> {
-        if observer_ns < 0 {
-            return None;
-        }
-        self.monotonic_ns.checked_add(observer_ns)
-    }
 }
 
 /// When this process began monitoring, read once and shared.
 ///
-/// One reading rather than one per caller, because the origin is what makes two timestamps
-/// comparable: the monitor counts its Observer readings from it and the Perfetto encoder places
-/// them with it, and an encoder that anchored a few milliseconds after the monitor started would
-/// put every marker slightly before the run it belongs to. Whichever asks first fixes it, and
-/// they are within a call of each other.
+/// One reading rather than one per caller. Every timestamp in a trace is read against this pair,
+/// so two anchors taken a few milliseconds apart would be two disagreeing claims about where the
+/// same trace sits. Whichever caller asks first fixes it.
 pub fn run_clock() -> RunClock {
     static RUN: std::sync::OnceLock<RunClock> = std::sync::OnceLock::new();
     *RUN.get_or_init(RunClock::start)
@@ -251,30 +238,20 @@ mod tests {
         );
     }
 
-    /// An Observer reading is an offset into the domain the anchor names, so the run's origin
-    /// maps to the origin and everything after it moves by its own elapsed time.
+    /// One reading of this clock is what every timestamp gcscope writes is placed against, so
+    /// two callers asking must get the one instant rather than the two they happened to ask at.
+    ///
+    /// The wait is what makes this deterministic: two readings taken back to back could agree by
+    /// landing in one tick of the counter, and after two milliseconds they could not.
     #[test]
-    fn an_observer_reading_becomes_a_point_on_the_machines_clock() {
-        let clock = RunClock::at(5_000_000_000, 9_000_000_000);
-        assert_eq!(clock.observer_to_monotonic(0), Some(5_000_000_000));
-        assert_eq!(clock.observer_to_monotonic(1_500), Some(5_000_001_500));
-    }
+    fn the_runs_anchor_is_read_once_and_shared() {
+        let first = run_clock();
 
-    /// A reading that is not elapsed time places nothing. `mark_process_lifecycle` already
-    /// refuses a negative, and a second refusal here costs nothing: this is the arithmetic that
-    /// would otherwise hand back a point *before* the run began and look like a measurement.
-    #[test]
-    fn a_reading_that_cannot_be_elapsed_time_maps_to_nothing() {
-        let clock = RunClock::at(5_000, 9_000);
-        assert_eq!(clock.observer_to_monotonic(-1), None);
-        assert_eq!(clock.observer_to_monotonic(i64::MIN), None);
-    }
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_millis(2) {
+            std::hint::spin_loop();
+        }
 
-    /// And one that would run off the end of the timeline rather than wrapping around it.
-    #[test]
-    fn an_addition_that_would_overflow_maps_to_nothing() {
-        let clock = RunClock::at(i64::MAX - 10, 0);
-        assert_eq!(clock.observer_to_monotonic(10), Some(i64::MAX));
-        assert_eq!(clock.observer_to_monotonic(11), None);
+        assert_eq!(run_clock(), first);
     }
 }

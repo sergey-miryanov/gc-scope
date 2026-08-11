@@ -729,6 +729,368 @@ fn a_sub_span_that_starts_before_its_parent_keeps_the_numbers_the_target_publish
     );
 }
 
+// ---------------------------------------------------------------------------------
+// 5. Counters
+// ---------------------------------------------------------------------------------
+
+fn counter(tid: i64, ts_ns: i64, name: &str, args: Vec<(&'static str, ArgValue)>) -> TraceEvent {
+    TraceEvent::Counter {
+        pid: 4242,
+        tid,
+        ts_ns,
+        name: name.to_string(),
+        args,
+    }
+}
+
+/// What one Collection's counters look like, as the conversion emits them: the per-generation
+/// series, and the heap as a series of one component carrying an empty name.
+fn metrics(generation: u32, ts_ns: i64, collected: i64) -> Vec<TraceEvent> {
+    vec![
+        counter(
+            0,
+            ts_ns,
+            &format!("G{generation}"),
+            vec![
+                ("collected", ArgValue::Int(collected)),
+                ("candidates", ArgValue::Int(40)),
+                ("duration", ArgValue::Float(0.00125)),
+            ],
+        ),
+        counter(0, ts_ns, "", vec![("heap_size", ArgValue::Int(4096))]),
+    ]
+}
+
+/// Every generation of one interpreter, each with its own metrics and the same heap.
+fn three_generations() -> Vec<TraceEvent> {
+    let mut events = vec![process_meta(4242), thread_meta(4242, 0)];
+    for generation in 0..3u32 {
+        events.extend(metrics(
+            generation,
+            1_000,
+            900 - i64::from(generation) * 100,
+        ));
+    }
+    events
+}
+
+/// Which track each track hangs off, by name, and what the query engine calls a counter.
+///
+/// `counter_track` carries a `parent_id` column of its own and it reads NULL for every row in
+/// 0.57.2; the parenting is in `track`, whose ids are the same rows. So the group a counter sits
+/// under is read there — the same track, not a different question asked of a column that happens
+/// to have a value.
+fn parents(document: &common::perfetto::Dump) -> std::collections::HashMap<String, String> {
+    let by_id: std::collections::HashMap<i64, &str> = document
+        .rows("track")
+        .iter()
+        .filter_map(|row| Some((row["id"].as_i64()?, row["name"].as_str()?)))
+        .collect();
+    document
+        .rows("track")
+        .iter()
+        .filter_map(|row| {
+            let name = row["name"].as_str()?.to_string();
+            let parent = match row["parent_id"].as_i64() {
+                Some(id) => (*by_id.get(&id)?).to_string(),
+                // A track parented to a process descriptor is folded into the process by
+                // trace-processor, which leaves this null rather than pointing at it.
+                None => "(the process)".to_string(),
+            };
+            Some((name, parent))
+        })
+        .collect()
+}
+
+/// The operator's question from the ticket, asked of the query engine: are the three
+/// generations' figures in one place, and is the heap where a whole-heap figure belongs.
+///
+/// Every counter track the events carried is here, with the samples that landed on it and the
+/// heading it sits under. `heap_size` appears **once** — three generations published it and the
+/// series they carried it on is unnamed, so it is one track rather than three — and it hangs
+/// beside the group rather than inside it.
+#[test]
+#[ignore = "needs the `perfetto` package and downloads the query engine — run with --ignored"]
+fn every_counter_track_is_drawn_where_the_layout_puts_it() {
+    let Some(python) = harness_python_or_skip("perfetto counter tracks") else {
+        return;
+    };
+    let path = export(&three_generations(), "counters");
+
+    let document = dump(&python, &path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(document.is_valid(), "{}", document.problems());
+
+    let tracks: Vec<&str> = document
+        .rows("counter_track")
+        .iter()
+        .filter_map(|row| row["name"].as_str())
+        .collect();
+    assert_eq!(
+        tracks,
+        [
+            "G0 collected",
+            "G0 candidates",
+            "G0 duration",
+            "heap_size",
+            "G1 collected",
+            "G1 candidates",
+            "G1 duration",
+            "G2 collected",
+            "G2 candidates",
+            "G2 duration",
+        ],
+        "one track per component of each series, and one heap between them"
+    );
+
+    let parents = parents(&document);
+    for track in &tracks {
+        let expected = if *track == "heap_size" {
+            "4242:0"
+        } else {
+            "GC Metrics"
+        };
+        assert_eq!(
+            parents.get(*track).map(String::as_str),
+            Some(expected),
+            "{track} hangs off the wrong track"
+        );
+    }
+    // And the heading itself sits under the interpreter whose figures it holds.
+    assert_eq!(
+        parents.get("GC Metrics").map(String::as_str),
+        Some("4242:0")
+    );
+
+    // The samples, by the track they landed on. `duration` is a float of seconds: written into
+    // an integer counter it would read as 0 here, which is what every pause under a second
+    // would come to.
+    let by_id: std::collections::HashMap<i64, &str> = document
+        .rows("counter_track")
+        .iter()
+        .filter_map(|row| Some((row["id"].as_i64()?, row["name"].as_str()?)))
+        .collect();
+    let mut samples: Vec<(&str, i64, f64)> = document
+        .rows("counter")
+        .iter()
+        .filter_map(|row| {
+            Some((
+                *by_id.get(&row["track_id"].as_i64()?)?,
+                row["ts"].as_i64()?,
+                row["value"].as_f64()?,
+            ))
+        })
+        .collect();
+    samples.sort_by(|a, b| a.0.cmp(b.0));
+    assert_eq!(
+        samples,
+        [
+            ("G0 candidates", 1_000, 40.0),
+            ("G0 collected", 1_000, 900.0),
+            ("G0 duration", 1_000, 0.00125),
+            ("G1 candidates", 1_000, 40.0),
+            ("G1 collected", 1_000, 800.0),
+            ("G1 duration", 1_000, 0.00125),
+            ("G2 candidates", 1_000, 40.0),
+            ("G2 collected", 1_000, 700.0),
+            ("G2 duration", 1_000, 0.00125),
+            ("heap_size", 1_000, 4096.0),
+            ("heap_size", 1_000, 4096.0),
+            ("heap_size", 1_000, 4096.0),
+        ],
+        "every sample on its own track, the heap sampled once per Record on one"
+    );
+}
+
+/// The three generations' `collected` read against each other because they say so, and the
+/// promoted metric says nothing — alone at its level it has nobody to share an axis with.
+///
+/// Asserted through the **wire view**, because `y_axis_share_key` is a rendering hint and
+/// trace-processor exposes no column for it as of 0.57.2. The SQL sits beside it as an expected
+/// failure that is not required to fail: the day the column arrives the values are checked too,
+/// and until then reaching for some other column that happens to exist would assert something
+/// else.
+#[test]
+#[ignore = "needs the `perfetto` package and downloads the query engine — run with --ignored"]
+fn the_generations_share_an_axis_and_the_promoted_metric_has_none() {
+    let Some(python) = harness_python_or_skip("perfetto share keys") else {
+        return;
+    };
+    let path = export(&three_generations(), "share-keys");
+
+    let document = dump(&python, &path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(document.is_valid(), "{}", document.problems());
+
+    let keys: Vec<(&str, Option<&str>)> = document
+        .packets()
+        .iter()
+        .filter_map(|packet| {
+            let descriptor = &packet["track_descriptor"];
+            let counter = descriptor.get("counter")?;
+            Some((
+                descriptor["name"].as_str()?,
+                counter["y_axis_share_key"].as_str(),
+            ))
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            ("G0 collected", Some("collected")),
+            ("G0 candidates", Some("candidates")),
+            ("G0 duration", Some("duration")),
+            ("heap_size", None),
+            ("G1 collected", Some("collected")),
+            ("G1 candidates", Some("candidates")),
+            ("G1 duration", Some("duration")),
+            ("G2 collected", Some("collected")),
+            ("G2 candidates", Some("candidates")),
+            ("G2 duration", Some("duration")),
+        ],
+        "the share key is the metric, so one metric's tracks read against each other"
+    );
+
+    // The same claim asked of the query engine. An error is the answer this release gives.
+    let sql = &document.document["trace_processor"]["counter_track_y_axis"];
+    match sql.as_array() {
+        Some(rows) => {
+            let shared: Vec<(&str, Option<&str>)> = rows
+                .iter()
+                .filter_map(|row| Some((row["name"].as_str()?, row["y_axis_share_key"].as_str())))
+                .collect();
+            assert_eq!(shared.len(), keys.len());
+            for (name, key) in shared {
+                let expected = keys
+                    .iter()
+                    .find(|(track, _)| *track == name)
+                    .map(|(_, k)| *k);
+                assert_eq!(Some(key), expected, "{name} shares a different axis in SQL");
+            }
+        }
+        None => eprintln!(
+            "NOTE: trace-processor 0.57.2 has no `y_axis_share_key` column, so only the wire \
+             view checked the keys. The query said: {sql}"
+        ),
+    }
+}
+
+/// The order the metric tracks read in is the one someone chose, and it is stated in the file.
+///
+/// From the wire view for the same reason the process ranks are: `sibling_order_rank` is not a
+/// column. A rank counts only where its parent declares the ordering explicit, so the group and
+/// the interpreter track above it both say so — and a rank written under a parent that does not
+/// is inert, which is a thing this file has shipped once already.
+#[test]
+#[ignore = "needs the `perfetto` package — run with --ignored"]
+fn the_metric_tracks_carry_the_ranks_and_the_orderings_that_make_them_count() {
+    let Some(python) = harness_python_or_skip("perfetto metric ranks") else {
+        return;
+    };
+    let path = export(&three_generations(), "metric-ranks");
+
+    let document = dump_wire_only(&python, &path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(document.is_valid(), "{}", document.problems());
+
+    let ranked: Vec<(&str, i64)> = document
+        .packets()
+        .iter()
+        .filter_map(|packet| {
+            let descriptor = &packet["track_descriptor"];
+            Some((
+                descriptor["name"].as_str()?,
+                descriptor["sibling_order_rank"].as_i64()?,
+            ))
+        })
+        .collect();
+    assert_eq!(
+        ranked,
+        [
+            ("python 4242", 0),
+            ("4242:0", 0),
+            ("GC Metrics", 1),
+            ("G0 collected", 2),
+            ("G0 candidates", 4),
+            ("G0 duration", 5),
+            ("heap_size", 0),
+            ("G1 collected", 2),
+            ("G1 candidates", 4),
+            ("G1 duration", 5),
+            ("G2 collected", 2),
+            ("G2 candidates", 4),
+            ("G2 duration", 5),
+        ],
+        "ranked by metric, so each generation's `collected` sits with the others'"
+    );
+
+    // Rendered as the enum's own spelling, so this confirms the value landed in a field typed to
+    // take it. Both parents declare it: without the one on the interpreter track the group's own
+    // rank is inert, and without the one on the group every metric rank above is.
+    let explicit: Vec<&str> = document
+        .packets()
+        .iter()
+        .filter_map(|packet| {
+            let descriptor = &packet["track_descriptor"];
+            descriptor.get("child_ordering")?;
+            descriptor["name"].as_str()
+        })
+        .collect();
+    assert_eq!(explicit, ["python 4242", "4242:0", "GC Metrics"]);
+}
+
+/// A build with no timing fields is counters or nothing
+/// ([ADR 0017](../docs/adr/0017-monitoring-tiers-follow-the-entry-layout.md)), so the tracks this
+/// step draws are the whole of what such a target produces. It has no `heap_size` to promote and
+/// no pause to draw, and the trace still holds a process, an interpreter and its figures.
+#[test]
+#[ignore = "needs the `perfetto` package and downloads the query engine — run with --ignored"]
+fn a_build_with_no_timing_still_draws_its_counter_tracks() {
+    let Some(python) = harness_python_or_skip("perfetto untimed tier") else {
+        return;
+    };
+    let events = vec![
+        process_meta(4242),
+        thread_meta(4242, 0),
+        counter(
+            0,
+            5_000,
+            "G0",
+            vec![
+                ("collections", ArgValue::Int(40)),
+                ("collected", ArgValue::Int(900)),
+            ],
+        ),
+    ];
+    let path = export(&events, "untimed");
+
+    let document = dump(&python, &path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(document.is_valid(), "{}", document.problems());
+
+    let tracks: Vec<&str> = document
+        .rows("counter_track")
+        .iter()
+        .filter_map(|row| row["name"].as_str())
+        .collect();
+    assert_eq!(tracks, ["G0 collections", "G0 collected"]);
+
+    assert!(
+        document.rows("slice").is_empty(),
+        "a build with no timestamps published no pause, so nothing may draw one"
+    );
+    let pids: Vec<i64> = document
+        .rows("process")
+        .iter()
+        .filter_map(|row| row["pid"].as_i64())
+        .collect();
+    assert!(pids.contains(&4242), "{pids:?}");
+}
+
 /// Two processes and a repeat, still one trace that holds together. The structural checks are
 /// the point rather than the counts: a second descriptor reusing a uuid, or a packet losing its
 /// sequence id, is caught here and by nothing in the crate.

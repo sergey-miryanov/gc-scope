@@ -63,6 +63,10 @@ Two ways to draw the line:
   `collecting` flag yields an aggregate duty cycle, and splitting one per generation by count
   is fabrication. Worth revisiting as a separately-named feature, never as a backfill for
   absent data.
-- One file mixing tiers, a 3.12 parent spawning a 3.15 child, carries two timelines: one tier
-  rides the Observer's clock and the other the target's. Tiers are per Record, so each track
-  holds together, and nothing aligns them across the split.
+- ~~One file mixing tiers, a 3.12 parent spawning a 3.15 child, carries two timelines: one tier
+  rides the Observer's clock and the other the target's, and nothing aligns them across the
+  split.~~ **Since [ADR 0023](0023-one-clock-read-per-platform.md) there is one timeline.** The
+  Observer's clock is the machine's monotonic counter, which is the one CPython times a
+  Collection with, so the two tiers are readings of the same thing and a mixed file aligns. The
+  distinction decision 5 draws is now about *which* reading a sample gets, not which clock:
+  a build with no timestamps takes the poll's, because it published none of its own.

@@ -36,8 +36,11 @@ pub trait EventsExporter {
     /// may rely on. A batch is whatever the producer converted in one step, so batch
     /// boundaries mean nothing.
     fn add_events(&mut self, events: &[TraceEvent]);
-    /// A process gcscope started or stopped watching, on **the Observer's clock** — this is
-    /// gcscope talking about itself, not the target talking about a Collection.
+    /// A process gcscope started or stopped watching. This is gcscope talking about itself
+    /// rather than the target talking about a Collection — but it is on **the same clock**, the
+    /// machine's monotonic counter, which is the one CPython times a Collection with
+    /// ([ADR 0023](../../../docs/adr/0023-one-clock-read-per-platform.md)). An encoder places
+    /// this reading exactly as it places a Record's, and there is nothing to rebase.
     ///
     /// `ts_ns` is `None` when there is no reading to give. An encoder must then write no
     /// timestamp rather than a zero: a zero is a point on the timeline, and one at the epoch

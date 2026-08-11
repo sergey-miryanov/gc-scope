@@ -65,9 +65,14 @@ run. A rejection is data either way, printed with its problems listed.
 | `trace_processor` | the binary the Perfetto UI runs | does a wire-valid trace *mean* what it should |
 | `proto_constants.py` | the same generated descriptors | is this the number that field actually has |
 
-Fields the trace processor does not expose as columns — `sibling_order_rank` among them — come
-from the wire view. Do not "fix" a missing column by asserting on something else that happens
-to exist.
+Fields the trace processor does not expose as columns — `sibling_order_rank` and
+`y_axis_share_key` among them — come from the wire view. Do not "fix" a missing column by
+asserting on something else that happens to exist.
+
+`counter_track_y_axis` is the shape that rule takes when a column might arrive: a query of its
+own, so its failure is one view's rather than `counter_track`'s, standing so that the day
+trace-processor models `y_axis_share_key` it starts answering and nobody has to remember to ask.
+It reads `{"error": …}` on 0.57.2.
 
 `proto_constants.py` is the narrowest of the three, and the only one that reads no trace. It
 takes claims — `(message, field, number)` and `(scope, enum, value, number)` — from a file or

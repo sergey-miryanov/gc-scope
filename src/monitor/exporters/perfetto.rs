@@ -7,11 +7,11 @@
 //! ## What it writes today
 //!
 //! The clock snapshot, the root descriptor, one track per process and one per interpreter under
-//! it, the marker that keeps a process visible when it never collects, and a slice per
-//! Collection and per sub-phase. Counters arrive with the step that groups them; until then a
-//! [`TraceEvent::Counter`] is dropped rather than guessed at. The encoding machinery is checked
-//! against a decoder gcscope did not write before any layout policy rides on it ([ADR
-//! 0021](../../../docs/adr/0021-hand-rolled-perfetto-encoder.md)).
+//! it, the marker that keeps a process visible when it never collects, a slice per Collection and
+//! per sub-phase, and every metric series as a counter track of its own under a `GC Metrics`
+//! heading. Only [`TraceEvent::Instant`] is still dropped, and nothing produces one. The encoding
+//! machinery was checked against a decoder gcscope did not write before any layout policy rode on
+//! it ([ADR 0021](../../../docs/adr/0021-hand-rolled-perfetto-encoder.md)).
 //!
 //! ## Which clock
 //!
@@ -36,9 +36,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::perfetto_proto::{
-    builtin_clock, child_tracks_ordering, clock, clock_snapshot, debug_annotation,
-    process_descriptor, process_ordering, thread_ordering, trace, trace_packet, track_descriptor,
-    track_event, track_event_type,
+    builtin_clock, child_tracks_ordering, clock, clock_snapshot, counter_descriptor,
+    debug_annotation, process_descriptor, process_ordering, thread_ordering, trace, trace_packet,
+    track_descriptor, track_event, track_event_type,
 };
 use super::protobuf::{put_double, put_int32, put_int64, put_message, put_string, put_uint64};
 use super::{EventsExporter, ProcessLifecycle};
@@ -64,6 +64,63 @@ const SEQUENCE_ID: u64 = 1;
 
 /// What the marker that keeps a silent process visible is called.
 const START_PROCESS: &str = "Start Process";
+
+/// What the metric tracks are gathered under, one per interpreter.
+const COUNTER_GROUP_NAME: &str = "GC Metrics";
+
+/// The order the metric tracks read in, and the only thing that decides it.
+///
+/// Ranked by **metric rather than by series**, so the three generations' `collected` tracks sit
+/// together and an operator reading one against another finds them adjacent — which is the same
+/// reason they share a Y axis. Within a metric the order is the order the generations were met.
+const METRIC_ORDER: &[&str] = &[
+    "heap_size",
+    "collections",
+    "collected",
+    "uncollectable",
+    "candidates",
+    "duration",
+];
+
+/// The metrics that describe the interpreter rather than one of its generations, and so are
+/// drawn beside the group instead of inside it.
+///
+/// The heap is the interpreter's, and every generation's Record republishes the same figure. Left
+/// in the grouping it reads as one generation's, which is a claim about the target that is not
+/// true; promoted, it is one track where a whole-heap figure belongs.
+const TOP_LEVEL_METRICS: &[&str] = &["heap_size"];
+
+/// Where the group sits among an interpreter's own tracks: after the metrics promoted out of it.
+const COUNTER_GROUP_RANK: i32 = TOP_LEVEL_METRICS.len() as i32;
+
+/// Where one metric's track sorts among its siblings.
+///
+/// A metric nobody ranked sorts after every one someone chose. Folding it in with the first
+/// instead — which is what a `0` default does — would put a new field silently at the top.
+fn metric_rank(metric: &str) -> i32 {
+    METRIC_ORDER
+        .iter()
+        .position(|known| *known == metric)
+        .unwrap_or(METRIC_ORDER.len()) as i32
+}
+
+/// Whether this metric is drawn beside the group rather than in it.
+fn is_top_level(metric: &str) -> bool {
+    TOP_LEVEL_METRICS.contains(&metric)
+}
+
+/// What one component of a series is called on its own track.
+///
+/// A series names its components: `G0` and `collected` make `G0 collected`. A single-component
+/// series carries an empty name and takes its label from the argument key alone, which is the
+/// rule [`TraceEvent::Counter`] states and this only spells.
+fn counter_label(series: &str, metric: &str) -> String {
+    if series.is_empty() {
+        metric.to_string()
+    } else {
+        format!("{series} {metric}")
+    }
+}
 
 /// gcscope's clock domain: the machine's monotonic counter, the one CPython times a Collection
 /// with. Perfetto keeps 1..=63 for the clocks it knows itself
@@ -255,8 +312,111 @@ fn interpreter_track(uuid: u64, parent_uuid: u64, name: Option<&str>, rank: i32)
         put_string(&mut descriptor, track_descriptor::NAME, name);
     }
     put_uint64(&mut descriptor, track_descriptor::PARENT_UUID, parent_uuid);
+    // The same bargain the process track strikes for this one: a child's rank counts only where
+    // its parent says the ordering is explicit, and the metric tracks below this are children.
+    put_uint64(
+        &mut descriptor,
+        track_descriptor::CHILD_ORDERING,
+        u64::from(child_tracks_ordering::EXPLICIT),
+    );
     put_int32(&mut descriptor, track_descriptor::SIBLING_ORDER_RANK, rank);
     descriptor_packet(&descriptor)
+}
+
+/// The heading the metric tracks are gathered under, one per interpreter.
+///
+/// **A plain track, scoped to neither a process nor a thread, and that is what it is for.**
+/// trace-processor ignores `sibling_order_rank` on an OS-scoped track, so metric tracks hung
+/// straight off a process descriptor come out in whatever order the encoder happened to write
+/// them and no hint can move them. A group scoped to neither is the workaround: the ranks on its
+/// children count, and the operator gets the order somebody chose. Written without that sentence
+/// it is a mystery, which is why the sentence is here.
+///
+/// It hangs off the **interpreter's** track rather than the process's, unlike gcmon's, and for a
+/// reason that is gcscope's own: gcscope draws its per-interpreter track as a plain child track
+/// too, so there is a level here that gcmon's OS-scoped thread tracks could not offer. Under the
+/// process, a tree with sub-interpreters would carry one identically-named `GC Metrics` heading
+/// per interpreter with nothing telling them apart.
+fn counter_group_track(uuid: u64, parent_uuid: u64) -> Vec<u8> {
+    let mut descriptor = Vec::new();
+    put_uint64(&mut descriptor, track_descriptor::UUID, uuid);
+    put_string(&mut descriptor, track_descriptor::NAME, COUNTER_GROUP_NAME);
+    put_uint64(&mut descriptor, track_descriptor::PARENT_UUID, parent_uuid);
+    put_uint64(
+        &mut descriptor,
+        track_descriptor::CHILD_ORDERING,
+        u64::from(child_tracks_ordering::EXPLICIT),
+    );
+    put_int32(
+        &mut descriptor,
+        track_descriptor::SIBLING_ORDER_RANK,
+        COUNTER_GROUP_RANK,
+    );
+    descriptor_packet(&descriptor)
+}
+
+/// One metric's track.
+///
+/// The `counter` sub-message is what makes it a counter track at all, so it is written even when
+/// there is nothing to put in it: an *empty* sub-message is a field that is present and says
+/// nothing, which is different from a field nobody wrote.
+///
+/// `share_key` is what puts `G0 collected` and `G2 collected` on one Y axis instead of at two
+/// scales an operator cannot read against each other. Only tracks with the same parent can share
+/// one, which is the other half of what the group is for — and why a metric promoted out of the
+/// group carries no key: alone at its level, it has nobody to share with, and a key claiming
+/// otherwise would be a scale nothing else is drawn to.
+fn counter_track(
+    uuid: u64,
+    parent_uuid: u64,
+    name: &str,
+    rank: i32,
+    share_key: Option<&str>,
+) -> Vec<u8> {
+    let mut counter = Vec::new();
+    if let Some(share_key) = share_key {
+        put_string(
+            &mut counter,
+            counter_descriptor::Y_AXIS_SHARE_KEY,
+            share_key,
+        );
+    }
+
+    let mut descriptor = Vec::new();
+    put_uint64(&mut descriptor, track_descriptor::UUID, uuid);
+    put_string(&mut descriptor, track_descriptor::NAME, name);
+    put_uint64(&mut descriptor, track_descriptor::PARENT_UUID, parent_uuid);
+    put_message(&mut descriptor, track_descriptor::COUNTER, &counter);
+    put_int32(&mut descriptor, track_descriptor::SIBLING_ORDER_RANK, rank);
+    descriptor_packet(&descriptor)
+}
+
+/// One sample of one metric.
+///
+/// The kinds are kept apart here as they are on a slice's annotations: a count goes to
+/// `counter_value` and `duration`, which is a float of seconds, to `double_counter_value`. The
+/// two share a `oneof`, so writing both would leave only the second — and a duration rounded into
+/// an integer counter loses everything below a whole second, which for a young run is all of it.
+///
+/// **What a sample means is the Record's, not this encoder's.** `duration` is a Lifetime total of
+/// GC seconds, the same shape as `collections` and `collected` — [`crate::monitor::loss`]
+/// differences it for exactly that reason — so the track it draws climbs rather than tracing
+/// pause lengths, and `candidates` beside it is per-Collection. Renaming either here is the one
+/// thing that must not happen: what a figure is called is [`crate::monitor::convert`]'s, decided
+/// once so the two formats describe one run the same way.
+fn counter_sample(uuid: u64, ts_ns: u64, value: ArgValue) -> Vec<u8> {
+    let mut event = Vec::new();
+    put_uint64(
+        &mut event,
+        track_event::TYPE,
+        u64::from(track_event_type::COUNTER),
+    );
+    put_uint64(&mut event, track_event::TRACK_UUID, uuid);
+    match value {
+        ArgValue::Int(v) => put_int64(&mut event, track_event::COUNTER_VALUE, v),
+        ArgValue::Float(v) => put_double(&mut event, track_event::DOUBLE_COUNTER_VALUE, v),
+    }
+    event_packet(ts_ns, &event)
 }
 
 /// One event argument as a debug annotation.
@@ -382,6 +542,14 @@ pub struct PerfettoExporter {
     /// the process names are: the announcement naming it arrives once, and a track declared
     /// before it — or after a write that failed — would otherwise stay nameless for the run.
     interpreter_names: HashMap<(u32, i64), String>,
+    /// The heading each interpreter's metric tracks hang off, declared on the first sample that
+    /// needs one. An interpreter whose only metrics are promoted out of the group never draws it.
+    counter_groups: HashMap<(u32, i64), u64>,
+    /// The track each metric of each series is drawn on, keyed by the interpreter that published
+    /// it, the series it belongs to and the metric itself. The series is part of the key because
+    /// `G0 collected` and `G1 collected` are two tracks; the metric is, because one series draws
+    /// one track per component.
+    counter_tracks: HashMap<(u32, i64, String, &'static str), u64>,
     /// The slices open on each track, innermost last. Keyed by track uuid rather than by
     /// `(pid, tid)`, because nesting is a property of the track Perfetto closes against.
     open_slices: HashMap<u64, Vec<OpenSlice>>,
@@ -389,6 +557,9 @@ pub struct PerfettoExporter {
     /// how much of its trace it distrusts rather than only that something was wrong: the first
     /// is named as it happens and the total reported at `close`.
     mismatched_ends: usize,
+    /// How many readings could not be placed on this timeline, counted the same way and for the
+    /// same reason: the events this format had to drop and the Chrome trace of the same run kept.
+    unplaceable: usize,
     next_uuid: u64,
 }
 
@@ -421,8 +592,11 @@ impl PerfettoExporter {
             marked_started: HashSet::new(),
             interpreter_tracks: HashMap::new(),
             interpreter_names: HashMap::new(),
+            counter_groups: HashMap::new(),
+            counter_tracks: HashMap::new(),
             open_slices: HashMap::new(),
             mismatched_ends: 0,
+            unplaceable: 0,
             next_uuid: FIRST_TRACK_UUID,
         }
     }
@@ -493,6 +667,93 @@ impl PerfettoExporter {
         Some(uuid)
     }
 
+    /// Declare the heading this interpreter's metric tracks hang off, if it has none.
+    ///
+    /// The interpreter's own track comes first, because this one hangs off it. Recorded only
+    /// once its descriptor reaches the file, for the same reason as [`track_for`](Self::track_for).
+    fn counter_group_for(&mut self, pid: u32, tid: i64) -> Option<u64> {
+        if let Some(uuid) = self.counter_groups.get(&(pid, tid)) {
+            return Some(*uuid);
+        }
+        let parent = self.interpreter_track_for(pid, tid)?;
+
+        let uuid = self.next_uuid;
+        let descriptor = counter_group_track(uuid, parent);
+
+        self.file.as_mut()?.write_all(&descriptor).ok()?;
+        self.next_uuid += 1;
+        self.counter_groups.insert((pid, tid), uuid);
+        Some(uuid)
+    }
+
+    /// Declare the track one metric of one series is drawn on, if it has none.
+    ///
+    /// Where it hangs is the layout decision: a metric describing the interpreter goes beside the
+    /// group, everything else inside it. Only what sits inside carries a share key, since sharing
+    /// an axis is a claim about siblings.
+    ///
+    /// The key is built before the lookup, so a hit — which is every sample after the first —
+    /// allocates one `String`. Kept, deliberately: it is a handful per poll on a path that has
+    /// just read another process's memory, and the alternative is a two-level map scanned
+    /// linearly, which is more code for a cost nobody has measured. Performance here is guarded
+    /// by a trigger and a pre-chosen instrument
+    /// ([ADR 0009](../../../docs/adr/0009-performance-guarded-by-shape.md)), not by hand.
+    fn counter_track_for(
+        &mut self,
+        pid: u32,
+        tid: i64,
+        series: &str,
+        metric: &'static str,
+    ) -> Option<u64> {
+        let key = (pid, tid, series.to_string(), metric);
+        if let Some(uuid) = self.counter_tracks.get(&key) {
+            return Some(*uuid);
+        }
+        let (parent, share_key) = if is_top_level(metric) {
+            (self.interpreter_track_for(pid, tid)?, None)
+        } else {
+            (self.counter_group_for(pid, tid)?, Some(metric))
+        };
+
+        let uuid = self.next_uuid;
+        let descriptor = counter_track(
+            uuid,
+            parent,
+            &counter_label(series, metric),
+            metric_rank(metric),
+            share_key,
+        );
+
+        self.file.as_mut()?.write_all(&descriptor).ok()?;
+        self.next_uuid += 1;
+        self.counter_tracks.insert(key, uuid);
+        Some(uuid)
+    }
+
+    /// Draw one sample of every component of a series.
+    ///
+    /// A series is one event and several tracks: `name` is the series and each argument is a
+    /// component of it, which is what decides the tracks rather than anything decided here.
+    ///
+    /// A reading that cannot be a point on this timeline declares **nothing** — not even the
+    /// tracks. There is no pairing to hold together as there is for a slice, so a track drawn
+    /// here would be an empty row standing for a sample gcscope refused to write.
+    fn sample_series(&mut self, pid: u32, tid: i64, ts_ns: i64, series: &str, args: &[Arg]) {
+        let Ok(ts_ns) = u64::try_from(ts_ns) else {
+            self.report_unplaceable(series);
+            return;
+        };
+        for &(metric, value) in args {
+            let Some(uuid) = self.counter_track_for(pid, tid, series, metric) else {
+                continue;
+            };
+            let bytes = counter_sample(uuid, ts_ns, value);
+            if let Some(file) = self.file.as_mut() {
+                file.write_all(&bytes).ok();
+            }
+        }
+    }
+
     /// Open a slice on the interpreter's track.
     ///
     /// A begin whose timestamp cannot be a point on this timeline is remembered as unwritten
@@ -512,7 +773,10 @@ impl PerfettoExporter {
             }
             // `TracePacket.timestamp` is a `uint64`, so a negative sign-extends to roughly 584
             // years out. A Collection that landed there would look like a measurement.
-            Err(_) => false,
+            Err(_) => {
+                self.report_unplaceable(name);
+                false
+            }
         };
         self.open_slices.entry(uuid).or_default().push(OpenSlice {
             name: name.to_string(),
@@ -557,6 +821,30 @@ impl PerfettoExporter {
         let bytes = slice_end(uuid, ts_ns);
         if let Some(file) = self.file.as_mut() {
             file.write_all(&bytes).ok();
+        }
+    }
+
+    /// Say once that a reading could not be a point on this timeline, and keep counting.
+    ///
+    /// `TracePacket.timestamp` is a `uint64`, so a negative would sign-extend to roughly 584 years
+    /// out and read as a measurement. Refusing it is right; refusing it in silence is not. **The
+    /// same `TraceEvent` reaches the Chrome encoder, whose `ts` is signed and takes it**, so a run
+    /// that says nothing here leaves an operator with two traces of one capture that disagree
+    /// about what happened — which is the thing `CombiningExporter` exists to prevent.
+    ///
+    /// The likeliest cause is a `ts_start` resolved through a wrong offset, since a target
+    /// publishes no negative timestamps of its own — the fail-open shape
+    /// [ADR 0004](../../../docs/adr/0004-per-platform-image-layout.md) warns about, arriving as a
+    /// number rather than as an error.
+    fn report_unplaceable(&mut self, what: &str) {
+        self.unplaceable += 1;
+        if self.unplaceable == 1 {
+            eprintln!(
+                "warning: \"{what}\" carried a timestamp that is not a point on this timeline, so \
+                 it is missing from the Perfetto trace. A Perfetto timestamp is unsigned; the \
+                 Chrome trace of the same run keeps the reading. The likeliest cause is a Record \
+                 decoded through the wrong offsets. The rest are counted and reported at the end."
+            );
         }
     }
 
@@ -624,14 +912,17 @@ impl EventsExporter for PerfettoExporter {
         self.process_tracks.clear();
         self.marked_started.clear();
         self.interpreter_tracks.clear();
+        self.counter_groups.clear();
+        self.counter_tracks.clear();
         // The open slices go with them. A reopened file is a new trace, and a slice opened into
         // the old one has no end coming that this file could write — carried over, it would let
         // the next end close something this file never opened.
         self.open_slices.clear();
-        // The tally belongs to a trace, not to the exporter. Carried over, the second file's
+        // The tallies belong to a trace, not to the exporter. Carried over, the second file's
         // first mismatch goes unreported — the "say it once" guard has already fired — and its
         // closing count is another file's.
         self.mismatched_ends = 0;
+        self.unplaceable = 0;
         self.next_uuid = FIRST_TRACK_UUID;
         Ok(())
     }
@@ -675,11 +966,19 @@ impl EventsExporter for PerfettoExporter {
                     cat,
                 } if self.file.is_some() => self.end_slice(*pid, *tid, *ts_ns, name, cat),
                 TraceEvent::Begin { .. } | TraceEvent::End { .. } => {}
-                // Counters group and share axes, which is a layout decision of its own, and an
-                // Instant has no producer yet. Both are dropped rather than encoded as something
-                // plausible: a counter on a track nobody grouped is worse than an absence a
-                // reader can see.
-                TraceEvent::Counter { .. } | TraceEvent::Instant { .. } => {}
+                // Unguarded, unlike the pair above: a sample stands on its own, so one dropped
+                // for want of a file leaves nothing half-done behind it. Without one, every
+                // declaration below writes nothing and consumes nothing.
+                TraceEvent::Counter {
+                    pid,
+                    tid,
+                    ts_ns,
+                    name,
+                    args,
+                } => self.sample_series(*pid, *tid, *ts_ns, name, args),
+                // Nothing produces an `Instant` yet, and it is dropped rather than encoded as
+                // something plausible: the control plane that would inject one is not built.
+                TraceEvent::Instant { .. } => {}
             }
         }
         if let Some(file) = self.file.as_mut() {
@@ -707,12 +1006,10 @@ impl EventsExporter for PerfettoExporter {
         let Some(ts_ns) = ts_ns else {
             return;
         };
-        // The reading is nanoseconds since the run began, and the trace is on the machine's
-        // monotonic clock — the one CPython published its own timestamps on. Placing it there is
-        // what puts this marker and the Collections that follow on one timeline.
-        let Some(ts_ns) = self.run.observer_to_monotonic(ts_ns) else {
-            return;
-        };
+        // The reading is already on the machine's monotonic clock — the one CPython published its
+        // own timestamps on — so it is placed exactly as a Collection's is. There is nothing to
+        // rebase, which is what puts this marker and the Collections that follow on one timeline.
+        //
         // `TracePacket.timestamp` is a `uint64`. A negative reading is not a point on this
         // timeline — written out it sign-extends to roughly 584 years — so it is refused here
         // rather than placed somewhere absurd, which is the whole of ADR 0022.
@@ -740,6 +1037,13 @@ impl EventsExporter for PerfettoExporter {
                 "warning: {} trace events in all closed a slice other than the one their track \
                  had open.",
                 self.mismatched_ends
+            );
+        }
+        if self.unplaceable > 1 {
+            eprintln!(
+                "warning: {} trace events in all carried a timestamp this format cannot hold, \
+                 and are missing from the trace.",
+                self.unplaceable
             );
         }
         let Some(mut file) = self.file.take() else {
@@ -1201,9 +1505,9 @@ mod tests {
         assert_eq!(exporter.process_tracks.len(), 1);
     }
 
-    /// Counters group and share axes, which is a decision of its own, and nothing produces an
-    /// `Instant` yet. Neither is half-encoded in the meantime — the assertion is on the packet
-    /// count, so an event that starts being written fails here first.
+    /// Nothing produces an `Instant` yet, and it is not half-encoded in the meantime — the
+    /// assertion is on the packet count, so an event that starts being written fails here first.
+    /// A series with no components is the same case: there is no track to draw from it.
     #[test]
     fn events_this_stage_does_not_encode_write_nothing() {
         let bytes = export(&[
@@ -1496,6 +1800,8 @@ mod tests {
             PREAMBLE + 4,
             "the two tracks and the pause's own pair; the unplaceable phase wrote neither half"
         );
+        // Dropped, and said so: the Chrome trace of the same run holds this phase.
+        assert_eq!(exporter.unplaceable, 1);
     }
 
     /// A batch that arrives before `open` is dropped whole, both halves of a pair together. Let
@@ -1520,6 +1826,283 @@ mod tests {
             PREAMBLE + 4,
             "the two tracks and the pair that arrived once there was somewhere to write it"
         );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Counter tracks.
+    // ---------------------------------------------------------------------------------
+
+    /// The per-generation series as the conversion emits one.
+    fn metrics(pid: u32, tid: i64, ts_ns: i64, generation: u32) -> TraceEvent {
+        TraceEvent::Counter {
+            pid,
+            tid,
+            ts_ns,
+            name: format!("G{generation}"),
+            args: vec![
+                ("collected", 900i64.into()),
+                ("candidates", 40i64.into()),
+                ("duration", 0.00125f64.into()),
+            ],
+        }
+    }
+
+    /// And the single-component one beside it.
+    fn heap_size(pid: u32, tid: i64, ts_ns: i64) -> TraceEvent {
+        TraceEvent::Counter {
+            pid,
+            tid,
+            ts_ns,
+            name: String::new(),
+            args: vec![("heap_size", 4096i64.into())],
+        }
+    }
+
+    /// A series draws the group it belongs to, a track per component, and a sample on each.
+    #[test]
+    fn a_series_draws_its_group_a_track_per_metric_and_a_sample_on_each() {
+        let bytes = export(&[process_meta(1), thread_meta(1, 0), metrics(1, 0, 1_000, 0)]);
+        assert_eq!(
+            packet_count(&bytes),
+            PREAMBLE + 9,
+            "the process and interpreter tracks, the group, three metric tracks and three samples"
+        );
+    }
+
+    /// Tracks are declared once and sampled every time. A run polling for an hour draws the
+    /// same six tracks it drew in the first second.
+    #[test]
+    fn a_second_sample_of_one_series_draws_no_second_track() {
+        let bytes = export(&[
+            process_meta(1),
+            thread_meta(1, 0),
+            metrics(1, 0, 1_000, 0),
+            metrics(1, 0, 2_000, 0),
+        ]);
+        assert_eq!(
+            packet_count(&bytes),
+            PREAMBLE + 12,
+            "three more samples and nothing else"
+        );
+    }
+
+    /// Every generation's metrics land in one group, so an operator comparing G0 against G2
+    /// finds them under one heading rather than three.
+    #[test]
+    fn every_generation_of_one_interpreter_shares_a_group() {
+        let mut exporter = exporter();
+        let path = temp_path();
+        exporter.open(&path).unwrap();
+        exporter.add_events(&[
+            process_meta(1),
+            thread_meta(1, 0),
+            metrics(1, 0, 1_000, 0),
+            metrics(1, 0, 1_000, 1),
+            metrics(1, 0, 1_000, 2),
+        ]);
+        exporter.close().unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(exporter.counter_groups.len(), 1);
+        assert_eq!(
+            exporter.counter_tracks.len(),
+            9,
+            "three metrics, three of each"
+        );
+    }
+
+    /// Two interpreters of one process each get their own group, because the figures are each
+    /// interpreter's own and a shared heading would read as one series.
+    #[test]
+    fn each_interpreter_gets_a_group_of_its_own() {
+        let mut exporter = exporter();
+        let path = temp_path();
+        exporter.open(&path).unwrap();
+        exporter.add_events(&[
+            process_meta(1),
+            thread_meta(1, 0),
+            metrics(1, 0, 1_000, 0),
+            thread_meta(1, 3),
+            metrics(1, 3, 1_000, 0),
+        ]);
+        exporter.close().unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(exporter.counter_groups.len(), 2);
+    }
+
+    /// A metric that describes the interpreter rather than one of its generations never reaches
+    /// the group — it is drawn beside it, one level up, which is the whole point of promoting it.
+    #[test]
+    fn a_top_level_metric_draws_no_group_at_all() {
+        let mut exporter = exporter();
+        let path = temp_path();
+        exporter.open(&path).unwrap();
+        exporter.add_events(&[process_meta(1), thread_meta(1, 0), heap_size(1, 0, 1_000)]);
+        exporter.close().unwrap();
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert!(
+            exporter.counter_groups.is_empty(),
+            "heap_size drew the grouping it is promoted out of"
+        );
+        assert_eq!(
+            packet_count(&bytes),
+            PREAMBLE + 4,
+            "the two tracks, the counter's own, and one sample"
+        );
+    }
+
+    /// Three generations publish the heap the same three times, and it is one track: the series
+    /// they carry it on is unnamed, so nothing in the key distinguishes them.
+    #[test]
+    fn the_heap_is_one_track_however_many_generations_publish_it() {
+        let mut exporter = exporter();
+        let path = temp_path();
+        exporter.open(&path).unwrap();
+        exporter.add_events(&[
+            process_meta(1),
+            thread_meta(1, 0),
+            heap_size(1, 0, 1_000),
+            heap_size(1, 0, 1_000),
+            heap_size(1, 0, 1_000),
+        ]);
+        exporter.close().unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(exporter.counter_tracks.len(), 1);
+    }
+
+    /// The order is stated rather than left to a reader's heuristic, and a rank counts only
+    /// where its parent said the ordering is explicit — which is what the group is for.
+    #[test]
+    fn the_metric_order_is_the_one_someone_chose() {
+        assert!(metric_rank("collected") < metric_rank("candidates"));
+        assert!(metric_rank("candidates") < metric_rank("duration"));
+        // A metric nobody ranked sorts after every one someone did, rather than tying with the
+        // first — which is where `unwrap_or(0)` would put it.
+        assert!(metric_rank("alive_size") > metric_rank("duration"));
+    }
+
+    /// A promoted metric and the group are siblings, so their ranks are read against each
+    /// other: the counters an operator asked to see first come before the heading.
+    #[test]
+    fn a_promoted_metric_ranks_before_the_group() {
+        for metric in TOP_LEVEL_METRICS {
+            assert!(
+                metric_rank(metric) < COUNTER_GROUP_RANK,
+                "{metric} sorts after the group it was promoted out of"
+            );
+        }
+    }
+
+    /// A sample that cannot be placed on the timeline draws nothing at all — not even the
+    /// track, which would otherwise be an empty row for a reading gcscope refused to write.
+    ///
+    /// It is counted, though. The same event reaches the Chrome encoder, whose `ts` is signed and
+    /// takes it, so a silent drop here leaves two traces of one capture disagreeing.
+    #[test]
+    fn a_sample_that_cannot_be_placed_declares_no_track_and_is_counted() {
+        let mut exporter = exporter();
+        let path = temp_path();
+        exporter.open(&path).unwrap();
+        exporter.add_events(&[process_meta(1), thread_meta(1, 0), metrics(1, 0, -1, 0)]);
+        exporter.close().unwrap();
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert!(exporter.counter_tracks.is_empty());
+        assert_eq!(
+            packet_count(&bytes),
+            PREAMBLE + 2,
+            "the two tracks and nothing else"
+        );
+        assert_eq!(
+            exporter.unplaceable, 1,
+            "the series went missing in silence"
+        );
+    }
+
+    /// The tally belongs to a trace: a reopened file starts its count, and its own first drop is
+    /// named rather than swallowed by a guard another file already tripped.
+    #[test]
+    fn reopening_forgets_what_the_old_file_could_not_place() {
+        let mut exporter = exporter();
+
+        let first = temp_path();
+        exporter.open(&first).unwrap();
+        exporter.add_events(&[process_meta(1), thread_meta(1, 0), metrics(1, 0, -1, 0)]);
+        assert_eq!(exporter.unplaceable, 1);
+
+        let second = temp_path();
+        exporter.open(&second).unwrap();
+        exporter.close().unwrap();
+        fs::remove_file(&first).ok();
+        fs::remove_file(&second).ok();
+
+        assert_eq!(exporter.unplaceable, 0);
+    }
+
+    /// A metric track's bytes, in the same spirit as the gate above: nothing else pins the field
+    /// order, and one input has to give one byte sequence. Read left to right, the grouped one:
+    ///   0a 26                Trace.packet, 38 bytes
+    ///     50 01              trusted_packet_sequence_id = 1
+    ///     e2 03 21           track_descriptor (60), 33 bytes
+    ///       08 03            uuid = 3
+    ///       12 0c …          .name (2) = "G0 collected"
+    ///       28 02            .parent_uuid (5) = 2, the group
+    ///       42 0b            .counter (8), 11 bytes — what makes this a counter track
+    ///         3a 09 …        CounterDescriptor.y_axis_share_key (7) = "collected"
+    ///       60 02            .sibling_order_rank (12) = 2
+    /// and the promoted one, whose `counter` is present and empty and whose axis is its own.
+    #[test]
+    fn a_metric_tracks_bytes_are_unchanged() {
+        const G0_COLLECTED_BYTES: [u8; 40] = [
+            0x0a, 0x26, 0x50, 0x01, 0xe2, 0x03, 0x21, 0x08, 0x03, 0x12, 0x0c, b'G', b'0', b' ',
+            b'c', b'o', b'l', b'l', b'e', b'c', b't', b'e', b'd', 0x28, 0x02, 0x42, 0x0b, 0x3a,
+            0x09, b'c', b'o', b'l', b'l', b'e', b'c', b't', b'e', b'd', 0x60, 0x02,
+        ];
+        const HEAP_SIZE_BYTES: [u8; 26] = [
+            0x0a, 0x18, 0x50, 0x01, 0xe2, 0x03, 0x13, 0x08, 0x03, 0x12, 0x09, b'h', b'e', b'a',
+            b'p', b'_', b's', b'i', b'z', b'e', 0x28, 0x02, 0x42, 0x00, 0x60, 0x00,
+        ];
+
+        assert_eq!(
+            counter_track(
+                3,
+                2,
+                "G0 collected",
+                metric_rank("collected"),
+                Some("collected")
+            ),
+            G0_COLLECTED_BYTES
+        );
+        assert_eq!(
+            counter_track(3, 2, "heap_size", metric_rank("heap_size"), None),
+            HEAP_SIZE_BYTES
+        );
+    }
+
+    /// A reopened file is a new trace, so every counter track has to be declared into it again.
+    #[test]
+    fn reopening_declares_the_counter_tracks_again() {
+        let mut exporter = exporter();
+
+        let first = temp_path();
+        exporter.open(&first).unwrap();
+        exporter.add_events(&[process_meta(1), thread_meta(1, 0), heap_size(1, 0, 1_000)]);
+        exporter.close().unwrap();
+        fs::remove_file(&first).ok();
+
+        let second = temp_path();
+        exporter.open(&second).unwrap();
+        exporter.add_events(&[process_meta(1), thread_meta(1, 0), heap_size(1, 0, 2_000)]);
+        exporter.close().unwrap();
+        let bytes = fs::read(&second).unwrap();
+        fs::remove_file(&second).ok();
+
+        assert_eq!(packet_count(&bytes), PREAMBLE + 4);
     }
 
     /// A trace that has to be reopened starts again. A slice opened into the old file has no end
