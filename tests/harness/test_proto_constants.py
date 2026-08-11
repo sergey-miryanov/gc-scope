@@ -53,6 +53,58 @@ def test_claims_taken_from_the_schema_all_hold(messages):
     assert verdict["checked"] == {"fields": 2, "enums": 1}
 
 
+def test_a_nested_message_is_reached_through_its_parent(messages):
+    """`ClockSnapshot.Clock` is where the clock domain ids live, and a table that writes one
+    has to be able to name it."""
+    clock = messages["ClockSnapshot"].nested_types_by_name["Clock"]
+    claims = {
+        "fields": [["ClockSnapshot.Clock", "clock_id", clock.fields_by_name["clock_id"].number]]
+    }
+
+    assert proto_constants.check(claims)["ok"]
+
+
+def test_a_nested_message_is_not_reachable_by_its_bare_name():
+    """Resolving `Clock` by hunting through every parent would answer a question nobody asked,
+    and would let a table name one message and be checked against another."""
+    verdict = proto_constants.check({"fields": [["Clock", "clock_id", 1]]})
+
+    assert not verdict["ok"]
+    assert "no message named Clock" in verdict["problems"][0]["detail"]
+
+
+def test_a_nested_path_whose_last_step_is_missing_is_rejected():
+    verdict = proto_constants.check({"fields": [["ClockSnapshot.Clocks", "clock_id", 1]]})
+
+    assert not verdict["ok"]
+    assert "no message named ClockSnapshot.Clocks" in verdict["problems"][0]["detail"]
+
+
+def test_an_enum_the_file_declares_is_claimed_against_the_empty_scope():
+    """`BuiltinClock` sits outside every message, so there is no message to hang it off."""
+    verdict = proto_constants.check({"enums": [["", "BuiltinClock", "BUILTIN_CLOCK_BOOTTIME", 6]]})
+
+    assert verdict["ok"], verdict["problems"]
+
+
+def test_a_wrong_file_scoped_enum_value_is_rejected_and_named_without_a_leading_dot():
+    verdict = proto_constants.check({"enums": [["", "BuiltinClock", "BUILTIN_CLOCK_BOOTTIME", 3]]})
+
+    assert not verdict["ok"]
+    (problem,) = verdict["problems"]
+    assert problem["claim"] == "BuiltinClock.BUILTIN_CLOCK_BOOTTIME"
+    assert "the schema says 6" in problem["detail"]
+
+
+def test_an_enum_the_file_does_not_declare_is_rejected():
+    verdict = proto_constants.check({"enums": [["", "BuiltinClocks", "BUILTIN_CLOCK_BOOTTIME", 6]]})
+
+    assert not verdict["ok"]
+    assert "the trace schema declares no enum named BuiltinClocks" in (
+        verdict["problems"][0]["detail"]
+    )
+
+
 def test_an_empty_claim_set_is_reported_as_nothing_checked():
     """A caller handed 55 claims and told `checked: 0` has learnt something a bare "no problems"
     would have hidden — an input that never arrived reads exactly like one that was fine."""

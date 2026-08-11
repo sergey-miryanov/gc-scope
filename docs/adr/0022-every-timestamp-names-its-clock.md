@@ -4,6 +4,13 @@
 Perfetto trace. Extends [ADR 0017](0017-monitoring-tiers-follow-the-entry-layout.md)'s
 "absent rather than zero" from pause figures to timestamps.
 
+**Superseded in part by [ADR 0023](0023-one-clock-read-per-platform.md) (2026-08-12).** Decision 4
+below is discharged: the machine-readable declaration exists, so a trace may now carry Collections
+and gcscope's own markers together. Decision 1's `clock` debug annotation is **gone**, replaced by
+the domain on the packet. Decisions 2 and 3 stand unchanged. The last consequence below — which
+predicted that the target's readings would have to become offsets into a domain gcscope invents —
+turned out to be wrong, and ADR 0023 says why it is left standing here rather than edited away.
+
 ## Context
 
 A gcscope trace carries readings from two clocks, and nothing in it says so.
@@ -40,6 +47,10 @@ That is the mechanism gcscope wants and cannot reach yet, for two separate reaso
 - Anchoring the **target's** clock is not a matter of effort. A snapshot pairs two clocks read
   at one instant, and gcscope cannot read CPython's counter on demand; it sees only the values
   already written into Records. There is no instant at which to take the pair.
+
+  *(This second point is where the reasoning went wrong, and
+  [ADR 0023](0023-one-clock-read-per-platform.md) is the correction: gcscope cannot read CPython's
+  counter, but it does not need to — the counter is a system clock, and gcscope can read that.)*
 
 ## Decision
 

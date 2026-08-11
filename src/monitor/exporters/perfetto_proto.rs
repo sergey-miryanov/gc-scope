@@ -83,11 +83,34 @@ proto_messages! {
         /// `timestamp_delta_us`, so an absolute nanosecond stamp written into a `TrackEvent`
         /// decodes as a microsecond delta and lands the event somewhere else entirely.
         TIMESTAMP = 8 as "timestamp",
+        /// Which clock the `timestamp` beside it is on. Absent means the trace's own, which is
+        /// BOOTTIME — a claim gcscope cannot make about a counter it read out of CPython, so
+        /// every packet carrying a timestamp names its domain here instead.
+        TIMESTAMP_CLOCK_ID = 58 as "timestamp_clock_id",
         /// Required in practice. Perfetto drops packets that name no sequence, since
         /// interning and incremental state are sequence-scoped.
         TRUSTED_PACKET_SEQUENCE_ID = 10 as "trusted_packet_sequence_id",
         TRACK_EVENT = 11 as "track_event",
+        CLOCK_SNAPSHOT = 6 as "clock_snapshot",
         TRACK_DESCRIPTOR = 60 as "track_descriptor",
+    }
+
+    /// Ties a producer's clock to one the reader knows, so events stamped in the producer's
+    /// domain can be converted into trace time.
+    clock_snapshot = "ClockSnapshot" {
+        CLOCKS = 1 as "clocks",
+        /// Which builtin clock trace time is measured in. gcscope leaves it unset and takes
+        /// the default, BOOTTIME, which is what the snapshot below anchors against.
+        PRIMARY_TRACE_CLOCK = 2 as "primary_trace_clock",
+    }
+
+    /// One clock's reading inside a [`clock_snapshot`]. Nested inside `ClockSnapshot`, which is
+    /// why the checker is handed the path rather than the bare name.
+    clock = "ClockSnapshot.Clock" {
+        CLOCK_ID = 1 as "clock_id",
+        TIMESTAMP = 2 as "timestamp",
+        IS_INCREMENTAL = 3 as "is_incremental",
+        UNIT_MULTIPLIER_NS = 4 as "unit_multiplier_ns",
     }
 
     /// Declares a track: a row in the UI, and the thing every event names.
@@ -150,6 +173,7 @@ proto_messages! {
         NAME = 10 as "name",
         BOOL_VALUE = 2 as "bool_value",
         INT_VALUE = 4 as "int_value",
+        DOUBLE_VALUE = 5 as "double_value",
         STRING_VALUE = 6 as "string_value",
     }
 }
@@ -176,6 +200,24 @@ proto_enums! {
         EXPLICIT = 1 as "PROCESS_ORDERING_EXPLICIT",
     }
 
+    /// The clock domains a reader already knows. Declared at file scope rather than inside a
+    /// message, which is what the empty scope spells: there is no `BuiltinClock` message to
+    /// hang it off, and the checker resolves it from the file's own enums.
+    ///
+    /// Only `BOOTTIME` is written. The other two are here because they are what an anchor
+    /// *looks* like it could use and cannot: a snapshot naming either leaves trace-processor
+    /// with no path from gcscope's domain to trace time, so it reports
+    /// `clock_sync_failure_no_path` and drops every event
+    /// ([ADR 0022](../../../docs/adr/0022-every-timestamp-names-its-clock.md)).
+    builtin_clock = ""."BuiltinClock" {
+        REALTIME = 1 as "BUILTIN_CLOCK_REALTIME",
+        MONOTONIC = 3 as "BUILTIN_CLOCK_MONOTONIC",
+        BOOTTIME = 6 as "BUILTIN_CLOCK_BOOTTIME",
+        /// The last id reserved for a builtin. gcscope's own domain has to be above it, and
+        /// this is what says so rather than a number chosen for looking large enough.
+        MAX_ID = 63 as "BUILTIN_CLOCK_MAX_ID",
+    }
+
     thread_ordering = "TrackDescriptor"."ThreadOrdering" {
         UNSPECIFIED = 0 as "THREAD_ORDERING_UNSPECIFIED",
         EXPLICIT = 1 as "THREAD_ORDERING_EXPLICIT",
@@ -194,6 +236,8 @@ mod tests {
     fn the_declarations_reach_the_tables_the_checker_reads() {
         assert!(FIELDS.contains(&("DebugAnnotation", "name", 10)));
         assert!(FIELDS.contains(&("Trace", "packet", 1)));
+        assert!(FIELDS.contains(&("ClockSnapshot.Clock", "clock_id", 1)));
+        assert!(ENUM_VALUES.contains(&("", "BuiltinClock", "BUILTIN_CLOCK_BOOTTIME", 6)));
         assert!(ENUM_VALUES.contains(&("TrackEvent", "Type", "TYPE_SLICE_BEGIN", 1)));
         assert!(ENUM_VALUES.contains(&(
             "TrackDescriptor",

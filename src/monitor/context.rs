@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
+use crate::monitor::clock::{self, RunClock};
 use crate::monitor::convert::{self, convert_record};
 use crate::monitor::cursor::{Cursor, MAX_RETAINED_INTERPRETERS};
 use crate::monitor::exporters::{EventsExporter, ProcessLifecycle};
@@ -37,9 +37,9 @@ pub struct MonitorContext<'a> {
     overflowed_pids: HashSet<u32>,
     /// When monitoring began: the origin of the Observer's clock. Read for builds that
     /// publish no timestamps of their own, and for the lifecycle marks, which are gcscope
-    /// talking about itself and are on no other clock.
+    /// talking about itself and have no timestamp of the target's to sit on.
     /// See [`observed_at_ns`](Self::observed_at_ns).
-    started: Instant,
+    started: RunClock,
 }
 
 impl<'a> MonitorContext<'a> {
@@ -50,7 +50,7 @@ impl<'a> MonitorContext<'a> {
             cursor: Cursor::new(),
             alive_pids: HashSet::new(),
             overflowed_pids: HashSet::new(),
-            started: Instant::now(),
+            started: clock::run_clock(),
         }
     }
 
@@ -185,15 +185,16 @@ impl<'a> MonitorContext<'a> {
         );
     }
 
-    /// The Observer's own clock, in nanoseconds since monitoring began. Not the wall clock: a
-    /// trace starting near zero reads more easily, and nothing correlates these samples with
-    /// anything outside the run.
+    /// The Observer's own clock, in nanoseconds since monitoring began.
+    ///
+    /// Still counted from the attach rather than from the wall clock: a trace starting near zero
+    /// reads more easily, and every counter-only trace already written is on this reading. What
+    /// changed with [`clock`](crate::monitor::clock) is that the origin is now a stated point on
+    /// the machine's monotonic clock — the one CPython times a Collection with — so a format
+    /// that needs to place this beside a Record's timestamps can, and this stays the number a
+    /// human reads.
     fn observed_at_ns(&self) -> i64 {
-        self.started
-            .elapsed()
-            .as_nanos()
-            .try_into()
-            .unwrap_or(i64::MAX)
+        clock::monotonic_now_ns().saturating_sub(self.started.monotonic_ns())
     }
 
     /// Emit `Died` (once) if the PID was alive, and return `InvalidProcess`.

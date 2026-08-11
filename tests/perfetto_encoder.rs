@@ -23,15 +23,17 @@ mod common;
 use std::path::PathBuf;
 
 use common::perfetto::{check_constants, dump, dump_wire_only, harness_python_or_skip, keys};
+use gcscope::monitor::clock::RunClock;
 use gcscope::monitor::exporters::perfetto::PerfettoExporter;
 use gcscope::monitor::exporters::perfetto_proto::{
-    ENUM_VALUES, FIELDS, trace, trace_packet, track_descriptor, track_event, track_event_type,
+    ENUM_VALUES, FIELDS, builtin_clock, trace, trace_packet, track_descriptor, track_event,
+    track_event_type,
 };
 use gcscope::monitor::exporters::protobuf::{
     put_double, put_int32, put_int64, put_message, put_string, put_uint64,
 };
 use gcscope::monitor::exporters::{EventsExporter, ProcessLifecycle};
-use gcscope::monitor::trace_event::TraceEvent;
+use gcscope::monitor::trace_event::{ArgValue, TraceEvent};
 
 fn trace_path(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -231,9 +233,20 @@ fn every_primitive_decodes_to_the_value_that_was_written() {
 // 3. A trace the exporter wrote
 // ---------------------------------------------------------------------------------
 
+/// An exporter anchored at the origin of both clocks.
+///
+/// A live anchor is the machine's monotonic counter, which is around 7×10¹⁴ after a week of
+/// uptime — so a test writing a Collection at `ts_ns: 1_000` would be claiming one a microsecond
+/// after boot, and trace-processor would convert it to a point before the trace began. Anchoring
+/// at zero makes gcscope's domain and Perfetto's trace clock the same numbers, so a test can
+/// write timestamps a human can read and still assert what the query engine did with them.
+fn exporter() -> PerfettoExporter {
+    PerfettoExporter::with_clock(RunClock::at(0, 0))
+}
+
 fn export(events: &[TraceEvent], tag: &str) -> PathBuf {
     let path = trace_path(tag);
-    let mut exporter = PerfettoExporter::new();
+    let mut exporter = exporter();
     exporter.open(&path).unwrap();
     exporter.add_events(events);
     exporter.close().unwrap();
@@ -266,11 +279,38 @@ fn a_trace_the_exporter_wrote_holds_together_and_names_its_process() {
     assert_eq!(document.exit_code, 0);
 
     let packets = document.packets();
-    assert_eq!(packets.len(), 2, "the root descriptor and one process");
+    assert_eq!(
+        packets.len(),
+        3,
+        "the clock snapshot, the root descriptor and one process"
+    );
+
+    // The snapshot: one instant on two clocks, which is what every timestamp after it is read
+    // through. Without a path from gcscope's domain to the one trace time is measured in,
+    // trace-processor drops the events rather than guessing.
+    let clocks = packets[0]["clock_snapshot"]["clocks"]
+        .as_array()
+        .expect("the trace opens with a clock snapshot");
+    // `clock_id` is a bare `uint32` rather than the `BuiltinClock` enum, so both arrive as
+    // numbers and 6 has to be read as BOOTTIME. That it is BOOTTIME and not MONOTONIC is the
+    // whole claim: the other two leave trace-processor with no path to trace time, and it drops
+    // every event rather than saying so.
+    let domains: Vec<i64> = clocks
+        .iter()
+        .filter_map(|clock| clock["clock_id"].as_i64())
+        .collect();
+    assert_eq!(
+        domains,
+        [
+            i64::from(builtin_clock::BOOTTIME),
+            64, // gcscope's own, above the 63 Perfetto reserves for the clocks it knows
+        ],
+        "{clocks:?}"
+    );
 
     // The root: uuid 0 and the two ordering hints, and no name, process or counter — a
     // descriptor with any of those becomes a track row in the UI, which this must not.
-    let root = &packets[0]["track_descriptor"];
+    let root = &packets[1]["track_descriptor"];
     assert_eq!(keys(root), ["process_ordering", "thread_ordering", "uuid"]);
     assert_eq!(
         root["uuid"], "0",
@@ -281,11 +321,23 @@ fn a_trace_the_exporter_wrote_holds_together_and_names_its_process() {
 
     // The process track, whole. Asserted against what the `TraceEvent` said — `process_meta`
     // built the name above — rather than against a copy of what the encoder emitted last time.
-    let process = &packets[1]["track_descriptor"];
+    let process = &packets[2]["track_descriptor"];
     assert_eq!(
         keys(process),
-        ["name", "process", "sibling_order_rank", "uuid"]
+        [
+            "child_ordering",
+            "name",
+            "process",
+            "sibling_order_rank",
+            "uuid"
+        ]
     );
+    // `child_ordering` is what makes the ranks on the interpreter tracks *under* this one count:
+    // Perfetto honours a child's `sibling_order_rank` only where its parent says the ordering is
+    // explicit. Without it the ranks are written and inert.
+    // Rendered as the enum's own spelling, so this also confirms 3 landed in a field typed
+    // `ChildTracksOrdering` rather than in some numeric field that would take any value.
+    assert_eq!(process["child_ordering"], "EXPLICIT");
     assert_ne!(process["uuid"], "0");
     assert_eq!(process["name"], "python 4242");
     assert_eq!(keys(&process["process"]), ["pid", "process_name"]);
@@ -325,7 +377,7 @@ fn a_process_that_collected_nothing_is_still_in_the_trace() {
         return;
     };
     let path = trace_path("silent");
-    let mut exporter = PerfettoExporter::new();
+    let mut exporter = exporter();
     exporter.open(&path).unwrap();
     // Exactly what the monitor does for a process it attached to: announce it, then mark it
     // started. No Record ever arrives.
@@ -356,16 +408,16 @@ fn a_process_that_collected_nothing_is_still_in_the_trace() {
         .collect();
     assert_eq!(markers, [("Start Process", 0), ("Start Process", 0)]);
 
-    // And it says which clock its timestamp is on, which is the Observer's — not the target's,
-    // and not one a reader should compare against a Collection's.
-    let clocks: Vec<&str> = document
-        .rows("slice_args")
+    // And each landed at the reading it was given, converted out of gcscope's clock domain
+    // rather than dropped for want of a path out of it. The marks were 1000 ns and 2000 ns after
+    // the run began, and this exporter's anchor puts the run's origin at the origin of trace
+    // time, so those are the numbers the query engine reports.
+    let stamps: Vec<i64> = document
+        .rows("slice")
         .iter()
-        .filter(|row| row["key"] == "debug.clock")
-        .filter_map(|row| row["string_value"].as_str())
+        .filter_map(|row| row["ts"].as_i64())
         .collect();
-    assert_eq!(clocks.len(), 2, "one per marker: {clocks:?}");
-    assert!(clocks[0].contains("gcscope"), "{clocks:?}");
+    assert_eq!(stamps, [1_000, 2_000]);
 }
 
 /// The order the tree reads in is the order gcscope met the processes, and it is stated rather
@@ -398,6 +450,283 @@ fn processes_are_ranked_in_the_order_they_were_met() {
         })
         .collect();
     assert_eq!(ranked, [(4242, 0), (7, 1), (99, 2)]);
+}
+
+// ---------------------------------------------------------------------------------
+// 4. Collections
+// ---------------------------------------------------------------------------------
+
+fn thread_meta(pid: u32, tid: i64) -> TraceEvent {
+    TraceEvent::ThreadMeta {
+        pid,
+        tid,
+        name: format!("{pid}:{tid}"),
+    }
+}
+
+fn begin(
+    tid: i64,
+    ts_ns: i64,
+    name: &str,
+    cat: &str,
+    args: Vec<(&'static str, ArgValue)>,
+) -> TraceEvent {
+    TraceEvent::Begin {
+        pid: 4242,
+        tid,
+        ts_ns,
+        name: name.to_string(),
+        cat: cat.to_string(),
+        args,
+    }
+}
+
+fn end(tid: i64, ts_ns: i64, name: &str, cat: &str) -> TraceEvent {
+    TraceEvent::End {
+        pid: 4242,
+        tid,
+        ts_ns,
+        name: name.to_string(),
+        cat: cat.to_string(),
+    }
+}
+
+/// One Collection with a sub-phase inside it, as the conversion emits them.
+fn a_collection() -> Vec<TraceEvent> {
+    vec![
+        process_meta(4242),
+        thread_meta(4242, 0),
+        begin(
+            0,
+            1_000,
+            "GC Pause (gen=1)",
+            "gc.pause(gen=1)",
+            vec![
+                ("generation", ArgValue::Int(1)),
+                ("collected", ArgValue::Int(900)),
+                ("duration", ArgValue::Float(0.00125)),
+            ],
+        ),
+        begin(
+            0,
+            1_200,
+            "Mark Alive (gen=1)",
+            "gc.mark.alive(gen=1)",
+            vec![("alive_size", ArgValue::Int(4096))],
+        ),
+        end(0, 1_800, "Mark Alive (gen=1)", "gc.mark.alive(gen=1)"),
+        end(0, 3_000, "GC Pause (gen=1)", "gc.pause(gen=1)"),
+    ]
+}
+
+/// The heart of this step, asserted through the engine the Perfetto UI runs: every slice the
+/// events carried is in the trace with its name, its category, its start, its width and its
+/// place in the nesting, and the sub-phase sits **inside** the Collection rather than beside it.
+///
+/// `depth` is what carries the nesting. A trace whose begins and ends paired wrongly would still
+/// produce two slices with the right names and put them at depth 0 and 0, or 0 and 1 in the
+/// wrong order — which is why the whole tuple is compared rather than the names alone.
+#[test]
+#[ignore = "needs the `perfetto` package and downloads the query engine — run with --ignored"]
+fn every_collection_and_sub_phase_becomes_a_slice_where_the_events_put_it() {
+    let Some(python) = harness_python_or_skip("perfetto slices") else {
+        return;
+    };
+    let path = export(&a_collection(), "slices");
+
+    let document = dump(&python, &path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(document.is_valid(), "{}", document.problems());
+
+    let slices: Vec<(&str, &str, i64, i64, i64)> = document
+        .rows("slice")
+        .iter()
+        .map(|row| {
+            (
+                row["name"].as_str().unwrap_or_default(),
+                row["category"].as_str().unwrap_or("(none)"),
+                row["ts"].as_i64().unwrap_or(-1),
+                row["dur"].as_i64().unwrap_or(-1),
+                row["depth"].as_i64().unwrap_or(-1),
+            )
+        })
+        .collect();
+    assert_eq!(
+        slices,
+        [
+            ("GC Pause (gen=1)", "gc.pause(gen=1)", 1_000, 2_000, 0),
+            ("Mark Alive (gen=1)", "gc.mark.alive(gen=1)", 1_200, 600, 1),
+        ]
+    );
+
+    // Timestamps stay the nanoseconds CPython published. The Chrome exporter's microsecond
+    // conversion is not reachable from here, and a trace that had been through it would report
+    // this pause as 2 µs wide instead of 2 ms.
+    let (_, _, ts, dur, _) = slices[0];
+    assert_eq!((ts, dur), (1_000, 2_000), "nanoseconds, not microseconds");
+}
+
+/// Arguments arrive keyed as the conversion keyed them, and an integer and a float stay their
+/// own kinds rather than both becoming strings. `duration` is a float of seconds; read back as a
+/// string it cannot be plotted or summed, which is most of what a counter is for.
+#[test]
+#[ignore = "needs the `perfetto` package and downloads the query engine — run with --ignored"]
+fn arguments_reach_the_trace_keyed_and_typed_as_the_conversion_left_them() {
+    let Some(python) = harness_python_or_skip("perfetto annotations") else {
+        return;
+    };
+    let path = export(&a_collection(), "args");
+
+    let document = dump(&python, &path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(document.is_valid(), "{}", document.problems());
+
+    let args: Vec<(&str, &str, Option<i64>, Option<f64>)> = document
+        .rows("slice_args")
+        .iter()
+        .filter(|row| {
+            row["key"]
+                .as_str()
+                .is_some_and(|key| key.starts_with("debug."))
+        })
+        .map(|row| {
+            (
+                row["key"].as_str().unwrap_or_default(),
+                row["value_type"].as_str().unwrap_or_default(),
+                row["int_value"].as_i64(),
+                row["real_value"].as_f64(),
+            )
+        })
+        .collect();
+    // Ordered by slice and then by key, which is how the harness asks for them — so the pause's
+    // three come first and the sub-phase's one after, rather than all four sorted together.
+    assert_eq!(
+        args,
+        [
+            ("debug.collected", "int", Some(900), None),
+            ("debug.duration", "real", None, Some(0.00125)),
+            ("debug.generation", "int", Some(1), None),
+            ("debug.alive_size", "int", Some(4096), None),
+        ],
+        "the keys are the conversion's, the kinds survive the trip, and each slice keeps its own"
+    );
+}
+
+/// Each interpreter has a track of its own under its process, named as the `ThreadMeta` event
+/// names it, and a Collection lands on the track of the interpreter that ran it.
+///
+/// The track is **not** a thread: gcscope's `tid` is an interpreter id, so a `ThreadDescriptor`
+/// would claim an OS thread of that number exists. That absence is asserted here against the
+/// `thread` table, which stays empty of these ids.
+#[test]
+#[ignore = "needs the `perfetto` package and downloads the query engine — run with --ignored"]
+fn each_interpreter_has_its_own_track_under_its_process() {
+    let Some(python) = harness_python_or_skip("perfetto interpreter tracks") else {
+        return;
+    };
+    let mut events = a_collection();
+    events.extend([
+        thread_meta(4242, 3),
+        begin(3, 5_000, "GC Pause (gen=0)", "gc.pause(gen=0)", vec![]),
+        end(3, 6_000, "GC Pause (gen=0)", "gc.pause(gen=0)"),
+    ]);
+    let path = export(&events, "interpreters");
+
+    let document = dump(&python, &path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(document.is_valid(), "{}", document.problems());
+
+    // Which track each slice sits on, by the track's own name.
+    let track_names: std::collections::HashMap<i64, &str> = document
+        .rows("track")
+        .iter()
+        .filter_map(|row| Some((row["id"].as_i64()?, row["name"].as_str()?)))
+        .collect();
+    let placed: Vec<(&str, &str)> = document
+        .rows("slice")
+        .iter()
+        .filter_map(|row| {
+            let track = track_names.get(&row["track_id"].as_i64()?)?;
+            Some((row["name"].as_str()?, *track))
+        })
+        .collect();
+    assert_eq!(
+        placed,
+        [
+            ("GC Pause (gen=1)", "4242:0"),
+            ("Mark Alive (gen=1)", "4242:0"),
+            ("GC Pause (gen=0)", "4242:3"),
+        ],
+        "each interpreter's Collections stay on its own row"
+    );
+
+    // And no OS thread was invented for either interpreter id.
+    let tids: Vec<i64> = document
+        .rows("thread")
+        .iter()
+        .filter_map(|row| row["tid"].as_i64())
+        .collect();
+    assert!(
+        !tids.contains(&3),
+        "interpreter 3 was described as an OS thread: {tids:?}"
+    );
+}
+
+/// A sub-span can start before the pause enclosing it, and it is written in the order it
+/// arrived rather than sorted into shape.
+///
+/// The build shape that produces it: one publishing a phase's stop but not its start chains that
+/// phase onto the preceding phase's stop, and a field its layout *defines* but which reads zero
+/// puts the sub-span at the epoch. Reordering on timestamps would repair the picture by
+/// inventing a pause the target never ran, so the raw numbers stay and the trace shows what was
+/// published. trace-processor reports the sub-slice's width as negative rather than refusing it.
+#[test]
+#[ignore = "needs the `perfetto` package and downloads the query engine — run with --ignored"]
+fn a_sub_span_that_starts_before_its_parent_keeps_the_numbers_the_target_published() {
+    let Some(python) = harness_python_or_skip("perfetto emission order") else {
+        return;
+    };
+    let events = vec![
+        process_meta(4242),
+        thread_meta(4242, 0),
+        begin(0, 60_000, "GC Pause (gen=0)", "gc.pause(gen=0)", vec![]),
+        begin(
+            0,
+            0,
+            "Finalize Garbage (gen=0)",
+            "gc.finalize(gen=0)",
+            vec![],
+        ),
+        end(0, 65_000, "Finalize Garbage (gen=0)", "gc.finalize(gen=0)"),
+        end(0, 70_000, "GC Pause (gen=0)", "gc.pause(gen=0)"),
+    ];
+    let path = export(&events, "emission-order");
+
+    let document = dump(&python, &path);
+    std::fs::remove_file(&path).ok();
+
+    assert!(
+        document.is_valid(),
+        "the pairs still nest even where the timestamps do not:\n{}",
+        document.problems()
+    );
+
+    let starts: Vec<(&str, i64)> = document
+        .rows("slice")
+        .iter()
+        .filter_map(|row| Some((row["name"].as_str()?, row["ts"].as_i64()?)))
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            ("Finalize Garbage (gen=0)", 0),
+            ("GC Pause (gen=0)", 60_000)
+        ],
+        "the query engine orders by timestamp; the file has them the other way round"
+    );
 }
 
 /// Two processes and a repeat, still one trace that holds together. The structural checks are

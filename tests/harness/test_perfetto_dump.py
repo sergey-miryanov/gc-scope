@@ -213,6 +213,25 @@ def test_an_event_on_a_sequence_with_no_default_and_no_track_is_still_caught(wri
     assert [p["check"] for p in validity["problems"]] == ["track_uuid", "track_uuid"]
 
 
+def test_unclosed_slices_on_resolvable_and_unresolvable_tracks_are_both_reported(write_trace):
+    """A verdict, not a crash.
+
+    Unresolvable events are filed under `None`, so a trace holding both kinds asks the reporter
+    to order `None` against an integer. Raised, that would leave the caller with exit 2 — the
+    harness saying it could not run — and would throw away the pairing problems it had already
+    found. An oracle that reports an infrastructure failure in place of the defect it detected is
+    worse than one that never looked.
+    """
+    trace = reference_traces.unclosed_on_a_named_and_an_unresolvable_track()
+    validity = wire_dump(write_trace(trace, "unclosed-mixed"))["validity"]
+
+    assert validity["ok"] is False
+    checks = [p["check"] for p in validity["problems"]]
+    assert checks.count("slice_pairing") == 2, validity["problems"]
+    # And the event naming no track is still reported by the check that owns that question.
+    assert "track_uuid" in checks
+
+
 def test_bytes_that_are_not_a_trace_are_reported_rather_than_raised(tmp_path):
     path = tmp_path / "garbage.perfetto-trace"
     path.write_bytes(b"\xff\xff\xff\xff not a trace at all")

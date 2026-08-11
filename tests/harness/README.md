@@ -70,11 +70,16 @@ from the wire view. Do not "fix" a missing column by asserting on something else
 to exist.
 
 `proto_constants.py` is the narrowest of the three, and the only one that reads no trace. It
-takes claims — `(message, field, number)` and `(message, enum, value, number)` — from a file or
+takes claims — `(message, field, number)` and `(scope, enum, value, number)` — from a file or
 stdin, and answers whether the schema agrees, so a table of field numbers transcribed by hand
 in another language is re-derived from the descriptors on every run. It knows nothing about who
 is asking or what they intend to write into those fields. Same exit codes: **0** every claim
 holds, **1** at least one does not, **2** it could not run.
+
+A message is named by its path from the file, so a nested one is `ClockSnapshot.Clock` and the
+bare `Clock` stays unknown — resolving it by hunting through every parent would answer a question
+nobody asked. An enum the file declares outside any message, `BuiltinClock` among them, takes the
+empty scope `""`.
 
 Its answer is only as current as the pinned `perfetto`. A field added or moved upstream is
 invisible here until someone bumps `requirements.txt` — the guarantee is against the schema

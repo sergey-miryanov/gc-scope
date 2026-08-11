@@ -156,6 +156,28 @@ def unopened_end() -> Trace:
     return trace
 
 
+def unclosed_on_a_named_and_an_unresolvable_track() -> Trace:
+    """Two slices left open: one on a declared track, one on no track at all.
+
+    The pair is the point. Events whose track cannot be resolved are filed under `None`, so a
+    trace holding both kinds makes the checker report a `None` key beside an integer one — and
+    ordering those against each other is where it used to raise instead of answering.
+    """
+    trace = Trace()
+    _descriptor_packet(trace, THREAD_TRACK, "Worker")
+
+    begin = _event_packet(trace, THREAD_TRACK, 1_000)
+    begin.type = TrackEvent.TYPE_SLICE_BEGIN
+    begin.name = "never ends"
+
+    packet = trace.packet.add()
+    packet.trusted_packet_sequence_id = 1
+    packet.timestamp = 2_000
+    packet.track_event.type = TrackEvent.TYPE_SLICE_BEGIN
+    packet.track_event.name = "never ends and names no track"
+    return trace
+
+
 def no_sequence_id() -> Trace:
     """A packet belonging to no sequence."""
     trace = Trace()
@@ -171,6 +193,7 @@ TRACES = {
     "undeclared-track": undeclared_track,
     "unmatched-begin": unmatched_begin,
     "unopened-end": unopened_end,
+    "unclosed-mixed-tracks": unclosed_on_a_named_and_an_unresolvable_track,
     "no-sequence-id": no_sequence_id,
 }
 

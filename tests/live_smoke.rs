@@ -881,3 +881,60 @@ fn live_monitor_puts_only_the_document_on_stdout() {
         "gcscope.gc-summary/1 1"
     );
 }
+
+/// **The clock gate.** A Record's timestamps and gcscope's own readings go into one Perfetto
+/// trace as one clock domain, and the only reason that is allowed is that they *are* one clock:
+/// the Probe times a Collection with `PyTime_PerfCounterRaw`, and CPython's perf counter is the
+/// machine's monotonic counter, which gcscope reads for itself in `monitor::clock`.
+///
+/// Which system clock that is differs per platform — `CLOCK_MONOTONIC` on Linux,
+/// `mach_absolute_time` on macOS, `QueryPerformanceCounter` on Windows — and getting it wrong
+/// **fails open**, exactly as the image-layout facts in ADR 0004 do. A wrong clock still returns
+/// a plausible number; the trace is merely wrong by however far the two counters happen to sit
+/// apart, and nothing in gcscope's own output can tell. So it is asked of the interpreter
+/// itself, on every leg of the matrix.
+///
+/// `time.perf_counter_ns()` is the same counter `PyTime_PerfCounterRaw` reads — the public name
+/// for it — so this compares what a Record would carry against what gcscope would place it
+/// with, without needing a build whose rings publish timestamps.
+///
+/// The window is a minute wide on purpose. What it has to catch is a *different* clock: an epoch
+/// away, or a raw tick count that is 41.67× out on Apple Silicon. A tight bound would buy
+/// nothing and fail on a loaded runner.
+#[test]
+#[ignore = "spawns an interpreter — run with --ignored"]
+fn a_targets_own_clock_is_the_one_gcscope_reads() {
+    let Some(python) = test_python() else {
+        eprintln!("SKIP a_targets_own_clock_is_the_one_gcscope_reads: no Python found");
+        return;
+    };
+
+    // Read gcscope's clock on both sides of the interpreter's, so the comparison is against an
+    // interval this test measured rather than against a single reading and a guess about which
+    // came first.
+    let before = gcscope::monitor::clock::monotonic_now_ns();
+    let out = Command::new(&python)
+        .args(["-c", "import time; print(time.perf_counter_ns())"])
+        .output()
+        .expect("the interpreter reports its perf counter");
+    let after = gcscope::monitor::clock::monotonic_now_ns();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let target: i64 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("perf_counter_ns prints an integer");
+
+    const SPAWN_WINDOW_NS: i64 = 60 * 1_000_000_000;
+    assert!(
+        target > before - SPAWN_WINDOW_NS && target < after + SPAWN_WINDOW_NS,
+        "the interpreter's perf counter reads {target} where gcscope's clock read {before} \
+         before spawning it and {after} after. They are not the same counter on this platform, \
+         so every Perfetto trace gcscope writes here places its Collections that far from the \
+         markers it puts beside them — see src/monitor/clock.rs."
+    );
+}

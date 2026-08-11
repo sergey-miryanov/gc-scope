@@ -16,6 +16,9 @@ The claims document:
     {"fields": [["TracePacket", "timestamp", 8], ...],
      "enums":  [["TrackEvent", "Type", "TYPE_SLICE_BEGIN", 1], ...]}
 
+A message is named by its path from the file: `ClockSnapshot.Clock` for a nested one. An enum
+declared at file scope rather than inside a message is claimed against the empty scope `""`.
+
 Exit codes: 0 every claim holds, 1 at least one does not, 2 the checker could not run (bad
 arguments, unreadable or malformed claims, missing dependency). The verdict is printed on
 stdout as JSON either way, so a caller reads *which* claim was wrong rather than inferring it.
@@ -37,15 +40,42 @@ def _problem(claim: str, detail: str) -> dict:
 
 
 def _messages() -> dict:
-    """Every message in the Perfetto trace schema, by name.
+    """Every top-level message in the Perfetto trace schema, by name.
 
-    Top-level only, which is every message a field-number table names. A nested one would have
-    to be reached through its parent, and asking for it here reports an unknown message rather
-    than resolving something that happens to share a name.
+    Nested messages are not in here and are not meant to be: they are reached through their
+    parent by [`_resolve_message`], so `Clock` on its own stays an unknown message rather than
+    resolving to whichever enclosing message happens to declare one.
     """
     from perfetto.protos.perfetto.trace import perfetto_trace_pb2
 
     return dict(perfetto_trace_pb2.DESCRIPTOR.message_types_by_name)
+
+
+def _file_enums() -> dict:
+    """Every enum the file declares outside any message, by name — `BuiltinClock` among them.
+
+    Perfetto puts the clock domain ids at file scope, so a table naming one has no message to
+    hang it off. Claims spell that scope as the empty string.
+    """
+    from perfetto.protos.perfetto.trace import perfetto_trace_pb2
+
+    return dict(perfetto_trace_pb2.DESCRIPTOR.enum_types_by_name)
+
+
+def _resolve_message(name: str, messages: dict):
+    """A message by its path from the file: `TracePacket`, or `ClockSnapshot.Clock`.
+
+    `None` for anything the schema does not declare, including a path whose first step exists
+    and whose second does not — the caller reports that as an unknown message, which is what it
+    is. A dotted name is the only way to reach a nested message here, deliberately: resolving a
+    bare `Clock` by searching every parent would answer a question nobody asked.
+    """
+    head, _, rest = name.partition(".")
+    descriptor = messages.get(head)
+    while descriptor is not None and rest:
+        head, _, rest = rest.partition(".")
+        descriptor = descriptor.nested_types_by_name.get(head)
+    return descriptor
 
 
 def check_fields(claims: list, messages: dict) -> list[dict]:
@@ -53,7 +83,7 @@ def check_fields(claims: list, messages: dict) -> list[dict]:
     problems = []
     for message, field, number in claims:
         where = f"{message}.{field}"
-        descriptor = messages.get(message)
+        descriptor = _resolve_message(message, messages)
         if descriptor is None:
             problems.append(_problem(where, f"no message named {message} in the schema"))
             continue
@@ -67,18 +97,27 @@ def check_fields(claims: list, messages: dict) -> list[dict]:
     return problems
 
 
-def check_enums(claims: list, messages: dict) -> list[dict]:
-    """Each `(message, enum, value, number)` against the schema's own value for that name."""
+def check_enums(claims: list, messages: dict, file_enums: dict) -> list[dict]:
+    """Each `(scope, enum, value, number)` against the schema's own value for that name.
+
+    `scope` is the message declaring the enum, or the empty string for one the file declares
+    outside any message. Both spellings report the same way, so a table does not have to know
+    which kind it is looking at until the schema disagrees with it.
+    """
     problems = []
     for message, enum, value, number in claims:
-        where = f"{message}.{enum}.{value}"
-        descriptor = messages.get(message)
-        if descriptor is None:
-            problems.append(_problem(where, f"no message named {message} in the schema"))
-            continue
-        enum_descriptor = descriptor.enum_types_by_name.get(enum)
+        where = f"{message}.{enum}.{value}" if message else f"{enum}.{value}"
+        if message:
+            descriptor = _resolve_message(message, messages)
+            if descriptor is None:
+                problems.append(_problem(where, f"no message named {message} in the schema"))
+                continue
+            enum_descriptor = descriptor.enum_types_by_name.get(enum)
+        else:
+            enum_descriptor = file_enums.get(enum)
         if enum_descriptor is None:
-            problems.append(_problem(where, f"{message} declares no enum named {enum}"))
+            where_from = message or "the trace schema"
+            problems.append(_problem(where, f"{where_from} declares no enum named {enum}"))
             continue
         actual = enum_descriptor.values_by_name.get(value)
         if actual is None:
@@ -99,7 +138,7 @@ def check(claims: dict) -> dict:
     messages = _messages()
     fields = claims.get("fields", [])
     enums = claims.get("enums", [])
-    problems = check_fields(fields, messages) + check_enums(enums, messages)
+    problems = check_fields(fields, messages) + check_enums(enums, messages, _file_enums())
     return {
         "schema": SCHEMA,
         "checked": {"fields": len(fields), "enums": len(enums)},

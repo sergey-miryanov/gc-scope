@@ -247,7 +247,13 @@ def _check_slices_are_paired(trace, tracks: list[int | None]) -> list[dict]:
             else:
                 open_slices[track].pop()
 
-    for track, still_open in sorted(open_slices.items()):
+    # Sorted for a stable report, and keyed rather than compared directly: an event that names no
+    # track files its begins under `None`, and `None < 0` is a `TypeError`. Raised here it would
+    # take the whole dump down with exit 2 — the harness saying it could not run — and swallow the
+    # pairing problems it had already found. An unresolvable track sorts last.
+    for track, still_open in sorted(
+        open_slices.items(), key=lambda item: (item[0] is None, item[0] or 0)
+    ):
         for index in still_open:
             problems.append(
                 _problem("slice_pairing", f"slice begin on track {track} never ends", index)
