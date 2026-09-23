@@ -53,7 +53,7 @@ jobs:
         run: cargo llvm-cov --lcov --output-path lcov.info --fail-under-lines 1
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: lcov.info
           flags: unit,${{ matrix.os }}
@@ -273,7 +273,7 @@ jobs:
           cargo llvm-cov report --lcov --output-path lcov.info --fail-under-lines 1
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: lcov.info
           flags: smoke,${{ matrix.os }}
@@ -368,7 +368,7 @@ jobs:
           cargo llvm-cov --test live_smoke --lcov --output-path lcov.info --fail-under-lines 1 -- --ignored --nocapture
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: lcov.info
           flags: smoke,custom-build
@@ -406,7 +406,7 @@ jobs:
         run: cargo llvm-cov --features test-hooks --tests --lcov --output-path lcov.info --fail-under-lines 1 -- --ignored
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: lcov.info
           flags: integration,ubuntu-latest
@@ -615,7 +615,7 @@ jobs:
           cargo llvm-cov --test probe --lcov --output-path lcov.info --fail-under-lines 1 -- --include-ignored --nocapture
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: lcov.info
           flags: probe,${{ matrix.os }}
