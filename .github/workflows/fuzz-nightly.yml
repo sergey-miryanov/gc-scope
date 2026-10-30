@@ -47,7 +47,7 @@ jobs:
           workspaces: |
             . -> target
             fuzz -> fuzz/target
-      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-fuzz
 
